@@ -180,7 +180,7 @@ describe('P4 native messages and projection', () => {
       expect(api().validateNativeHistory(changed)).toMatchObject({ ok: false });
     }
     const cycle: Record<string, unknown> = {}; cycle.self = cycle;
-    expect(api().validateModelMessages([{ ...result, details: cycle }])).toMatchObject({ ok: false });
+    expect(api().validateModelMessages([{ ...result, details: cycle } as AgentMessage])).toMatchObject({ ok: false });
     expect(api().validateModelMessages([{ ...user, content: [{ type: 'image', data: 'a', mimeType: 'image/png' }] }]))
       .toMatchObject({ ok: true });
     for (const invalid of [{ ...valid, leafId: 'missing' }, { ...valid, header: { ...valid.header, version: 2 } },
@@ -191,9 +191,9 @@ describe('P4 native messages and projection', () => {
   });
 
   it('allows omitted SDK object fields but rejects array holes, undefined array elements and accessor data', () => {
-    expect(api().validateModelMessages([user, call, { ...result, details: { optional: undefined } }]).ok).toBe(true);
+    expect(api().validateModelMessages([user, call, { ...result, details: { optional: undefined } } as unknown as AgentMessage]).ok).toBe(true);
     for (const details of [[undefined], new Array(1), { get secret() { return 'hidden'; } }, { [Symbol('secret')]: 'hidden' }]) {
-      expect(api().validateModelMessages([user, call, { ...result, details }]).ok).toBe(false);
+      expect(api().validateModelMessages([user, call, { ...result, details } as AgentMessage]).ok).toBe(false);
     }
   });
 

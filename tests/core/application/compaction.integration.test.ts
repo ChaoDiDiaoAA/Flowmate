@@ -9,7 +9,7 @@ import type { PreparedAgent } from '@flowmate/contracts';
 import { makeApplication } from '../../../packages/core/src/application.ts';
 import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
 import { SessionService } from '../../../packages/core/src/sessions/service.ts';
-import { openTestDatabase } from '../../support/database.ts';
+import { openTestDatabase, withNativeHistoryFaults } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync, waitFor } from '../../support/resources.ts';
 import { createAgentHistoryFixture } from './agent-history-fixture.ts';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
@@ -76,7 +76,7 @@ function fixture(holdPreparation = false) {
       return ok({ snapshot, execute: async () => { throw new Error('Manual compaction cannot execute an Agent Run.'); } });
     },
     compactSession: async (_id, value): Promise<NativeCompactionOutcome> => {
-      compacts++; control = value; expect(value.maxModelCalls).toBe(2); need(value.verifyUse());
+      compacts++; control = value; expect(value.maxModelCalls).toBe(2); need(await value.verifyUse());
       observation = { sessionId: session.sessionId, nativeSessionId: nativeId, operationId: value.operationId, runId: null,
         reason: 'manual', observationSequence: 1, phase: 'compacting', generated: false, nativeOutcome: 'pending',
         entryId: null, saved: null, error: null, stopRequested: false, stopped: false, continuation: 'next-run',
@@ -96,13 +96,12 @@ function fixture(holdPreparation = false) {
     close: async () => ({ stopped: true, closed: true, errors: [] }),
   };
   let sessions!: SessionService;
-  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions,
-    sessionInputs: store.sessionInputs, agent, isSessionManaging: id => sessions.isManaging(id),
+  const runtime = new RuntimeService({ database: store,  agent, isSessionManaging: id => sessions.isManaging(id),
     provider: { async prepare() { throw new Error('Manual compaction cannot call Provider port.'); },
       async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
-  sessions = new SessionService(store.sessions, agent, () => runtime.state(), () => at, store.runs, store.memory,
-    store.sessionInputs, undefined, undefined, id => runtime.verifySessionMutation(id));
+  sessions = new SessionService(agent, () => runtime.state(), () => at, store,
+     undefined, undefined, (id, intent, repository) => runtime.verifySessionMutation(id, intent, repository));
   const app = makeApplication(runtime, store.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
   deferCleanup(async () => { preparation.resolve(); completion.resolve(); await runtime.close(); });
   const expected = need(store.sessions.loadHistoryForContext(session.sessionId)).commit!;
@@ -122,6 +121,50 @@ function fixture(holdPreparation = false) {
 }
 
 describe('P10 manual admission and readonly queries (controlled port, not SDK proof)', () => {
+  it('does not claim manual compaction for a disconnected foreground client', async () => {
+    const f = fixture(), controller = new AbortController(); controller.abort('shutdown');
+    expect(await f.app.compactSession(f.request, { signal: controller.signal }))
+      .toMatchObject({ ok: false, error: { code: 'runtime_shutdown' } });
+    expect(f.counts()).toMatchObject({ prepares: 0, compacts: 0 });
+    expect(f.runtime.state().active).toBeNull();
+  });
+
+  it('propagates foreground disconnection into the original manual compaction preparation', async () => {
+    const f = fixture(true), controller = new AbortController();
+    need(await f.app.compactSession(f.request, { signal: controller.signal }));
+    await waitFor(async () => f.counts().prepares === 1);
+    controller.abort('shutdown'); f.unblockPreparation();
+    await waitFor(async () => f.runtime.state().active === null);
+    expect(f.counts()).toMatchObject({ prepares: 1, compacts: 0 });
+    expect(f.rows().runs).toEqual([]);
+  });
+
+  it('queries compaction only after a held owner commits its Session eligibility change', async () => {
+    const f = fixture(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const held = f.store.transaction(async scope => {
+      scope.db.query("UPDATE sessions SET status='archived' WHERE id=?").run(f.session.sessionId);
+      entered.resolve(); await release.promise;
+    });
+    await entered.promise;
+    let settled = false;
+    const query = f.app.querySessionCompaction({ sessionId: f.session.sessionId }).then(result => { settled = true; return result; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+    } finally { release.resolve(); await held; }
+    expect(await query).toMatchObject({ ok: true, data: { manualAllowed: false, blockCode: 'session_archived' } });
+  });
+
+  it('executes manual compaction from live owner repositories after legacy root aliases become unavailable', async () => {
+    const f = fixture();
+    f.store.sessions.readHistorySnapshot = () => fail(appError('storage_read_failed', 'storage', 'Root alias must not serve compaction.'));
+    need(await f.app.compactSession(f.request));
+    await waitFor(async () => f.control() !== undefined || f.runtime.state().active === null);
+    expect(f.counts()).toMatchObject({ prepares: 1, compacts: 1 });
+    expect(await f.control()!.verifyUse()).toEqual(ok(undefined));
+    f.finish(); await waitFor(async () => f.runtime.state().active === null);
+  });
+
   it('manual-claims-slot-before-prepare-await', async () => {
     const f = fixture(true);
     expect(need(await f.call('compactSession', f.request))).toEqual({ sessionId: f.session.sessionId, operationId: f.request.operationId });
@@ -131,9 +174,10 @@ describe('P10 manual admission and readonly queries (controlled port, not SDK pr
       .toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
     expect(await f.runtime.start({ sessionId: f.session.sessionId, text: 'blocked', config: f.request.config }))
       .toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
-    expect(need(f.sessions.get(f.session.sessionId))).toMatchObject({ availability: 'busy', activeRunId: null });
-    expect(f.runtime.verifySessionMutation(f.session.sessionId)).toMatchObject({ ok: false, error: { code: 'session_busy' } });
-    expect(f.sessions.setStatus({ sessionId: f.session.sessionId, expectedStatus: 'active', status: 'archived' })).toMatchObject({ ok: false, error: { code: 'session_busy' } });
+    expect(need(await f.sessions.get(f.session.sessionId))).toMatchObject({ availability: 'busy', activeRunId: null });
+    expect(await f.store.read(scope => f.runtime.verifySessionMutation(f.session.sessionId, undefined, scope.sessions)))
+      .toMatchObject({ ok: false, error: { code: 'session_busy' } });
+    expect(await f.sessions.setStatus({ sessionId: f.session.sessionId, expectedStatus: 'active', status: 'archived' })).toMatchObject({ ok: false, error: { code: 'session_busy' } });
     const before = f.rows();
     expect(await f.sessions.branch({ sessionId: f.session.sessionId, expectedLeafId: f.request.expected.leafId,
       expectedEntryCount: f.request.expected.entryCount, expectedCommitRevision: f.request.expected.commitRevision, targetEntryId: 'blocked-target' }))
@@ -159,7 +203,7 @@ describe('P10 manual admission and readonly queries (controlled port, not SDK pr
     need(await f.call('compactSession', f.request));
     await waitFor(async () => f.control() !== undefined);
     expect(f.preparationCommit()).toEqual({ commitRevision: f.request.expected.commitRevision + 1, entryCount: 1, leafId: 'model-fixture' });
-    expect(f.control()!.verifyUse()).toEqual(ok(undefined));
+    expect(await f.control()!.verifyUse()).toEqual(ok(undefined));
     for (const table of ['runs', 'session_inputs', 'jobs']) expect(f.rows()[table]).toEqual(before[table]);
     expect(f.store.db.query('SELECT run_id FROM session_native_entries').all()).toEqual([{ run_id: null }]);
     f.finish(); await waitFor(async () => f.runtime.state().active === null);
@@ -268,11 +312,11 @@ describe('P10 manual admission and readonly queries (controlled port, not SDK pr
 
 describe('P10 public Application → native SDK → controlled HTTP → SQLite', () => {
   async function realFixture(mode: 'manual' | 'threshold' | 'split' | 'post-threshold' | 'overflow-stop' | 'overflow-error' | 'overflow-length' | 'overflow-twice',
-    respond?: (request: Request, count: number) => Promise<Response | null>, authFailure = false) {
+    respond?: (request: Request, count: number) => Promise<Response | null>, failure?: 'pre-start' | 'auth') {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-p10-public-'));
     const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), runtimeDir: join(root, 'runtime'),
       artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), logsDir: join(root, 'logs') };
-    const store = need(openTestDatabase(paths));
+    const store = withNativeHistoryFaults(need(openTestDatabase(paths)));
     const payloads: unknown[] = [];
     const server = await createHttpProvider(async request => {
       payloads.push(await request.json());
@@ -310,8 +354,11 @@ describe('P10 public Application → native SDK → controlled HTTP → SQLite',
     const agent = new PiAgentAdapter({ cwd: root, agentDir: root, credentials: new InMemoryCredentialStore(),
       runtimeApiKey: 'synthetic-public-p10', promptTrace, sessionSetup(session) {
         session.subscribe(event => { if (event.type === 'compaction_start' || event.type === 'compaction_end') nativeEvents.push(event.type); });
-        // Inject authentication failure at the fixed SDK seam, before its start event or any transport.
-        if (authFailure) Reflect.set(session, '_getSummarizationRequestAuth', async () => { throw new Error('controlled pre-start auth failure'); });
+        if (failure === 'pre-start') Reflect.set(session, '_runAutoCompaction', async function(_reason: unknown, _willRetry: unknown) {
+          throw new Error('controlled pre-start native failure');
+        });
+        // Pi 1.4 emits compaction_start before resolving summary authentication.
+        if (failure === 'auth') Reflect.set(session, '_getSummarizationRequestAuth', async () => { throw new Error('controlled summary auth failure'); });
       } });
     const nativeCompact = agent.compactSession.bind(agent);
     agent.compactSession = async (...args) => {
@@ -321,11 +368,10 @@ describe('P10 public Application → native SDK → controlled HTTP → SQLite',
       return value;
     };
     const context = new ContextService({ store, materials: { inspectParsed() { throw new Error('Pure chat cannot inspect material.'); } } });
-    const runtime = new RuntimeService({ memory: store.memory, sessions: store.sessions, runs: store.runs, sessionInputs: store.sessionInputs,
-      contextRepository: store.context, contextService: context, agent,
+    const runtime = new RuntimeService({ database: store,  contextService: context, agent,
       provider: { async prepare() { throw new Error('No direct Provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
       log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
-    const sessions = new SessionService(store.sessions, agent, () => runtime.state(), () => at, store.runs, store.memory);
+    const sessions = new SessionService(agent, () => runtime.state(), () => at, store);
     const app = makeApplication(runtime, store.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
     deferCleanup(async () => { await runtime.close(); });
     const config: ProviderConfig = { version: 1, name: 'Public fixture', revision: 1, modelRef: { provider: 'p10-public', model: 'offline' },
@@ -334,17 +380,20 @@ describe('P10 public Application → native SDK → controlled HTTP → SQLite',
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
     return { root, store, row, agent, runtime, app, config, payloads, promptTrace, sessions, nativeEvents };
   }
-  it('native automatic authentication failure before start preserves an unknown cause and sends no HTTP', async () => {
-    const f = await realFixture('threshold', undefined, true);
+  for (const failure of ['pre-start', 'auth'] as const) it(`native automatic ${failure} failure preserves its actual lifecycle and sends no HTTP`, async () => {
+    const f = await realFixture('threshold', undefined, failure);
     const accepted = need(await f.app.startRun({ sessionId: f.row.sessionId, text: 'New explicit input', config: f.config,
       timeoutMs: 5000, stopGraceMs: 100 }));
     await waitFor(async () => f.runtime.state().active === null);
     expect(need(await f.app.queryRun(accepted.runId)).status).toBe('failed');
-    expect(f.nativeEvents).toEqual([]); expect(f.payloads).toHaveLength(0);
+    expect(f.nativeEvents).toEqual(failure === 'pre-start' ? [] : ['compaction_start', 'compaction_end']);
+    expect(f.payloads).toHaveLength(0);
     const state = need(await f.app.querySessionCompaction({ sessionId: f.row.sessionId, runId: accepted.runId }));
     expect(state.operation).toMatchObject({ generated: false, saved: null, stopped: true, mayContinue: false,
-      nativeOutcome: 'failed', error: { code: 'compaction_unavailable' }, tokens: { totalTokens: null, cost: null } });
-    expect(state.operation!.error!.message).toContain('unknown');
+      nativeOutcome: 'failed', error: { code: failure === 'pre-start' ? 'compaction_unavailable' : 'compaction_failed' },
+      tokens: { totalTokens: null, cost: null } });
+    if (failure === 'pre-start') expect(state.operation!.error!.message).toContain('unknown');
+    expect(state.operation!.error!.message).not.toContain('controlled');
     expect(NativeSessionHistorySchema.parse(need(f.store.memory.load(f.row.sessionId))!.history).entries.filter(e => e.type === 'compaction')).toHaveLength(0);
   });
   it('a successful threshold summary exhausting the original budget refuses continuation without poisoning verified history', async () => {
@@ -401,7 +450,8 @@ describe('P10 public Application → native SDK → controlled HTTP → SQLite',
     if (kind !== 'capacity') expect(history.entries.slice(0, before.entries.length)).toEqual([...before.entries]);
     const view = need(await f.app.querySessionCompaction({ sessionId: f.row.sessionId }));
     expect(view.operation?.mayContinue).toBe(false);
-    if (kind === 'native-sql') expect(view.operation).toMatchObject({ generated: true, saved: null, nativeOutcome: 'failed' });
+    if (kind === 'native-sql') expect(view.operation).toMatchObject({ generated: true, saved: null, nativeOutcome: 'succeeded',
+      mayContinue: false, error: { code: 'storage_write_failed' } });
     if (kind === 'journal-ended') expect(view.operation).toMatchObject({ generated: true, nativeOutcome: 'succeeded',
       saved: { leafId: expect.any(String) }, error: { code: 'storage_write_failed' } });
     if (kind === 'capacity') {
@@ -449,11 +499,12 @@ describe('P10 public Application → native SDK → controlled HTTP → SQLite',
     const accepted = need(await f.app.startRun({ sessionId: f.row.sessionId, text: 'Original input', config: f.config,
       timeoutMs: 5000, stopGraceMs: 100 }));
     await entered.promise;
-    const commit = f.store.memory.commit;
+    const transaction = f.store.transaction;
     let stopped: Promise<Result<unknown>> | undefined;
-    f.store.memory.commit = input => {
-      const result = commit(input);
-      if (result.ok && !stopped && input.appendEntries.at(-1)?.type === 'compaction')
+    f.store.transaction = async operation => {
+      const result = await transaction(operation);
+      const saved = need(f.store.memory.load(f.row.sessionId));
+      if (!stopped && saved?.history.entries.at(-1)?.type === 'compaction')
         stopped = f.app.cancelRun(accepted.runId);
       return result;
     };
@@ -575,8 +626,7 @@ describe('P10 public Application → native SDK → controlled HTTP → SQLite',
         entry.type === 'message' && entry.message.role === 'assistant' && entry.message.stopReason === 'error')).toHaveLength(mode === 'overflow-twice' ? 2 : 1);
       expect(store.db.query('SELECT COUNT(*) AS n FROM session_inputs').get()).toEqual({ n: 1 });
       const coldAgent = new PiAgentAdapter({ cwd: root, agentDir: root });
-      const coldRuntime = new RuntimeService({ memory: store.memory, sessions: store.sessions, runs: store.runs,
-        contextRepository: store.context, agent: coldAgent,
+      const coldRuntime = new RuntimeService({ database: store,  agent: coldAgent,
         provider: { async prepare() { throw new Error('Readonly query.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
         log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
       const recorded = need(await coldRuntime.querySessionCompaction({ sessionId: row.sessionId, runId: next.runId,

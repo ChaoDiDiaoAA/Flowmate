@@ -12,7 +12,7 @@ function chunk(content: string, finishReason: string | null = null, usage?: Reco
     id: 'fixture-response-1',
     object: 'chat.completion.chunk',
     created: 1,
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-flash',
     choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }],
     ...(usage ? { usage } : {}),
   })}\n\n`;

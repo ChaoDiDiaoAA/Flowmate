@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { appError, fail, ok, invoiceHeaderFields, InvoiceFormDraftSchema, formatExecutionPrompt } from '@flowmate/contracts';
 import { WorkspaceService } from '../../../packages/core/src/workspace/service.ts';
-import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
+import { makeCurrentSelectedCandidate, makeSelectedCandidate } from '../../support/selected-candidate.ts';
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ProviderConfig, Result, WorkspaceExpectation } from '@flowmate/contracts';
@@ -44,63 +44,63 @@ function registerOtherMaterial(f: ReturnType<typeof makeSelectedCandidate>, same
 }
 
 describe('P7 Workspace authority and recovery', () => {
-  it('reads persisted versioned selection and preserves it on view and Session changes', () => {
-    const fixture = makeSelectedCandidate();
+  it('reads persisted versioned selection and preserves it on view and Session changes', async () => {
+    const fixture = await makeCurrentSelectedCandidate();
     const selection = { formatVersion: 1, kind: 'field', target: 'candidate', targetId: fixture.candidateId,
       targetVersion: 1, fieldPath: 'fields.taxAmount' };
     fixture.db.query('UPDATE workspace SET selection_json=?').run(JSON.stringify(selection));
-    const service = new WorkspaceService(fixture.workspace, () => fixture.stamp, fixture.verify);
-    expect(service.read()).toMatchObject({ ok: true, data: { selection } });
-    expect(service.update({ expectedRevision: fixture.selectedWorkspace.revision,
+    const service = new WorkspaceService(fixture, () => fixture.stamp, fixture.verify);
+    expect(await service.read()).toMatchObject({ ok: true, data: { selection } });
+    expect(await service.update({ expectedRevision: fixture.selectedWorkspace.revision,
       change: { kind: 'view', view: 'parsed' } })).toMatchObject({ ok: true, data: { selection } });
   });
 
-  it('persists a valid source selection and treats key order as the same value', () => {
-    const fixture = makeSelectedCandidate();
-    const service = new WorkspaceService(fixture.workspace, () => fixture.stamp, fixture.verify);
+  it('persists a valid source selection and treats key order as the same value', async () => {
+    const fixture = await makeCurrentSelectedCandidate();
+    const service = new WorkspaceService(fixture, () => fixture.stamp, fixture.verify);
     const selection = { formatVersion: 1, kind: 'source', target: 'document', targetId: 1,
       targetVersion: 'v1', artifactId: 2, page: 1, block: 'b1' };
-    const saved = service.update({ expectedRevision: fixture.selectedWorkspace.revision, change: { kind: 'selection', selection } });
+    const saved = await service.update({ expectedRevision: fixture.selectedWorkspace.revision, change: { kind: 'selection', selection } });
     expect(saved).toMatchObject({ ok: true, data: { selection, revision: fixture.selectedWorkspace.revision + 1 } });
     if (!saved.ok) return;
-    const same = service.update({ expectedRevision: saved.data.revision, change: { kind: 'selection',
+    const same = await service.update({ expectedRevision: saved.data.revision, change: { kind: 'selection',
       selection: { block: 'b1', page: 1, artifactId: 2, targetVersion: 'v1', targetId: 1,
         target: 'document', kind: 'source', formatVersion: 1 } } });
     expect(same).toEqual(saved);
-    expect(service.update({ expectedRevision: fixture.selectedWorkspace.revision,
+    expect(await service.update({ expectedRevision: fixture.selectedWorkspace.revision,
       change: { kind: 'selection', selection } })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
   });
 
-  it('restores a stale supported locator and reports only committed cleanup', () => {
-    const fixture = makeSelectedCandidate();
+  it('restores a stale supported locator and reports only committed cleanup', async () => {
+    const fixture = await makeCurrentSelectedCandidate();
     fixture.db.query('UPDATE workspace SET selection_json=?').run(JSON.stringify({ formatVersion: 1, kind: 'line',
       target: 'candidate', targetId: fixture.candidateId, targetVersion: 1, lineIndex: 0 }));
-    const service = new WorkspaceService(fixture.workspace, () => fixture.stamp, fixture.verify);
+    const service = new WorkspaceService(fixture, () => fixture.stamp, fixture.verify);
     expect(typeof service.restore).toBe('function');
     if (typeof service.restore !== 'function') return;
-    expect(service.restore()).toMatchObject({ ok: true, data: { workspace: { selection: null,
+    expect(await service.restore()).toMatchObject({ ok: true, data: { workspace: { selection: null,
       revision: fixture.selectedWorkspace.revision + 1, invalidReferences: [] }, clearedReferences: ['selection_location_missing'] } });
   });
 
-  it('rejects a shaped locator outside the actual candidate without any write', () => {
-    const f = makeSelectedCandidate();
+  it('rejects a shaped locator outside the actual candidate without any write', async () => {
+    const f = await makeCurrentSelectedCandidate();
     const before = f.db.query('SELECT * FROM workspace').get();
-    const service = new WorkspaceService(f.workspace, () => f.stamp, f.verify);
-    expect(service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'selection', selection: {
+    const service = new WorkspaceService(f, () => f.stamp, f.verify);
+    expect(await service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'selection', selection: {
       formatVersion: 1, kind: 'line', target: 'candidate', targetId: f.candidateId, targetVersion: 1, lineIndex: 0 } } }))
       .toMatchObject({ ok: false, error: { code: 'selection_invalid' } });
     expect(f.db.query('SELECT * FROM workspace').get()).toEqual(before);
   });
 
-  it('preserves diagnostics on read and allows a new scene to clear the stale selection', () => {
-    const f = makeSelectedCandidate();
+  it('preserves diagnostics on read and allows a new scene to clear the stale selection', async () => {
+    const f = await makeCurrentSelectedCandidate();
     f.db.query('UPDATE workspace SET selection_json=?').run(JSON.stringify({ formatVersion: 1, kind: 'line',
       target: 'candidate', targetId: f.candidateId, targetVersion: 1, lineIndex: 0 }));
-    const service = new WorkspaceService(f.workspace, () => f.stamp, f.verify);
-    expect(service.read()).toMatchObject({ ok: true, data: { invalidReferences: ['selection_location_missing'] } });
-    expect(service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'view', view: 'parsed' } }))
+    const service = new WorkspaceService(f, () => f.stamp, f.verify);
+    expect(await service.read()).toMatchObject({ ok: true, data: { invalidReferences: ['selection_location_missing'] } });
+    expect(await service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'view', view: 'parsed' } }))
       .toMatchObject({ ok: false, error: { code: 'selection_invalid' } });
-    expect(service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'document', documentId: null } }))
+    expect(await service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'document', documentId: null } }))
       .toMatchObject({ ok: true, data: { documentRef: null, jobId: null, selection: null } });
   });
 
@@ -119,16 +119,16 @@ describe('P7 Workspace authority and recovery', () => {
     expect(f.workspace.read(f.stamp, f.verify)).toMatchObject({ ok: true, data: { sessionId: null, selection, revision: f.selectedWorkspace.revision + 2 } });
   });
 
-  it('repairs only availability with valid material without advancing Workspace revision or time', () => {
-    const f = makeSelectedCandidate();
+  it('repairs only availability with valid material without advancing Workspace revision or time', async () => {
+    const f = await makeCurrentSelectedCandidate();
     expect(f.documents.setAvailability({ documentId: 1, status: 'unavailable', reason: 'parsed_document_mismatch', at: f.stamp }).ok).toBe(true);
     const before = f.db.query('SELECT * FROM workspace').get();
     const later = '2026-10-03T01:00:00.000Z';
-    const service = new WorkspaceService(f.workspace, () => later, f.verify);
-    expect(service.read()).toMatchObject({ ok: true, data: { documentRef: { id: 1 }, invalidReferences: ['document_unavailable'] } });
-    expect(service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'view', view: 'parsed' } }))
+    const service = new WorkspaceService(f, () => later, f.verify);
+    expect(await service.read()).toMatchObject({ ok: true, data: { documentRef: { id: 1 }, invalidReferences: ['document_unavailable'] } });
+    expect(await service.update({ expectedRevision: f.selectedWorkspace.revision, change: { kind: 'view', view: 'parsed' } }))
       .toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
-    expect(service.restore()).toMatchObject({ ok: true, data: { clearedReferences: [], workspace: { invalidReferences: [] } } });
+    expect(await service.restore()).toMatchObject({ ok: true, data: { clearedReferences: [], workspace: { invalidReferences: [] } } });
     expect(f.db.query('SELECT * FROM workspace').get()).toEqual(before);
     expect(f.documents.get(1)).toMatchObject({ ok: true, data: { status: 'available', unavailableReason: null, updatedAt: later } });
   });
@@ -147,16 +147,16 @@ describe('P7 Workspace authority and recovery', () => {
     expect(f.documents.get(1)).toEqual(document);
   });
 
-  it('keeps references on temporary root failure and clears definite missing material on restore', () => {
-    const f = makeSelectedCandidate();
+  it('keeps references on temporary root failure and clears definite missing material on restore', async () => {
+    const f = await makeCurrentSelectedCandidate();
     const before = f.db.query('SELECT * FROM workspace').get();
-    const service = new WorkspaceService(f.workspace, () => f.stamp, f.verify);
+    const service = new WorkspaceService(f, () => f.stamp, f.verify);
     renameSync(join(f.root, 'artifacts'), join(f.root, 'artifacts-away'));
-    expect(service.restore()).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+    expect(await service.restore()).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
     expect(f.db.query('SELECT * FROM workspace').get()).toEqual(before);
     renameSync(join(f.root, 'artifacts-away'), join(f.root, 'artifacts'));
     unlinkSync(join(f.root, 'artifacts', '2', 'parsed.json'));
-    expect(service.restore()).toMatchObject({ ok: true, data: { workspace: { documentRef: null, jobId: null, selection: null,
+    expect(await service.restore()).toMatchObject({ ok: true, data: { workspace: { documentRef: null, jobId: null, selection: null,
       sessionId: f.session.sessionId, activeView: 'original', revision: f.selectedWorkspace.revision + 1 }, clearedReferences: ['artifact_missing_or_invalid'] } });
   });
 
@@ -264,7 +264,7 @@ describe('P7 Workspace authority and recovery', () => {
     expect(f.runs.freezeInput({ runId: admitted.runId, sessionId: f.session.sessionId, text: 'Follow up.', expected: runRequest(f, selected).expected, at: f.stamp }, invalid))
       .toMatchObject({ ok: false, error: { code: 'selection_invalid' } });
     const frozen = need(f.runs.freezeInput({ runId: admitted.runId, sessionId: f.session.sessionId, text: 'Follow up.', expected: runRequest(f, selected).expected, at: f.stamp }, f.verify));
-    expect(f.runs.verifyInputUse(frozen.content, invalid)).toMatchObject({ ok: false, error: { code: 'selection_invalid' } });
+    expect(f.runs.verifyInputUse([{ content: frozen.content }], invalid)).toMatchObject({ ok: false, error: { code: 'selection_invalid' } });
   });
 
   it.each(['document', 'version', 'job', 'candidate', 'session'] as const)
@@ -364,25 +364,25 @@ describe('P7 Workspace authority and recovery', () => {
     expect(f.db.query('SELECT * FROM workspace').get()).toEqual(before);
   });
 
-  it('restores a raw missing Document reference and all dependent references once', () => {
-    const f = makeSelectedCandidate(); chooseTax(f);
+  it('restores a raw missing Document reference and all dependent references once', async () => {
+    const f = await makeCurrentSelectedCandidate(); chooseTax(f);
     f.db.exec('PRAGMA foreign_keys=OFF');
     f.db.query('DELETE FROM documents WHERE id=1').run();
     f.db.exec('PRAGMA foreign_keys=ON');
-    const service = new WorkspaceService(f.workspace, () => f.stamp, f.verify);
+    const service = new WorkspaceService(f, () => f.stamp, f.verify);
     const revision = f.selectedWorkspace.revision + 1;
-    expect(service.read()).toMatchObject({ ok: true, data: { invalidReferences: expect.arrayContaining(['document_missing']) } });
-    expect(service.restore()).toMatchObject({ ok: true, data: { workspace: { documentRef: null, jobId: null, selection: null,
+    expect(await service.read()).toMatchObject({ ok: true, data: { invalidReferences: expect.arrayContaining(['document_missing']) } });
+    expect(await service.restore()).toMatchObject({ ok: true, data: { workspace: { documentRef: null, jobId: null, selection: null,
       sessionId: f.session.sessionId, revision: revision + 1 }, clearedReferences: ['document_missing'] } });
   });
 
-  it('restores hidden Job while retaining its valid Document source locator and business pointer', () => {
-    const f = makeSelectedCandidate();
+  it('restores hidden Job while retaining its valid Document source locator and business pointer', async () => {
+    const f = await makeCurrentSelectedCandidate();
     const selection = { formatVersion: 1 as const, kind: 'source' as const, target: 'document' as const, targetId: 1, targetVersion: 'v1', artifactId: 2, page: 1, block: 'b1' };
     f.db.query('UPDATE workspace SET selection_json=?').run(JSON.stringify(selection));
     f.db.query('UPDATE jobs SET hidden_at=? WHERE id=?').run(f.stamp, f.jobId);
-    const service = new WorkspaceService(f.workspace, () => f.stamp, f.verify);
-    expect(service.restore()).toMatchObject({ ok: true, data: { workspace: { documentRef: { id: 1 }, jobId: null, candidateRef: null,
+    const service = new WorkspaceService(f, () => f.stamp, f.verify);
+    expect(await service.restore()).toMatchObject({ ok: true, data: { workspace: { documentRef: { id: 1 }, jobId: null, candidateRef: null,
       selection, revision: f.selectedWorkspace.revision + 1 }, clearedReferences: ['job_hidden'] } });
     expect(f.jobs.get(f.jobId)).toMatchObject({ ok: true, data: { currentCandidateId: f.candidateId } });
   });
@@ -400,8 +400,8 @@ describe('P7 Workspace authority and recovery', () => {
       .toEqual(ok({ workspace: restored.workspace, clearedReferences: [] }));
   });
 
-  it.each(['format', 'json', 'candidate_body'] as const)('blocks %s corruption without cleanup or invalid-reference fallback', kind => {
-    const f = makeSelectedCandidate();
+  it.each(['format', 'json', 'candidate_body'] as const)('blocks %s corruption without cleanup or invalid-reference fallback', async kind => {
+    const f = await makeCurrentSelectedCandidate();
     if (kind === 'candidate_body') f.db.query('UPDATE invoice_candidates SET fields_json=? WHERE id=?').run('{"version":1,"values":{}}', f.candidateId);
     else {
       f.db.exec('PRAGMA ignore_check_constraints=ON');
@@ -409,9 +409,9 @@ describe('P7 Workspace authority and recovery', () => {
       f.db.exec('PRAGMA ignore_check_constraints=OFF');
     }
     const before = f.db.query('SELECT * FROM workspace').get();
-    const service = new WorkspaceService(f.workspace, () => f.stamp, f.verify);
-    expect(service.read()).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
-    expect(service.restore()).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    const service = new WorkspaceService(f, () => f.stamp, f.verify);
+    expect(await service.read()).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    expect(await service.restore()).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
     expect(f.workspace.restore({ expectedRevision: f.selectedWorkspace.revision, at: f.stamp }, f.verify))
       .toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
     expect(f.db.query('SELECT * FROM workspace').get()).toEqual(before);
@@ -446,13 +446,13 @@ describe('P7 Workspace authority and recovery', () => {
       config: f.config, usage: f.usage, cleanup: f.cleanup, createdAt: f.stamp }));
     const frozen = need(f.runs.freezeInput({ runId, sessionId: f.session.sessionId, text: 'Chat follow up.', at: f.stamp }, undefined));
     expect(frozen.content).toMatchObject({ workspaceContext: null, workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [] });
-    expect(f.runs.verifyInputUse(frozen.content, undefined)).toEqual(ok(undefined));
-    expect(f.runs.verifyInputUse({ ...frozen.content, allowedDocumentIds: [1] }, undefined))
+    expect(f.runs.verifyInputUse([{ content: frozen.content }], undefined)).toEqual(ok(undefined));
+    expect(f.runs.verifyInputUse([{ content: { ...frozen.content, allowedDocumentIds: [1] } }], undefined))
       .toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
   });
 
-  it('reports database unreadability without claiming missing or clearing references', () => {
-    const f = makeSelectedCandidate(); f.close();
+  it('reports database unreadability without claiming missing or clearing references', async () => {
+    const f = makeSelectedCandidate(); await f.close();
     expect(f.workspace.read(f.stamp, f.verify)).toMatchObject({ ok: false, error: { code: 'storage_read_failed' } });
   });
 });

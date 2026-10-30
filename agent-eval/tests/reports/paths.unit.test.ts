@@ -46,9 +46,9 @@ test('lookup rejects a linked workload directory and traversal without reading o
     expect(() => reportPath(repo, '../foreign')).toThrow('Invalid execution ID');
 });
 
-test('Case review creation rejects a linked result root before creating any outside directory', () => {
-    const repo = root(), outside = root(); mkdirSync(join(repo, 'agent-eval'));
-    symlinkSync(outside, join(repo, 'agent-eval/runs'), 'junction');
+test('Case review creation rejects a linked feedback parent before creating any outside directory', () => {
+    const repo = root(), outside = root();
+    symlinkSync(outside, join(repo, 'agent-eval'), 'junction');
     expect(() => addFeedback(repo, { dataset, caseId: dataset.cases[0]!.id, reviewer: 'synthetic', verdict: 'good', note: 'controlled test' })).toThrow(/link|real|escape/i);
     expect(readdirSync(outside)).toEqual([]);
 });

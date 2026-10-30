@@ -63,7 +63,7 @@ export type PreparedSubagent = Readonly<{
   pluginAgentId: string; parentRunId: DbId; inputId: DbId; scope: RunScope;
   input: AgentExecutionInput; signal: AbortSignal;
   config: SubagentConfig;
-  start(systemPrompt: string): Result<void>;
+  start(systemPrompt: string): Result<void> | Promise<Result<void>>;
   observe(event: AgentObservation): void;
 }>;
 export type SubagentConfig = SafeConfigSnapshot & {

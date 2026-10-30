@@ -23,6 +23,20 @@ it('displays Core readiness independently of enablement and adapts both Skills e
   let failure: Error | undefined;
   try {
     const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20_000 });
+    // DOM queries can succeed while Electron is minimized; capture also needs its native window ready to paint.
+    const captureVisibleWindow = async (file: string) => {
+      const nativeWindow = await app.browserWindow(page);
+      try {
+        await nativeWindow.evaluate(window => {
+          if (window.isMinimized()) window.restore();
+          window.show(); window.focus(); window.webContents.focus();
+        });
+        await expect.poll(() => nativeWindow.evaluate(window => ({ visible: window.isVisible(), minimized: window.isMinimized(),
+          focused: window.isFocused(), webContentsFocused: window.webContents.isFocused() }))).toEqual({
+          visible: true, minimized: false, focused: true, webContentsFocused: true });
+      } finally { await nativeWindow.dispose(); }
+      await page.screenshot({ path: it.info().outputPath(file) });
+    };
     await page.getByRole('button', { name: 'Skills', exact: true }).click();
     await page.getByRole('switch', { name: 'Enable invoice v1', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible();
@@ -53,7 +67,7 @@ it('displays Core readiness independently of enablement and adapts both Skills e
     await expect(row('invoice').locator('.skill-missing button')).toHaveCount(4);
     await row('invoice').getByRole('button', { name: 'read_invoice_evidence', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Resource details' })).toContainText('A declared tool is unavailable');
-    await page.screenshot({ path: it.info().outputPath('skills-partial.png') });
+    await captureVisibleWindow('skills-partial.png');
     await page.getByRole('button', { name: 'Partial', exact: true }).click(); await expect(page.getByRole('switch')).toHaveCount(1);
     await page.getByRole('button', { name: 'Disabled', exact: true }).click(); await expect(row('invoice')).toHaveCount(0);
     await page.getByRole('button', { name: 'Ready', exact: true }).click(); await expect(page.getByRole('switch')).toHaveCount(0);
@@ -98,12 +112,12 @@ it('displays Core readiness independently of enablement and adapts both Skills e
       await page.getByRole('button', { name: 'Refresh resources', exact: true }).focus(); await expect(page.getByRole('button', { name: 'Refresh resources', exact: true })).toBeFocused();
       const copy = await row('invoice').locator('.skill-row-copy').boundingBox(), readiness = await row('invoice').locator('.skill-readiness').boundingBox();
       expect(readiness!.y).toBeLessThan(copy!.y + copy!.height);
-      await page.screenshot({ path: it.info().outputPath(`skills-${theme}.png`) });
+      await captureVisibleWindow(`skills-${theme}.png`);
       await page.setViewportSize({ width: 850, height: 900 });
       const narrowCopy = await row('invoice').locator('.skill-row-copy').boundingBox(), narrowCount = await row('invoice').locator('.skill-readiness').boundingBox();
       expect(narrowCount!.y).toBeGreaterThanOrEqual(narrowCopy!.y + narrowCopy!.height);
       expect(await page.locator('main').evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
-      await page.screenshot({ path: it.info().outputPath(`skills-narrow-${theme}.png`) });
+      await captureVisibleWindow(`skills-narrow-${theme}.png`);
       await page.getByRole('button', { name: 'Settings', exact: true }).click(); await page.getByRole('tab', { name: 'Skills', exact: true }).click();
       await expect(page.locator('.embedded-resources .skill-controls')).toBeVisible(); await expect(row('invoice').getByText('5/5 capabilities', { exact: true })).toBeVisible();
       await page.setViewportSize({ width: 1600, height: 1000 });
@@ -111,13 +125,13 @@ it('displays Core readiness independently of enablement and adapts both Skills e
       const embeddedCopy = await row('invoice').locator('.skill-row-copy').boundingBox(), embeddedCount = await row('invoice').locator('.skill-readiness').boundingBox();
       expect(embeddedCount!.y).toBeGreaterThanOrEqual(embeddedCopy!.y + embeddedCopy!.height);
       expect(await row('invoice').locator('.skill-row-copy p').evaluate(node => getComputedStyle(node).whiteSpace)).toBe('nowrap');
-      await page.screenshot({ path: it.info().outputPath(`settings-skills-${theme}.png`) });
+      await captureVisibleWindow(`settings-skills-${theme}.png`);
       await display(catalogs.zero);
       await expect(row('invoice').locator('.skill-missing button')).toHaveCount(5);
       expect(await row('invoice').evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
       for (const tag of await row('invoice').locator('.skill-missing button').all())
         await expect(tag).toHaveAttribute('title', /unavailable/);
-      await page.screenshot({ path: it.info().outputPath(`settings-skills-missing-${theme}.png`) });
+      await captureVisibleWindow(`settings-skills-missing-${theme}.png`);
       await display(catalogs.full);
       await page.getByRole('button', { name: 'Skills', exact: true }).click();
     }

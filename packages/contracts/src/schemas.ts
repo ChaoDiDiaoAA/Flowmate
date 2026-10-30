@@ -1,4 +1,4 @@
-import { isAbsolute } from 'node:path';
+import { isAbsoluteConfigPath as isAbsolute } from './config-path.ts';
 import { normalizeSessionTitle } from './session-title.ts';
 import { z } from 'zod';
 import { appError, fail, ok } from './errors.ts';

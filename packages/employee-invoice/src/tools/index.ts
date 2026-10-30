@@ -1,7 +1,6 @@
 import { INVOICE_REVIEW_TOOL_NAMES } from '@flowmate/contracts';
 import type { ToolDefinition } from '@flowmate/contracts';
-import type { DocumentRepository, DocumentService } from '@flowmate/data';
-import type { CandidateRepository } from '@flowmate/contracts';
+import type { InvoiceCandidateRepository, InvoiceDocumentReader, InvoiceDocumentRepository } from './definition.ts';
 import { listInvoicePages } from './list_invoice_pages.ts';
 import { readInvoiceDocument } from './read_invoice_document.ts';
 export { projectInvoiceDocumentPage } from './read_invoice_document.ts';
@@ -20,8 +19,8 @@ import { getInvoiceCandidate } from './get_invoice_candidate.ts';
 import { compareInvoiceCandidates } from './compare_invoice_candidates.ts';
 import { saveInvoiceCandidate } from './save_invoice_candidate.ts';
 
-export function createInvoiceTools(services: { documents: DocumentService; documentRepository: DocumentRepository;
-  candidates: CandidateRepository; now: () => string }): readonly ToolDefinition<any, any>[] {
+export function createInvoiceTools(services: { documents: InvoiceDocumentReader; documentRepository: InvoiceDocumentRepository;
+  candidates: InvoiceCandidateRepository; now: () => string }): readonly ToolDefinition<any, any>[] {
   const tools = [listInvoicePages(services.documents), readInvoiceDocument(services.documents), searchInvoiceDocument(services.documents),
     listInvoiceTables(services.documents), readInvoiceEvidence(services.documents), checkInvoiceSources(services.documents, services.documentRepository),
     normalizeInvoiceValuesTool(), calculateInvoiceAmountsTool(), validateInvoiceCandidate(services.documents, services.documentRepository),

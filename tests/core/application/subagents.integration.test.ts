@@ -9,14 +9,36 @@ import type { AgentRunEvent, Result, ProviderConfig } from '@flowmate/contracts'
 import { createApplication } from '../../../apps/composition.ts';
 import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
+import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
+import type { DbHandle, SqlDatabaseStore } from '../../../packages/core/src/storage/database.ts';
 import { HostClient } from '../../../apps/desktop/main/host-client.ts';
 import { createHttpProvider, deferCleanup, mkdtempSync } from '../../support/resources.ts';
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`); return result.data; }
 
+async function heldSubagentOwner<T>(runtime: RuntimeService, action: () => T | Promise<T>, read: (store: SqlDatabaseStore) => unknown) {
+  const database = Reflect.get(runtime, 'dependencies').database as DbHandle;
+  const entered = Promise.withResolvers<void>(), inspect = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const observed = Promise.withResolvers<unknown>();
+  const held = database.transaction(async store => {
+    entered.resolve(); await inspect.promise;
+    observed.resolve(read(store)); await release.promise;
+  });
+  await entered.promise;
+  let settled = false;
+  const pending = Promise.resolve().then(action).then(value => { settled = true; return value; });
+  void pending.catch(() => {});
+  let before: unknown, wasSettled = false;
+  try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    wasSettled = settled; inspect.resolve(); before = await observed.promise;
+  } finally { inspect.resolve(); release.resolve(); await held; }
+  return { value: await pending, before, settled: wasSettled };
+}
+
 async function fixture(delegate: boolean, options: { allTools?: boolean; maxModelCalls?: number; maxToolCalls?: number;
   reuseNativeId?: boolean; lateTool?: boolean; resources?: boolean; skillTools?: boolean; switchWorkspace?: boolean;
-  cancel?: 'parent' | 'child'; hang?: boolean;
+  cancel?: 'parent' | 'child'; hang?: boolean; thinkingLevel?: 'medium';
   historyFault?: 'child-before-request' | 'child-final' | 'parent-feedback'; childRetry?: boolean;
   duplicateDelegate?: boolean; delegateFault?: 'return' | 'parent-http'; secondDelegate?: boolean;
   cancelAfterChild?: boolean; deniedChildTool?: 'write' | 'Agent'; hungTool?: boolean; delegateTimeout?: boolean; pureTools?: boolean } = {}) {
@@ -86,6 +108,7 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   let refs: import('@flowmate/contracts').ExtensionRef[] = [];
   let selection: import('@flowmate/contracts').ResourceSelection = { prompt: null, enabledSkills: [] };
   app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, resourceRoot: resolve(import.meta.dir, '../../../resources'),
+    thinkingLevelOverride: options.thinkingLevel,
     resourceDefaults: () => ok({ revision: 1, selection, extensions: { enabledExtensions: refs } }),
     toolDefinitions: definitions => definitions.map(tool => !options.hungTool || tool.name !== 'read_invoice_document' ? tool : { ...tool,
       execute: async (...args) => {
@@ -96,6 +119,7 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
       } }),
     agentFactory: (tools, resourceContents) => {
       adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+        thinkingLevelOverride: options.thinkingLevel,
         ...(options.hang ? { fetch: (request, init) => globalThis.fetch(request, { ...init, signal: undefined }) } : {}),
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p13-loopback-only', sessionSetup: session => {
           if (options.lateTool && session.systemPrompt.startsWith('Verify invoice evidence')) session.subscribe(event => {
@@ -174,7 +198,8 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   current = need(await app.updateWorkspace({ expectedRevision: current.revision, change: { kind: 'document', documentId: docId } }));
   current = need(await app.startTask({ clientSequence: 1, expectedRevision: current.revision, documentRef: doc.documentRef, goal: 'Verify invoice total' })).workspace;
   const config: ProviderConfig = { version: 1, name: 'P13', revision: 1, modelRef: { provider: 'p13', model: 'p13' },
-    native: { authPath: join(root, 'auth.json'), modelsPath: null }, connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16000 }, parameters: { maxRetries: options.childRetry ? 1 : 0, maxRetryDelayMs: 100 } };
+    native: { authPath: join(root, 'auth.json'), modelsPath: null }, connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64000, maxTokens: 16000,
+      ...(options.thinkingLevel ? { reasoning: true } : {}) }, parameters: { maxRetries: options.childRetry ? 1 : 0, maxRetryDelayMs: 100 } };
   let finish!: (event: Extract<AgentRunEvent, { type: 'run_finished' }>) => void;
   const done = new Promise<Extract<AgentRunEvent, { type: 'run_finished' }>>(resolve => finish = resolve);
   const executionStarted = performance.now();
@@ -192,6 +217,54 @@ async function fixture(delegate: boolean, options: { allTools?: boolean; maxMode
   return { app, adapter, paths, payloads, observed, session, accepted, terminal, childCalls, injectedExecutions, cancellations, releaseHung, outcomes, injectedFaults, duplicateResults, conflicts,
     elapsedMs: performance.now() - executionStarted };
 }
+
+it('trusted thinking override reaches every actual parent and child request', async () => {
+  const f = await fixture(true, { thinkingLevel: 'medium' });
+  expect(need(f.terminal.result).status).toBe('completed');
+  expect(f.payloads.length).toBeGreaterThan(2);
+  expect(f.payloads.every(payload => payload.reasoning_effort === 'medium')).toBe(true);
+  expect(f.payloads.some(payload => payload.messages[0]?.content.startsWith('Verify invoice evidence'))).toBe(true);
+});
+
+for (const stage of ['prepare', 'start'] as const) it(`subagent ${stage} waits for the SQLite owner before publishing child metadata`, async () => {
+  const original = RuntimeService.prototype.prepareSubagent;
+  let probe: { before: unknown; settled: boolean } | undefined;
+  RuntimeService.prototype.prepareSubagent = async function (...parameters) {
+    if (stage === 'prepare') {
+      const held = await heldSubagentOwner(this, () => original.apply(this, parameters),
+        store => store.db.query("SELECT COUNT(*) AS count FROM runs WHERE kind='subagent'").get());
+      probe = held; return held.value;
+    }
+    const prepared = await original.apply(this, parameters);
+    if (!prepared.ok) return prepared;
+    return ok({ ...prepared.data, start: async prompt => {
+      const held = await heldSubagentOwner(this, () => prepared.data.start(prompt),
+        store => need(store.runs.get(prepared.data.childRunId)).status);
+      probe = held; return held.value;
+    } });
+  };
+  deferCleanup(() => { RuntimeService.prototype.prepareSubagent = original; });
+  const f = await fixture(true);
+  expect(probe).toBeDefined();
+  expect(probe!.before).toEqual(stage === 'prepare' ? { count: 0 } : 'created');
+  expect(probe!.settled).toBe(false);
+  expect(need(f.terminal.result).status).toBe('completed');
+});
+
+it('replayed subagent completion waits for the SQLite owner before reading its saved original facts', async () => {
+  const original = RuntimeService.prototype.prepareSubagent;
+  let runtime!: RuntimeService;
+  RuntimeService.prototype.prepareSubagent = function (...parameters) { runtime = this; return original.apply(this, parameters); };
+  deferCleanup(() => { RuntimeService.prototype.prepareSubagent = original; });
+  const f = await fixture(true);
+  expect(f.outcomes).toHaveLength(1);
+  const completed = f.outcomes[0]!;
+  const held = await heldSubagentOwner(runtime, () => runtime.finishSubagent(completed.runId, completed.outcome),
+    store => need(store.runs.get(completed.runId)).status);
+  expect(held.before).toBe('completed');
+  expect(held.settled).toBe(false);
+  expect(held.value).toEqual(ok(undefined));
+});
 
 it('[F13-30] dynamically declared PURE tools execute through the real child SDK registry', async () => {
   const f = await fixture(true, { pureTools: true });
@@ -606,7 +679,7 @@ it('[F13-11/15/20] original completion may repeat but conflicting or foreign cal
     .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
   expect(await callbacks.finish(f.accepted.runId, first.outcome)).toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
   expect(f.adapter.requestSubagentStop({ childRunId: first.runId, childNativeSessionId: f.session.nativeSessionId,
-    pluginAgentId: before.kind === 'subagent' ? before.pluginAgentId : '' }))
+    pluginAgentId: before.kind === 'subagent' && 'pluginAgentId' in before ? before.pluginAgentId : '' }))
     .toMatchObject({ ok: false, error: { code: 'subagent_identity_conflict' } });
   expect(need(await f.app.queryRun(first.runId))).toEqual(before);
   expect(await readEvents()).toEqual(originalEvents);

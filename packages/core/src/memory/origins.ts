@@ -1,4 +1,5 @@
-import { SQLiteError, type Database } from 'bun:sqlite';
+import { SQLiteError } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, NativeSessionHistorySchema, NativeHistoryRecoveryBundleSchema, SessionInputContentSchema } from '@flowmate/contracts';

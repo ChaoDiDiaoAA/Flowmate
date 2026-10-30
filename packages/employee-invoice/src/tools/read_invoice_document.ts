@@ -1,9 +1,8 @@
 import { invoiceToolSchemas, MAX_INVOICE_TOOL_PAGE_SIZE } from '@flowmate/contracts';
-import type { DocumentService } from '@flowmate/data';
 import type { DocumentSnapshot, InvoiceToolInput, InvoiceToolOutput, ParsedBlock, Result, ToolDefinition } from '@flowmate/contracts';
 import type { StoredParsedDocument } from '@flowmate/data';
 import { appError, fail, ok } from '@flowmate/contracts';
-import { unwrap } from './definition.ts';
+import { unwrap, type InvoiceDocumentReader } from './definition.ts';
 import { MAX_RESULT_BYTES, sourceFor } from './source.ts';
 
 export function projectInvoiceDocumentPage(input: InvoiceToolInput<'read_invoice_document'>,
@@ -35,7 +34,7 @@ export function projectInvoiceDocumentPage(input: InvoiceToolInput<'read_invoice
     nextAfterBlockId: completePage ? null : selected.at(-1)?.id ?? input.afterBlockId, completePage });
 }
 
-export const readInvoiceDocument = (documents: DocumentService) => ({
+export const readInvoiceDocument = (documents: InvoiceDocumentReader) => ({
   name: 'read_invoice_document',
   version: '1',
   label: 'Read invoice',
@@ -45,5 +44,5 @@ export const readInvoiceDocument = (documents: DocumentService) => ({
   effect: 'READ',
   executionMode: 'parallel',
   execute: async (input, _call, context) =>
-    unwrap(projectInvoiceDocumentPage(input, unwrap(documents.readParsedForRun(input.documentId, context)))),
+    unwrap(projectInvoiceDocumentPage(input, unwrap(await documents.readParsedForRun(input.documentId, context)))),
 } satisfies ToolDefinition<InvoiceToolInput<'read_invoice_document'>, InvoiceToolOutput<'read_invoice_document'>>);

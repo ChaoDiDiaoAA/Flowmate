@@ -377,9 +377,9 @@ test('report readback rederives same-Trial F1 and rejects copied values or a dro
 });
 
 test('comparison aligns actual Case and repetition and rejects different scoring conditions', () => {
-    const left=reportFixture(), right=reportFixture();
+    const left=reportFixture(), right=reportFixture(), facts=comparisonFacts();
     right.trials=structuredClone(left.trials).reverse();
-    for(const report of [left,right]){const directory=mkdtempSync(join(tmpdir(),'eval-comparison-facts-'));writeFileSync(join(directory,'snapshot.json'),JSON.stringify(comparisonFacts()));saveReport(join(directory,'report.json'),report);}
+    for(const report of [left,right]){const directory=mkdtempSync(join(tmpdir(),'eval-comparison-facts-'));writeFileSync(join(directory,'snapshot.json'),JSON.stringify(facts));saveReport(join(directory,'report.json'),report);}
     expect(comparison(left,right)).toHaveLength(1);
     left.scoringConfiguration.judge={provider:'openai-compatible',model:'model-a',baseUrl:'https://example.invalid',timeoutMs:1000};
     right.scoringConfiguration.judge={...left.scoringConfiguration.judge,model:'model-b'};
@@ -398,6 +398,7 @@ test('historical compact scalar research reports remain readable without inventi
         FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'synthetic-f1-key' })!;
     const raw=JSON.stringify({v:1,r:[[1,3,0],[1,2,0]],f:[]});
     const data=JSON.stringify({plan,evidence:{original:'historical scalar grading record'}});
+    if (config.provider === 'codex-cli') throw Error('This historical fixture requires HTTP configuration');
     const configuration={provider:'openai-compatible' as const,model:'historical-synthetic',baseUrl:config.baseUrl,timeoutMs:30000,protocolVersion:'flowmate-judge/v2',
         rubric:{id:legacyCompactRubric.id,version:legacyCompactRubric.version}};
     const call:Parameters<typeof compactScores>[0]={callId:'00000000-0000-4000-8000-000000000001',configuration:{...configuration},

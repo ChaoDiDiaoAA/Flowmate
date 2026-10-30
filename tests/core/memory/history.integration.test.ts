@@ -1,6 +1,6 @@
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { SessionService, ensureNativeSession } from '../../../packages/core/src/sessions/service.ts';
 import type { NativeSessionEntry } from '@flowmate/contracts';
 import { appError, fail, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
@@ -23,7 +23,7 @@ function paths() {
 }
 
 function fixture(legacy = false) {
-  const p = paths(), store = need(core.openDatabase(p));
+  const p = paths(), store = need(openDatabase(p));
   deferCleanup(() => store.close());
   const history: NativeSessionHistory = { storageVersion: 1, header: { type: 'session', version: 3, id: 'p9-native', timestamp: at, cwd: p.root },
     entries: [], leafId: null, unusable: false };
@@ -339,7 +339,7 @@ function seed015(p: ReturnType<typeof paths>) {
   db.close();
   return { original, oldHeader };
 }
-it('P9 T02 migrates 015 atomically without rewriting original facts', () => {
+it('P9 T02 migrates 015 atomically without rewriting original facts', async () => {
   const failures = ['BEGIN IMMEDIATE', 'ALTER TABLE session_native_history', 'CREATE TABLE session_forks', 'CREATE INDEX session_forks_source',
     'CREATE TRIGGER session_forks_initial_target', 'CREATE TRIGGER session_forks_immutable', 'INSERT INTO schema_migrations(version,applied_at) VALUES(16', 'FK', 'COMMIT'];
   for (const failure of failures) {
@@ -355,7 +355,7 @@ it('P9 T02 migrates 015 atomically without rewriting original facts', () => {
       if (in016 && failure === 'FK' && sql === 'PRAGMA foreign_key_check') { fired = true; throw new Error('injected-fk'); }
       return originalQuery.call(this, sql) as Statement<R, P extends any[] ? P : [P]>;
     });
-    try { const opened = core.openDatabase(p); if (opened.ok) opened.data.close(); expect(opened.ok).toBe(false); expect(fired).toBe(true); }
+    try { const opened = openDatabase(p); if (opened.ok) await opened.data.close(); expect(opened.ok).toBe(false); expect(fired).toBe(true); }
     finally { exec.mockRestore(); query.mockRestore(); }
     const db = new Database(p.databaseFile);
     try {
@@ -366,7 +366,7 @@ it('P9 T02 migrates 015 atomically without rewriting original facts', () => {
       expect(db.query('SELECT header_json,leaf_id,entry_count,unusable FROM session_native_history').all()).toEqual(before.oldHeader);
       expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally { db.close(); }
-    const opened = need(core.openDatabase(p));
+    const opened = need(openDatabase(p));
     expect(opened.db.query('SELECT commit_revision FROM session_native_history').get()).toEqual({ commit_revision: 0 });
     expect(['session_native_entries', 'session_inputs', 'context_snapshots', 'runs'].map((table, index) =>
       opened.db.query(`SELECT ${table === 'runs' ? Object.keys((before.original[index] as Record<string, unknown>[])[0]!).join(',') : table === 'session_inputs' ? Object.keys((before.original[index] as Record<string, unknown>[])[0]!).filter(key => key !== 'request_hash').join(',') : '*'} FROM ${table}`).all())).toEqual(before.original.map((rows, index) => index === 1 ? (rows as Record<string, unknown>[]).map(({ request_hash: _retired, ...row }) => row) : rows));
@@ -375,15 +375,17 @@ it('P9 T02 migrates 015 atomically without rewriting original facts', () => {
     expect(opened.db.query('SELECT header_json,leaf_id,entry_count,unusable FROM session_native_history').all()).toEqual(before.oldHeader);
     expect(opened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(opened.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
-    opened.close();
+    await opened.close();
   }
 });
+
+import { withNativeHistoryFaults } from '../../support/database.ts';
 
 function historyFixture(entries: NativeSessionEntry[]) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p9-history-'));
   const paths = { root, databaseFile: join(root, 'test.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
-  const store = need(openDatabase(paths)); deferCleanup(() => store.close());
+  const store = withNativeHistoryFaults(need(openDatabase(paths))); deferCleanup(() => store.close());
   let requests = 0;
   const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir, credentials: new InMemoryCredentialStore(),
     fetch: async () => { requests++; throw new Error('Unexpected model HTTP during history management'); } });
@@ -391,8 +393,8 @@ function historyFixture(entries: NativeSessionEntry[]) {
   const native = need(agent.createSession()); const empty = need(agent.exportSession(native.nativeSessionId));
   const session = need(store.sessions.create({ nativeSessionId: native.nativeSessionId, title: 'History', at,
     nativeHistory: { ...empty, entries, leafId: entries.at(-1)?.id ?? null } }));
-  const service = new SessionService(store.sessions, agent, () => ({ active: null, blocked: false, error: null }),
-    () => at, store.runs, store.memory);
+  const service = new SessionService(agent, () => ({ active: null, blocked: false, error: null }),
+    () => at, store);
   return { store, agent, service, session, requests: () => requests };
 }
 const user = (id: string, parentId: string | null, text: string): NativeSessionEntry => ({ type: 'message', id, parentId,
@@ -454,7 +456,7 @@ it('P9 T05 browses empty and incomplete positions, uses current authorization, a
   f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
     .run(JSON.stringify({ documentIds: [1], at, reason: 'document_use_revoked' }), f.session.sessionId);
   expect(need(await f.service.querySessionHistory({ sessionId: f.session.sessionId })).items[1]).toMatchObject({ canSelect: false, cannotSelectReason: 'source-unavailable' });
-  expect(ensureNativeSession(f.store.sessions, f.agent, f.session, f.store.memory)).toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
+  expect(await ensureNativeSession(f.store, f.agent, f.session)).toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
   f.store.db.exec('PRAGMA foreign_keys=OFF');
   f.store.db.query("UPDATE session_native_entries SET run_id=999 WHERE entry_id='u'").run();
   expect(await f.service.querySessionHistory({ sessionId: f.session.sessionId })).toMatchObject({ ok: false, error: { code: 'context_binding_unknown' } });
@@ -499,9 +501,9 @@ it.each(['user', 'custom_message'] as const)('P9 T05 selects complete nodes on o
 it('P9 T05 restores complete history beyond the first page for missing and ready instances', async () => {
   const f = historyFixture(Array.from({ length: 61 }, (_, n) => user(`u${n}`, n ? `u${n - 1}` : null, `question ${n}`)));
   await f.agent.releaseSession(f.session.nativeSessionId);
-  expect(ensureNativeSession(f.store.sessions, f.agent, f.session, f.store.memory)).toEqual({ ok: true, data: undefined });
+  expect(await ensureNativeSession(f.store, f.agent, f.session)).toEqual({ ok: true, data: undefined });
   expect(need(f.agent.exportSession(f.session.nativeSessionId)).entries).toHaveLength(61);
-  expect(ensureNativeSession(f.store.sessions, f.agent, f.session, f.store.memory)).toEqual({ ok: true, data: undefined });
+  expect(await ensureNativeSession(f.store, f.agent, f.session)).toEqual({ ok: true, data: undefined });
   const created = await f.service.create({ title: 'Receipt installation' });
   expect(created).toMatchObject({ ok: true });
 });
@@ -574,11 +576,11 @@ it('P9 T05 keeps chat and History cursors independent on mixed paths', async () 
   const f = historyFixture(entries); const before = f.store.db.query('SELECT * FROM session_native_entries').all();
   const page = need(await f.service.querySessionHistory({ sessionId: f.session.sessionId }));
   expect(new Set(page.items.map(item => item.type)).size).toBe(9);
-  const chat = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 1 }));
+  const chat = need(await f.service.listMessages({ sessionId: f.session.sessionId, limit: 1 }));
   expect(chat.items.map(item => item.role)).toEqual(['assistant']); expect(chat.nextBeforeEntryId).toBe('assistant');
-  const earlier = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 1, beforeEntryId: 'assistant' }));
+  const earlier = need(await f.service.listMessages({ sessionId: f.session.sessionId, limit: 1, beforeEntryId: 'assistant' }));
   expect(earlier.items.map(item => item.role)).toEqual(['user']);
-  const empty = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 1, beforeEntryId: 'user' }));
+  const empty = need(await f.service.listMessages({ sessionId: f.session.sessionId, limit: 1, beforeEntryId: 'user' }));
   expect(empty.items).toEqual([]); expect(need(await f.service.querySessionHistory({ sessionId: f.session.sessionId })).items).toHaveLength(11);
   expect(JSON.stringify(page)).not.toContain('private-secret'); expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(before);
   await f.agent.releaseSession(f.session.nativeSessionId);
@@ -622,7 +624,7 @@ it('P9 T05 projects all seven message roles through the closed display fields', 
     else expect(detail.fields).toMatchObject({ toolName: null });
     expect(JSON.stringify(detail)).not.toContain(secret);
   }
-  const chat = need(f.service.listMessages({ sessionId: f.session.sessionId, limit: 100 }));
+  const chat = need(await f.service.listMessages({ sessionId: f.session.sessionId, limit: 100 }));
   expect(chat.items.map(item => item.role)).toEqual(['user', 'assistant', 'toolResult']);
   expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(original);
 });

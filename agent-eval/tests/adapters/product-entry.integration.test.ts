@@ -1,11 +1,12 @@
 import {test,expect,spyOn} from 'bun:test';
 import {mkdirSync,writeFileSync,existsSync,readFileSync} from 'node:fs';
-import {join,dirname} from 'node:path';
+import {join} from 'node:path';
 import {REPO_ROOT} from '../../src/dataset-loader/local.ts';
 import {exportEvents} from '../../src/langfuse/export.ts';
 import {main} from '../../src/cli.ts';
 import {productAgent, createProductAgent} from '../../src/adapters/agent.ts';
 import {readReport,reportPath,comparison} from '../../src/reports/store.ts';
+import {readSnapshot} from '../../src/reports/archive.ts';
 import {fixtureRepo} from '../support/fixtures.ts';
 import {manifest} from '../fixtures/minimal-dataset.ts';
 import {createHttpProvider} from '../../../tests/support/resources.ts';
@@ -17,11 +18,19 @@ test('local CLI readiness does not require a Docker engine or image', () => {
  finally { if(originalPath===undefined)delete process.env.PATH;else process.env.PATH=originalPath; }
 });
 
-test('production readiness reports the missing Agent credential independently of Judge configuration',()=>{
- const original=process.env.FLOWMATE_EVAL_AGENT_API_KEY,generic=process.env.FLOWMATE_LLM_API_KEY;
- process.env.FLOWMATE_EVAL_AGENT_API_KEY='';process.env.FLOWMATE_LLM_API_KEY='synthetic-generic-key';
- try{expect(productAgent.readiness()).toMatchObject({ready:false});expect(productAgent.readiness().reason).toContain('FLOWMATE_EVAL_AGENT_API_KEY');}
- finally{if(original===undefined)delete process.env.FLOWMATE_EVAL_AGENT_API_KEY;else process.env.FLOWMATE_EVAL_AGENT_API_KEY=original;if(generic===undefined)delete process.env.FLOWMATE_LLM_API_KEY;else process.env.FLOWMATE_LLM_API_KEY=generic;}
+test('local Luna readiness permits no key while remote preparation requires its dedicated credential before dispatch',async()=>{
+ const values={FLOWMATE_EVAL_AGENT_API_KEY:'',FLOWMATE_LLM_API_KEY:'synthetic-generic-key',FLOWMATE_EVAL_AGENT_MODEL:'gpt-6-luna',
+  FLOWMATE_EVAL_AGENT_API:'openai-completions',FLOWMATE_EVAL_AGENT_BASE_URL:'http://127.0.0.1:8767/v1'};
+ const saved=Object.fromEntries(Object.keys(values).map(key=>[key,process.env[key]]));Object.assign(process.env,values);let requests=0;
+ const fetcher=spyOn(globalThis,'fetch').mockImplementation(Object.assign(async()=>{requests++;throw Error('Provider dispatch forbidden before credential validation');},{preconnect:()=>{}}));
+ try{
+  expect(productAgent.readiness()).toMatchObject({ready:true});
+  await expect(productAgent.prepare({identity:{executionId:'credential-check',trialId:'credential-trial',caseId:'credential-case',caseVersion:1},
+   directory:fixtureRepo,input:{prompt:'Controlled credential prerequisite check.',materials:[]},requires:['agent'],
+   configuration:{model:'llama-3.3-70b-versatile',api:'openai-completions',baseUrl:'https://synthetic-remote.invalid/v1'}},new AbortController().signal))
+   .rejects.toThrow('FLOWMATE_EVAL_AGENT_API_KEY');
+  expect(requests).toBe(0);
+ }finally{fetcher.mockRestore();for(const[key,value]of Object.entries(saved))if(value===undefined)delete process.env[key];else process.env[key]=value;}
 });
 
 test('default CLI runs only independent synthetic data through local Host, one independent Judge and saved report comparison',async()=>{
@@ -53,7 +62,7 @@ test('default CLI runs only independent synthetic data through local Host, one i
   if(report.trials[0]!.status!=='PASS')throw new Error(JSON.stringify({reason:report.trials[0]!.reason,error:report.trials[0]!.execution?.error,scores:report.trials[0]!.scores}));
   expect(report.trials[0]!.status).toBe('PASS');expect(report.trials[0]!.judgeCalls).toHaveLength(1);
   expect(report.trials[0]!.execution!.evidence.environment!.present).toBe(true);expect(report.executionComplete).toBe(true);
-  const snapshot=JSON.parse(readFileSync(join(dirname(file),'snapshot.json'),'utf8'));
+  const snapshot=readSnapshot(file);
   expect(snapshot.runtimeSource.files).toContainEqual({path:'apps/host/main.ts',text:readFileSync(join(REPO_ROOT,'apps/host/main.ts'),'utf8')});
   expect(snapshot.runtimeSource.files).toContainEqual({path:'agent-eval/src/execution/source.ts',text:readFileSync(join(REPO_ROOT,'agent-eval/src/execution/source.ts'),'utf8')});
   expect(JSON.stringify(exportEvents(report))).not.toContain('runtimeSource');

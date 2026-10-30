@@ -5,10 +5,12 @@ import { EvaluationPreviewRequestSchema, type EvaluationCatalog, type Evaluation
 import type { DesktopState } from '@flowmate/contracts';
 import type { z } from 'zod';
 import { evaluationBusy } from './evaluation-state.ts';
+import { EvaluationLoop, type EvaluationTraceTarget } from './evaluation-loop.tsx';
 
 type Catalog = Extract<EvaluationCatalog, { view: 'list' }>;
 type CaseView = Extract<EvaluationCatalog, { view: 'case' }>;
 type Props = { desktop: DesktopState | null; control: EvaluationControlState | null;
+  traceTarget?: EvaluationTraceTarget | null; onOpenActivity?(runId: number, sessionId: number | null): void;
   revision(): number; onControl(value: EvaluationControlState, revision: number): void; onModels(): void };
 const id = () => crypto.randomUUID();
 const json = (value: unknown) => JSON.stringify(value, null, 2);
@@ -70,10 +72,15 @@ export function EvaluationScores({ scores }: { scores: EvaluationScoreView[] }) 
   return <>{([['formal', 'Formal metric scores'], ['diagnostic', 'Additional diagnostics'], ['guardrail', 'Hard constraints'], [null, 'Legacy checks']] as const).map(([category, label]) => {
     const rows = scores.filter(score => score.category === category);
     return rows.length === 0 ? null : <section key={label} aria-label={label}><h3>{label}</h3><div className="evaluation-table-wrap"><table>
-      <thead><tr><th>Metric / Evaluator</th><th>Method / status</th><th>Original statistics</th><th>Reason / evidence</th></tr></thead>
+      <thead><tr><th>Metric / Evaluator</th><th>Method / status</th><th>Original statistics</th><th>Reason / evidence</th><th>Judge / calibration</th></tr></thead>
       <tbody>{rows.map((score, index) => <tr key={index}><td>{score.metricId}<small>{score.evaluatorId ?? 'legacy'} v{score.evaluatorVersion ?? score.version}</small></td>
         <td>{score.method} · {score.status}<p>{score.required ? 'Required' : 'Optional'} · {score.value ?? 'unknown'}</p></td><td><pre>{json(score.statistics ?? 'unknown')}</pre></td>
-        <td>{score.reason}<p>{score.applicabilityReason}</p><small>{score.evidence.join(', ')}</small></td></tr>)}</tbody>
+        <td>{score.reason}<p>{score.applicabilityReason}</p><small>{score.evidence.join(', ')}</small></td>
+        <td>{score.judge ? <p>{score.judge.callId} · criterion {score.judge.criterion + 1}</p> : 'No submitted Judge task'}
+          {score.method === 'llm-judge' ? <><p>Calibration: {score.calibration?.state ?? 'not-provided'}</p>
+            {score.calibration && <><p>{score.calibration.reference ?? 'No reference'} · {score.calibration.kind ?? 'unknown source'}</p>
+              <small>{score.calibration.metricIds.join(', ')}</small><p>{score.calibration.reason}</p></>}
+            <small>Acceptance: {score.calibration?.acceptance ?? 'not-assessed'}</small></> : <p>Local calculation; no Judge calibration required</p>}</td></tr>)}</tbody>
     </table></div></section>;
   })}</>;
 }
@@ -168,7 +175,7 @@ function CompareResults({ items }: { items: EvaluationExecutionList['items'] }) 
   </details>;
 }
 
-export function EvaluationPage({ desktop, control, revision, onControl, onModels }: Props) {
+export function EvaluationPage({ desktop, control, revision, onControl, onModels, traceTarget, onOpenActivity }: Props) {
   const [catalog, setCatalog] = useState<Catalog | null>(null), [executions, setExecutions] = useState<EvaluationExecutionList | null>(null);
   const [datasetId, setDatasetId] = useState('all'), [selection, setSelection] = useState('smoke'), [caseId, setCaseId] = useState('');
   const [repeat, setRepeat] = useState('1'), [judge, setJudge] = useState('auto'), [limits, setLimits] = useState<Record<string, string>>({});
@@ -250,6 +257,7 @@ export function EvaluationPage({ desktop, control, revision, onControl, onModels
   return <section className="page-content evaluation-page"><div className="page-heading"><div><h1>Evaluation</h1><p>Run registered tasks and review their saved evidence.</p></div>
     <button className="secondary-button" onClick={onModels}>Configure evaluation models</button></div>
     {message && <div className="notice bad" role="status">{message}</div>}
+    <EvaluationLoop blocked={blocked || working} traceTarget={traceTarget} productRoot={desktop?.userDataPath} onOpenActivity={onOpenActivity} onOpenExecution={setSelectedExecution} />
     <div className="evaluation-layout"><aside className="panel evaluation-history"><div className="panel-head"><h2>Saved executions</h2>
       <button className="text-button" onClick={() => void historyRead()}>Refresh history</button></div>
       {!executions && <p>Loading saved executions…</p>}{executions?.items.length === 0 && <p>No saved executions yet.</p>}
@@ -257,7 +265,7 @@ export function EvaluationPage({ desktop, control, revision, onControl, onModels
         <small>{item.summary ? `${item.summary.dataset.id} · ${item.summary.scoring}` : item.error}</small></div>)}
       {executions && <Paging page={executions.page} onPage={offset => void historyRead(offset)} />}</aside>
       <div className="evaluation-main"><section className="panel"><div className="panel-head"><h2>Run setup</h2><button className="text-button" onClick={() => void catalogRead()}>Refresh catalog</button></div>
-        <p>25 deterministic / derived Evaluators · 10 semantic Evaluators · 39 formal metrics. Local results are authoritative.</p>
+        <p>39 formal metrics · 55 Evaluator definitions (25 deterministic / derived + 30 independent semantic) · 0–1 logical Judge tasks per Trial.</p>
         {catalog?.items.length === 0 && <p>No registered tasks are available.</p>}
         <fieldset className="form-grid" disabled={blocked || working}><label className="field"><span>Dataset</span><select aria-label="Dataset" value={datasetId} onChange={event => change(() => { setDatasetId(event.target.value); setCaseId(''); })}>
           <option value="all">All baseline datasets</option>{datasets.map(dataset => <option key={dataset.id} value={dataset.id}>{dataset.id} · v{dataset.version}</option>)}</select></label>
@@ -279,7 +287,8 @@ export function EvaluationPage({ desktop, control, revision, onControl, onModels
         <button className="primary-button" disabled={!preview?.ready || blocked || working} onClick={() => void action(start)}>Start evaluation</button>
       </section>
       {control && <section className="panel" aria-label="Evaluation progress"><div className="panel-head"><h2>Current batch</h2><button className="text-button" onClick={() => void controlRead()}>Refresh progress</button></div>
-        <p>{control.state} · {control.outcome ?? 'no final outcome'} · stop: {control.stop}</p><small>{control.batchId}</small><pre>{json(control.progress)}</pre>
+        <p>{control.state} · {control.outcome ?? 'no final outcome'} · stop: {control.stop}</p><small>{control.batchId}</small>
+        {control.progress?.phase === 'capturing' && <p>采集证据</p>}<pre>{json(control.progress)}</pre>
         {control.errors.map((error, index) => <p role="alert" key={index}>{error}</p>)}{control.executionIds.map(executionId => <button className="text-button" key={executionId} onClick={() => setSelectedExecution(executionId)}>Open {executionId}</button>)}</section>}
       {inspected && <section className="panel" aria-label="Case inspection"><div className="panel-head"><h2>{inspected.name}</h2><button className="text-button" onClick={() => void action(() => inspect())}>Refresh Case</button></div>
         <p>{inspected.caseId} · v{inspected.caseVersion} · {inspected.fileCount} available files</p><pre className="evaluation-text">{inspected.summary}</pre>

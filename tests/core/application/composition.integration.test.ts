@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { describe, expect, it, mock } from 'bun:test';
 import { createApplication } from '../../../apps/composition.ts';
 import type { ProviderPort } from '../../../packages/contracts/src/ports.ts';
-import { createFileStore, openDatabase } from '@flowmate/core';
+import { createFileStore } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { Database } from 'bun:sqlite';
 
 function paths(root: string) {
@@ -56,7 +57,7 @@ it('lists sparse real Workspace page identities through the public application w
   if (!seeded.ok) throw new Error(seeded.error.code);
   const store = seeded.data;
   deferCleanup(() => store.close());
-  const files = createFileStore(productPaths, store.documents);
+  const files = createFileStore(productPaths, store);
   const at = '2026-10-03T00:00:00.000Z';
   const original = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=', 'base64');
   const parsed = Buffer.from(JSON.stringify({ formatVersion: 1, parser: { key: 'legacy-parser' },
@@ -75,7 +76,7 @@ it('lists sparse real Workspace page identities through the public application w
   if (!registered.ok) throw new Error(registered.error.code);
   const before = { runs: store.db.query('SELECT * FROM runs').all(), inputs: store.db.query('SELECT * FROM session_inputs').all(),
     documents: store.db.query('SELECT * FROM documents').all() };
-  store.close();
+  await store.close();
   let requests = 0;
   const provider: ProviderPort = { prepare: async () => { requests += 1; return { ok: false,
     error: { code: 'unexpected_request', category: 'provider', message: 'Unexpected request.', retryable: false } }; },

@@ -3,7 +3,7 @@ import { validateToolArguments, type TSchema } from '@earendil-works/pi-ai';
 import {
   createReadToolDefinition, createGrepToolDefinition, createFindToolDefinition, createLsToolDefinition,
   createEditToolDefinition, createWriteToolDefinition, createBashToolDefinition, createPowerShellToolDefinition,
-  getShellConfig, getPowerShellConfig, getToolPath,
+  getShellConfig, getPowerShellConfig, getToolPath, VERSION,
 } from '@earendil-works/pi-coding-agent';
 import {
   appError, NATIVE_TOOL_NAMES, NativeToolOutputSchema, ToolExecutionFailure,
@@ -11,7 +11,7 @@ import {
 } from '@flowmate/contracts';
 
 const parameters = new WeakMap<ToolDefinition<any, any>, TSchema>();
-export type NativeToolsOptions = { getWorkingDirectory(ctx: ProductToolContext): Result<string> };
+export type NativeToolsOptions = { getWorkingDirectory(ctx: ProductToolContext): Result<string> | Promise<Result<string>> };
 export function getNativeToolParameters(definition: ToolDefinition<any, any>): TSchema | undefined { return parameters.get(definition); }
 
 export function createNativeTools(options: NativeToolsOptions): {
@@ -33,7 +33,7 @@ export function createNativeTools(options: NativeToolsOptions): {
   const definitions = NATIVE_TOOL_NAMES.map((name, index) => {
     const schemaTool = factories[name](process.cwd());
     const definition: ToolDefinition<unknown, NativeToolOutput> = {
-      name, version: 'pi-0.85.1', label: schemaTool.label, description: schemaTool.description,
+      name, version: `pi-${VERSION}`, label: schemaTool.label, description: schemaTool.description,
       inputSchema: z.unknown().transform((raw, context) => {
         try {
           const input = structuredClone(raw);
@@ -44,13 +44,18 @@ export function createNativeTools(options: NativeToolsOptions): {
       outputSchema: NativeToolOutputSchema, effect: index < 4 ? 'READ' : 'LOCAL_WRITE',
       executionMode: index < 4 ? 'parallel' : 'sequential',
       async execute(input, call, ctx) {
-        const working = options.getWorkingDirectory(ctx);
+        const working = await options.getWorkingDirectory(ctx);
         if (!working.ok) throw new ToolExecutionFailure(working.error);
+        if (call.signal.aborted) throw new ToolExecutionFailure(appError('tool_cancelled', 'tool', 'The native call was cancelled before execution.'));
+        if (call.deadlineAt !== undefined && performance.now() >= call.deadlineAt)
+          throw new ToolExecutionFailure(appError('tool_timeout', 'tool', 'The native call deadline elapsed before execution.', true));
         const native = factories[name](working.data);
         let partial: NativeToolOutput | undefined;
         try {
           const result = await native.execute(call.nativeToolCallId, input as never, call.signal,
             update => { partial = output(update); }, undefined as never);
+          if (result.isError) throw new ToolExecutionFailure(
+            appError('tool_execution_failed', 'tool', 'The native tool could not complete the requested operation.'), output(result));
           return output(result);
         } catch (error) {
           if (error instanceof ToolExecutionFailure) throw error;

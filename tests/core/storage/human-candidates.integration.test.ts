@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { invoiceHeaderFields, invoiceLineFields, invoiceFieldDisplayValue, CandidateDraftSchema, StoredCandidateDraftSchema } from '@flowmate/contracts';
 import type { InvoiceFormDraft, Result } from '@flowmate/contracts';
-import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { makeSelectedCandidate, makeCurrentSelectedCandidate } from '../../support/selected-candidate.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { Database } from 'bun:sqlite';
 import { join } from 'node:path';
 import { deferCleanup } from '../../support/resources.ts';
@@ -105,7 +105,7 @@ describe('human candidate transactions', () => {
     expect(legacy.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 9 });
     legacy.close();
     const store = required(openDatabase(paths)); deferCleanup(() => store.close());
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect({ candidate: store.db.query(candidateSql).all(), jobs: store.db.query('SELECT * FROM jobs').all(),
       artifacts: store.db.query('SELECT * FROM artifacts').all(), events: store.db.query('SELECT * FROM business_events').all() }).toEqual(before);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -197,16 +197,21 @@ describe('human candidate transactions', () => {
       .toMatchObject({ ok: false, error: { code: 'job_completed' } });
   });
 
-  it('verifies real parsed evidence, keeps unchanged sources, and checks damaged values again before acceptance', () => {
-    const store = makeSelectedCandidate(false, true);
+  it('verifies real parsed evidence, keeps unchanged sources, and checks damaged values again before acceptance', async () => {
+    const store = await makeCurrentSelectedCandidate(true);
     const paths = { root: store.root, databaseFile: join(store.root,'data','flowmate.sqlite'), outputsDir: join(store.root,'outputs'),
       artifactsDir: join(store.root,'artifacts'), logsDir: join(store.root,'logs'), runtimeDir: join(store.root,'runtime') };
-    const files = createFileStore(paths, store.documents);
-    const documents = new DocumentService({ paths, allowedSourceRoot: store.root, repository: store.documents, files, now: () => store.stamp });
-    const edits = createInvoiceEditService({ candidates: store.candidates, files, now: () => store.stamp,
-      validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, documents) });
+    const files = createFileStore(paths, store);
+    const documents = new DocumentService({ paths, allowedSourceRoot: store.root, files, now: () => store.stamp,
+      transaction: operation => store.transaction(scope => operation({ repository: scope.documents,
+        files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })) });
+    const edits = createInvoiceEditService({ database: store, files, now: () => store.stamp,
+      validate: (draft, ref, scope) => validateHumanInvoiceCandidate(draft, ref, {
+        readParsedForWorkspace: id => documents.readParsedForWorkspace(id, { repository: scope.documents,
+          files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }),
+      }) });
     const input = request(store); input.draft.notes = ['User explanation only.'];
-    const saved = required(edits.save(input));
+    const saved = required(await edits.save(input));
     expect(saved.candidate.fields.totalAmount).toEqual(required(store.candidates.readByJob({ jobId: store.jobId, candidateId: store.candidateId })).candidate.fields.totalAmount);
     expect(saved.candidate.issues.some(issue => issue.code === 'model_note')).toBe(false);
     expect(saved.candidate.sources).toHaveLength(1);
@@ -214,13 +219,13 @@ describe('human candidate transactions', () => {
       expectedCandidateId: saved.candidate.candidateId, expectedRevision: saved.workspace.revision, dirty: false };
     store.db.query("UPDATE invoice_candidates SET fields_json=json_set(fields_json,'$.values.totalAmount.sources[0].quote','Forged quote') WHERE id=?")
       .run(saved.candidate.candidateId);
-    expect(edits.accept(operation)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(await edits.accept(operation)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
     expect(required(store.jobs.get(store.jobId)).status).not.toBe('completed');
     store.db.query("UPDATE invoice_candidates SET fields_json=json_set(fields_json,'$.values.totalAmount.sources[0].quote','Total 113.00','$.values.totalAmount.normalized','1e3') WHERE id=?")
       .run(saved.candidate.candidateId);
-    expect(edits.accept(operation)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(await edits.accept(operation)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
     store.db.query("UPDATE invoice_candidates SET fields_json=json_set(fields_json,'$.values.totalAmount.normalized','113.00') WHERE id=?").run(saved.candidate.candidateId);
-    expect(edits.accept(operation)).toMatchObject({ ok: true, data: { candidate: { status: 'accepted' } } });
+    expect(await edits.accept(operation)).toMatchObject({ ok: true, data: { candidate: { status: 'accepted' } } });
   });
 
   it('queries committed operations without running validation or modifying a later current pointer', () => {

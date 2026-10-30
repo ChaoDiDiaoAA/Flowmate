@@ -3,9 +3,9 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const root = join(import.meta.dir, '../../src/datasets');
-test('baseline declarations remain three modules alongside the explicit supplemental directory', () => {
-  expect(readdirSync(root).sort()).toEqual(['badcase', 'cases.ts', 'gold.ts', 'review.ts']);
-  expect(readdirSync(join(root, 'badcase')).sort()).toEqual(['cases.ts', 'gold.ts', 'members.ts', 'review.ts']);
+test('baseline declarations remain three modules and old supplemental code is absent', () => {
+  expect(readdirSync(root, { withFileTypes: true }).filter(entry => entry.isFile()).map(entry => entry.name).sort()).toEqual(['cases.ts', 'gold.ts', 'review.ts']);
+  for (const name of ['cases.ts', 'gold.ts', 'members.ts', 'review.ts']) expect(existsSync(join(root, 'badcase', name))).toBe(false);
 });
 test('all audited cases are short English declarations with independent gold', async () => {
   expect(existsSync(join(root, 'cases.ts'))).toBe(true);

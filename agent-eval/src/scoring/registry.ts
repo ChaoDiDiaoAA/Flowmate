@@ -7,6 +7,9 @@ export class EvaluatorRegistry {
     register(def: EvaluatorDefinition) {
         if (this.items.has(def.id))
             throw new Error('Duplicate metric: ' + def.id);
+        if (def.kind === 'llm-judge' && def.outputs && (def.outputs.length !== 1 || def.outputs[0] !== def.id ||
+            this.list().some(prior => prior.kind === 'llm-judge' && prior.outputs?.includes(def.id))))
+            throw Error('Semantic evaluator must own exactly its Metric: ' + def.id);
         this.items.set(def.id, def);
     }
     get(id: string) {

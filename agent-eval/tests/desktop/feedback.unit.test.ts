@@ -14,7 +14,7 @@ import { createEvaluationService } from '../../src/desktop/service.ts';
 test('a saved feedback retry returns its original conditions and time after Case changes without rewriting the record', () => {
   const task = dataset.cases[0]!, input = { dataset, caseId: task.id, id: 'synthetic-original-operation',
     reviewer: 'synthetic-reviewer', verdict: 'bad' as const, note: 'Original synthetic finding' };
-  const first = addFeedback(fixtureRepo, input), file = join(feedbackDirectory(fixtureRepo), 'review.json'), before = readFileSync(file, 'utf8');
+  const first = addFeedback(fixtureRepo, input), file = join(feedbackDirectory(fixtureRepo), 'feedback.json'), before = readFileSync(file, 'utf8');
   const material = join(fixtureRepo, 'data/invoices/voxel51/000001/content.md'), source = readFileSync(material, 'utf8');
   try {
     writeFileSync(material, source.replace('TEST-001', 'TEST-009'));
@@ -36,7 +36,7 @@ test('registered Case feedback can record a material gap and rejects new feedbac
   const first = addFeedback(repo, input, before.conditions);
   expect(first.kind).toBe('case-quality'); expect(first.caseVersion).toBe(1);
   expect(first.conditions).toMatchObject({ contract: 'flowmate-case-inspection/v1', gaps: before.gaps });
-  const file = join(feedbackDirectory(repo), 'review.json'), saved = readFileSync(file, 'utf8');
+  const file = join(feedbackDirectory(repo), 'feedback.json'), saved = readFileSync(file, 'utf8');
   const material = join(repo, 'data/invoices/voxel51/000001/content.md');
   mkdirSync(join(material, '..'), { recursive: true }); writeFileSync(material, 'New synthetic source.');
   expect(() => addFeedback(repo, { ...input, id: 'synthetic-new-stale-view' }, before.conditions)).toThrow('Case inspection changed');
@@ -53,7 +53,7 @@ test('a saved valid feedback operation remains retryable beside a read-only hist
   cpSync(fixtureDirectory, join(repo, 'agent-eval/src/datasets/facility-test'), { recursive: true });
   const input = { datasetId: 'facility-test', caseId: 'test-fields', id: 'synthetic-valid-operation',
     reviewer: 'synthetic-reviewer', verdict: 'bad' as const, note: 'Original synthetic material gap.' };
-  const first = addFeedback(repo, input), file = join(feedbackDirectory(repo), 'review.json');
+  const first = addFeedback(repo, input), file = join(feedbackDirectory(repo), 'feedback.json');
   writeFileSync(file, JSON.stringify({ version: 'v1', records: [first, { ...first, id: 'synthetic-legacy', conditions: undefined }] }));
   const before = readFileSync(file, 'utf8');
   expect(addFeedback(repo, input)).toEqual(first);
@@ -64,7 +64,7 @@ test('a saved valid feedback operation remains retryable beside a read-only hist
 
 test('malformed feedback collections and rows fail validation before an append', () => {
   const repo = mkdtempSync(join(tmpdir(), 'eval-invalid-feedback-')), directory = feedbackDirectory(repo);
-  mkdirSync(directory, { recursive: true }); const file = join(directory, 'review.json');
+  mkdirSync(directory, { recursive: true }); const file = join(directory, 'feedback.json');
   for (const records of [null, {}, 'invalid', [null], [7]]) {
     const source = JSON.stringify({ version: 'v1', records }); writeFileSync(file, source);
     expect(() => readFeedbackRecords(repo)).toThrow(ZodError);
@@ -77,7 +77,7 @@ test('feedback saved before a write ownership failure remains queryable by its o
   cpSync(fixtureDirectory, join(repo, 'agent-eval/src/datasets/facility-test'), { recursive: true });
   const input = { datasetId: 'facility-test', caseId: 'test-fields', id: 'synthetic-saved-before-release-failure',
     reviewer: 'synthetic-reviewer', verdict: 'bad' as const, note: 'Synthetic write receipt was interrupted.' };
-  const file = join(feedbackDirectory(repo), 'review.json'), atomicJson = reportFiles.atomicJson;
+  const file = join(feedbackDirectory(repo), 'feedback.json'), atomicJson = reportFiles.atomicJson;
   const writing = spyOn(reportFiles, 'atomicJson').mockImplementation((path, value) => {
     atomicJson(path, value); if (path === file) writeFileSync(file + '.write-lock', 'synthetic-replaced-owner');
   });

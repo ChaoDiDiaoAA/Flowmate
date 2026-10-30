@@ -1,0 +1,101 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "parsePolicy": "metric-json-fence-strict-counts/v1",
+  "id": "combination-task-tools-tune",
+  "instanceId": "combination-task-tools-tune-instance",
+  "sourceGroup": "combination-task-tools-tune",
+  "partition": "tune",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic combined-metric engineering reference; labels derive from the declared goal, contract and original observations. No evaluated Agent output or human approval is claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "clarification-decision",
+        "version": "v1",
+        "unit": "决策点",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one clarification-decision opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      },
+      {
+        "metricId": "tool-arguments",
+        "version": "v1",
+        "unit": "请求",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one tool-arguments opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      },
+      {
+        "metricId": "diagnostic-partial-failure-explanation",
+        "version": "v1",
+        "unit": "披露机会",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one diagnostic-partial-failure-explanation opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "independentScenario": "combination-task-tools-tune",
+    "userGoal": "Read the supplied invoice and disclose any unresolved extraction failure.",
+    "requiredInput": "an invoice document",
+    "providedDocuments": [],
+    "observedRequest": {
+      "documentId": 99
+    },
+    "toolResult": "document does not exist",
+    "observedAnswer": "Done; invoice read successfully."
+  },
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"clarification-decision\",\"counts\":{\"numerator\":0,\"denominator\":1,\"unassessable\":0},\"failures\":[{\"opportunityIndex\":0,\"code\":1}]},{\"metricId\":\"tool-arguments\",\"counts\":{\"numerator\":0,\"denominator\":1,\"unassessable\":0},\"failures\":[{\"opportunityIndex\":0,\"code\":1}]},{\"metricId\":\"diagnostic-partial-failure-explanation\",\"counts\":{\"numerator\":0,\"denominator\":1,\"unassessable\":0},\"failures\":[{\"opportunityIndex\":0,\"code\":1}]}]}",
+  "references": [
+    {
+      "metricId": "clarification-decision",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": true,
+      "citationSupport": null,
+      "reason": "Original observations contradict the independent criterion."
+    },
+    {
+      "metricId": "tool-arguments",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": true,
+      "citationSupport": null,
+      "reason": "Original observations contradict the independent criterion."
+    },
+    {
+      "metricId": "diagnostic-partial-failure-explanation",
+      "counts": [
+        0,
+        1,
+        0
+      ],
+      "severeError": true,
+      "citationSupport": null,
+      "reason": "Original observations contradict the independent criterion."
+    }
+  ]
+}

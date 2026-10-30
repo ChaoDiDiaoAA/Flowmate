@@ -401,10 +401,13 @@ async function treeFixture() {
       ];
       for(let i=0;i<45;i++)entries.push({...base('side-'+i,'user','custom_message'),customType:'side',display:true,content:'Side branch '+i});
       const header=SessionManager.inMemory(paths.runtimeDir).getHeader();
-      const session=need(db.sessions.create({nativeSessionId:header.id,title:'Complete tree',at,nativeHistory:{storageVersion:1,header,entries,leafId:'branch',unusable:false}}));
-      if(db.db.query('PRAGMA foreign_key_check').all().length)throw new Error('FK failure');
-      console.log(JSON.stringify({sessionId:session.sessionId,count:entries.length,entries:db.db.query('SELECT * FROM session_native_entries ORDER BY sequence').all()}));
-    } finally {db.close();}
+      const seeded=await db.transaction(scope=>{
+        const session=need(scope.sessions.create({nativeSessionId:header.id,title:'Complete tree',at,nativeHistory:{storageVersion:1,header,entries,leafId:'branch',unusable:false}}));
+        if(scope.db.query('PRAGMA foreign_key_check').all().length)throw new Error('FK failure');
+        return {sessionId:session.sessionId,count:entries.length,entries:scope.db.query('SELECT * FROM session_native_entries ORDER BY sequence').all()};
+      });
+      console.log(JSON.stringify(seeded));
+    } finally {await db.close();}
   `;
   const child = spawn('bun', ['--no-env-file', '--eval', script], { cwd: repository, env: environment(), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');

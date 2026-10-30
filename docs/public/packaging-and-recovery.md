@@ -4,7 +4,7 @@
 
 ## Build a Windows package
 
-The installed target is **Windows x64**, built with Bun **1.4.0** and pinned dependencies. The packager checks Pi 0.85.1, pi-subagents 0.19.0, Electron 44.4.5, migrations, native tools and required assets.
+The installed target is **Windows x64**, built with Bun **1.4.4** and pinned dependencies. The packager checks Pi SDK 1.4.0, pi-subagents 0.19.0, Electron 44.4.5, schema 21 migrations, native tools and required assets.
 
 ```powershell
 bun install --frozen-lockfile
@@ -15,7 +15,9 @@ bun --no-env-file run package:win
 
 The scripts build the desktop and stage runtime resources under `out/package-stage/`. Electron-builder writes to `out/package/` with publishing disabled. NSIS is per-user, allows an installation directory choice, does not auto-run after installation and does not delete app data on uninstall.
 
-The runtime includes Bun, Host/evaluation/maintenance launchers, Pi assets, migrations, author resources, required native files and licenses. `release.json` records explicit versions and the file inventory. Installed validation checks actual inventory/versions and does not fall back to developer source or PATH Bun. Preserve required patches/licenses; see [Development](development.md#dependency-patches).
+The runtime includes Bun, Host/evaluation/maintenance launchers, ServiceOwner/service-management entries, WinSW, both Pi runtime paths, migrations, author resources, required native files and licenses. `release.json` records explicit versions and the file inventory. Installed validation checks actual inventory/versions and does not fall back to developer source or PATH Bun. Preserve required patches/licenses; see [Development](development.md#dependency-patches).
+
+The current engineering delivery retains the existing `out/package/win-unpacked` directory package and its `resources/flowmate-runtime/release.json`; this documentation closeout does not rebuild them. Application-running execution, committed facts and eligible recovery define the current delivery boundary. Real SCM installation/startup, boot, upgrade/rollback and continued execution after closing the desktop remain deferred acceptance.
 
 ## Data and diagnostics
 
@@ -23,11 +25,13 @@ Default data root: `%APPDATA%\Flowmate`. Installation files and writable product
 
 | Relative location | Purpose |
 |---|---|
-| `data/app.sqlite` | Sessions, Runs, inputs, Context and business facts |
+| `data/app.sqlite` | Sessions, Runs, inputs, Context, invoice Work and Durable native records under one coordinated owner |
 | `data/settings.json`, `data/installed-release.json` | Settings and installed release record |
+| `service-installation.json` | Service installation and explicit activation selection |
 | `artifacts/`, `outputs/` | Managed materials and delivered files |
 | `runtime/resource-bundles/`, `runtime/subagents/` | Original Run resources and user roles |
 | `security/credentials/`, `Local State` | Encrypted credential envelopes and Electron key material |
+| `security/service-credentials/` | CurrentUser DPAPI service credentials and staged operation receipts |
 | `imports/invoices/` | Installed invoice import source |
 | `evaluation/agent-eval/runs/` | Installed local evaluation results |
 | `logs/` | Runtime diagnostics |
@@ -38,7 +42,7 @@ Missing replies and unconfirmed stopping do not prove an operation had no effect
 
 ## Offline backup
 
-Close Flowmate and other controllers of the target root. Maintenance acquires the controller lease, checks storage, checkpoints the database and verifies copied persistent files. The absolute destination must not exist, and its parent must exist. Copying only a live SQLite file does not ensure consistent WAL/associated files.
+Close Flowmate and confirm that any ServiceOwner or other controller of the target root has stopped; a closed desktop window alone does not establish that its controller has exited. Maintenance acquires the controller lease, checks storage, checkpoints the database and verifies copied persistent files. The absolute destination must not exist, and its parent must exist. Copying only a live SQLite file does not ensure consistent WAL/associated files.
 
 This is an **installed-runtime** template. Replace placeholders with actual absolute locations; do not use the developer source entry:
 
@@ -49,7 +53,7 @@ $backup = '<absolute new backup directory>'
 & (Join-Path $runtime 'bin\bun.exe') --no-env-file (Join-Path $runtime 'apps\maintenance.js') backup --user-data-root $userData --destination $backup
 ```
 
-Inspect JSON `result`, `leaseRelease`, exit status and `gaps`. The manifest lists copied paths/byte lengths. Selected persistent data, encrypted credentials and Local State are retained; this is not a mirror of every file under the root. Logs, `.env` secrets, external source directories and external evaluation datasets are outside a complete-backup promise; preserve necessary external material separately.
+Inspect JSON `result`, `leaseRelease`, exit status and `gaps`. The manifest lists copied paths/byte lengths. Selected persistent data, service installation selection, encrypted credentials, staged service-credential receipts and Local State are retained; this is not a mirror of every file under the root. Logs, `.env` secrets, external source directories and external evaluation datasets are outside a complete-backup promise; preserve necessary external material separately.
 
 Credentials still depend on the Windows account/system encryption context. Encrypted envelopes and Local State do not guarantee portability to another account or machine.
 
@@ -68,7 +72,7 @@ $restoredRoot = '<absolute restored user-data directory>'
 
 4. Inspect readability, compatibility and gaps. `runtimeValidation: pending` means file/reference verification has not checked live execution. Check credential access under the intended account, then explicitly start a safe new Run only after accepting the restored store for use.
 
-The verifier compares the restored persistent set/content and references to the manifest and checks schema/settings compatibility. It does not copy files, replay old calls, repair historical gaps, prove model access or certify business quality. A changed installed release triggers a pre-upgrade backup before opening/migrating state. Failure retains original data rather than claiming successful recovery.
+The verifier compares the restored persistent set/content and references to the manifest and checks schema/settings compatibility. An activated service selection requires its original SQLite database; a missing database is rejected rather than replaced with an empty store. Verification does not copy files, replay old calls, repair historical gaps, prove model access or certify business quality. A changed installed release triggers a pre-upgrade backup before opening/migrating state. Failure retains original data rather than claiming successful recovery.
 
 ## Source and verification
 

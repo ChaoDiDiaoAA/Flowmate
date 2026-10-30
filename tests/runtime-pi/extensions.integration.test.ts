@@ -7,7 +7,7 @@ import { mkdirSync, writeFileSync, copyFileSync, readFileSync, unlinkSync } from
 import { tmpdir } from 'node:os';
 import { invoiceToolSchemas, ok } from '@flowmate/contracts';
 import type { AgentRunEvent, ProviderConfig, Result, ToolDefinition } from '@flowmate/contracts';
-import { openDatabase } from '../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
 import { createApplication } from '../../apps/composition.ts';
 import { resolveProductPaths } from '../../packages/shared/src/paths.ts';
 import { createExtensionService } from '../../packages/core/src/extensions/service.ts';
@@ -27,7 +27,7 @@ function fixture(subagents = false) {
     name, version: '1', description: name, effect: 'READ' as const, executionMode: 'parallel' as const,
     inputSchema: invoiceToolSchemas[name].input, outputSchema: invoiceToolSchemas[name].output,
     execute: async () => { throw new Error('Registry-only fixture must never execute business tools'); } }))] : [tool];
-  const catalog = createExtensionService({ resourceRoot: resolve(import.meta.dir, '../../resources'), sdkVersion: '0.85.1', registeredTools: tools });
+  const catalog = createExtensionService({ resourceRoot: resolve(import.meta.dir, '../../resources'), sdkVersion: '1.4.0', registeredTools: tools });
   const refs = need(catalog.list()).filter(item => subagents || item.ref.id === 'invoice-assist').map(item => item.ref);
   let native!: AgentSession;
   const adapter = new PiAgentAdapter({ cwd: root, agentDir: root, tools, credentials: new InMemoryCredentialStore(),
@@ -194,7 +194,7 @@ async function businessFixture(options: { sessionSetup?: (session: AgentSession)
   const resourceRoot = join(root, 'author'); mkdirSync(join(resourceRoot, 'extensions'), { recursive: true });
   copyFileSync(resolve(import.meta.dir, '../../resources/extensions/invoice-v1.json'), join(resourceRoot, 'extensions/invoice-v1.json'));
   copyFileSync(resolve(import.meta.dir, '../../resources/extensions/subagents-v1.json'), join(resourceRoot, 'extensions/subagents-v1.json'));
-  if (options.trigger) { const seeded = need(openDatabase(paths)); seeded.db.exec(options.trigger); seeded.close(); }
+  if (options.trigger) { const seeded = need(openDatabase(paths)); seeded.db.exec(options.trigger); await seeded.close(); }
   const server = await createHttpProvider(async request => {
     payloads.push(await request.json());
     if (options.waitForResponse) await options.waitForResponse(request);
@@ -203,14 +203,14 @@ async function businessFixture(options: { sessionSetup?: (session: AgentSession)
     const chunk = (value: unknown, finish: string | null) => `data: ${JSON.stringify({ id: 'p12', choices: [{ index: 0, delta: value, finish_reason: finish }] })}\n\n`;
     return new Response(chunk(delta, null) + chunk({}, payloads.length === 1 ? 'tool_calls' : 'stop') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   }); deferCleanup(() => server.stop());
-  const catalog = createExtensionService({ resourceRoot, sdkVersion: '0.85.1', registeredTools: [tool] });
+  const catalog = createExtensionService({ resourceRoot, sdkVersion: '1.4.0', registeredTools: [tool] });
   const selection = { enabledExtensions: [need(catalog.list())[0]!.ref] };
   settings.extensions = selection;
   let adapter!: PiAgentAdapter;
   const app = need(await createApplication({ paths, resourceRoot, invoiceSourceRoot: sourceRoot,
     resourceDefaults: () => ok(settings),
-    agentFactory: (tools, resourceContents) => {
-      adapter = new PiAgentAdapter({ resourceContents, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, sessionSetup: options.sessionSetup,
+    agentFactory: tools => {
+      adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, sessionSetup: options.sessionSetup,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p12-loopback-only' });
       if (options.prepare || options.beforePrepare) { const original = adapter.prepare.bind(adapter); adapter.prepare = async (...args) => { await options.beforePrepare?.(); const prepared = await original(...args); if (prepared.ok) options.prepare?.(prepared.data); return prepared; }; }
       return adapter;

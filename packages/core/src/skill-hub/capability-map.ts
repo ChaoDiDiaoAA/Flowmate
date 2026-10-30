@@ -30,7 +30,8 @@ export function checkDependency(dependency: ResourceDependency, packages: readon
     }
 }
 
-export function visibleFrozenSkills(frozen: FrozenResources, tools: readonly string[], extensions: AvailableExtensions = []): ResourceRef[] {
+export function visibleFrozenSkills(frozen: Pick<FrozenResources, 'prompt' | 'discoveredSkills' | 'manifests'>,
+  tools: readonly string[], extensions: AvailableExtensions = []): ResourceRef[] {
   const selection = { prompt: frozen.prompt, enabledSkills: frozen.discoveredSkills };
   return frozen.discoveredSkills.filter(ref => checked(() =>
     dependencies(find(frozen.manifests, ref), frozen.manifests, selection, new Set(tools), extensions)).ok);

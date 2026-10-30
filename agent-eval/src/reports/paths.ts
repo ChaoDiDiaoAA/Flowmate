@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, realpathSync, readdirSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import type { LocalDataset } from '../dataset-loader/local.ts';
+import { archiveExecutionLocations } from './archive.ts';
 
 export type RunScope = 'business' | 'research' | 'mixed' | 'calibration';
 const scopes: RunScope[] = ['business', 'research', 'mixed', 'calibration'];
@@ -34,16 +35,18 @@ function locations(repo: string, id: string) {
     });
 }
 export function reportPath(repo: string, id: string) {
-    const found = locations(repo, id).flatMap(directory => ['report.json', 'summary.json'].filter(name => existsSync(join(directory, name))).map(name => join(directory, name)));
+    const found = [...locations(repo, id).flatMap(directory => ['report.json', 'summary.json'].filter(name => existsSync(join(directory, name))).map(name => join(directory, name))),
+        ...archiveExecutionLocations(repo).filter(item => item.executionId === id).map(item => item.report)];
     if (found.length > 1) throw Error(`Conflicting duplicate execution ID: ${id}`);
     if (!found.length) throw Error(`Saved execution not found: ${id}`);
-    if (lstatSync(found[0]!).isSymbolicLink()) throw Error('Linked report rejected');
+    if (lstatSync(found[0]!.split('#')[0]!).isSymbolicLink()) throw Error('Linked report rejected');
     return found[0]!;
 }
 export type SavedExecutionLocation = { executionId: string; report: string | null;
     error: 'duplicate-execution' | 'linked-path' | 'invalid-id' | 'invalid-report' | null };
 export function discoverSavedExecutions(repo: string): SavedExecutionLocation[] {
     const found = new Map<string, SavedExecutionLocation[]>();
+    for (const item of archiveExecutionLocations(repo)) found.set(item.executionId, [...(found.get(item.executionId) ?? []), item]);
     for (const parent of reportParents(repo)) for (const entry of readdirSync(parent, { withFileTypes: true })) {
         if (basename(parent) === 'runs' && [...scopes, 'case-reviews'].includes(entry.name)) continue;
         const directory = join(parent, entry.name), file = join(directory, 'report.json');

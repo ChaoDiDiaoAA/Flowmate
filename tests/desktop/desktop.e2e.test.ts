@@ -47,7 +47,7 @@ it('P6 Activity reads persistent processing through Electron without another mod
       return runs.ok && runs.data.items[0] ? { runId: runs.data.items[0].runId, sessionId } : null;
     });
     expect(identity).not.toBeNull(); if (!identity) return;
-    expect(await page.locator('.rail .nav-item').count()).toBe(12);
+    expect(await page.locator('.rail .nav-item').count()).toBe(13);
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
     await expect(page.getByTestId('activity-page')).toBeVisible();
     await page.getByLabel('Conversation', { exact: true }).selectOption(String(identity.sessionId));
@@ -423,6 +423,21 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
     // Playwright normally forces document.hasFocus() to true, which masks native blur.
     const cdp = await page.context().newCDPSession(page);
     await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false });
+    // Programmatic selectors do not focus Electron's native window after CDP focus emulation is disabled.
+    const focusReadingWindow = async () => {
+      const window = await app.browserWindow(page);
+      try {
+        await window.evaluate(window => { window.focus(); window.webContents.focus(); });
+        await expect.poll(async () => {
+          const native = await window.evaluate(window => ({ visible: window.isVisible(), minimized: window.isMinimized(),
+            focused: window.isFocused(), webContentsFocused: window.webContents.isFocused() }));
+          const dom = await page.evaluate(() => ({ focused: document.hasFocus(), hidden: document.hidden }));
+          return { native, dom };
+        }).toEqual({
+          native: { visible: true, minimized: false, focused: true, webContentsFocused: true }, dom: { focused: true, hidden: false } });
+      } finally { await window.dispose(); }
+    };
+    await focusReadingWindow();
     await page.locator('.rail').getByRole('button', { name: 'Activity', exact: true }).click();
     await page.getByLabel('Conversation', { exact: true }).selectOption('12');
     await page.getByLabel('Processing request', { exact: true }).selectOption('101');
@@ -440,8 +455,17 @@ it('P6 Renderer checks beyond H and preserves C and D across late opens, expired
     await page.waitForTimeout(2_200);
     expect(await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').reads.length)).toBe(settledReads);
 
+    // Clear the previous target before native focus can reopen its observer.
     await page.getByLabel('Conversation', { exact: true }).selectOption('12');
+    await focusReadingWindow();
     await page.getByLabel('Processing request', { exact: true }).selectOption('101');
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.length)).toBe(3);
+    const gapSubscription = await app.evaluate(() => Reflect.get(globalThis, 'p6Lifecycle').opens.at(-1).subscriptionId);
+    await expect.poll(() => app.evaluate((_electron, id) => Reflect.get(globalThis, 'p6Lifecycle').reads.filter(
+      (read: { subscriptionId: string }) => read.subscriptionId === id), gapSubscription)).toEqual([
+      { runId: 101, subscriptionId: gapSubscription, c: 0, d: null, through: 3 },
+      { runId: 101, subscriptionId: gapSubscription, c: 1, d: null, through: 3 },
+    ]);
     await page.getByRole('button', { name: 'View available activity after the gap', exact: true }).click();
     await expect(page.getByText('Showing an available segment. The continuous position is still 1.', { exact: true })).toBeVisible();
     await expect(page.getByTestId('processing-details').locator('.activity-sequence')).toHaveText(['1', '3']);
@@ -594,7 +618,7 @@ async function captureDesktopViews(page: Page) {
   if (!root) return;
   mkdirSync(root, { recursive: true });
   const nav = page.getByRole('navigation', { name: 'Workspace navigation' });
-  expect(await page.locator('.rail .nav-item').count()).toBe(12);
+  expect(await page.locator('.rail .nav-item').count()).toBe(13);
   for (const name of ['Invoices', 'Workspace', 'Processing History', 'Chats', 'Activity', 'Models', 'Evaluation', 'Prompts', 'Skills', 'Extensions', 'Settings']) {
     expect(await page.locator('.rail').getByRole('button', { name, exact: true }).count()).toBe(1);
   }
@@ -1003,7 +1027,7 @@ it(`desktop manages same-Run inputs, recovers whitespace ${unknownMode} ${unknow
     })).toMatchObject({ ok: true });
     expect(await page.evaluate(request => window.flowmate.submitInput(request), originalPrompt)).toMatchObject(originalReceipt);
     expect(requests).toHaveLength(callsAfterStop);
-    expect(await page.locator('.rail .nav-item').count()).toBe(12);
+    expect(await page.locator('.rail .nav-item').count()).toBe(13);
     const closingApp = electronApp;
     electronApp = null;
     await closeDesktopFixture(closingApp, userData);
@@ -1398,14 +1422,14 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     await page.getByLabel('Pi provider').selectOption('deepseek');
     expect(await piKey.inputValue()).toBe('synthetic-before-provider');
     const catalogModel = page.locator('.config-panel .form-grid select').nth(1);
-    await catalogModel.selectOption('deepseek-v4-flash');
+    await catalogModel.selectOption('deepseek-flash');
     await piKey.fill('');
-    expect(await catalogModel.locator('option:checked').textContent()).toBe('DeepSeek V4 Flash');
+    expect(await catalogModel.locator('option:checked').textContent()).toBe('DeepSeek V4.1 Flash');
     expect(await page.locator('.model-limit').allTextContents()).toEqual(['1,000,000 tokens', '384,000 tokens']);
     expect(await page.getByText('Context window', { exact: true }).count()).toBe(1);
     expect(await page.getByText('Maximum output', { exact: true }).count()).toBe(1);
     await page.getByRole('button', { name: 'Refresh models' }).click();
-    expect(await catalogModel.inputValue()).toBe('deepseek-v4-flash');
+    expect(await catalogModel.inputValue()).toBe('deepseek-flash');
     expect(await page.getByLabel('Find provider').count()).toBe(0);
     expect(await page.getByLabel('Find model').count()).toBe(0);
     expect(await page.getByLabel('Service URL').count()).toBe(0);
@@ -1452,7 +1476,7 @@ it('desktop sends directly, keeps drafts editable and restores native history af
     expect(await piKey.getAttribute('placeholder')).toBe('Enter API Key');
     expect(await page.getByRole('button', { name: 'Test connection' }).isDisabled()).toBe(true);
     await page.getByLabel('Pi provider').selectOption('deepseek');
-    await catalogModel.selectOption('deepseek-v4-flash');
+    await catalogModel.selectOption('deepseek-flash');
     expect(await piKey.getAttribute('placeholder')).toBe('Leave blank to keep the saved key');
     await page.getByRole('button', { name: 'Remove API key' }).click();
     await page.getByText('API key removed. Add a key before testing or sending.').waitFor({ state: 'visible' });

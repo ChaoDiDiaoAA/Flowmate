@@ -47,24 +47,24 @@ test('terminal progress reports actual stages immediately and waiting every sixt
     expect(cli.createProgressReporter).toBeFunction();
     jest.useFakeTimers();
     const lines: string[] = [], reporter = cli.createProgressReporter(line => { lines.push(line); });
-    reporter.onProgress({ type:'plan',selection:'smoke',total:14,datasets:[{id:'flowmate-agent-v1',total:10},{id:'flowmate-research-v1',total:4}] });
+    reporter.onProgress({ type:'plan',selection:'smoke',total:7,datasets:[{id:'flowmate-agent-v1',total:5},{id:'flowmate-research-v1',total:2}] });
     reporter.onProgress({ type:'dataset-start',datasetId:'flowmate-agent-v1',executionId:'synthetic',reportPath:'D:/synthetic/report.json' });
-    reporter.onProgress({ type:'trial-phase',index:1,total:14,caseId:'FM-001',trialId:'synthetic-FM-001-trial-1',phase:'executing' });
-    expect(lines.at(-1)).toBe('▶ [1/14] FM-001 · Trial 1/1：Agent执行\n');
+    reporter.onProgress({ type:'trial-phase',index:1,total:7,caseId:'FM-001',trialId:'synthetic-FM-001-trial-1',phase:'executing' });
+    expect(lines.at(-1)).toBe('▶ [1/7] FM-001 · Trial 1/1：Agent执行\n');
     jest.advanceTimersByTime(59999);
     expect(lines.join('')).not.toContain('仍在等待');
     jest.advanceTimersByTime(1);
-    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001 · Trial 1/1：Agent执行；仍在等待，已用时60秒\n');
+    expect(lines.at(-1)).toBe('⏳ [1/7] FM-001 · Trial 1/1：Agent执行；仍在等待，已用时60秒\n');
     const firstWaitCount = lines.length;
     jest.advanceTimersByTime(59999);
     expect(lines).toHaveLength(firstWaitCount);
     jest.advanceTimersByTime(1);
     expect(lines).toHaveLength(firstWaitCount + 1);
-    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001 · Trial 1/1：Agent执行；仍在等待，已用时120秒\n');
-    reporter.onProgress({ type:'trial-end',index:1,total:14,caseId:'FM-001',trialId:'synthetic-FM-001-trial-1',status:'FAIL',reason:'Synthetic mismatch',
-        elapsedMs:120000,evidenceDirectory:'evidence/synthetic-FM-001-trial-1/' });
+    expect(lines.at(-1)).toBe('⏳ [1/7] FM-001 · Trial 1/1：Agent执行；仍在等待，已用时120秒\n');
+    reporter.onProgress({ type:'trial-end',index:1,total:7,caseId:'FM-001',trialId:'synthetic-FM-001-trial-1',status:'FAIL',reason:'Synthetic mismatch',
+        elapsedMs:120000,evidenceDirectory:'run.json#/executions/synthetic/trials/0' });
     expect(lines.join('')).toContain('FAIL'); expect(lines.join('')).toContain('结果已保存');
-    expect(lines.join('')).toContain('evidence/synthetic-FM-001-trial-1/');
+    expect(lines.join('')).toContain('run.json#/executions/synthetic/trials/0');
     const count=lines.length;
     jest.advanceTimersByTime(60000);
     expect(lines).toHaveLength(count);
@@ -74,11 +74,11 @@ test('terminal progress reports actual stages immediately and waiting every sixt
 test('switching phases resets the sixty-second wait and clears the previous timer', () => {
     jest.useFakeTimers();
     const lines: string[] = [], reporter = cli.createProgressReporter(line => { lines.push(line); });
-    const identity = { index: 1, total: 14, caseId: 'FM-001', trialId: 'synthetic-trial' };
+    const identity = { index: 1, total: 7, caseId: 'FM-001', trialId: 'synthetic-trial' };
     reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'executing' });
     jest.advanceTimersByTime(45000);
     reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'scoring' });
-    expect(lines.at(-1)).toBe('▶ [1/14] FM-001 · Trial 1/1：评分\n');
+    expect(lines.at(-1)).toBe('▶ [1/7] FM-001 · Trial 1/1：评分\n');
     const count = lines.length;
     jest.advanceTimersByTime(15000);
     expect(lines).toHaveLength(count);
@@ -86,7 +86,7 @@ test('switching phases resets the sixty-second wait and clears the previous time
     expect(lines).toHaveLength(count);
     jest.advanceTimersByTime(1);
     expect(lines).toHaveLength(count + 1);
-    expect(lines.at(-1)).toBe('⏳ [1/14] FM-001 · Trial 1/1：评分；仍在等待，已用时60秒\n');
+    expect(lines.at(-1)).toBe('⏳ [1/7] FM-001 · Trial 1/1：评分；仍在等待，已用时60秒\n');
     reporter.close();
     jest.advanceTimersByTime(60000);
     expect(lines).toHaveLength(count + 1);
@@ -95,7 +95,7 @@ test('switching phases resets the sixty-second wait and clears the previous time
 test('Agent and scoring completion display distinct outcomes with symbols and stop waiting', () => {
     jest.useFakeTimers();
     const lines: string[] = [], reporter = cli.createProgressReporter(line => { lines.push(line); });
-    const identity = { index: 1, total: 14, caseId: 'FM-001', trialId: 'synthetic-trial' };
+    const identity = { index: 1, total: 7, caseId: 'FM-001', trialId: 'synthetic-trial' };
     for (const [status, symbol, label] of [
         ['completed', '✅', 'Agent执行成功'], ['failed', '❌', 'Agent执行失败'], ['error', '❌', 'Agent执行失败'],
         ['timeout', '⚠', 'Agent执行失败（超时）'], ['cancelled', '⏹', 'Agent执行已取消'], ['not-started', '⏭', 'Agent执行未启动'],
@@ -105,7 +105,7 @@ test('Agent and scoring completion display distinct outcomes with symbols and st
         const beforeEnd = lines.length;
         reporter.onProgress({ type: 'agent-end', ...identity, status, reason: 'Synthetic Agent outcome.' });
         expect(lines).toHaveLength(beforeEnd + 1);
-        expect(lines.at(-1)).toBe(`${symbol} [1/14] FM-001 · Trial 1/1：${label}；Synthetic Agent outcome.\n`);
+        expect(lines.at(-1)).toBe(`${symbol} [1/7] FM-001 · Trial 1/1：${label}；Synthetic Agent outcome.\n`);
         const count = lines.length; jest.advanceTimersByTime(60000); expect(lines).toHaveLength(count);
     }
     reporter.onProgress({ type: 'trial-phase', ...identity, phase: 'scoring' });
@@ -120,7 +120,7 @@ test('Agent and scoring completion display distinct outcomes with symbols and st
         const beforeEnd = lines.length;
         reporter.onProgress({ type: 'scoring-end', ...identity, status, reason: 'Synthetic outcome.' });
         expect(lines).toHaveLength(beforeEnd + 1);
-        expect(lines.at(-1)).toBe(`${symbol} [1/14] FM-001 · Trial 1/1：评分结果：${label}；Synthetic outcome.\n`);
+        expect(lines.at(-1)).toBe(`${symbol} [1/7] FM-001 · Trial 1/1：评分结果：${label}；Synthetic outcome.\n`);
         const count = lines.length; jest.advanceTimersByTime(60000); expect(lines).toHaveLength(count);
     }
     reporter.close();
@@ -131,7 +131,7 @@ test('terminal errors name the last phase and existing report without disclosing
     jest.useFakeTimers(); registerSecrets(['synthetic-progress-private-key']);
     const lines: string[]=[],reporter=cli.createProgressReporter(line=>{lines.push(line);});
     reporter.onProgress({type:'dataset-start',datasetId:'flowmate-agent-v1',executionId:'synthetic',reportPath:'D:/synthetic/report.json'});
-    reporter.onProgress({type:'trial-phase',index:3,total:14,caseId:'FM-005',trialId:'synthetic-FM-005-trial-1',phase:'scoring'});
+    reporter.onProgress({type:'trial-phase',index:3,total:7,caseId:'FM-005',trialId:'synthetic-FM-005-trial-1',phase:'scoring'});
     reporter.close(Error('synthetic-progress-private-key'));
     const text=lines.join('');expect(text).toContain('运行异常');expect(text).toContain('FM-005');expect(text).toContain('评分');
     expect(text).toContain('D:/synthetic/report.json');expect(text).not.toContain('synthetic-progress-private-key');

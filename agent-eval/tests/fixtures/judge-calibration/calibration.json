@@ -225,6 +225,38 @@
     {
       "id": "dr06-validation",
       "file": "dr06-validation.json"
+    },
+    {
+      "id": "combination-task-tools-tune",
+      "file": "combination-task-tools-tune.json"
+    },
+    {
+      "id": "combination-task-tools-validation",
+      "file": "combination-task-tools-validation.json"
+    },
+    {
+      "id": "combination-memory-tune",
+      "file": "combination-memory-tune.json"
+    },
+    {
+      "id": "combination-memory-validation",
+      "file": "combination-memory-validation.json"
+    },
+    {
+      "id": "combination-safety-business-tune",
+      "file": "combination-safety-business-tune.json"
+    },
+    {
+      "id": "combination-safety-business-validation",
+      "file": "combination-safety-business-validation.json"
+    },
+    {
+      "id": "combination-research-tune",
+      "file": "combination-research-tune.json"
+    },
+    {
+      "id": "combination-research-validation",
+      "file": "combination-research-validation.json"
     }
   ]
 }

@@ -4,25 +4,32 @@
 
 ## 进程与信任边界
 
-Electron 展示工作台并管理窗口和系统集成，Bun Host 持有产品 Application 与本地数据库访问。Pi AgentSession 经产品适配层在 Host 内运行，Renderer 通过有限的 Preload 接口访问产品能力，不直接读取 SQLite 或调用 SDK。
+Electron 展示工作台并管理窗口和系统集成，本地模式由 Bun Host 持有产品 Application 与本地数据库访问。Chats、Invoices、Deep Research 使用 Pi AgentSession，独立 Personal Agent 使用 Pi Durable。两套适配器统一使用 SDK 1.4.0，复用 Application、业务服务、ToolExecutor、Workspace 与 Context。Renderer 通过有限的 Preload 接口访问产品能力，不直接读取 SQLite 或调用 SDK。
+
+明确启用服务模式后，ServiceOwner 持有 Application，桌面通过生产 Node ServiceClient 连接；选定服务不可连接时，不启动第二个本地 Host。
 
 ```mermaid
 flowchart TB
   User[用户操作] --> Renderer[React Renderer]
   Renderer --> Preload[Preload 白名单接口]
   Preload --> Main[Electron Main]
-  Main -->|校验后的协议| Host[Bun Host]
-  Host --> App[Application 与 Runtime]
-  App --> Context[Session 与 Context 服务]
-  App --> Adapter[runtime-pi 适配层]
+  Main -->|校验后的协议| Host[Bun Host 或选定的 ServiceOwner]
+  Host --> App[共用 Application 与业务服务]
+  App --> Context[Workspace 与 Context 服务]
+  App --> Adapter[runtime-pi: Chats / Invoices / Deep Research]
   Adapter --> SDK[Pi AgentSession]
+  App --> Durable[runtime-durable: Personal Agent]
+  Durable --> Harness[Pi Durable Harness]
   SDK --> Model[选定模型服务]
+  Harness --> Model
   SDK --> Executor[产品 ToolExecutor]
+  Harness --> Executor
   Executor --> Domain[研究 / 发票 / 资源 / 原生工具]
   Context --> Store[(SQLite 与受管文件)]
   Domain --> Store
-  App --> Children[归属明确的子 Session 与 Run]
+  App --> Children[归属明确的子执行]
   Children --> Adapter
+  Children --> Durable
 ```
 
 Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取，持久查询提供权威状态；回复丢失或迟到不授权重执行写入。生命周期详见 [Agent Runtime](agent-runtime.zh-CN.md)。
@@ -31,12 +38,14 @@ Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取
 
 | 位置 | 职责 |
 |---|---|
-| `apps/desktop` | Main、Preload、React 页面、系统凭据、文件对话框与 Host 生命周期 |
-| `apps/host` | 协议分发与产品 Application 归属 |
-| `apps/composition.ts` | 将存储、领域、资源、工具和 Pi 适配器组装为 Application |
+| `apps/desktop` | Main、Preload、React 页面、系统凭据、文件对话框、Host 生命周期与 ServiceClient |
+| `apps/host` | 本地协议分发与产品 Application 归属 |
+| `apps/service` | 独立 ServiceOwner、认证协议与服务模式的 Application 归属 |
+| `apps/composition.ts`、`apps/personal-agent.ts` | 组装共用存储、领域、资源、工具与两套运行时适配器 |
 | `packages/contracts` | 输入、结果、状态、事件及跨层接口的校验契约 |
-| `packages/core` | Session/Run 编排、Context、工具记录、资源、研究与存储 |
+| `packages/core` | Session/Run 与发票事项协调、Context、工具记录、资源、研究与存储 |
 | `packages/runtime-pi` | Provider/模型准备、AgentSession、原生历史、受控扩展与工具 |
+| `packages/runtime-durable` | Durable Harness、SDK 原生 Task/检查点与 Personal Agent 运行时适配 |
 | `packages/data` | 原件与解析材料登记、读取 |
 | `packages/employee-invoice` | 发票规则、提取工具、来源校验和表单操作 |
 | `packages/logging` | 有界运行日志与 Prompt Trace |
@@ -45,18 +54,20 @@ Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取
 
 ## 从输入到保存结果
 
-1. Main 校验用户操作并路由到 Host。
-2. Application 核对 Session/工作区归属，受理具体输入。
-3. Runtime 固定当次模型配置、允许资料和工具、资源版本与 Context 依据。
-4. Pi 适配器准备实际原生消息与工具，模型工具调用经过产品执行器落实权限、预算和交付记录。
+1. Main 校验用户操作并路由到选定的 Application 控制者。
+2. Application 核对 Session/工作区或发票事项归属，受理具体输入或命令。
+3. 选定运行时固定当次模型配置、允许资料和工具、资源版本与 Context 依据。
+4. 对应适配器准备实际原生消息与工具，模型工具调用经过产品执行器落实权限、预算和交付记录。
 5. 领域服务核对业务副作用，SQLite 与受管文件保存执行事实和产物身份。
 6. UI 查询已保存结果并显示实时进度，进度本身不等于业务提交。
 
-子任务由 `Agent` 工具经 Core 准入，进入独立归属的 Pi Session/Run。父子仍在同一 Host，共享根预算，不是独立操作系统沙箱或可写代理。权限、上下文和停止规则统一见 [Subagent](subagents.zh-CN.md)。
+子任务经 Core 准入，进入同一 Application 控制进程内归属相应运行时的执行。父子共享根预算，最多四个子任务，禁止嵌套；停止未知时继续占用名额。Personal Agent 仅委派给只读 `invoice-evidence-checker` 角色。权限、上下文和停止规则统一见 [Subagent](subagents.zh-CN.md)，子执行不是独立操作系统沙箱或可写代理。
 
 ## 持久化与资源
 
-Windows 用户数据根为 `%APPDATA%\Flowmate`，`data/app.sqlite` 保存产品状态，`artifacts/`、`outputs/` 和 `runtime/` 保存受管内容与运行资源。控制者锁避免同一数据根被多个产品控制者同时持有。
+Windows 用户数据根为 `%APPDATA%\Flowmate`，`data/app.sqlite` 在同一数据库 owner 和共用写入协调下保存产品状态及 Durable 原生记录，`artifacts/`、`outputs/` 和 `runtime/` 保存受管内容与运行资源。控制者锁避免同一数据根被多个产品控制者同时持有。AgentSession 历史与 Durable 原生 Task/检查点仍各由对应适配器负责。
+
+ServiceOwner/Node ServiceClient、SID/DACL 校验、CurrentUser DPAPI 凭据、原凭据迁移与维护实现继续保留。当前工程版以 Application 控制者运行期间的执行、已提交事实和合法恢复为交付边界；真实 Windows SCM 安装/启动、开机、升级/回退及关闭桌面后持续运行统一延期验收。
 
 作者资源位于 `resources/`，启用的版本准备为当次运行的资源包，并保留历史所需原文。当前作者文件不静默替换旧 Run 的证据，详见 [Skills 与扩展](skills-and-extensions.zh-CN.md)。
 
@@ -64,7 +75,7 @@ Windows 用户数据根为 `%APPDATA%\Flowmate`，`data/app.sqlite` 保存产品
 
 ## 源码与验证入口
 
-- [应用组装](../../apps/composition.ts)、[Host 分发](../../apps/host/main.ts)、[Host 协议](../../apps/host/protocol.ts)
+- [应用组装](../../apps/composition.ts)、[Personal Agent 组装](../../apps/personal-agent.ts)、[Host 分发](../../apps/host/main.ts)、[Host 协议](../../apps/host/protocol.ts)
 - [Desktop Main](../../apps/desktop/main/index.ts)、[Preload](../../apps/desktop/preload)、[Renderer](../../apps/desktop/renderer/src)
-- [Runtime](../../packages/core/src/runtime/service.ts)、[Pi 适配器](../../packages/runtime-pi/src/session.ts)、[运行布局](../../packages/shared/src/runtime-layout.ts)
+- [Runtime](../../packages/core/src/runtime/service.ts)、[Pi 适配器](../../packages/runtime-pi/src/session.ts)、[Durable 适配器](../../packages/runtime-durable/src/index.ts)、[ServiceOwner](../../apps/service/owner.ts)、[ServiceClient](../../apps/desktop/main/service-client.ts)、[运行布局](../../packages/shared/src/runtime-layout.ts)
 - [应用测试](../../tests/core/application)、[桌面测试](../../tests/desktop)、[打包测试](../../tests/packaging)

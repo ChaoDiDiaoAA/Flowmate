@@ -50,6 +50,32 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .desktop-shell { display: grid; grid-template-columns: var(--sidebar-width, 240px) minmax(360px, 1fr) var(--assistant-width, 380px); width: 100%; height: 100vh; min-height: 0; overflow: hidden; background: var(--background); color: var(--foreground); position: relative; }
 .desktop-shell.chat-is-collapsed { grid-template-columns: var(--sidebar-width, 240px) minmax(360px, 1fr) 44px; }
 .desktop-shell.conversation-is-main, .desktop-shell.conversation-is-main.chat-is-collapsed { grid-template-columns: var(--sidebar-width, 240px) minmax(0, 1fr); }
+.desktop-shell.personal-is-main, .desktop-shell.personal-is-main.chat-is-collapsed { grid-template-columns: var(--sidebar-width, 240px) minmax(0, 1fr); }
+.desktop-shell.personal-is-main .panel-resizer.assistant { display: none; }
+.personal-agent-page { min-width: 0; }
+.personal-agent-page .panel { padding: 16px; }
+.personal-agent-page :where(button:not(.primary-button):not(.text-button)) { min-height: 34px; padding: 6px 10px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--foreground); background: var(--surface); }
+.personal-agent-page :where(button:not(:disabled):not(.primary-button):not(.text-button)):hover { background: var(--surface-hover); }
+.personal-agent-page form, .personal-agent-page fieldset { display: grid; gap: 10px; min-width: 0; }
+.personal-agent-page fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; }
+.personal-agent-page pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; padding: 10px; background: var(--surface-muted); border-radius: 6px; }
+.personal-layout { display: grid; grid-template-columns: minmax(180px, 250px) minmax(0, 1fr); gap: 16px; margin-top: 16px; align-items: start; }
+.personal-work-list { display: grid; gap: 8px; }
+.personal-work-list > button { display: grid; gap: 6px; padding: 10px; text-align: left; color: var(--foreground); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+.personal-work-list > button.active { border-color: var(--primary); background: var(--surface-muted); }
+.personal-work-list strong { overflow-wrap: anywhere; }
+.personal-work-list span, .personal-document-option small { color: var(--foreground-muted); font-size: 12px; }
+.personal-document-option { display: flex; align-items: center; gap: 8px; padding: 5px 0; overflow-wrap: anywhere; }
+.personal-document-option small { margin-left: auto; }
+.personal-items { padding: 0; list-style: none; display: grid; gap: 8px; }
+.personal-items li { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.personal-work-detail .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.personal-work-detail .tabs [aria-selected="true"] { color: var(--primary); font-weight: 600; }
+.personal-work-detail article, .personal-item-detail { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px; }
+.personal-configuration { margin: 16px 0; }
+.personal-configuration summary { cursor: pointer; font-weight: 600; }
+.personal-review-return { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 24px 12px; }
+@media (max-width: 920px) { .personal-layout { grid-template-columns: minmax(0, 1fr); } }
 .rail { display: flex; min-width: 0; min-height: 0; flex-direction: column; padding: 16px 10px 12px; border-right: 1px solid var(--border); background: var(--sidebar); align-items: stretch; }
 .brand-lockup { color: var(--foreground); font-size: 25px; font-weight: 700; display: flex; gap: 10px; min-height: 40px; margin: 0 4px 16px; align-items: center; font-family: var(--font-sans-stack); letter-spacing: 0; }
 .brand-mark { display: grid; place-items: center; font-weight: 700; width: 32px; height: 32px; flex: 0 0 32px; border: 0; border-radius: 8px; background: var(--brand); color: #102017; font-family: var(--font-display-stack); font-size: 18px; }

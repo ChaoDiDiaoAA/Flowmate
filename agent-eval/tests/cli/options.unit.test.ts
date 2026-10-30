@@ -61,18 +61,19 @@ test('trials rejects retired, missing, duplicate and invalid counts before datas
     } finally { globalThis.fetch=originalFetch; }
 });
 
-test('Smoke and Full shortcuts forward --trials to the CLI before any paid preparation', () => {
+test('Smoke and Full shortcuts reject Trial overrides before any paid preparation', () => {
     const guardDirectory=mkdtempSync(join(tmpdir(),'flowmate-cli-offline-')),guard=join(guardDirectory,'guard.mjs');
     writeFileSync(guard,"import { Socket } from 'node:net'; globalThis.fetch=()=>{throw Error('Network forbidden');}; Socket.prototype.connect=function(){throw Error('Network forbidden');};");
     try {
-    for (const script of ['eval:smoke', 'eval:full']) {
-        const child = spawnSync(process.execPath, ['--no-env-file', 'run', script, '--trials', '0'], {
+    for (const script of ['eval:smoke', 'eval:full']) for (const trials of ['0', '2']) {
+        const child = spawnSync(process.execPath, ['--no-env-file', 'run', script, '--trials', trials], {
             cwd: new URL('../../../', import.meta.url), encoding: 'utf8', timeout: 15000,
             env:{...process.env,NODE_OPTIONS:'--import='+pathToFileURL(guard).href} });
         expect(child.error).toBeUndefined();
         expect(child.status).toBe(1);
-        expect(child.stderr).toContain('1–20');
+        expect(child.stderr).toContain('Unknown argument');
+        expect(child.stderr).not.toContain('Network forbidden');
         expect(child.stdout).toBe('');
     }
     } finally { unlinkSync(guard);rmdirSync(guardDirectory); }
-});
+}, 65000);

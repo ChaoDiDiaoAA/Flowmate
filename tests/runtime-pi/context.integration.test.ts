@@ -1,13 +1,15 @@
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { InMemoryCredentialStore, createAssistantMessageEventStream, type AssistantMessage, type Context } from '@earendil-works/pi-ai';
 import { streamSimple as completionsStream } from '@earendil-works/pi-ai/api/openai-completions';
 import { streamSimple as responsesStream } from '@earendil-works/pi-ai/api/openai-responses';
-import { ModelRuntime, SessionManager, type AgentSession } from '@earendil-works/pi-coding-agent';
+import { normalizeContext } from '@earendil-works/pi-ai/utils/transcript';
+import { SessionManager, type AgentSession } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { openDatabase } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
+import * as bootstrap from '../../packages/core/src/storage/bootstrap.ts';
 import { CandidateDraftSchema, invoiceHeaderFields, RUNTIME_CONFIG } from '@flowmate/contracts';
 import { ContextObservationsSchema, SessionInputContentV2Schema, appError, fail, ok } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, ProviderConfig, Result, SessionInputRequest, PromptInputRequest, AgentToolBinding, ToolDefinition, RequestContextBinding, ContextEvidenceUpdate } from '@flowmate/contracts';
@@ -51,7 +53,7 @@ async function evidenceFixture(options: {
   sdkCallback?: 'same' | 'null-then-id' | 'status' | 'identity' | 'missing-slot';
   wire?: 'request' | 'opaque' | 'remove-user';
   networkThrow?: boolean; ignoreAbort?: boolean;
-  syncThrow?: boolean; timeoutMs?: number; afterRecord?: (update: ContextEvidenceUpdate) => void;
+  syncThrow?: boolean; timeoutMs?: number; afterRecord?: (update: ContextEvidenceUpdate) => void | Promise<void>;
   nativeUnavailable?: boolean; ancestor?: boolean;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p8-evidence-'));
@@ -110,8 +112,9 @@ async function evidenceFixture(options: {
       ...(options.onResponse ? { onResponse: async response => { await options.onResponse!(response); } } : {}) });
   }
   if (options.sdkCallback || options.wire || options.nativeUnavailable) {
-    const original = ModelRuntime.prototype.streamSimple;
-    ModelRuntime.prototype.streamSimple = function (model, context, streamOptions) {
+    // Request policies bind the native stream during preparation; inject at the live instance.
+    const requestRuntime = sdk.modelRuntime, original = requestRuntime.streamSimple;
+    requestRuntime.streamSimple = function (model, context, streamOptions) {
       if (options.nativeUnavailable) {
         const stream = createAssistantMessageEventStream();
         const message: AssistantMessage = { role: 'assistant', api: model.api, provider: model.provider, model: model.id,
@@ -150,18 +153,30 @@ async function evidenceFixture(options: {
           if (options.sdkCallback === 'same') await callback?.(response, requested);
         } });
     };
-    deferCleanup(() => { ModelRuntime.prototype.streamSimple = original; });
+    deferCleanup(() => { requestRuntime.streamSimple = original; });
   }
-  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent: adapter,
-    contextService: new ContextService({ store, materials: { inspectParsed() { throw new Error('No chat material.'); } } }),
-    contextRepository: { bindRequest: store.context.bindRequest, resolveToolResult: store.context.resolveToolResult,
-      recordRequest(binding, update) { updates.push(update);
+  const transaction = store.transaction;
+  store.transaction = async operation => {
+    const committed: ContextEvidenceUpdate[] = [];
+    const result = await transaction(scope => operation({ ...scope, context: { ...scope.context,
+      recordRequest(binding, update) {
+        updates.push(update);
         if (options.reject?.(update)) return fail(appError('storage_write_failed', 'storage', 'Controlled necessary evidence rejection.', true));
-        const saved = store.context.recordRequest(binding, update); if (saved.ok) options.afterRecord?.(update); return saved; } },
+        const saved = scope.context.recordRequest(binding, update);
+        if (saved.ok) committed.push(update);
+        return saved;
+      },
+    } }));
+    for (const update of committed) await options.afterRecord?.(update);
+    return result;
+  };
+  const runtime = new RuntimeService({ database: store,  agent: adapter,
+    contextService: new ContextService({ store, materials: { inspectParsed() { throw new Error('No chat material.'); } } }),
+
     provider: { async prepare() { throw new Error('No direct Provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: at, monotonicNow: () => performance.now() });
   deferCleanup(() => runtime.close());
-  const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.memory, store.sessionInputs,
+  const sessions = new SessionService(adapter, () => runtime.state(), at, store,
     (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
   const start = async (text = 'Text with \ud800 lone and 😀 paired', clientSequence = 1) => {
     let finish!: (event: AgentRunEvent & { type: 'run_finished' }) => void;
@@ -180,6 +195,66 @@ async function begin(app: Application, input: SessionInputRequest) {
   const accepted = need(await app.submitInput(input, { onEvent(event) { if (event.type === 'run_finished') finish(event); } }));
   return { accepted, terminal };
 }
+
+it('uses the current owner for model permission and Context evidence after root repositories expire', async () => {
+  const f = await evidenceFixture();
+  f.store.context.bindRequest = () => fail(appError('storage_write_failed', 'storage', 'Expired root Context repository.'));
+  f.store.context.recordRequest = () => fail(appError('storage_write_failed', 'storage', 'Expired root Context repository.'));
+  f.store.sessions.get = () => fail(appError('storage_read_failed', 'storage', 'Expired root Session repository.'));
+  f.store.sessions.isModelUseBlocked = () => fail(appError('storage_read_failed', 'storage', 'Expired root Session repository.'));
+  const run = await f.start();
+  expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+  expect(f.payloads).toHaveLength(1);
+  expect(f.journal(run.accepted.runId).requests).toMatchObject([
+    { sdkPayload: { inclusion: 'confirmed' }, attempts: [{ responseStatus: 200, nativeRequestId: 'response-success' }] },
+  ]);
+});
+
+it('waits for the actual Context binding COMMIT before starting the model', async () => {
+  const f = await evidenceFixture(), transaction = f.store.transaction;
+  const entered = barrier(), release = barrier();
+  f.store.transaction = operation => transaction(async scope => {
+    let bound = false;
+    const result = await operation({ ...scope, context: { ...scope.context, bindRequest(value) {
+      const saved = scope.context.bindRequest(value); bound = saved.ok; return saved;
+    } } });
+    if (bound) { entered.release(); await release.ready; }
+    return result;
+  });
+  const run = await f.start();
+  try {
+    await entered.ready;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.baseCalls()).toBe(0); expect(f.payloads).toHaveLength(0);
+    release.release();
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
+    expect(f.payloads).toHaveLength(1);
+  } finally { release.release(); await run.terminal; }
+});
+
+it.each(['denied', 'rejected'] as const)('awaits asynchronous model permission and fails closed when %s', async mode => {
+  const f = await evidenceFixture(), prepare = f.adapter.prepare.bind(f.adapter);
+  const entered = barrier(), release = barrier();
+  f.adapter.prepare = async (...args) => {
+    const prepared = await prepare(...args); if (!prepared.ok) return prepared;
+    return { ...prepared, data: { ...prepared.data, execute(input, signal, observe) {
+      return prepared.data.execute({ ...input, verifyModelUse: async () => {
+        entered.release(); await release.ready;
+        if (mode === 'rejected') throw Error('Controlled permission rejection.');
+        return fail(appError('session_scope_revoked', 'session', 'Material access was revoked.'));
+      } }, signal, observe);
+    } } };
+  };
+  const run = await f.start();
+  try {
+    await entered.ready;
+    expect(f.baseCalls()).toBe(0);
+    release.release();
+    expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed',
+      error: { code: mode === 'rejected' ? 'storage_read_failed' : 'session_scope_revoked' } } });
+    expect(f.payloads).toHaveLength(0);
+  } finally { release.release(); await run.terminal; }
+});
 
 it.each([[402, 'provider_billing_failed'], [401, 'provider_auth_failed'], [403, 'provider_auth_failed'],
   [429, 'provider_rate_limited'], [400, 'provider_request_rejected']] as const)
@@ -423,7 +498,7 @@ it('P10 overflow continuation then tool-loop threshold refuses the exhausted bud
   });
   for (let index = 1; index <= 4; index++) {
     const seed = await begin(f.app, f.prompt(index, 'Seed invoice ' + 'y'.repeat(45000)));
-    expect((await seed.terminal).result.ok).toBe(true);
+    expect((await seed.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
   }
   const workspace = need(await f.app.readWorkspace());
   const active = await begin(f.app, { ...f.prompt(5, 'Original explicit invoice question'), timeoutMs: 12000, budget: { maxModelCalls: 5 },
@@ -533,7 +608,7 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
       originInput = need(store.sessionInputs.admit({ sessionId: session.sessionId, clientSequence: 1, mode: 'prompt', text: 'old question', config }, () => {
         legacyRunId = createOriginRun();
         const built = need(contextService.build({ runId: legacyRunId, sessionId: session.sessionId, jobId: null, text: 'old question', goalMode: 'answer',
-          workspaceContext: null, workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [], workingDirectory: null, createdAt: at() }));
+          workspaceContext: null, workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [], workingDirectory: null, createdAt: at() }, store));
         return ok({ runId: legacyRunId, contextPolicyVersion: 'p8-context-v1', contextSnapshotId: built.snapshot.id,
           content: SessionInputContentV2Schema.parse({ version: 2, text: 'old question', promptText: built.promptText,
             workspaceContext: null, workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [] }) });
@@ -577,12 +652,24 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
       cleanup: { version: 1, stopped: true, stopReason: 'stop', errors: [], lateObservationRequired: false },
       endedAt: at(), stoppedAt: at(), durationMs: null }));
   }
-  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent: adapter,
-    contextService, ...(withRepository ? { contextRepository: store.context } : {}),
+  let bindingReadFailures = 0;
+  const database = { transaction: store.transaction,
+    read: <T>(operation: (scope: import('../../packages/core/src/storage/database.ts').SqlDatabaseStore) => T | Promise<T>) => store.read(scope => operation({ ...scope,
+      runs: { ...scope.runs, get(runId) {
+        const saved = scope.runs.get(runId);
+        if (!withRepository && saved.ok && saved.data.config.contextPolicyVersion === 'p8-context-v1') {
+          bindingReadFailures++;
+          return fail(appError('context_binding_unknown', 'runtime', 'Current Context binding is unavailable.', true, runId));
+        }
+        return saved;
+      } },
+    })) };
+  const runtime = new RuntimeService({ database, agent: adapter,
+    contextService,
     provider: { async prepare() { throw new Error('No direct Provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: at, monotonicNow: () => performance.now() });
   deferCleanup(() => runtime.close());
-  const sessions = new SessionService(store.sessions, adapter, () => runtime.state(), at, store.runs, store.memory, store.sessionInputs,
+  const sessions = new SessionService(adapter, () => runtime.state(), at, store,
     (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
   const start = async (clientSequence: number) => {
     // This manual Runtime fixture owns its restoration boundary; full Application recovery remains T05.
@@ -602,7 +689,8 @@ async function storedFixture(withRepository = true, toolOrigin: false | 'legacy'
   };
   const journal = (runId: number) => ContextObservationsSchema.parse(JSON.parse(store.db.query<{ context_observations_json: string }, [number]>
     ('SELECT context_observations_json FROM runs WHERE id=?').get(runId)!.context_observations_json));
-  return { store, adapter, session, config, start, journal, calls: () => calls, legacyRunId, originalCallId };
+  return { store, adapter, session, config, start, journal, calls: () => calls,
+    bindingReadFailures: () => bindingReadFailures, legacyRunId, originalCallId };
 }
 
 describe('T06 actual payload and transport evidence', () => {
@@ -737,9 +825,9 @@ describe('T06 actual payload and transport evidence', () => {
     f = await evidenceFixture({ retries: 1, ...(cause === 'deadline' ? { timeoutMs: 200 } : {}), response: () =>
       new Response(JSON.stringify({ error: { message: 'retry after qualification change' } }), { status: 503,
         headers: { 'content-type': 'application/json', 'retry-after-ms': '400' } }),
-      afterRecord: update => {
+      afterRecord: async update => {
         if (update.kind !== 'response' || update.status !== 503) return;
-        if (cause === 'cancel') { const active = f.runtime.state().active; if (!active || active.kind === 'compaction') throw new Error('Missing active Run'); need(f.runtime.cancel(active.runId)); }
+        if (cause === 'cancel') { const active = f.runtime.state().active; if (!active || active.kind === 'compaction') throw new Error('Missing active Run'); need(await f.runtime.cancel(active.runId)); }
         if (cause === 'revoke') f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
           .run(JSON.stringify({ documentIds: [1], at: new Date().toISOString(), reason: 'document_use_revoked' }), f.session.sessionId);
       } });
@@ -760,7 +848,7 @@ describe('T06 actual payload and transport evidence', () => {
     const entered = barrier(), release = barrier(); deferCleanup(() => release.release());
     const f = await evidenceFixture({ replacement: async payload => { entered.release(); await release.ready; return payload; } });
     const run = await f.start(); await entered.ready;
-    if (cause === 'cancel') need(f.runtime.cancel(run.accepted.runId));
+    if (cause === 'cancel') need(await f.runtime.cancel(run.accepted.runId));
     else f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
       .run(JSON.stringify({ documentIds: [1], at: new Date().toISOString(), reason: 'document_use_revoked' }), f.session.sessionId);
     release.release(); expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: cause === 'cancel' ? 'cancelled' : 'failed' } });
@@ -771,7 +859,7 @@ describe('T06 actual payload and transport evidence', () => {
     const f = await evidenceFixture({ ignoreAbort: true, response: async () => { entered.release(); await release.ready;
       const response = reply(); response.headers.set('x-request-id', 'late-original'); return response; } });
     const run = await f.start('Original late request'); await entered.ready;
-    need(f.runtime.cancel(run.accepted.runId));
+    need(await f.runtime.cancel(run.accepted.runId));
     expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', stopped: false,
       error: { code: 'agent_cancelled' }, cleanupErrors: [expect.objectContaining({ code: 'stop_unconfirmed' })] } });
     expect(f.journal(run.accepted.runId).requests[0]!.attempts[0]!.responseAt).toBeNull();
@@ -791,8 +879,8 @@ describe('T06 public SDK codec conversion', () => {
     const codec = need(preparePayloadCodec(api, context, true)); let payload: unknown;
     const options = { apiKey: 'synthetic-codec-key', maxRetries: 0, fetch: globalThis.fetch,
       onPayload: (outgoing: unknown) => { payload = outgoing; expect(need(checkPayload(codec, outgoing)).inclusion).toBe('confirmed'); } };
-    const stream = api === 'openai-completions' ? completionsStream({ ...f.sdk.model!, api }, context, options)
-      : responsesStream({ ...f.sdk.model!, api }, context, options);
+    const stream = api === 'openai-completions' ? completionsStream({ ...f.sdk.model!, api }, normalizeContext(context), options)
+      : responsesStream({ ...f.sdk.model!, api }, normalizeContext(context), options);
     await stream.result(); expect(f.payloads).toHaveLength(1); expect(payload).toEqual(f.payloads[0]);
     const body = payload as { messages?: Array<{ role: string; content: unknown }>; input?: Array<{ role: string; content: unknown }> };
     const rows = (body.messages ?? body.input)!;
@@ -812,7 +900,7 @@ describe('T06 public SDK codec conversion', () => {
       { role: 'toolResult', toolCallId: 'read-b', toolName: 'read', isError: false, timestamp: 4,
         content: [{ type: 'text', text: 'second image' }, { type: 'image', mimeType: 'image/png', data: 'SECOND' }] }] };
     const codec = need(preparePayloadCodec('openai-completions', context, true)); let payload: unknown;
-    const stream = completionsStream({ ...f.sdk.model!, api: 'openai-completions', input: ['text', 'image'] }, context, { apiKey: 'synthetic-codec-key', maxRetries: 0,
+    const stream = completionsStream({ ...f.sdk.model!, api: 'openai-completions', input: ['text', 'image'] }, normalizeContext(context), { apiKey: 'synthetic-codec-key', maxRetries: 0,
       fetch: globalThis.fetch, onPayload: outgoing => { payload = outgoing; expect(need(checkPayload(codec, outgoing)).inclusion).toBe('confirmed'); } });
     const result = await stream.result(); expect(result.stopReason).toBe('stop'); expect(f.payloads).toHaveLength(1);
     const body = payload as { messages: Array<{ role: string; content: unknown }> };
@@ -1024,10 +1112,11 @@ describe('P8 actual Pi request context', () => {
     expect(f.payloads).toHaveLength(4);
   });
 
-  it('stops a marked Run without the real repository before SDK preparation or HTTP', async () => {
+  it('stops a marked Run when its current Context binding is unavailable before SDK preparation or HTTP', async () => {
     const f = await storedFixture(false); const run = await f.start(1);
     expect((await run.terminal).result).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'context_binding_unknown' } } });
     expect(f.calls()).toBe(0); expect(f.journal(run.accepted.runId).requests).toEqual([]);
+    expect(f.bindingReadFailures()).toBeGreaterThan(0);
     expect(need(f.store.sessionInputs.get(run.accepted.inputId))).toMatchObject({ nativeEntryId: null });
   });
 
@@ -1152,7 +1241,8 @@ it('P9 T04 persists late idle native facts without reopening the terminal SQL Ru
   expect(record.active).toBeUndefined();
   await record.session.sendCustomMessage({ customType: 'late', content: 'late native context', display: false });
   const userId = record.manager.appendMessage({ role: 'user', content: 'late native user', timestamp: 123 });
-  const after = need(f.store.sessions.loadHistoryForContext(f.session.sessionId));
+  await waitFor(async () => f.adapter.inspect(f.session.nativeSessionId).availability !== 'busy');
+  const after = need(await f.store.read(scope => scope.sessions.loadHistoryForContext(f.session.sessionId)));
   expect(after.history!.entries.length).toBe(before.history!.entries.length + 2);
   expect(after.seed.origins.slice(-2).every(origin => origin.originSessionId === f.session.sessionId && origin.originRunId === null)).toBe(true);
   expect(after.seed.inputs.find(input => input.nativeEntryId === userId)).toEqual({ nativeEntryId: userId, originRunId: null, inputId: null, snapshotId: null });
@@ -1192,11 +1282,13 @@ async function t07Fixture(api: 'openai-completions' | 'openai-responses' | 'goog
     modelRef: { provider: 't07-loopback', model }, native: { authPath: join(root, 'unused.json'), modelsPath },
     parameters: { maxRetries: retries, maxRetryDelayMs: 100 } });
   let app!: Application, adapter!: PiAgentAdapter, sdk!: AgentSession, ownedDb!: Database;
-  const runtimeState = RuntimeService.prototype.state;
-  RuntimeService.prototype.state = function (...args) {
-    ownedDb = (this as any).dependencies.contextService.options.store.db; return runtimeState.apply(this, args);
-  };
-  deferCleanup(() => { RuntimeService.prototype.state = runtimeState; });
+  const originalOpen = bootstrap.bootstrapDatabase;
+  const opening = spyOn(bootstrap, 'bootstrapDatabase').mockImplementation(input => {
+    const opened = originalOpen(input);
+    if (opened.ok) ownedDb = opened.data.db;
+    return opened;
+  });
+  deferCleanup(() => opening.mockRestore());
   const sql = <T>(fn: (db: Database) => T): T => fn(ownedDb);
   const open = async () => {
     app = need(await createApplication({ paths, invoiceSourceRoot: join(root, 'source'), logger: { write() {}, async close() {} }, agentFactory: tools => {
@@ -1237,7 +1329,6 @@ async function t07Fixture(api: 'openai-completions' | 'openai-responses' | 'goog
           ? fail(appError('storage_write_failed', 'storage', 'Controlled M3 metadata commit failure.')) : write(value));
       return adapter;
     } }));
-    await app.queryRuntimeState();
     const opened = app; deferCleanup(() => opened.close()); return app;
   };
   await open();
@@ -1276,7 +1367,7 @@ async function t07Fixture(api: 'openai-completions' | 'openai-responses' | 'goog
         leafId: next.leafId, unusable: next.unusable, contexts: [] }));
       const bundle = need(store.sessions.loadHistoryForContext(sessionId));
       expect(bundle.commit).toEqual(receipt); expect(bundle.seed.origins).toHaveLength(next.entries.length);
-    } finally { store.close(); }
+    } finally { await store.close(); }
     await open();
   };
   const material = async () => {
@@ -1373,8 +1464,8 @@ it('P9 T07 binds inherited and native derived contexts through request reload', 
   const next = await f.input(c.session.sessionId, 1, 'New independent input', 'M3');
   expect((await next.terminal).result).toMatchObject({ ok: true, data: { status: 'completed' } });
   const converted = f.conversions.at(-1)!;
-  expect(converted.input.map(m => m.role)).toEqual(['compactionSummary', 'user', 'assistant', 'toolResult', 'assistant', 'bashExecution', 'bashExecution', 'custom', 'custom', 'branchSummary', 'branchSummary', 'compactionSummary', 'user']);
-  expect(converted.output).toHaveLength(12); expect(converted.input[7]).not.toBe(converted.input[8]);
+  expect(converted.input.map(m => m.role)).toEqual(['compactionSummary', 'user', 'assistant', 'toolResult', 'assistant', 'bashExecution', 'bashExecution', 'custom', 'custom', 'branchSummary', 'branchSummary', 'compactionSummary', 'system', 'user']);
+  expect(converted.output).toHaveLength(13); expect(converted.input[7]).not.toBe(converted.input[8]);
   expect(converted.output[6].content).toEqual([{ type: 'text', text: 'same derived body' }]);
   expect(converted.output[7].content).toEqual(converted.output[6].content);
   expect(JSON.stringify(converted.output[5])).toContain('included-bash'); expect(JSON.stringify(converted.output)).not.toContain('excluded-bash');

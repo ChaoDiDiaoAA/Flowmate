@@ -18,13 +18,21 @@ export const EvaluationConnectionSchema = z.object({
   }, 'A credential-free HTTP URL is required'),
   model: z.string().trim().min(1).max(128),
 }).strict();
-export const EvaluationJudgeConnectionSchema = EvaluationConnectionSchema.extend({
+export const EvaluationHttpJudgeConnectionSchema = EvaluationConnectionSchema.extend({
   timeoutMs: z.number().int().positive().max(300_000).default(180_000),
 });
+export const EvaluationNativeJudgeConnectionSchema = z.object({ provider: z.literal('codex-cli'),
+  executable: z.string().trim().min(1).max(2048), model: z.string().trim().min(1).max(128),
+  reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).default('medium'),
+  timeoutMs: z.number().int().positive().max(300_000).default(180_000),
+}).strict();
+export const EvaluationJudgeConnectionSchema = z.union([EvaluationHttpJudgeConnectionSchema, EvaluationNativeJudgeConnectionSchema]);
 export type EvaluationConnection = z.infer<typeof EvaluationConnectionSchema>;
 export type EvaluationJudgeConnection = z.infer<typeof EvaluationJudgeConnectionSchema>;
 export const EvaluationAgentProfileSchema = EvaluationConnectionSchema.extend({ credentialRef: z.string().regex(/^[a-f0-9]{32}$/) });
-export const EvaluationJudgeProfileSchema = EvaluationJudgeConnectionSchema.extend({ credentialRef: z.string().regex(/^[a-f0-9]{32}$/) });
+export const EvaluationJudgeProfileSchema = z.union([
+  EvaluationHttpJudgeConnectionSchema.extend({ credentialRef: z.string().regex(/^[a-f0-9]{32}$/) }), EvaluationNativeJudgeConnectionSchema,
+]);
 export const EvaluationSettingsSchema = z.object({
   agent: EvaluationAgentProfileSchema.nullable(), judge: EvaluationJudgeProfileSchema.nullable(),
 }).strict();
@@ -87,7 +95,8 @@ const keyUpdate = z.string().trim().min(1).max(4096).optional();
 export const SaveEvaluationSettingsSchema = z.discriminatedUnion('role', [
   z.object({ expectedRevision: revision, role: z.literal('agent'), connection: EvaluationConnectionSchema.nullable(), apiKey: keyUpdate }).strict(),
   z.object({ expectedRevision: revision, role: z.literal('judge'), connection: EvaluationJudgeConnectionSchema.nullable(), apiKey: keyUpdate }).strict(),
-]).refine(value => value.connection !== null || value.apiKey === undefined, 'A cleared connection cannot receive a credential');
+]).refine(value => (value.connection !== null && !('provider' in value.connection && value.connection.provider === 'codex-cli')) || value.apiKey === undefined,
+  'A cleared or native connection cannot receive an API credential');
 export type SaveEvaluationSettingsRequest = z.infer<typeof SaveEvaluationSettingsSchema>;
 
 export const evaluationRequests = {
@@ -145,7 +154,7 @@ export const EvaluationProgressViewSchema = z.object({
   executionId: executionId.optional(), datasetId: EvaluationIdSchema.optional(), caseId: EvaluationIdSchema.optional(),
   trialId: EvaluationIdSchema.optional(), index: revision.optional(), total: revision.optional(), caseCount: revision.optional(),
   trialIndex: revision.optional(), trialsPerCase: revision.optional(),
-  phase: z.enum(['preparing', 'executing', 'cleanup', 'restoring', 'scoring', 'saving']).optional(),
+  phase: z.enum(['preparing', 'executing', 'capturing', 'cleanup', 'restoring', 'scoring', 'saving']).optional(),
   status: z.string().max(64).optional(), reason: z.string().max(16_000).optional(), error: z.string().max(16_000).optional(),
   endpointReached: z.boolean().optional(), elapsedMs: z.number().finite().nonnegative().optional(),
   stopped: z.boolean().optional(), stopConfirmed: z.boolean().optional(), count: revision.optional(),
@@ -228,12 +237,14 @@ export const EvaluationExportResultSchema = z.object({ version: z.literal(1), se
 export type EvaluationExportResult = z.infer<typeof EvaluationExportResultSchema>;
 export const EvaluationExecutionConditionsSchema = z.object({
   agent: EvaluationConnectionSchema.extend({ modelCapabilities: z.object({ contextWindow: z.number().int().positive(),
-    maxTokens: z.number().int().positive(), reasoning: z.boolean(), source: z.enum(['pi-sdk-model-catalog', 'deepseek-models-api']),
+    transport: z.object({ maxTokens: z.number().int().positive(), source: z.literal('local-codex-gateway-source') }).strict().optional(),
+    maxTokens: z.number().int().positive(), reasoning: z.boolean(), source: z.enum(['pi-sdk-model-catalog', 'deepseek-models-api', 'codex-cli-cache-and-openai-model-reference']),
     providers: z.array(z.string().max(200)).min(1).max(50) }).strict().nullable() }),
   run: EvaluationRunConfigurationSchema.extend({ resources: ResourceSelectionSchema.optional(), extensions: ExtensionSelectionSchema.optional() }),
-  judge: z.object({ api: EvaluationApiSchema.nullable(), baseUrl: EvaluationConnectionSchema.shape.baseUrl,
-    model: EvaluationConnectionSchema.shape.model, timeoutMs: z.number().int().positive() }).strict().nullable().optional(),
-  scoring: z.object({ version: z.number().int().positive(), judgeMode: z.enum(['off', 'auto', 'required']) }).strict(),
+  judge: z.object({ api: EvaluationApiSchema.nullable(), baseUrl: EvaluationConnectionSchema.shape.baseUrl.nullable(),
+    model: EvaluationConnectionSchema.shape.model, timeoutMs: z.number().int().positive(),
+    transport: z.literal('codex-cli').optional(), reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional() }).strict().nullable().optional(),
+  scoring: z.object({ version: z.number().int().positive(), scoringVersion:z.literal(2).optional(), judgeMode: z.enum(['off', 'auto', 'required']) }).strict(),
   source: z.object({ runtime: z.object({ node: z.string().max(200), platform: z.string().max(200), arch: z.string().max(200) }).strict(),
     dependencies: z.record(z.string().max(200).nullable()).refine(value => Object.keys(value).length <= 100), fileCount: revision,
     paths: z.array(z.string().max(1024)).max(200), pathsTruncated: z.boolean() }).strict().nullable(),
@@ -254,11 +265,17 @@ export const EvaluationTrialViewSchema = z.object({ trialId: EvaluationIdSchema,
   judgeGenerations: revision.nullable(), usage: z.record(measured).nullable(), artifactReferences: revision.nullable(),
 }).strict();
 export type EvaluationTrialView = z.infer<typeof EvaluationTrialViewSchema>;
+export const EvaluationCalibrationViewSchema = z.object({ state:z.enum(['not-provided','insufficient-coverage','version-mismatch','matched']),
+  reason:z.string().max(2000),metricIds:z.array(z.string().min(1).max(200)).max(30),reference:EvaluationIdSchema.nullable(),
+  kind:z.enum(['engineering-fixture','actual-judge-calibration']).nullable(),acceptance:z.literal('not-assessed') }).strict();
+export type EvaluationCalibrationView = z.infer<typeof EvaluationCalibrationViewSchema>;
 export const EvaluationScoreViewSchema = z.object({ trialId: EvaluationIdSchema, caseId: EvaluationIdSchema, repetition: z.number().int().positive(),
   metricId: z.string().min(1).max(200), name: z.string().max(2000), version: z.number().int().positive(), method: z.enum(['deterministic', 'llm-judge']),
   required: z.boolean(), status: z.enum([...grade.options, 'NOT_APPLICABLE']), value: z.number().finite().min(0).max(1).nullable(),
   reason: z.string().max(2000), reasonTruncated: z.boolean(), evidence: z.array(z.string().max(2000)),
   evaluatorId: EvaluationIdSchema.nullable(), evaluatorVersion: z.number().int().positive().nullable(),
+  judge:z.object({callId:EvaluationIdSchema,criterion:z.number().int().nonnegative()}).strict().nullable().optional(),
+  calibration:EvaluationCalibrationViewSchema.nullable().optional(),
   category: z.enum(['formal', 'diagnostic', 'guardrail']).nullable(), applicabilityReason: z.string().max(2000).nullable(),
   statistics: z.object({ unit: z.string().min(1).max(200), numerator: revision.nullable(), denominator: revision.nullable(), missing: revision.nullable() }).strict().nullable(),
 }).strict();
@@ -335,7 +352,11 @@ export function matchesEvaluationResponse(command: EvaluationCommand, value: Res
   if (command.type === 'save_evaluation_settings') {
     if (!('role' in data) || data.role !== command.input.role || data.revision <= command.input.expectedRevision) return false;
     const role = data.evaluation[command.input.role], expected = command.input.connection;
-    return expected === null ? role === null : role !== null && role.api === expected.api && role.baseUrl === expected.baseUrl && role.model === expected.model
+    if (expected === null) return role === null;
+    if (role === null || role.model !== expected.model) return false;
+    if ('provider' in expected) return 'provider' in role && role.provider === expected.provider && role.executable === expected.executable
+      && role.reasoningEffort === expected.reasoningEffort && role.timeoutMs === expected.timeoutMs;
+    return 'api' in role && role.api === expected.api && role.baseUrl === expected.baseUrl
       && (!('timeoutMs' in expected) || 'timeoutMs' in role && role.timeoutMs === expected.timeoutMs);
   }
   if (command.type === 'preview_evaluation')

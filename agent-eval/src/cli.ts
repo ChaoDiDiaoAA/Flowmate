@@ -14,25 +14,41 @@ import { judgeConfig, prepareJudge, publicJudgeConfig } from './scoring/judges/c
 import { scanEvidence } from './execution/evidence-safety.ts';
 import { createProductAgent } from './adapters/agent.ts';
 import { prepareAgentConfig } from './configuration.ts';
+import { EvaluationWorkflowRequestSchema, type EvaluationWorkflowRequest } from '../../packages/contracts/src/evaluation-workflow.ts';
+import { dispatchWorkflow } from './desktop/workflow.ts';
+import { archiveFile, isArchiveReference, readArchivePart } from './reports/archive.ts';
+import { finalizeBenchmark } from './execution/benchmark.ts';
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const HELP = `Flowmate local evaluation
 bun --no-env-file run eval -- dataset validate --dir <local-dataset-directory>
 bun --no-env-file run eval -- doctor [--backend local|langfuse]
 bun run test:e2e
-bun run eval:smoke [--trials <1..20>]  # 10 business + 4 research; local Agent and Judge
-bun run eval:full [--trials <1..20>]   # 50 business + 12 research; local Agent and Judge
-bun run eval:upload -- --execution-id <id>  # saved results only, repeat to resend
-bun --no-env-file run eval -- run [--dataset <local-id|all>] [--selection smoke|holdout|full] [--case <id>] [--trials <1..20>] [--model <name>] [--api <type>] [--base-url <url>] [--execution-id <id>] [--backend local|langfuse] [--judge auto|off|required]
+bun --no-env-file run eval:smoke  # 7 Cases, 2 models, 1 repeat = 14 Trials; full workflow
+bun --no-env-file run eval:full   # 62 Cases, 2 models, 1 repeat = 124 Trials; full workflow
+bun run eval:upload -- --run-id <Run-id>  # saved results only; no Subject rerun
+bun run eval:upload -- --execution-id <id>
+bun --no-env-file run eval -- run [--dataset <local-id|all>] [--benchmark-revision N] [--selection smoke|holdout|full] [--case <id>] [--trials <1..20>] [--model <name>] [--api <type>] [--base-url <url>] [--execution-id <id>] [--backend local|langfuse] [--judge auto|off|required]
 bun --no-env-file run eval -- status --execution-id <id> | --dataset <id>
 bun --no-env-file run eval -- compare --left <execution-id> --right <execution-id>
-bun --no-env-file run eval -- judge calibrate --dir <independent-reference-directory> --execution-id <id>
+bun --no-env-file run eval -- judge calibrate --dir <independent-reference-directory> --execution-id <id> [--metric <metricId>]
 bun --no-env-file run eval -- resend (--execution-id <id> | --report <absolute-report.json>)
 bun --no-env-file run eval -- review add (--execution-id <id> | --dataset <id>) --case <id> [--trial <TrialID>] --reviewer <name> --verdict good|bad --note <text>
 bun --no-env-file run eval -- review status (--execution-id <id> | --dataset <id>)
 bun --no-env-file run eval -- review setup --backend langfuse
 bun --no-env-file run eval -- review enqueue|import|sync --execution-id <id> --backend langfuse
+bun --no-env-file run eval -- trace list | show --trace-id UUID | pull --from ISO --to ISO [--trace-id ID] [--entry chats|invoices|research|evaluation]
+bun --no-env-file run eval -- trace upload --trace-id UUID --revision N --operation-id UUID | process --trace-id UUID | feedback --file feedback.json
+bun --no-env-file run eval -- mine --trace-id UUID --revision N --kind gold|bad|regression --operation-id UUID
+bun --no-env-file run eval -- candidate list [--kind gold|bad|regression] | show --candidate-id UUID | edit --candidate-id UUID --revision N --file patch.json
+bun --no-env-file run eval -- candidate validate --candidate-id UUID --revision N [--replay] | review --file feedback.json | publish --file publication.json
+bun --no-env-file run eval -- benchmark list
+bun --no-env-file run eval -- experiment preview|run --file plan.json | list | show|compare --experiment-id ID
+bun --no-env-file run eval -- baseline create --experiment-id ID --arm-id ID [--baseline-id ID] | list
+bun --no-env-file run eval -- gate check --baseline-id ID --experiment-id ID --arm-id ID [--full-release]
+bun --no-env-file run eval -- observability get | save --capture true|false --upload true|false --mining true|false
+bun --no-env-file run eval -- workflow --file request.json
 Retired: review apply (use review import --backend langfuse), dataset publish, sync, --version and --wait-seconds.
-Defaults: backend local; judge auto (independent configuration, may incur fees); trials per Case 1. Retired --repeat: use --trials N. Benchmark Agent settings use FLOWMATE_EVAL_AGENT_BASE_URL/API_KEY/MODEL/API in agent-eval/configs/.env; CLI overrides model/API/URL. Native model capacities come from the Pi SDK catalog or exact DeepSeek provider metadata, without evaluation Token limits. Each Trial starts an independent local Flowmate Host; no Docker or image is required. Judge credentials are independent. Stage one engineering acceptance does not start a real Benchmark.
+Defaults: backend local; judge auto (independent configuration, may incur fees); trials per Case 1. Retired --repeat: use --trials N. Benchmark Agent settings use FLOWMATE_EVAL_AGENT_BASE_URL/API_KEY/MODEL/API/REASONING_EFFORT in agent-eval/configs/.env; the configured local Luna Subject and candidate replay use max reasoning by default. CLI overrides model/API/URL. FLOWMATE_EVAL_DEEPSEEK_API_KEY is reserved for the explicit DeepSeek control of two-model experiments. Native model capacities come from the Pi SDK catalog or exact DeepSeek provider metadata, without evaluation Token limits. Each Trial starts an independent local Flowmate Host; no Docker or image is required. Judge credentials are independent. Stage one engineering acceptance does not start a real Benchmark.
 Exit 0: necessary automatic scores pass; 1: failed/error/incomplete; 2: necessary scoring pending. Human acceptance and export are separate.`;
 export function parseOptions(args: string[], valued: string[], flags: string[] = []): Record<string, string | true> {
     const out: Record<string, string | true> = {};
@@ -53,13 +69,56 @@ export function parseOptions(args: string[], valued: string[], flags: string[] =
     }
     return out;
 }
+export function parseWorkflowCli(args: string[]): EvaluationWorkflowRequest | undefined {
+    const command = args[0];
+    if (!command || !['workflow', 'trace', 'mine', 'candidate', 'benchmark', 'experiment', 'baseline', 'gate', 'observability'].includes(command)) return undefined;
+    const action = command === 'workflow' ? 'workflow' : command === 'mine' ? 'mine' : command === 'observability' ? 'settings.' + args[1] : command + '.' + args[1];
+    const wholeFile = ['candidate.review', 'trace.feedback', 'candidate.publish', 'experiment.preview', 'experiment.run'];
+    const allowed: Record<string, string[]> = {
+        workflow: ['--file'], 'settings.get': [], 'settings.save': ['--capture', '--upload', '--mining'],
+        'trace.list': [], 'trace.show': ['--trace-id'], 'trace.pull': ['--from', '--to', '--trace-id', '--entry'],
+        'trace.upload': ['--trace-id', '--revision', '--operation-id'], 'trace.process': ['--trace-id'], 'trace.feedback': ['--file'],
+        mine: ['--trace-id', '--revision', '--operation-id', '--kind'], 'candidate.list': ['--kind'], 'candidate.show': ['--candidate-id'],
+        'candidate.edit': ['--candidate-id', '--revision', '--file'], 'candidate.validate': ['--candidate-id', '--revision'],
+        'candidate.review': ['--file'], 'candidate.publish': ['--file'], 'benchmark.list': [],
+        'experiment.preview': ['--file'], 'experiment.run': ['--file'], 'experiment.list': [], 'experiment.show': ['--experiment-id'], 'experiment.compare': ['--experiment-id'],
+        'benchmark.run': ['--selection'],
+        'baseline.create': ['--experiment-id', '--arm-id', '--baseline-id'], 'baseline.list': [], 'gate.check': ['--baseline-id', '--experiment-id', '--arm-id'],
+    };
+    if (!(action in allowed)) throw Error(HELP);
+    const options = parseOptions(args.slice(command === 'mine' || command === 'workflow' ? 1 : 2), allowed[action]!,
+        action === 'candidate.validate' ? ['--replay'] : action === 'gate.check' ? ['--full-release'] : []);
+    const string = (name: string) => typeof options[name] === 'string' ? options[name] as string : undefined;
+    const file = () => { const path = string('--file'); if (!path) throw Error('Required --file'); return JSON.parse(readFileSync(resolve(path), 'utf8')); };
+    if (command === 'workflow') return EvaluationWorkflowRequestSchema.parse(file());
+    if (wholeFile.includes(action)) return EvaluationWorkflowRequestSchema.parse(action.startsWith('experiment.') ? { action, plan: file() } : { ...file(), action });
+    const number = (name: string) => string(name) === undefined ? undefined : Number(string(name));
+    const boolean = (name: string) => string(name) === 'true' ? true : string(name) === 'false' ? false : string(name);
+    let input: Record<string, unknown> = { action };
+    switch (action) {
+        case 'benchmark.run': input.selection = string('--selection'); break;
+        case 'settings.save': input.settings = { capture: boolean('--capture'), upload: boolean('--upload'), mining: boolean('--mining') }; break;
+        case 'trace.show': case 'trace.process': input.traceId = string('--trace-id'); break;
+        case 'trace.upload': case 'mine': input = { action, traceId: string('--trace-id'), expectedRevision: number('--revision'), operationId: string('--operation-id'),
+            ...(action === 'mine' ? { kind: string('--kind') } : {}) }; break;
+        case 'trace.pull': input = { action, from: string('--from'), to: string('--to'), traceId: string('--trace-id'), entry: string('--entry') }; break;
+        case 'candidate.list': input.kind = string('--kind'); break;
+        case 'candidate.show': input.candidateId = string('--candidate-id'); break;
+        case 'candidate.edit': input = { action, candidateId: string('--candidate-id'), expectedRevision: number('--revision'), patch: file() }; break;
+        case 'candidate.validate': input = { action, candidateId: string('--candidate-id'), expectedRevision: number('--revision'), replay: options['--replay'] === true }; break;
+        case 'experiment.show': case 'experiment.compare': input.experimentId = string('--experiment-id'); break;
+        case 'baseline.create': input = { action, experimentId: string('--experiment-id'), armId: string('--arm-id'), baselineId: string('--baseline-id') }; break;
+        case 'gate.check': input = { action, baselineId: string('--baseline-id'), experimentId: string('--experiment-id'), armId: string('--arm-id'), fullRelease: options['--full-release'] === true }; break;
+    }
+    return EvaluationWorkflowRequestSchema.parse(input);
+}
 const shortReason = (reason: string) => {
     const text = reason.replace(/[\r\n\t]/g, ' '), anomaly = text.indexOf('评分异常：');
     return anomaly >= 0 ? text.slice(0, Math.min(anomaly, 100)) + '；' + text.slice(anomaly, anomaly + 110) : text.slice(0, 220);
 };
 export function createProgressReporter(write: (line: string) => void = line => { process.stderr.write(line); }) {
     const datasetName = (id: string) => id === 'flowmate-agent-v1' ? '业务' : id === 'flowmate-research-v1' ? '研究' : id;
-    const phases = { restoring: '准备授权输入', preparing: '准备Host环境', executing: 'Agent执行', cleanup: '确认停止与清理', scoring: '评分', saving: '保存结果' };
+    const phases = { restoring: '准备授权输入', preparing: '准备Host环境', executing: 'Agent执行', capturing: '采集证据', cleanup: '确认停止与清理', scoring: '评分', saving: '保存结果' };
     const agentLabels = { completed: ['✅', 'Agent执行成功'], failed: ['❌', 'Agent执行失败'], error: ['❌', 'Agent执行失败'],
         timeout: ['⚠', 'Agent执行失败（超时）'], cancelled: ['⏹', 'Agent执行已取消'], 'not-started': ['⏭', 'Agent执行未启动'] } as const;
     const scoreLabels = { PASS: ['✅', '通过（PASS）'], FAIL: ['❌', '失败（FAIL）'], ERROR: ['❌', '错误（ERROR）'],
@@ -169,6 +228,14 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
         console.log(HELP);
         return;
     }
+    const workflow = parseWorkflowCli(args);
+    if (workflow) {
+        const controller = new AbortController(), stop = () => controller.abort(); process.once('SIGINT', stop); process.once('SIGTERM', stop);
+        const progress = createProgressReporter();
+        try { const result = await dispatchWorkflow(repoRoot, workflow, { signal: controller.signal, experiments: { onProgress: progress.onProgress } }); console.log(artifactJson(scanEvidence(result).value).trimEnd()); process.exitCode = result.exitCode; }
+        finally { progress.close(); process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
+        return;
+    }
     if (args.some(arg => arg === '--repeat' || arg.startsWith('--repeat=')))
         throw Error('参数已更名，请使用 --trials N（1–20）；未准备模型或创建Execution。');
     if (args.includes('--stage') || args.includes('--mode'))
@@ -178,7 +245,7 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
     if (args[0] === 'sync' || args.includes('--version') || args.includes('--wait-seconds') || (args[0] === 'dataset' && args[1] === 'publish'))
         throw new Error('Platform-first interface retired. Use dataset validate, a local dataset and local status. No model was called.');
     const command = args[0]!, action = ['dataset', 'review','judge'].includes(command) ? args[1] : undefined;
-    const allowed: Record<string, string[]> = { doctor: ['--backend'], dataset: ['--dir'], run: ['--model','--api','--base-url','--dataset', '--selection', '--case', '--trials', '--execution-id', '--backend', '--judge'], status: ['--execution-id', '--dataset'], compare: ['--left', '--right'], judge:['--dir','--execution-id'],resend: ['--report','--execution-id'], review: ['--execution-id', '--dataset', '--case', '--trial', '--reviewer', '--verdict', '--note', '--backend'] };
+    const allowed: Record<string, string[]> = { doctor: ['--backend'], dataset: ['--dir'], run: ['--model','--api','--base-url','--dataset', '--benchmark-revision', '--selection', '--case', '--trials', '--execution-id', '--backend', '--judge'], status: ['--execution-id', '--dataset'], compare: ['--left', '--right'], judge:['--dir','--execution-id','--metric'],resend: ['--report','--execution-id','--run-id'], review: ['--execution-id', '--dataset', '--case', '--trial', '--reviewer', '--verdict', '--note', '--backend'] };
     if (!allowed[command])
         throw new Error(HELP);
     const options = parseOptions(args.slice(action ? 2 : 1), allowed[command]!);
@@ -196,7 +263,7 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
         const controller=new AbortController(),stop=()=>controller.abort();process.once('SIGINT',stop);process.once('SIGTERM',stop);
         try{
             const {calibrateJudge}=await import('./scoring/judges/calibration.ts');
-            const result=await calibrateJudge(repoRoot,{directory,executionId},{signal:controller.signal});
+            const result=await calibrateJudge(repoRoot,{directory,executionId,metric:opt('--metric')},{signal:controller.signal});
             print({executionId:result.report.executionId,report:result.file,kind:result.report.kind,acceptance:result.report.acceptance,criteria:result.report.criteria});
             if(!result.report.executionComplete||result.report.criteria.some(c=>c.errors||c.notRun))process.exitCode=1;
         }finally{process.removeListener('SIGINT',stop);process.removeListener('SIGTERM',stop);}
@@ -248,6 +315,8 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
         return;
     }
     if (command === 'run') {
+        const requestedRevision = opt('--benchmark-revision'), version = requestedRevision === undefined ? undefined : Number(requestedRevision);
+        if (requestedRevision !== undefined && (!/^[1-9]\d*$/.test(requestedRevision) || !Number.isSafeInteger(version))) throw Error('Benchmark revision must be a positive integer');
         const trials = opt('--trials'), repeat = trials === undefined ? 1 : Number(trials);
         if (trials !== undefined && !/^\d+$/.test(trials) || !Number.isSafeInteger(repeat) || repeat < 1 || repeat > 20)
             throw Error('--trials 必须是1–20的整数；未准备模型或创建Execution。');
@@ -256,8 +325,8 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
             throw new Error('Invalid backend/judge/selection');
         const all = opt('--dataset') === 'all';
         if (all && (opt('--case') || opt('--execution-id'))) throw Error('Dataset all cannot use --case or --execution-id');
-        const datasets = all ? ['flowmate-agent-v1','flowmate-research-v1'].map(dataset => findDataset(repoRoot,{dataset}))
-            : [findDataset(repoRoot, { dataset: opt('--dataset') })];
+        const datasets = all ? ['flowmate-agent-v1','flowmate-research-v1'].map(dataset => findDataset(repoRoot,{dataset,version}))
+            : [findDataset(repoRoot, { dataset: opt('--dataset'), version })];
         const config = parseRunConfig({model:opt('--model'),api:opt('--api'),baseUrl:opt('--base-url')});
         const controller = new AbortController(), stop = () => controller.abort();
         const progress = createProgressReporter();
@@ -282,11 +351,13 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
         if (Boolean(opt('--execution-id')) === Boolean(opt('--dataset')))
             throw new Error('Specify execution-id or dataset');
         if (opt('--execution-id')) {
-            const raw = JSON.parse(readFileSync(reportPath(repoRoot, opt('--execution-id')!), 'utf8'));
+            const savedPath = reportPath(repoRoot, opt('--execution-id')!);
+            const raw = isArchiveReference(savedPath) ? readArchivePart(savedPath) : JSON.parse(readFileSync(savedPath, 'utf8'));
             if (raw.contract === 'flowmate-judge-calibration-report/v1') {
-                const { readCalibrationReport } = await import('./scoring/judges/calibration.ts');
+                const { readCalibrationReport,calibrationCoverage } = await import('./scoring/judges/calibration.ts');
                 const report = readCalibrationReport(reportPath(repoRoot, opt('--execution-id')!));
-                print({ ...report, badcases: deriveCalibrationBadcases(report) });
+                const scopes=[...new Map(report.samples.map(s=>{const plan=s.plan??s.reference.plan;return[JSON.stringify(plan.criteria.map(c=>c.metricId).sort()),plan];})).values()];
+                print({ ...report, definitionCoverage:scopes.map(plan=>calibrationCoverage(report,plan,report.configuration)), badcases: deriveCalibrationBadcases(report) });
                 process.exitCode = !report.executionComplete || report.criteria.some(row => row.errors || row.notRun) ? 1 : 0;
                 return;
             }
@@ -312,6 +383,10 @@ export async function main(args: string[], root: string = repoRoot): Promise<voi
         return;
     }
     if (command === 'resend') {
+        if (opt('--run-id')) {
+            if (opt('--execution-id') || opt('--report')) throw Error('Run retry cannot also select an Execution or report');
+            const result = await finalizeBenchmark(repoRoot, opt('--run-id')!); print(result); process.exitCode = result.exitCode; return;
+        }
         if (Boolean(opt('--execution-id')) === Boolean(opt('--report'))) throw Error('Exactly one --execution-id or --report required');
         const path = opt('--execution-id') ? reportPath(repoRoot, opt('--execution-id')!) : required('--report');
         if (!isAbsolute(path))

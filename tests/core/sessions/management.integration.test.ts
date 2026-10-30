@@ -4,9 +4,11 @@ import { describe, expect, it } from 'bun:test';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { SessionService, ensureNativeSession } from '../../../packages/core/src/sessions/service.ts';
 import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
+import { makeApplication } from '../../../packages/core/src/application.ts';
+import { withNativeHistoryFaults } from '../../support/database.ts';
 import { ContextService } from '../../../packages/core/src/context/service.ts';
 import { appError, fail } from '@flowmate/contracts';
 import type { AgentPort, AgentRunEvent, NativeContextBindingSeed, NativeSessionHistory, Result, RuntimeState } from '@flowmate/contracts';
@@ -17,14 +19,14 @@ function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p5-management-'));
   const paths = { root, databaseFile: join(root, 'data', 'test.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
-  const store = need(openDatabase(paths));
+  const store = withNativeHistoryFaults(need(openDatabase(paths)));
   deferCleanup(() => store.close());
   const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir,
     credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-management-key' });
   deferCleanup(async () => { await agent.close(); });
   let runtime: RuntimeState = { active: null, blocked: false, error: null };
-  const service = new SessionService(store.sessions, agent, () => runtime,
-    () => at, store.runs, store.memory, store.sessionInputs);
+  const service = new SessionService(agent, () => runtime,
+    () => at, store);
   return { store, service, agent, paths, setRuntime: (state: RuntimeState) => { runtime = state; } };
 }
 async function savedConversation(app: ReturnType<typeof fixture>) {
@@ -50,6 +52,81 @@ async function savedConversation(app: ReturnType<typeof fixture>) {
     request: { sessionId: session.sessionId, expectedCommitRevision: committed.commitRevision, expectedLeafId: history.leafId,
       expectedEntryCount: history.entries.length, targetEntryId: firstReply } };
 }
+
+function readOnlyApplication(f: ReturnType<typeof fixture>) {
+  let models = 0;
+  f.agent.prepare = async () => { models++; throw Error('Session queries must not prepare a model.'); };
+  const runtime = new RuntimeService({ database: f.store, agent: f.agent,
+    provider: { async prepare() { models++; throw Error('Session queries must not prepare a Provider.'); },
+      async close() { return { stopped: true, closed: true, errors: [] }; } },
+    log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
+  deferCleanup(() => runtime.close());
+  const application = makeApplication(runtime, { get: id => f.store.read(scope => scope.runs.get(id)) },
+    async () => ({ stopped: true, closed: true, errors: [] }), f.service);
+  return { application, models: () => models };
+}
+
+for (const operation of ['history-page', 'history-entry', 'input', 'inputs']) {
+  it(`captures the original ${operation} request before its public Session query waits for the owner`, async () => {
+    const f = fixture(), saved = await savedConversation(f), api = readOnlyApplication(f);
+    const page = { sessionId: saved.session.sessionId, expectedCommitRevision: saved.request.expectedCommitRevision,
+      afterSequence: 0, limit: 1 };
+    const entry = { sessionId: saved.session.sessionId, expectedCommitRevision: saved.request.expectedCommitRevision,
+      entryId: saved.firstReply, partIndex: 0, offset: 0 };
+    const input = { sessionId: saved.session.sessionId, inputId: 1 };
+    const inputs = { sessionId: saved.session.sessionId, limit: 1 };
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const holding = f.store.transaction(async () => { entered.resolve(); await release.promise; });
+    await entered.promise;
+    let settled = false;
+    const pending = (operation === 'history-page' ? api.application.querySessionHistory(page)
+      : operation === 'history-entry' ? api.application.querySessionHistoryEntry(entry)
+        : operation === 'input' ? api.application.querySessionInput(input) : api.application.listSessionInputs(inputs))
+      .then(value => { settled = true; return value; });
+    page.sessionId = entry.sessionId = input.sessionId = inputs.sessionId = saved.session.sessionId + 1000;
+    page.afterSequence = 2; page.limit = 100; entry.offset = 2; input.inputId = 2; inputs.limit = 0;
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve)); expect(settled).toBe(false);
+      release.resolve(); await holding;
+      const expected = operation === 'history-page'
+        ? { session: { sessionId: saved.session.sessionId }, items: [{ entryId: saved.firstReply }], nextAfterSequence: 1 }
+        : operation === 'history-entry' ? { summary: { entryId: saved.firstReply }, part: { text: 'First reply' }, offset: 0 }
+          : operation === 'input' ? { input: null, nextClientSequence: 1 } : { items: [], nextBeforeInputId: null };
+      expect(await pending).toMatchObject({ ok: true, data: expected });
+      expect(api.models()).toBe(0);
+    } finally { release.resolve(); await holding; }
+  });
+}
+
+it('keeps owner read failures ahead of invalid public Session query parameters', async () => {
+  const f = fixture(), api = readOnlyApplication(f);
+  await f.store.close();
+  const results = await Promise.all([
+    api.application.querySessionHistory({ sessionId: 0 }),
+    api.application.querySessionHistoryEntry({ sessionId: 0, entryId: 'missing', expectedCommitRevision: 0 }),
+    api.application.querySessionInput({ sessionId: 0 }),
+    api.application.listSessionInputs({ sessionId: 0, limit: 0 }),
+  ]);
+  for (const result of results) expect(result).toMatchObject({ ok: false, error: { code: 'storage_read_failed' } });
+  expect(api.models()).toBe(0);
+});
+
+it('keeps an unknown branch position blocked when the database owner rejects the postcommit read', async () => {
+  const app = fixture(), saved = await savedConversation(app);
+  const read = app.store.read, move = app.agent.moveSessionLeaf.bind(app.agent);
+  let rejectRead = false;
+  app.store.read = async operation => {
+    if (rejectRead) { rejectRead = false; throw Error('Controlled owner read failure after branch commit'); }
+    return read(operation);
+  };
+  app.agent.moveSessionLeaf = async (...args) => {
+    const moved = await move(...args); expect(moved.ok).toBe(true); rejectRead = true; return moved;
+  };
+  expect(await app.service.branch(saved.request)).toMatchObject({ ok: false, error: { code: 'storage_read_failed' } });
+  expect(app.service.isManaging(saved.session.sessionId)).toBe(true);
+  const current = need(await read(scope => scope.memory.load(saved.session.sessionId)))!;
+  expect(current.history).toMatchObject({ leafId: saved.firstReply, unusable: true });
+});
 describe('T04 explicit restore and persisted Session queries', () => {
   it('branches the original ready Pi after two real Runtime replies and keeps management available', async () => {
     const app = fixture(); const session = need(await app.service.create({ title: 'Original ready SDK' }));
@@ -66,8 +143,7 @@ describe('T04 explicit restore and persisted Session queries', () => {
       modelRef: { provider: 'ready-branch-fixture', model: 'fixture' }, native: { authPath: join(app.paths.root, 'unused.json'), modelsPath: null },
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' as const, contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
-    const runtime = new RuntimeService({ memory: app.store.memory, runs: app.store.runs, sessions: app.store.sessions, sessionInputs: app.store.sessionInputs,
-      contextRepository: app.store.context,
+    const runtime = new RuntimeService({ database: app.store,
       agent: app.agent, contextService: new ContextService({ store: app.store,
         materials: { inspectParsed() { throw new Error('Pure chat cannot inspect material.'); } } }),
       provider: { async prepare() { throw new Error('No direct Provider calls.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
@@ -109,12 +185,12 @@ describe('T04 explicit restore and persisted Session queries', () => {
     const persisted = need(app.store.sessions.loadHistoryForContext(session.sessionId));
     expect(persisted.history?.entries).toEqual([]);
     expect(persisted.seed.inputs).toEqual([]);
-    expect(ensureNativeSession(app.store.sessions, app.agent, need(app.store.sessions.get(session.sessionId)), app.store.memory)).toEqual({ ok: true, data: undefined });
+    expect(await ensureNativeSession(app.store, app.agent, need(app.store.sessions.get(session.sessionId)))).toEqual({ ok: true, data: undefined });
     expect(JSON.parse(JSON.stringify(need(app.agent.exportSession(session.nativeSessionId))))).toEqual(persisted.history);
   });
   it.each(['missing', 'ready'] as const)('queries %s native state without restore, watch or prepare', async state => {
     const app = fixture(); const { session } = await savedConversation(app);
-    if (state === 'ready') need(ensureNativeSession(app.store.sessions, app.agent, need(app.store.sessions.get(session.sessionId)), app.store.memory));
+    if (state === 'ready') need(await ensureNativeSession(app.store, app.agent, need(app.store.sessions.get(session.sessionId))));
     const port: AgentPort = app.agent;
     const calls = { restore: 0, leaf: 0, watch: 0, prepare: 0, enqueue: 0 };
     const restore = port.restoreSession!.bind(port), leaf = port.restoreSessionLeaf!.bind(port), watch = port.watchSession!.bind(port);
@@ -125,7 +201,7 @@ describe('T04 explicit restore and persisted Session queries', () => {
     port.prepare = (...args) => { calls.prepare++; return prepare(...args); };
     port.enqueueInput = (...args) => { calls.enqueue++; return enqueue(...args); };
     const before = app.store.db.query('SELECT * FROM session_native_history').all();
-    expect(need(app.service.get(session.sessionId))).toMatchObject({ historyState: 'recoverable', availability: 'ready' });
+    expect(need(await app.service.get(session.sessionId))).toMatchObject({ historyState: 'recoverable', availability: 'ready' });
     const page = need(await app.service.querySessionHistory({ sessionId: session.sessionId }));
     expect(page.items).toHaveLength(4);
     expect(await app.service.querySessionHistoryEntry({ sessionId: session.sessionId, entryId: page.items[0]!.entryId,
@@ -140,7 +216,7 @@ describe('T04 explicit restore and persisted Session queries', () => {
     app.agent.restoreSession = (...args) => { restored++; return original(...args); };
     app.store.db.query("UPDATE session_native_history SET header_json='{}' WHERE session_id=?").run(session.sessionId);
     const before = app.store.db.query('SELECT * FROM session_native_history').all();
-    expect(need(app.service.get(session.sessionId)).historyState).toBe('invalid');
+    expect(need(await app.service.get(session.sessionId)).historyState).toBe('invalid');
     expect(restored).toBe(0); expect(app.store.db.query('SELECT * FROM session_native_history').all()).toEqual(before);
   });
   it.each(['saved', 'rejected', 'lost-receipt'] as const)('passes the exact DB-confirmed branch and seeds after %s', async kind => {
@@ -172,9 +248,9 @@ describe('P5 same-Session management', () => {
   it('archives and unarchives an idle Session without adding native messages or Runs', async () => {
     const { store, service } = fixture();
     const session = need(await service.create({ title: 'Manage me' }));
-    expect(need(service.setStatus({ sessionId: session.sessionId, expectedStatus: 'active', status: 'archived' })))
+    expect(need(await service.setStatus({ sessionId: session.sessionId, expectedStatus: 'active', status: 'archived' })))
       .toMatchObject({ status: 'archived', deletePending: false });
-    expect(need(service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' })))
+    expect(need(await service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' })))
       .toMatchObject({ status: 'active', deletePending: false });
     expect(store.db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 0 });
     expect(need(store.sessions.loadHistory(session.sessionId))?.entries).toEqual([]);
@@ -186,12 +262,12 @@ describe('P5 same-Session management', () => {
     agent.releaseSession = async () => ({ stopped: true, closed: false, errors: [] });
     expect(await service.deleteSession(session.sessionId)).toMatchObject({ ok: false, error: { code: 'session_delete_incomplete' } });
     expect(need(store.sessions.get(session.sessionId))).toMatchObject({ status: 'archived', deletePending: true });
-    store.close();
+    await store.close();
     const restarted = need(openDatabase(paths));
     deferCleanup(() => restarted.close());
-    const reopenedService = new SessionService(restarted.sessions, agent, () => ({ active: null, blocked: false, error: null }),
-      () => at, restarted.runs, restarted.memory, restarted.sessionInputs);
-    expect(reopenedService.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' }))
+    const reopenedService = new SessionService(agent, () => ({ active: null, blocked: false, error: null }),
+      () => at, restarted);
+    expect(await reopenedService.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' }))
       .toMatchObject({ ok: false, error: { code: 'session_delete_incomplete' } });
     agent.releaseSession = originalRelease;
     expect(await reopenedService.deleteSession(session.sessionId)).toMatchObject({ ok: true, data: { disposition: 'permanent' } });
@@ -201,24 +277,24 @@ describe('P5 same-Session management', () => {
     const first = need(await app.service.create({ title: 'Active' }));
     const other = need(await app.service.create({ title: 'Idle' }));
     app.setRuntime({ active: { kind: 'agent', runId: 1, sessionId: first.sessionId }, blocked: false, error: null });
-    expect(app.service.setStatus({ sessionId: first.sessionId, expectedStatus: 'active', status: 'archived' }))
+    expect(await app.service.setStatus({ sessionId: first.sessionId, expectedStatus: 'active', status: 'archived' }))
       .toMatchObject({ ok: false, error: { code: 'session_busy' } });
     expect(await app.service.branch({ sessionId: first.sessionId, expectedCommitRevision: 1, expectedLeafId: null, expectedEntryCount: 0, targetEntryId: 'invalid' }))
       .toMatchObject({ ok: false, error: { code: 'session_busy' } });
-    expect(need(app.service.setStatus({ sessionId: other.sessionId, expectedStatus: 'active', status: 'archived' })).status).toBe('archived');
+    expect(need(await app.service.setStatus({ sessionId: other.sessionId, expectedStatus: 'active', status: 'archived' })).status).toBe('archived');
     expect(app.store.db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 0 });
   });
   it('keeps revocation and unusable history after Unarchive and refuses hidden Session revival', async () => {
     const app = fixture();
     const session = need(await app.service.create({ title: 'Restricted' }));
-    need(app.service.setStatus({ sessionId: session.sessionId, expectedStatus: 'active', status: 'archived' }));
+    need(await app.service.setStatus({ sessionId: session.sessionId, expectedStatus: 'active', status: 'archived' }));
     app.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
       .run(JSON.stringify({ documentIds: [1], at, reason: 'document_use_revoked' }), session.sessionId);
     app.store.db.query('UPDATE session_native_history SET unusable=1 WHERE session_id=?').run(session.sessionId);
-    expect(need(app.service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' })))
+    expect(need(await app.service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' })))
       .toMatchObject({ status: 'active', modelUseBlocked: true, availability: 'unusable' });
     app.store.db.query("UPDATE sessions SET status='archived',hidden_at=? WHERE id=?").run(at, session.sessionId);
-    expect(app.service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' }))
+    expect(await app.service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' }))
       .toMatchObject({ ok: false, error: { code: 'session_not_found' } });
   });
   it('retains Delete intent when its second transaction fails and only explicit Delete retries it', async () => {
@@ -226,13 +302,13 @@ describe('P5 same-Session management', () => {
     const session = need(await app.service.create({ title: 'Second transaction' }));
     app.store.db.exec("CREATE TRIGGER reject_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT,'delete failed'); END;");
     expect(await app.service.deleteSession(session.sessionId)).toMatchObject({ ok: false, error: { code: 'session_delete_incomplete' } });
-    app.store.close();
+    await app.store.close();
     const reopened = need(openDatabase(app.paths));
     deferCleanup(() => reopened.close());
-    const service = new SessionService(reopened.sessions, app.agent, () => ({ active: null, blocked: false, error: null }),
-      () => at, reopened.runs, reopened.memory, reopened.sessionInputs);
+    const service = new SessionService(app.agent, () => ({ active: null, blocked: false, error: null }),
+      () => at, reopened);
     expect(need(reopened.sessions.get(session.sessionId))).toMatchObject({ status: 'archived', deletePending: true });
-    expect(service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' })).toMatchObject({ ok: false });
+    expect(await service.setStatus({ sessionId: session.sessionId, expectedStatus: 'archived', status: 'active' })).toMatchObject({ ok: false });
     expect(await service.branch({ sessionId: session.sessionId, expectedCommitRevision: 1, expectedLeafId: null, expectedEntryCount: 0, targetEntryId: 'irrelevant' }))
       .toMatchObject({ ok: false, error: { code: 'session_delete_incomplete' } });
     reopened.db.exec('DROP TRIGGER reject_delete;');
@@ -284,7 +360,7 @@ describe('P5 same-Session management', () => {
       modelRef: { provider: 'management-fixture', model: 'fixture' }, native: { authPath: join(app.paths.root, 'unused.json'), modelsPath: null },
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' as const, contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
-    need(ensureNativeSession(app.store.sessions, app.agent, need(app.store.sessions.get(session.sessionId)), app.store.memory));
+    need(await ensureNativeSession(app.store, app.agent, need(app.store.sessions.get(session.sessionId))));
     need(await app.agent.prepare(session.nativeSessionId, config, { timeoutMs: 5000, stopGraceMs: 500 }, new AbortController().signal,
       { sessionInputs: true }));
     const history = need(app.store.sessions.loadHistory(session.sessionId))!;
@@ -296,7 +372,7 @@ describe('P5 same-Session management', () => {
     expect(await app.service.branch(request)).toMatchObject({ ok: true, data: { leafId: firstReply } });
     app.store.memory.commit = originalSave;
     app.store.db.exec("CREATE TRIGGER reject_next_user BEFORE INSERT ON session_native_entries WHEN NEW.run_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'new user save failed'); END;");
-    const runtime = new RuntimeService({ memory: app.store.memory, runs: app.store.runs, sessions: app.store.sessions, sessionInputs: app.store.sessionInputs,
+    const runtime = new RuntimeService({ database: app.store,
       agent: app.agent, provider: { async prepare() { throw new Error('No direct Provider calls are authorized.'); },
         async close() { return { stopped: true, closed: true, errors: [] }; } },
       log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
@@ -310,13 +386,17 @@ describe('P5 same-Session management', () => {
     const saved = need(app.store.memory.load(session.sessionId))!;
     expect(saved.history.header).toEqual(history.header);
     expect(saved.history.entries.slice(0, history.entries.length)).toEqual([...history.entries]);
-    expect(saved.history.entries).toHaveLength(history.entries.length + 1);
+    expect(saved.history.entries).toHaveLength(history.entries.length + 2);
+    const modelChange = saved.history.entries.at(-2)!;
     const metadata = saved.history.entries.at(-1)!;
-    expect(metadata).toMatchObject({ type: 'model_change', parentId: firstReply, provider: config.modelRef.provider, modelId: config.modelRef.model });
+    expect(modelChange).toMatchObject({ type: 'model_change', parentId: firstReply, provider: config.modelRef.provider, modelId: config.modelRef.model });
+    expect(metadata).toMatchObject({ type: 'message', parentId: modelChange.id, message: { role: 'system' } });
     expect(saved.history).toMatchObject({ leafId: metadata.id, unusable: true });
-    expect(saved.commit).toEqual({ commitRevision: request.expectedCommitRevision + 3, entryCount: history.entries.length + 1, leafId: metadata.id });
-    expect(app.store.db.query('SELECT run_id FROM session_native_entries WHERE session_id=? AND entry_id=?').get(session.sessionId, metadata.id)).toEqual({ run_id: null });
-    expect(app.store.db.query('SELECT id FROM session_inputs WHERE native_entry_id=? OR result_entry_id=?').all(metadata.id, metadata.id)).toEqual([]);
+    expect(saved.commit).toEqual({ commitRevision: request.expectedCommitRevision + 4, entryCount: history.entries.length + 2, leafId: metadata.id });
+    for (const entry of [modelChange, metadata]) {
+      expect(app.store.db.query('SELECT run_id FROM session_native_entries WHERE session_id=? AND entry_id=?').get(session.sessionId, entry.id)).toEqual({ run_id: null });
+      expect(app.store.db.query('SELECT id FROM session_inputs WHERE native_entry_id=? OR result_entry_id=?').all(entry.id, entry.id)).toEqual([]);
+    }
     expect(need(app.store.sessionInputs.query({ sessionId: session.sessionId, inputId: accepted.inputId! })).input)
       .toMatchObject({ status: 'delivery_unknown', processingStatus: 'failed', nativeEntryId: null });
     expect(providerCalls).toBe(0);
@@ -344,7 +424,7 @@ describe('P5 same-Session management', () => {
     expect(await app.service.branch(request)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
     expect(app.service.isManaging(session.sessionId)).toBe(true);
     expect(need(app.store.sessions.get(session.sessionId)).nativeUnusable).toBe(true);
-    app.store.close();
+    await app.store.close();
     const reopened = need(openDatabase(app.paths));
     deferCleanup(() => reopened.close());
     expect(need(reopened.sessions.get(session.sessionId)).nativeUnusable).toBe(true);

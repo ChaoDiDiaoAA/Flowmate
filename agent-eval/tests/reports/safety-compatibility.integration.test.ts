@@ -15,7 +15,7 @@ import { aggregate, aggregateTrials } from '../../src/scoring/aggregate.ts';
 import { readReport, saveReport } from '../../src/reports/store.ts';
 import type { EvaluationContext } from '../../src/scoring/types.ts';
 
-const configured = () => judgeConfig({ FLOWMATE_JUDGE_API: 'openai-completions', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
+const configured = () => judgeConfig({ FLOWMATE_JUDGE_PROVIDER: 'openai-compatible', FLOWMATE_JUDGE_API: 'openai-completions', FLOWMATE_JUDGE_MODEL: 'llama-3.3-70b-versatile',
     FLOWMATE_JUDGE_BASE_URL: 'https://unused.invalid/v1', FLOWMATE_JUDGE_API_KEY: 'controlled-report-key' })!;
 function context(leaked: boolean): EvaluationContext {
     const c: EvaluationContext = formalFixture('actual-leakage'); c.task.id = 'FM-046';

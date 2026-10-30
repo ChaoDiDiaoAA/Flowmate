@@ -3,11 +3,12 @@ import { expect, it } from 'bun:test';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createResourceService, openDatabase } from '../../../packages/core/src/index.ts';
+import { createResourceService } from '../../../packages/core/src/index.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { inspectNativeResources } from '../../../packages/runtime-pi/src/index.ts';
 import { mkdtempSync, deferCleanup } from '../../support/resources.ts';
 
-it('loads one flat Prompt author package without changing its version or fixed bundle identity', () => {
+it('loads one flat Prompt author package without changing its version or fixed bundle identity', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-flat-prompt-'));
   const author = join(root, 'author'), dir = join(author, 'prompts', 'invoice');
   mkdirSync(dir, { recursive: true });
@@ -31,7 +32,7 @@ it('loads one flat Prompt author package without changing its version or fixed b
   changed[changed.length - 1] = changed[changed.length - 1] === 32 ? 10 : 32;
   writeFileSync(join(frozen.data.bundleDirectory, 'prompts/invoice/v1/prompt.md'), changed);
   expect(service.verifyFrozen(frozen.data)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
-  storage.data.close();
+  await storage.data.close();
   const restarted = openDatabase(paths.data); if (!restarted.ok) throw new Error(restarted.error.code);
   deferCleanup(() => restarted.data.close());
   const restored = createResourceService({ contents: restarted.data.contents, resourceRoot: author,

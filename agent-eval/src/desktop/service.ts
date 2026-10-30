@@ -4,7 +4,7 @@ import { appError, fail, ok, EvaluationConfigurationSnapshotSchema, EvaluationCo
   EvaluationIdSchema, EvaluationPreviewSchema, EvaluationProgressViewSchema, EvaluationExportResultSchema, evaluationRequests,
   type EvaluationConfigurationSnapshot, type EvaluationControlState, type EvaluationEvent,
   type EvaluationPreview, type EvaluationExportResult, type Result } from '@flowmate/contracts';
-import { prepareAgentConnection, langfuseConnection } from '../configuration.ts';
+import { prepareAgentConnection, langfuseConnection, type EvaluationAgentCredential } from '../configuration.ts';
 import { createEvaluationPlan, sameEvaluationPlan, type EvaluationPlan } from '../execution/plan.ts';
 import { runLocal, runBatch, type EvaluationProgress } from '../execution/runner.ts';
 import { registerSecrets, scanEvidence } from '../execution/evidence-safety.ts';
@@ -14,8 +14,12 @@ import { createEvaluationCases } from './cases.ts';
 import { exportReport } from '../langfuse/export.ts';
 import { readReport, reportPath, readExportState } from '../reports/store.ts';
 import type { EvaluationRuntime } from '../execution/source.ts';
+import { EvaluationWorkflowRequestSchema, EvaluationWorkflowResultSchema, isWorkflowReadOnly, EVALUATION_WORKSPACE_UNAVAILABLE_REASON, type EvaluationWorkflowResult } from '../../../packages/contracts/src/evaluation-workflow.ts';
+import { dispatchWorkflow, type WorkflowDependencies } from './workflow.ts';
+import { createWorkflowRecordReader } from './workflow-records.ts';
 
 export type EvaluationServiceOptions = {
+  workflowDependencies?: WorkflowDependencies;
   runtime?: EvaluationRuntime;
   sessionId?: string; onEvent?: (event: EvaluationEvent) => void;
   prepareAgent?: typeof prepareAgentConnection; prepareJudge?: typeof prepareJudge;
@@ -29,6 +33,7 @@ const text = (value: unknown) => scanEvidence(String(value)).value.slice(0, 16_0
 const failure = (code: string, message: string) => fail(appError(code, 'runtime', message, true));
 
 export function createEvaluationService(repo: string, options: EvaluationServiceOptions = {}) {
+  const desktopReader = createWorkflowRecordReader(repo);
   const sessionId = EvaluationIdSchema.parse(options.sessionId ?? randomUUID());
   const reader = createEvaluationReader(repo, sessionId);
   const cases = createEvaluationCases(repo, sessionId);
@@ -38,6 +43,9 @@ export function createEvaluationService(repo: string, options: EvaluationService
   let preview: { value: EvaluationPreview; plan: EvaluationPlan; consumed: boolean } | null = null;
   const starts = new Map<string, StartRecord>();
   let exporting: Promise<Result<EvaluationExportResult>> | null = null;
+  let workflowTask: Promise<Result<EvaluationWorkflowResult>> | null = null;
+  let workflowCancellation: AbortController | null = null;
+  let workflowStopUnconfirmed = false;
   const exports = new Map<string, { executionId: string; promise: Promise<Result<EvaluationExportResult>> }>();
   const snapshot = () => structuredClone(state);
   const emit = () => {
@@ -79,8 +87,9 @@ export function createEvaluationService(repo: string, options: EvaluationService
       const agent = await (options.prepareAgent ?? prepareAgentConnection)(context.settings.agent!, context.credentials.agent, undefined,
         { signal: controller.signal, timeoutMs: plan.summary.configuration.timeoutMs });
       controller.signal.throwIfAborted();
-      const needsJudge = plan.summary.judgeMaxGenerations > 0 && context.settings.judge !== null && context.credentials.judge !== null;
-      const judge = needsJudge ? await (options.prepareJudge ?? prepareJudge)(judgeConnection({ ...context.settings.judge!, apiKey: context.credentials.judge! }),
+      const nativeJudge = context.settings.judge && 'provider' in context.settings.judge;
+      const needsJudge = plan.summary.judgeMaxGenerations > 0 && context.settings.judge !== null && (nativeJudge || context.credentials.judge !== null);
+      const judge = needsJudge ? await (options.prepareJudge ?? prepareJudge)(judgeConnection(nativeJudge ? context.settings.judge : { ...context.settings.judge!, apiKey: context.credentials.judge! }),
         undefined, controller.signal) : null;
       controller.signal.throwIfAborted();
       if (!sameEvaluationPlan(plan, createEvaluationPlan(repo, plan.request, options.runtime))) throw Error('预览后的评测条件已变化，请重新预览。');
@@ -114,9 +123,38 @@ export function createEvaluationService(repo: string, options: EvaluationService
   }
   return {
     ...reader,
+    workflow(input: unknown, context?: { agentCredentials: EvaluationAgentCredential[] }): Promise<Result<EvaluationWorkflowResult>> {
+      const parsed = EvaluationWorkflowRequestSchema.safeParse(input);
+      if (!parsed.success) return Promise.resolve(failure('input_invalid', '评测闭环请求无效。'));
+      const readOnly = isWorkflowReadOnly(parsed.data.action);
+      const workspaceUnavailableReason = options.runtime?.mode === 'installed' ? EVALUATION_WORKSPACE_UNAVAILABLE_REASON : undefined;
+      if (!readOnly && workspaceUnavailableReason) return Promise.resolve(failure('evaluation_workspace_unavailable', workspaceUnavailableReason));
+      if (closing || !readOnly && (workflowStopUnconfirmed || workflowTask || exporting || activeStates.has(state.state)))
+        return Promise.resolve(failure('evaluation_busy', '评测正在运行、写入、关闭或停止未确认。'));
+      const controller = readOnly ? null : new AbortController();
+      registerSecrets(context?.agentCredentials.map(item => item.apiKey) ?? []);
+      const work = (async (): Promise<Result<EvaluationWorkflowResult>> => {
+        try {
+          const value = EvaluationWorkflowResultSchema.parse(scanEvidence(await dispatchWorkflow(repo, parsed.data,
+            { ...options.workflowDependencies, desktopReader, workspaceUnavailableReason, signal: controller?.signal,
+              experiments: { ...options.workflowDependencies?.experiments, ...(context ? { agentCredentials: context.agentCredentials } : {}) } })).value);
+          if (value.action === 'mine' && value.data.operation.stopConfirmed === false
+            || value.action === 'trace.process' && value.data.mining.stopConfirmed === false) workflowStopUnconfirmed = true;
+          return ok(value);
+        } catch (error) {
+          if (error && typeof error === 'object' && 'stopConfirmed' in error && error.stopConfirmed === false) workflowStopUnconfirmed = true;
+          return failure('evaluation_workflow_failed', text(error));
+        }
+      })();
+      if (!readOnly) {
+        workflowTask = work; workflowCancellation = controller;
+        void work.finally(() => { if (workflowTask === work) { workflowTask = null; workflowCancellation = null; } });
+      }
+      return work;
+    },
     catalog: cases.catalog, feedback: cases.feedback,
     addFeedback(input: unknown) {
-      if (closing || exporting || activeStates.has(state.state)) return failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认，反馈请在空闲后提交。');
+      if (closing || workflowStopUnconfirmed || workflowTask || exporting || activeStates.has(state.state)) return failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认，反馈请在空闲后提交。');
       return cases.addFeedback(input);
     },
     export(input: unknown, connectionInput: unknown): Promise<Result<EvaluationExportResult>> {
@@ -125,7 +163,7 @@ export function createEvaluationService(repo: string, options: EvaluationService
       const request = parsed.data, prior = exports.get(request.operationId);
       if (prior) return prior.executionId === request.executionId ? prior.promise
         : Promise.resolve(failure('evaluation_request_conflict', '原导出操作ID不能改绑其他Execution。'));
-      if (closing || exporting || activeStates.has(state.state)) return Promise.resolve(failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。'));
+      if (closing || workflowStopUnconfirmed || workflowTask || exporting || activeStates.has(state.state)) return Promise.resolve(failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。'));
       const work = (async (): Promise<Result<EvaluationExportResult>> => {
         try {
           const connection = langfuseConnection(connectionInput), file = reportPath(repo, request.executionId), report = readReport(file);
@@ -154,12 +192,13 @@ export function createEvaluationService(repo: string, options: EvaluationService
       if (!parsed.success) return failure('input_invalid', '评测启动请求无效。');
       const { previewId, requestId } = parsed.data, prior = starts.get(requestId);
       if (prior) return prior.previewId === previewId ? ok(structuredClone(prior.control)) : failure('evaluation_request_conflict', '原请求ID不能改绑其他预览。');
-      if (closing || exporting || activeStates.has(state.state)) return failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。');
+      if (closing || workflowStopUnconfirmed || workflowTask || exporting || activeStates.has(state.state)) return failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。');
       if (!preview || preview.value.previewId !== previewId) return failure('evaluation_preview_unknown', '预览已失效，请刷新。');
       if (preview.consumed) return failure('evaluation_preview_consumed', '该预览已受理，重跑须重新预览。');
       if (!preview.value.ready) return failure('evaluation_not_ready', preview.value.issues.join('；'));
       if (!isDeepStrictEqual(preview.value.settings, context.settings)) return failure('evaluation_preview_changed', '模型设置或凭据状态已变化，请刷新。');
-      if (!context.credentials.agent.trim() || preview.plan.summary.judgeRequired && !context.credentials.judge?.trim())
+      if (!context.credentials.agent.trim() || preview.plan.summary.judgeRequired
+        && !(context.settings.judge && 'provider' in context.settings.judge) && !context.credentials.judge?.trim())
         return failure('evaluation_not_ready', '所选评测所需凭据不可用。');
       try { if (!sameEvaluationPlan(preview.plan, createEvaluationPlan(repo, preview.plan.request, options.runtime))) return failure('evaluation_preview_changed', '评测条件已变化，请刷新。'); }
       catch (error) { return failure('evaluation_preview_changed', text(error)); }
@@ -176,10 +215,12 @@ export function createEvaluationService(repo: string, options: EvaluationService
     control: readControl, cancel,
     async shutdown(): Promise<Result<{ closed: boolean; stopped: boolean }>> {
       closing = true;
+      workflowCancellation?.abort();
       if (state.batchId && ['preparing', 'running', 'cancelling'].includes(state.state)) cancel({ batchId: state.batchId });
       await active;
       await exporting;
-      const stopped = state.stop !== 'pending' && state.stop !== 'unconfirmed';
+      await workflowTask;
+      const stopped = !workflowStopUnconfirmed && state.stop !== 'pending' && state.stop !== 'unconfirmed';
       return ok({ closed: stopped, stopped });
     },
   };

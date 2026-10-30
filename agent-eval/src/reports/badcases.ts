@@ -5,6 +5,7 @@ import type { Feedback } from '../review/local.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
 import type { EvaluationScore } from '../scoring/types.ts';
 import { atomicJson, atomicText } from './files.ts';
+import { archiveFile, archiveReference, isArchiveReference, writeArchivePart } from './archive.ts';
 import type { CalibrationReport } from '../scoring/judges/calibration.ts';
 import { compactScores } from '../scoring/judges/compact.ts';
 
@@ -34,7 +35,8 @@ export function deriveBadcases(report: LocalReport, options: {
     file?: string; feedback?: Feedback[];
     comparison?: { executionId: string; trials: Array<{ caseId: string; repetition: number; before: string; after: string }> };
 } = {}): BadcaseIndex {
-    const file = basename(options.file ?? 'report.json'), candidates: Candidate[] = [];
+    const inline = !!options.file && isArchiveReference(options.file);
+    const file = basename(archiveFile(options.file ?? 'report.json')), candidates: Candidate[] = [];
     for (const [index, trial] of report.trials.entries()) {
         if (trial.status === 'NOT_RUN' && trial.reason === 'Planned' && !trial.execution) continue;
         const prefix = `evidence/${trial.trialId}/`, observation = prefix + 'observation.json';
@@ -46,10 +48,10 @@ export function deriveBadcases(report: LocalReport, options: {
                 trial.status === 'ERROR' || trial.status === 'UNJUDGEABLE' ? 'evidence-scoring' : 'commit-output', trial.reason);
         const gaps = [...new Set(trial.scores.flatMap(score => score.evidence.filter(key =>
             !key.startsWith('gold-') && key !== 'research-frame' && !key.startsWith('judge-') && execution && !execution.evidence[key]?.present)))];
-        for (const score of trial.scores) if (['FAIL', 'ERROR', 'UNJUDGEABLE'].includes(score.status))
+        for (const [scoreIndex,score] of trial.scores.entries()) if (['FAIL', 'ERROR', 'UNJUDGEABLE'].includes(score.status))
             signal(score.method === 'llm-judge' && score.status === 'ERROR' ? 'judge-error' : 'metric-' + score.status.toLowerCase(),
                 score.method === 'llm-judge' && score.status === 'ERROR' ? 'evidence-scoring' : metricNode(score.metricId), score.reason, [score.metricId],
-                [{ file: observation, jsonPointer: '/scoringFacts', nodeId: 'metric:' + score.metricId },
+                [{ file: observation, jsonPointer: '/scoringFacts/'+scoreIndex, nodeId: 'metric:' + score.metricId },
                     ...score.evidence.filter(key => execution?.evidence[key]).map(key => ({ file: observation, jsonPointer: '/evidence/' + pointer(key) }))]);
         for (const [callIndex, call] of trial.judgeCalls.entries()) if (call.error || Object.keys(call.compact?.validationErrors ?? {}).length)
             signal('judge-error', 'evidence-scoring', call.error ?? 'Judge metric validation failed',
@@ -83,6 +85,19 @@ export function deriveBadcases(report: LocalReport, options: {
             signal('repeat-difference', 'summary-review-export', 'Repeated attempts under this execution differ; retain every attempt');
         if (report.sourceInvalidation)
             signal('source-invalidated', 'summary-review-export', report.sourceInvalidation.reason, [], [{ file, jsonPointer: '/sourceInvalidation' }]);
+        if (inline) for (const item of signals) for (const evidence of item.evidence) {
+            const root = '/executions/' + pointer(report.executionId), trialRoot = root + '/trials/' + index;
+            if (evidence.file === observation) {
+                evidence.file = file;
+                evidence.jsonPointer = trialRoot + (evidence.jsonPointer.startsWith('/scoringFacts/') ? evidence.jsonPointer.replace('/scoringFacts/','/scores/') :
+                    (evidence.jsonPointer.startsWith('/evidence') ? '/execution' : '') + evidence.jsonPointer);
+            } else if (evidence.file === prefix + 'trial.json') {
+                evidence.file = file; evidence.jsonPointer = trialRoot + '/execution' + evidence.jsonPointer;
+            } else if (evidence.file === prefix + 'events.jsonl') {
+                evidence.file = file; evidence.jsonPointer = trialRoot + '/execution/observations' + evidence.jsonPointer;
+            } else if (evidence.file === 'review.json') evidence.file = '../../feedback.json';
+            else if (evidence.file === file) evidence.jsonPointer = root + evidence.jsonPointer;
+        }
         if (signals.length) candidates.push({ id: trial.trialId, caseId: trial.caseId, caseVersion: trial.caseVersion, trialId: trial.trialId, repetition: trial.repetition,
             originalStatus: trial.status, status: 'pending-review', primaryCause: null,
             scores: trial.scores.map(({ metricId, status, required }) => ({ metricId, status, required })), signals, gaps: [...new Set(gaps)] });
@@ -102,6 +117,7 @@ export function deriveCalibrationBadcases(report: CalibrationReport, file = 'sum
         if (!sample.call) add('blocked-calibration', 'Calibration ended before this reference was judged');
         else if (sample.call.error) add('judge-error', sample.call.error);
         for (const reference of sample.reference.references) {
+            if(!(sample.plan??sample.reference.plan).criteria.some(c=>c.metricId===reference.metricId))continue;
             const score = scores.find(row => row.metricId === reference.metricId);
             if (!score) { if (sample.call) add('judge-error', 'Judge result omitted the reference metric', [reference.metricId]); continue; }
             if (score.status === 'ERROR') { add('judge-error', score.reason, [reference.metricId]); continue; }
@@ -128,6 +144,12 @@ export function badcaseMarkdown(index: BadcaseIndex) {
 export function saveBadcases(file: string, index: BadcaseIndex):
     { saved: true; json: string; markdown: string; count: number } | { saved: false; error: string } {
     try {
+        if (isArchiveReference(file)) {
+            const reference = archiveReference(archiveFile(file), 'diagnostics', index.source.executionId), scanned = scanEvidence(index);
+            if ((scanned.fact.actual as { leaked: boolean }).leaked) throw Error('Diagnostic index contains protected data');
+            writeArchivePart(reference, scanned.value);
+            return { saved: true, json: reference, markdown: join(dirname(file), 'README.md'), count: index.summary.candidates };
+        }
         const directory = dirname(file), json = join(directory, 'badcases.json'), markdown = join(directory, 'badcases.md');
         const scanned = scanEvidence(index);
         if ((scanned.fact.actual as { leaked: boolean }).leaked) throw Error('Diagnostic index contains protected data');

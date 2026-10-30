@@ -5,10 +5,10 @@ import { randomUUID } from 'node:crypto';
 import { runLocal } from '../../src/execution/runner.ts';
 import { main } from '../../src/cli.ts';
 import { readReport, saveReport, comparison } from '../../src/reports/store.ts';
+import { archiveFile } from '../../src/reports/archive.ts';
 import { recordRegressions, regressionView } from '../../src/reports/regressions.ts';
 import { exportEvents } from '../../src/langfuse/export.ts';
 import type { RegressionOrigin } from '../../src/dataset-loader/regression-origin.ts';
-import { flowmateAgentV1Dataset } from '../../src/datasets/cases.ts';
 import { dataset, fixtureRepo, observed, reportFixture } from '../support/fixtures.ts';
 
 const origin: RegressionOrigin = { batch: 'controlled-enrollment', issueId: 'BC-1', sourceExecutionId: 'original', sourceTrialId: 'original-trial', sourceCaseId: 'FM-001',
@@ -16,7 +16,7 @@ const origin: RegressionOrigin = { batch: 'controlled-enrollment', issueId: 'BC-
 
 function savedReference(kind: 'controlled' | 'model' = 'controlled', started = true, referenceOrigin = origin, caseId = 'sample') {
     const value = reportFixture(), id = 'record-reference-' + randomUUID(); value.executionId = id;
-    value.dataset.id = 'flowmate-badcase-business-v1';
+    value.dataset.id = 'historical-regression-fixture';
     value.executionKind = kind; value.repeat = 3; const first = value.trials[0]!;
     value.trials = [1, 2, 3].map(repetition => {
         const trial = structuredClone(first); trial.trialId = id + '-trial-' + repetition; trial.repetition = repetition;
@@ -45,7 +45,7 @@ test('report readback retains quality-only origins and rejects changing an open 
 });
 
 test('controlled supplemental run saves origins, records only started attempts and exposes read-only linkage', async () => {
-    const data = structuredClone(dataset); data.manifest.id = 'flowmate-badcase-business-v1';
+    const data = structuredClone(dataset); data.manifest.id = 'historical-regression-fixture';
     Object.assign(data.manifest, { suite: 'badcase', smoke: [] }); Object.assign(data, { regressionOrigins: { [data.cases[0]!.id]: [origin] } });
     const executedInputs: unknown[] = [];
     const run = await runLocal(fixtureRepo, { dataset: data, caseId: data.cases[0]!.id, executionId: 'enrollment-' + randomUUID(), repeat: 3, backend: 'local', judge: 'off' }, {
@@ -60,13 +60,13 @@ test('controlled supplemental run saves origins, records only started attempts a
     expect(run.report.trials[0]!.partition).toBe('badcase');
     const file = join(fixtureRepo, 'agent-eval/records/controlled-enrollment/reruns.csv'); expect(existsSync(file)).toBe(true);
     expect(readFileSync(file, 'utf8').split('\n').filter(Boolean)).toHaveLength(4);
-    const before = readFileSync(run.file), rows = readFileSync(file), output = spyOn(console, 'log').mockImplementation(() => {}), exit = process.exitCode;
+    const before = readFileSync(archiveFile(run.file)), rows = readFileSync(file), output = spyOn(console, 'log').mockImplementation(() => {}), exit = process.exitCode;
     try {
         await main(['status', '--execution-id', run.report.executionId], fixtureRepo);
         const status = JSON.parse(String(output.mock.calls.at(-1)![0]));
         expect(status.regressions.entries[0]).toMatchObject({ enrolled: true, stable: false });
         expect(status.regressions.entries[0].reruns.map((row: { executionKind: string }) => row.executionKind)).toEqual(['controlled', 'controlled', 'controlled']);
-        expect(readFileSync(run.file).equals(before)).toBe(true); expect(readFileSync(file).equals(rows)).toBe(true);
+        expect(readFileSync(archiveFile(run.file)).equals(before)).toBe(true); expect(readFileSync(file).equals(rows)).toBe(true);
         expect(existsSync(join(dirname(run.file), 'exposure.csv'))).toBe(false);
     } finally { output.mockRestore(); process.exitCode = exit ?? 0; }
 });
@@ -99,19 +99,13 @@ test('recording is idempotent and stable claims require every model-classified a
     } finally { writeFileSync(csv, before); }
 });
 
-test('changing current enrolled targets cannot inherit stability from earlier passing targets', () => {
+test('changing a saved report target cannot inherit stability from earlier passing targets', () => {
     // Every report here is synthetic; the classification exercises the real stability join.
     const { file } = savedReference('model', true, origin, 'FM-001'); expect(recordRegressions(fixtureRepo, file).saved).toBe(true);
-    const directory = join(fixtureRepo, 'agent-eval/src/datasets/badcase'); mkdirSync(directory, { recursive: true });
-    const source = reportFixture(); source.executionId = origin.sourceExecutionId;
-    Object.assign(source.trials[0]!, { caseId: origin.sourceCaseId, caseVersion: origin.sourceCaseVersion, trialId: origin.sourceTrialId });
-    const task = flowmateAgentV1Dataset.cases.find(task => task.id === 'FM-001')!;
-    const declare = (metrics: string[]) => writeFileSync(join(directory, 'cases.ts'), 'export const flowmateBadcaseDataset = ' + JSON.stringify({
-        version: 'v1', suite: 'badcase', cases: [task], regressionOrigins: { [task.id]: [{ ...origin, metricIds: metrics }] }
-    }) + ';');
-    try {
-        declare(origin.metricIds); expect(regressionView(fixtureRepo, source).entries[0]?.stable).toBe(true);
-        const metrics = [...origin.metricIds, 'input-isolation']; declare(metrics);
+    const source = readReport(file);
+        expect(regressionView(fixtureRepo, source).entries[0]?.stable).toBe(true);
+        const metrics = [...origin.metricIds, 'input-isolation'];
+        for (const trial of source.trials) trial.regressionOrigins = [{ ...origin, metricIds: metrics }];
         const current = regressionView(fixtureRepo, source).entries[0]!;
         expect(current.stable).toBe(false);
         expect(current.reruns).toContainEqual(expect.objectContaining({ matchesCurrentTarget: false, metricIds: origin.metricIds }));
@@ -120,7 +114,6 @@ test('changing current enrolled targets cannot inherit stability from earlier pa
         const verified = regressionView(fixtureRepo, source).entries[0]!;
         expect(verified.stable).toBe(true); expect(verified.warnings).toEqual([]);
         expect(verified.reruns).toContainEqual(expect.objectContaining({ matchesCurrentTarget: true, metricIds: metrics }));
-    } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test.each([{ sourceCaseId: 'FM-002' }, { sourceCaseVersion: 2 }])('different source Case identity cannot inherit stable evidence: %j', changed => {
@@ -151,11 +144,11 @@ test('explicit platform projection includes regression identities but omits priv
     expect(JSON.stringify(events)).not.toContain('verification');
 });
 
-test('an unavailable current enrollment declaration does not prevent reading an old report', () => {
+test('removed enrollment code is never executed while reading an old report', () => {
     const directory = join(fixtureRepo, 'agent-eval/src/datasets/badcase'); mkdirSync(directory, { recursive: true });
     writeFileSync(join(directory, 'cases.ts'), 'throw new Error("Controlled unavailable declaration");');
     try {
         const view = regressionView(fixtureRepo, reportFixture()); expect(view.entries).toEqual([]);
-        expect(view).toHaveProperty('warnings.0');
+        expect(view.warnings).toEqual([]);
     } finally { rmSync(directory, { recursive: true, force: true }); }
 });

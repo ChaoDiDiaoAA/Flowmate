@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { AppError, DbId } from './runtime.ts';
 import { RequestContextBindingSchema } from './context.ts';
 import { MAX_TOOL_NAME_CHARS, MAX_TOOL_VERSION_CHARS, RunScopeSchema } from './tool-config.ts';
+import type { DurableSubagentInvoker } from './durable-subagents.ts';
 export { MAX_TOOL_NAME_CHARS, MAX_TOOL_VERSION_CHARS, RunScopeSchema } from './tool-config.ts';
 
 // 工具身份的固定契约长度，供装配、记录与 Schema 共用。
@@ -95,6 +96,7 @@ export const ToolExecutionContextSchema = z.object({
   nativeToolCallId: z.string().min(1).max(256),
   requestBinding: RequestContextBindingSchema.optional(),
   deadlineAt: z.number().finite().positive().optional(),
+  nativeDelegate: z.custom<DurableSubagentInvoker>(value => typeof value === 'function').optional(),
   scope: RunScopeSchema,
   signal: z.custom<AbortSignal>((value) => typeof value === 'object' && value !== null
     && typeof (value as AbortSignal).aborted === 'boolean'
@@ -104,7 +106,7 @@ export const ToolExecutionContextSchema = z.object({
   'Tool request binding belongs to a different Run or Session.');
 
 export type ToolExecutionContext = Readonly<Omit<z.infer<typeof ToolExecutionContextSchema>, 'scope'> & { scope: RunScope }>;
-export type ToolCallContext = Pick<ToolExecutionContext, 'nativeToolCallId' | 'signal' | 'requestBinding' | 'deadlineAt'>;
+export type ToolCallContext = Pick<ToolExecutionContext, 'nativeToolCallId' | 'signal' | 'requestBinding' | 'deadlineAt' | 'nativeDelegate'>;
 export type ProductToolContext = Pick<ToolExecutionContext, 'sessionId' | 'runId' | 'scope'>;
 
 export type ToolResult<O> =

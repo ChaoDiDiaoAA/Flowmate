@@ -8,6 +8,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from '../support/resources.ts';
 import { saveReport } from '../../agent-eval/src/reports/store.ts';
+import { observationRowsFromOtlp } from '../../agent-eval/tests/langfuse/otlp-fixture.ts';
 
 const repository = resolve(import.meta.dir, '../..');
 const settings: EvaluationConfigurationSnapshot = { revision: 1,
@@ -174,22 +175,43 @@ test('Main and the real fixed Worker expose registered Cases and original feedba
     cpSync(join(fixtureRepo, 'data'), join(root, 'data'), { recursive: true });
     expect(await c.addFeedback({ ...input, operationId: 'synthetic-new-stale-view' })).toMatchObject({ ok: false });
     expect(await c.addFeedback(input)).toMatchObject({ ok: true, data: { operationId: input.operationId } });
-    expect(c.state).toBeNull(); expect(readdirSync(join(root, 'agent-eval/runs'))).toEqual(['case-reviews']);
+    expect(c.state).toBeNull(); expect(existsSync(join(root, 'agent-eval/runs'))).toBe(false);
+    expect(readFileSync(join(root, 'agent-eval/feedback.json'), 'utf8')).toContain(input.operationId);
   } finally { expect(await c.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } }); }
 }, 45_000);
 
 test('Main prepares a platform connection only for an explicit upload and the real Worker preserves target-bound receipts', async () => {
   const root = mkdtempSync(join(tmpdir(), 'eval-client-export-')), directory = join(root, 'agent-eval/runs/business/unit');
-  mkdirSync(directory, { recursive: true }); const file = join(directory, 'report.json'); saveReport(file, reportFixture());
+  mkdirSync(directory, { recursive: true }); const file = join(directory, 'report.json'), report = reportFixture();
+  report.trials[0]!.execution!.observations = [{ id: 'synthetic-tool', kind: 'tool', name: 'Read controlled fixture',
+    startedAt: '2026-09-23T00:00:00Z', endedAt: '2026-09-23T00:00:01Z', input: { path: 'fixture.txt' }, output: { text: 'Controlled source' } }];
+  saveReport(file, report);
   const original = readFileSync(file, 'utf8'), c = new Client(repository, root);
   let projects = 0, sends = 0, preparations = 0;
+  type Observation = { id: string; traceId: string; parentObservationId?: string; input: unknown; output: unknown; metadata: { localObservationId: string } };
+  const observations: Observation[] = [], scores: Array<{ id: string; traceId: string; name: string; value: number; source: string }> = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    if (new URL(request.url).pathname.endsWith('/projects')) {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith('/projects')) {
       projects++; return Response.json({ data: [{ id: 'synthetic-main-project', name: 'Synthetic', organization: { id: 'org', name: 'Synthetic' }, metadata: {} }] });
     }
-    if (!new URL(request.url).pathname.endsWith('/ingestion')) return new Response(null, { status: 404 });
-    sends++; const body = await request.json() as { batch: Array<{ id: string }> };
-    return Response.json({ successes: body.batch.map(event => ({ id: event.id, status: 201 })), errors: [] });
+    if (url.pathname.endsWith('/v2/observations')) {
+      expect(url.searchParams.get('traceId')).toBe('abcdef0123456789abcdef0123456789');
+      return Response.json({ data: observations, meta: {} });
+    }
+    if (url.pathname.endsWith('/v3/scores')) {
+      expect(url.searchParams.get('traceId')).toBe('abcdef0123456789abcdef0123456789');
+      return Response.json({ data: scores.map(score => ({ ...score, subject: { kind: 'trace', id: score.traceId } })), meta: {} });
+    }
+    if (url.pathname.endsWith('/scores') && request.method === 'POST') {
+      const score = await request.json() as typeof scores[number]; scores.push(score); return Response.json({ id: score.id });
+    }
+    if (!url.pathname.endsWith('/otel/v1/traces')) return new Response(null, { status: 404 });
+    expect(request.headers.get('x-langfuse-ingestion-version')).toBe('4'); sends++;
+    const body = await request.json() as { resourceSpans: Array<{ scopeSpans: Array<{ spans: Array<{ spanId: string; traceId: string;
+      parentSpanId?: string; attributes: Array<{ key: string; value: { stringValue: string } }> }> }> }> };
+    observations.push(...observationRowsFromOtlp(body));
+    return Response.json({});
   } });
   const connection = { baseUrl: `http://127.0.0.1:${server.port}`, publicKey: 'synthetic-main-platform-public', secretKey: 'synthetic-main-platform-secret' };
   try {
@@ -207,6 +229,14 @@ test('Main prepares a platform connection only for an explicit upload and the re
     expect(await c.export(input, prepare)).toEqual(sent);
     expect(await c.export({ ...input, executionId: 'different-report' }, prepare)).toMatchObject({ ok: false });
     expect(preparations).toBe(2); expect(projects).toBe(1); expect(sends).toBe(1);
+    expect(observations).toHaveLength(2);
+    const parent = observations.find(row => row.metadata.localObservationId === 'abcdef0123456789abcdef0123456789:root');
+    expect(parent).toMatchObject({ traceId: 'abcdef0123456789abcdef0123456789' });
+    const tool = observations.find(row => row.metadata.localObservationId === 'abcdef0123456789abcdef0123456789:synthetic-tool');
+    expect(tool).toMatchObject({ traceId: 'abcdef0123456789abcdef0123456789', parentObservationId: parent!.id });
+    expect(JSON.parse(String(tool!.input))).toEqual({ path: 'fixture.txt' }); expect(JSON.parse(String(tool!.output))).toEqual({ text: 'Controlled source' });
+    expect(scores).toMatchObject([{ id: 'abcdef0123456789abcdef0123456789:task-result:1',
+      traceId: 'abcdef0123456789abcdef0123456789', name: '任务终点', value: 1, source: 'API' }]);
     expect(readFileSync(file, 'utf8')).toBe(original); expect(JSON.stringify(sent)).not.toContain(connection.secretKey);
     expect(c.state).toBeNull();
   } finally { expect(await c.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } }); await server.stop(true); }

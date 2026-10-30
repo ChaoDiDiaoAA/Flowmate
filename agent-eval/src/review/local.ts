@@ -1,41 +1,15 @@
-import { acquireEvaluationWrite, atomicJson, publicVersions } from '../reports/files.ts';
-import { readFileSync, readdirSync, writeFileSync, existsSync, lstatSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { acquireEvaluationWrite, publicVersions } from '../reports/files.ts';
+import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { caseFiles, inside, type LocalDataset } from '../dataset-loader/local.ts';
+import { caseFiles, type LocalDataset } from '../dataset-loader/local.ts';
 import { inspectCaseDeclaration } from '../dataset-loader/declarations.ts';
 import { findDataset } from '../execution/plan.ts';
 import { readReport, reportPath, type LocalReport, type TrialReport } from '../reports/store.ts';
-import { z } from 'zod';
 import { scanEvidence } from '../execution/evidence-safety.ts';
 import { artifactJson } from '../artifacts.ts';
-import { caseReviewDirectory } from '../reports/paths.ts';
-export type Feedback = {
-    id: string;
-    kind: 'case-quality' | 'run-feedback';
-    caseId: string;
-    caseVersion: number;
-    executionId?: string;
-    trialId?: string;
-
-    conditions?: Record<string,unknown>;
-    reviewer: string;
-    at: string;
-    verdict: 'good' | 'bad';
-    note: string;
-    source: string;
-};
-function legacyFeedback(record:any){const {caseHash,scoringHash,...facts}=record;return facts;}
-const feedbackSchema = z.object({ id: z.string().min(1), kind: z.enum(['case-quality', 'run-feedback']), caseId: z.string().min(1),
-    caseVersion: z.number().int().positive(), executionId: z.string().optional(), trialId: z.string().optional(),
-     conditions:z.record(z.unknown()).optional(), reviewer: z.string().min(1), at: z.string().datetime(),
-    verdict: z.enum(['good', 'bad']), note: z.string().min(1), source: z.string().min(1) }).strict();
-const feedbackRecordsSchema = z.array(feedbackSchema).refine(records => new Set(records.map(record => record.id)).size === records.length, 'Duplicate feedback identity');
-function parseFeedbackRecords(records: unknown): Feedback[] {
-    const rows = z.array(z.record(z.unknown())).parse(records);
-    return feedbackRecordsSchema.parse(rows.map(record => ({ ...legacyFeedback(record), caseVersion: record.caseVersion === 'v1' ? 1 : record.caseVersion })));
-}
+import { humanFeedbackFile, isLocalFeedback, localFeedbackSchema, readHumanFeedback, writeHumanFeedback, type LocalFeedback } from '../reports/feedback.ts';
+export type Feedback = LocalFeedback;
 function scoringConditions(report: LocalReport, trial: TrialReport) {
     return publicVersions(({ contract: report.contract, scoring: report.scoringConfiguration,
         metricPlan: trial.metricPlan, semanticPlan: trial.semanticPlan,
@@ -48,14 +22,10 @@ export function caseFeedbackConditions(dataset:LocalDataset,caseId:string) {
         gold:authored?.gold[caseId]??null,fixture:fixture?authored!.fixtures[fixture]:null,
         environment:dataset.manifest.environment,scoring:dataset.manifest.scoring}));
 }
-export function feedbackDirectory(repo: string, executionId?: string) { return executionId ? dirname(reportPath(repo, executionId)) : caseReviewDirectory(repo); }
+export function feedbackDirectory(repo: string, executionId?: string) { return dirname(humanFeedbackFile(repo)); }
 export function readFeedbackRecords(repo: string, executionId?: string): Feedback[] {
-    const directory = feedbackDirectory(repo, executionId), file = join(directory, 'review.json');
-    const records = lstatSync(file, { throwIfNoEntry: false })
-        ? parseFeedbackRecords(JSON.parse(readFileSync(inside(directory, 'review.json'), 'utf8')).records) : [];
-    if (executionId && records.some(record => record.kind !== 'run-feedback' || record.executionId !== executionId))
-        throw Error('Feedback execution identity mismatch');
-    return records;
+    return readHumanFeedback(repo).filter(isLocalFeedback).filter(record => executionId
+        ? record.kind === 'run-feedback' && record.executionId === executionId : record.kind === 'case-quality');
 }
 export function addFeedback(repo: string, input: {
     dataset?: LocalDataset;
@@ -77,14 +47,13 @@ export function addFeedback(repo: string, input: {
     const isCase = input.dataset !== undefined || input.datasetId !== undefined;
     if (isCase && input.trialId !== undefined) throw Error('Case quality feedback cannot target a Trial');
     if (expectedCaseConditions && input.datasetId === undefined) throw Error('Inspection conditions require a registered Case target');
-    const directory=input.executionId?feedbackDirectory(repo,input.executionId):caseReviewDirectory(repo,true);
-    const file=join(directory,'review.json');
+    const file=humanFeedbackFile(repo,true);
     const release=acquireEvaluationWrite(file);
     try {
-        const saved=lstatSync(file, { throwIfNoEntry: false })?JSON.parse(readFileSync(inside(directory,'review.json'),'utf8')).records:[];
-        const records = parseFeedbackRecords(saved);
-        const prior=input.id?records.find(r=>r.id===input.id):undefined;
+        const saved=readHumanFeedback(repo), records=saved.filter(isLocalFeedback);
+        const prior=input.id?saved.find(r=>r.id===input.id):undefined;
         if(prior){
+            if(!isLocalFeedback(prior))throw Error('Conflicting imported feedback identity');
             const originalDataset=prior.conditions?.dataset as {id?:unknown}|undefined;
             const target=prior.kind===(isCase?'case-quality':'run-feedback')&&prior.caseId===input.caseId&&prior.executionId===input.executionId&&
                 (isCase?originalDataset?.id===(input.datasetId??input.dataset!.manifest.id):!input.trialId||prior.trialId===input.trialId);
@@ -92,7 +61,8 @@ export function addFeedback(repo: string, input: {
                 input.at!==undefined&&prior.at!==input.at)throw Error('Conflicting imported feedback identity');
             return prior;
         }
-        if(records.some(r=>!r.conditions))throw Error('Historical feedback is read-only; original content conditions are unavailable');
+        if(records.some(r=>!r.conditions&&(isCase?r.kind==='case-quality':r.kind==='run-feedback'&&r.executionId===input.executionId)))
+            throw Error('Historical feedback is read-only; original content conditions are unavailable');
         let caseVersion:number,trialId:string|undefined,conditions:Record<string,unknown>;
         if(input.datasetId !== undefined){
             const inspected = inspectCaseDeclaration(repo, input.datasetId, input.caseId);
@@ -112,9 +82,9 @@ export function addFeedback(repo: string, input: {
         }
         const record:Feedback={id:input.id??randomUUID(),kind:isCase?'case-quality':'run-feedback',caseId:input.caseId,caseVersion,
             executionId:input.executionId,trialId,reviewer:input.reviewer,at:input.at??new Date().toISOString(),verdict:input.verdict,note:input.note,source:input.source??'local',conditions};
-        feedbackSchema.parse(record);
+        localFeedbackSchema.parse(record);
         if((scanEvidence(record).fact.actual as {leaked:boolean}).leaked)throw Error('Feedback contains configured secret');
-        atomicJson(file,publicVersions({version:'v1',records:[...saved,record]}));return record;
+        writeHumanFeedback(repo,[...saved,record]);return localFeedbackSchema.parse(JSON.parse(artifactJson(record)));
     } finally { release(); }
 }
 

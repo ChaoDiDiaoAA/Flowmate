@@ -9,14 +9,17 @@ export const PACKAGED_MIGRATIONS = ['001_provider.sql', '002_agent_sessions.sql'
   '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql',
   '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql',
   '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql',
-  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql'] as const;
+  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql'] as const;
 
 export const PACKAGED_NATIVE_TOOLS = { rg: { name: 'ripgrep', version: '15.2.0' }, fd: { name: 'fd', version: '10.4.2' } } as const;
+export const PACKAGED_BUN_VERSION = '1.4.4' as const;
+export const PACKAGED_SERVICE_FILES = ['apps/service.js', 'apps/service-manager.js', 'service/FlowmateRuntime.exe',
+  'resources/service/FlowmateRuntime.xml', 'licenses/winsw@2.12.0/LICENSE.txt', 'resources/prompts/invoice/prompt.md'] as const;
 export const PACKAGED_REQUIRED_FILES = ['bin/bun.exe', 'bin/photon_rs_bg.wasm', 'bin/rg.exe', 'bin/fd.exe',
   'licenses/ripgrep@15.2.0/LICENSE-MIT', 'licenses/fd@10.4.2/LICENSE-MIT', 'apps/host.js', 'apps/start-host.js',
   'apps/evaluation-worker.js', 'apps/start-evaluation.js', 'apps/maintenance.js', 'apps/image-resize-worker.js',
   'apps/fill-controls/main.mjs', 'apps/fill-controls/preload.cjs', 'apps/fill-controls/renderer.mjs', 'apps/fill-controls/index.html',
-  'native/win32/prebuilds/win32-x64/win32-console-mode.node', 'sdk/package.json', 'sdk/README.md',
+  'native/win32/prebuilds/win32-x64/win32-platform.node', 'sdk/package.json', 'sdk/README.md',
   'sdk/docs/sdk.md', 'sdk/dist/modes/interactive/theme/dark.json', 'sdk/dist/modes/interactive/theme/light.json',
   ...PACKAGED_MIGRATIONS.map(name => `apps/migrations/${name}`)] as const;
 
@@ -24,18 +27,22 @@ function isRuntimeMember(path: string): boolean {
   if (!path || path.length > 512 || /[\\:\x00-\x1f]/.test(path)
     || path.split('/').some(part => !part || part === '.' || part === '..')) return false;
   return PACKAGED_REQUIRED_FILES.includes(path as typeof PACKAGED_REQUIRED_FILES[number])
+    || PACKAGED_SERVICE_FILES.includes(path as typeof PACKAGED_SERVICE_FILES[number])
     || /^(?:sdk\/(?:dist|docs)|native|resources|licenses)\/.+/.test(path);
 }
 
 export const PackagedReleaseSchema = z.object({
   version: z.literal(1), releaseId: z.string().uuid(), productVersion: z.string().regex(/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/),
   platform: z.literal('win32'), arch: z.literal('x64'),
-  bunVersion: z.literal('1.4.0'), electronVersion: z.literal('44.4.5'), sdkVersion: z.literal('0.85.1'),
-  pluginVersion: z.literal('0.19.0'), schemaVersion: z.literal(20), settingsVersion: z.literal(7),
+  bunVersion: z.enum(['1.4.0', PACKAGED_BUN_VERSION]), electronVersion: z.literal('44.4.5'), sdkVersion: z.literal('1.4.0'),
+  pluginVersion: z.literal('0.19.0'), schemaVersion: z.literal(21), settingsVersion: z.literal(7),
+  service: z.object({ wrapperVersion: z.literal('2.12.0'), framework: z.literal('net461') }).strict().optional(),
   files: z.array(z.string().refine(isRuntimeMember)).min(PACKAGED_REQUIRED_FILES.length).max(20_000),
 }).strict().superRefine((release, ctx) => {
   if (new Set(release.files).size !== release.files.length || PACKAGED_REQUIRED_FILES.some(file => !release.files.includes(file)))
     ctx.addIssue({ code: 'custom', message: 'Incomplete or duplicate runtime inventory.' });
+  if (release.service && PACKAGED_SERVICE_FILES.some(file => !release.files.includes(file)))
+    ctx.addIssue({ code: 'custom', message: 'Service declaration and installed assets disagree.' });
 });
 
 export type PackagedRelease = Omit<z.infer<typeof PackagedReleaseSchema>, 'files'> & { files: readonly string[] };

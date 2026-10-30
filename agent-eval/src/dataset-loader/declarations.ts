@@ -3,13 +3,13 @@ import { join, resolve, relative, isAbsolute } from 'node:path';
 import { createRequire } from 'node:module';
 import { inside, readLocalMaterial, visitLocalCaseFiles } from './local.ts';
 import { expandHarness } from './harness.ts';
-import { type FlatDataset } from './flat.ts';
+import { decodeFile, type FlatDataset, type EmbeddedFile } from './flat.ts';
 import { assertSafeFixtureName, loadFixture } from '../testing/load-fixture.ts';
 import { authorDatasetSchema, type AuthorCase } from './authoring.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { caseSchema, caseV2Schema, manifestSchema, type LocalCase } from './schema.ts';
+import { listPublishedBenchmarks, loadPublishedBenchmark } from '../curation/publication.ts';
 
-export const supplementalDatasetIds: readonly string[] = ['flowmate-badcase-business-v1', 'flowmate-badcase-research-v1'];
 function sampleName(virtual: string) {
     if (virtual.includes('\\') || virtual.split('/').some(part => !part || part === '.' || part === '..'))
         throw Error('Invalid material path: ' + virtual);
@@ -26,10 +26,10 @@ function readDeclaredMaterial(repo: string, fixtureRoot: string, fixture: Declar
     const inline = fixture.files?.[virtual];
     return inline ? Buffer.from(inline.text ?? JSON.stringify(inline.json)) : readFileSync(inside(fixtureRoot, sampleName(virtual)));
 }
-function membership(task: AuthorCase, supplemental: boolean) {
+function membership(task: AuthorCase) {
     const tag = task.tags.includes('business') ? 'agent' : task.tags.includes('research') ? 'research' : undefined;
     if (!tag) throw Error('Unknown dataset membership: ' + task.id);
-    return { tag, id: supplemental ? `flowmate-badcase-${tag === 'agent' ? 'business' : 'research'}-v1` : `flowmate-${tag}-v1` };
+    return { tag, id: `flowmate-${tag}-v1` };
 }
 function scenario(task: AuthorCase, scenariosByName: Record<string, any>) {
     const name = task.input.fixture?.name;
@@ -82,26 +82,11 @@ export function readDeclarationSource(root: string, repo: string) {
     }
     for(const name of ['cases.ts','gold.ts','review.ts'])delete require.cache[require.resolve(inside(root,name))];
     const declarations = require(inside(root, 'cases.ts'));
-    const declaration = declarations.flowmateBadcaseDataset ?? declarations.flowmateAgentV1Dataset;
+    const declaration = declarations.flowmateAgentV1Dataset;
     const dataset = authorDatasetSchema.parse(declaration);
     const { goldByCaseId: gold } = require(inside(root, 'gold.ts'));
     const { reviewByCaseId: reviews } = require(inside(root, 'review.ts'));
-    const supplemental = dataset.suite === 'badcase';
-    if (supplemental) {
-        const base = join(repo, 'agent-eval/src/datasets');
-        const canonical = require(inside(base, 'cases.ts')).flowmateAgentV1Dataset.cases as AuthorCase[];
-        const originalGold = require(inside(base, 'gold.ts')).goldByCaseId, originalReviews = require(inside(base, 'review.ts')).reviewByCaseId;
-        const added: number[] = [];
-        for (const c of dataset.cases) {
-            const prior = canonical.find(old => old.id === c.id);
-            if (prior && (!isDeepStrictEqual(prior, c) || !isDeepStrictEqual(originalGold[c.id], gold[c.id]) || !isDeepStrictEqual(originalReviews[c.id], reviews[c.id])))
-                throw Error('Referenced Case/Gold/Review changed: ' + c.id);
-            if (!prior) added.push(Number(c.id.slice(3)));
-        }
-        const next = Math.max(...canonical.map(c => Number(c.id.slice(3)))) + 1;
-        if (added.sort((a,b) => a-b).some((id, index) => id !== next + index)) throw Error('Independent Case identities must be consecutive from FM-' + next);
-    }
-    const testingRoot = supplemental ? join(repo, 'agent-eval/src/testing') : join(root, '../testing'), fixtureRoot = join(testingRoot, 'fixtures');
+    const testingRoot = join(root, '../testing'), fixtureRoot = join(testingRoot, 'fixtures');
     const scenarioPath = inside(testingRoot, 'scenarios.ts');
     delete require.cache[require.resolve(scenarioPath)];
     const { scenariosByName } = require(scenarioPath);
@@ -115,7 +100,6 @@ export function readDeclarationSource(root: string, repo: string) {
 /** Trusted authored TS is loaded only by the evaluator, never mounted for the Agent. */
 export function readDeclarationDatasets(root: string, repo: string, resourceRepository = repo): FlatDataset[] {
     const { dataset, gold, reviews, scenariosByName, fixtureRoot } = readDeclarationSource(root, repo);
-    const supplemental = dataset.suite === 'badcase';
     const groups = new Map<string, FlatDataset>();
     for (const c of [...dataset.cases].sort((a:any,b:any)=>a.id.localeCompare(b.id))) {
         if (!/^FM-\d{3}$/.test(c.id) || !/^[a-z0-9]+(?:_[a-z0-9]+){2,}$/.test(c.name) || /\p{Script=Han}/u.test(JSON.stringify(c)) ||
@@ -123,11 +107,8 @@ export function readDeclarationDatasets(root: string, repo: string, resourceRepo
         const fixtureName = c.input.fixture?.name;
         const fixture = scenario(c, scenariosByName);
         if(gold[c.id].checks.some((check:any)=>!c.scoring.deterministic.includes(check.metric)))throw Error('Unselected deterministic check: '+c.id);
-        if (dataset.regressionOrigins?.[c.id]?.some(origin => origin.metricIds.some(metric => ![...c.scoring.deterministic, ...c.scoring.judge].includes(metric))))
-            throw Error('Unselected regression metric: ' + c.id);
-        const { tag, id } = membership(c, supplemental);
+        const { tag, id } = membership(c);
         const metadata = {contract:'flowmate-agent-dataset/v2',id,version:1,name:id,
-            ...(supplemental ? { suite: 'badcase' } : {}),
             environment:{profile:'isolated-agent/v2',source:tag==='research'?'local':'mixed',risks:['Independent human review and real evaluation are pending.']},
             scoring:{version:1,required:['task-result','input-isolation','environment-isolation','no-secret','closed'],judges:[{id:'semantic-batch',required:false,requiredFor:[] as string[]}]}};
         const resources = fixture.selection.enabledSkills.flatMap((skill:string)=>{
@@ -155,22 +136,22 @@ export function readDeclarationDatasets(root: string, repo: string, resourceRepo
         };
         for(const key of Object.keys(c.expected))if(Object.hasOwn(gold[c.id].values,key))throw Error('Gold must not overwrite Case constraint: '+c.id+'/'+key);
         const raw={contract:'flowmate-eval-case/v4',version:1,id:c.id,name:c.name,category:c.category,purpose:c.purpose,
-            source:{type:'controlled-workflow',basis:'Reviewed product workflows; controlled setup, not a real evaluation result.'},dataset:id,smoke:!supplemental && c.tags.includes('smoke'),tags:c.tags,
+            source:{type:'controlled-workflow',basis:'Reviewed product workflows; controlled setup, not a real evaluation result.'},dataset:id,smoke:c.tags.includes('smoke'),tags:c.tags,
             requires:fixture.requires,input:{prompt:c.input.prompt,...(c.input.turns?{turns:c.input.turns}:{}),materials:fixture.materials},environment:'isolated',setup:fixture.setup,steps:fixture.steps,
             expected:{...c.expected,checks:gold[c.id].checks},scoring:{methods:['deterministic','llm-judge','human-review'],metrics:Object.fromEntries(Object.entries(gold[c.id].opportunities).filter(([id])=>id==='task-success'||c.scoring.judge.includes(id)||c.scoring.deterministic.includes(id))),humanReview:c.scoring.manual},risks:c.risks};
         const expanded=expandHarness(raw,{contract:'flowmate-eval-gold/v4',caseId:c.id,version:1,...gold[c.id]},
             {contract:'flowmate-eval-review/v4',caseId:c.id,version:1,status:'agent-reviewed',...reviews[c.id]},
             {datasets:{[id]:metadata},files:Object.fromEntries([...paths].map(p=>[p,p])),resources},resourceRepository,read);
         let group=groups.get(id);
-        if(!group){group={manifest:{...metadata,members:[],smoke:[]},tasks:{},files:{},inputs:{},reviews:{},authored:{version:'v1',cases:[],gold:{},reviews:{},fixtures:{}}};groups.set(id,group);}
+        if(!group){group={manifest:{...metadata,members:[],smoke:[],holdout:[]},tasks:{},files:{},inputs:{},reviews:{},authored:{version:'v1',cases:[],gold:{},reviews:{},fixtures:{}}};groups.set(id,group);}
         const task=expanded.task, member=`cases/${c.id}.json`;
         const {files:visible,...input}=task.input;
         group.tasks[member]={contract:'flowmate-agent-case/v2',id:c.id,version:1,name:c.name,category:c.category,difficulty:c.difficulty,purpose:c.purpose,source:c.source,tags:c.tags,requires:task.requires,input,
             ...(task.setup?{setup:task.setup}:{}),...(task.steps?{steps:task.steps}:{}),expected:{...task.expected,...expanded.gold.values},review:{status:'pending'}};
         group.inputs[c.id]=[...visible,...task.resourceFiles];
-        group.manifest.members.push(member);if(!supplemental && c.tags.includes('smoke'))group.manifest.smoke.push(c.id);
+        group.manifest.members.push(member);if(c.tags.includes('smoke'))group.manifest.smoke.push(c.id);
+        if(c.tags.includes('holdout'))group.manifest.holdout!.push(c.id);
         if(c.scoring.judge.length)group.manifest.scoring.judges[0]!.requiredFor!.push(c.id);
-        if (supplemental) (group.regressionOrigins ??= {})[c.id] = dataset.regressionOrigins![c.id]!;
         for(const file of [...visible,...task.resourceFiles,...task.controllerFiles,...expanded.gold.sources]) {
             if(group.files[file.path]&&!isDeepStrictEqual(group.files[file.path],file))throw Error('Conflicting source: '+file.path);
             group.files[file.path]=file;
@@ -185,21 +166,20 @@ export type CaseDeclaration = {
     datasetId: string; datasetVersion: number; caseId: string; caseVersion: number; name: string; category: string; smoke: boolean;
     root: string; task: AuthorCase | LocalCase; gold: unknown; review: unknown; fixture: unknown; fixtureRoot: string | null;
     manifest?: import('./local.ts').LocalDataset['manifest'];
+    snapshotFiles?: Record<string, EmbeddedFile>;
 };
 export function discoverCaseDeclarations(repo: string): CaseDeclaration[] {
     const base = join(repo, 'agent-eval/src/datasets'), declarations: CaseDeclaration[] = [];
-    for (const root of [base, join(base, 'badcase')]) {
+    for (const root of [base]) {
         if (!existsSync(root)) continue;
         if (!lstatSync(root).isDirectory() || lstatSync(root).isSymbolicLink() || realpathSync(root).toLowerCase() !== resolve(root).toLowerCase())
             throw Error('Linked or invalid Dataset collection rejected');
-        const supplementalRoot = root !== base;
         if (existsSync(join(root, 'cases.ts'))) {
-            const source = readDeclarationSource(root, repo), supplemental = source.dataset.suite === 'badcase';
+            const source = readDeclarationSource(root, repo);
             for (const task of source.dataset.cases) {
-                const { id } = membership(task, supplemental);
-                if (supplementalDatasetIds.includes(id) !== supplementalRoot) continue;
+                const { id } = membership(task);
                 declarations.push({ datasetId: id, datasetVersion: 1, caseId: task.id, caseVersion: 1, name: task.name,
-                    category: task.category, smoke: !supplemental && task.tags.includes('smoke'), root, task,
+                    category: task.category, smoke: task.tags.includes('smoke'), root, task,
                     gold: source.gold[task.id], review: source.reviews[task.id], fixture: scenario(task, source.scenariosByName), fixtureRoot: source.fixtureRoot });
             }
         } else for (const entry of readdirSync(root, { withFileTypes: true })) {
@@ -207,7 +187,6 @@ export function discoverCaseDeclarations(repo: string): CaseDeclaration[] {
             const directory = join(root, entry.name);
             if (!existsSync(join(directory, 'dataset.json'))) continue;
             const manifest = manifestSchema.parse(JSON.parse(readFileSync(inside(root, entry.name + '/dataset.json'), 'utf8')));
-            if (supplementalDatasetIds.includes(manifest.id) !== supplementalRoot) continue;
             const schema = manifest.contract === 'flowmate-agent-dataset/v2' ? caseV2Schema : caseSchema, ids = new Set<string>();
             for (const member of manifest.members) {
                 const task = schema.parse(JSON.parse(readFileSync(inside(directory, member), 'utf8')));
@@ -218,6 +197,16 @@ export function discoverCaseDeclarations(repo: string): CaseDeclaration[] {
                     fixture: { requires: task.requires, materials: task.input.materials, ...(task.setup ? { setup: task.setup } : {}), ...(task.steps ? { steps: task.steps } : {}) },
                     fixtureRoot: null, manifest });
             }
+        }
+    }
+    const latest = new Map(listPublishedBenchmarks(repo).map(item => [item.id, item]));
+    for (const publication of latest.values()) for (const dataset of loadPublishedBenchmark(repo, publication.id, publication.revision)) {
+        for (const task of dataset.cases) {
+            const authored = dataset.embedded!.authored!, c = authored.cases.find(value => value.id === task.id);
+            declarations.push({ datasetId: dataset.manifest.id, datasetVersion: dataset.manifest.version, caseId: task.id, caseVersion: task.version,
+                name: task.name, category: task.category, smoke: dataset.manifest.smoke.includes(task.id), root: dataset.root, task,
+                gold: authored.gold[task.id], review: authored.reviews[task.id], fixture: authored.fixtures[c.input.fixture.name],
+                fixtureRoot: null, manifest: dataset.manifest, snapshotFiles: dataset.embedded!.files });
         }
     }
     const identities = declarations.map(item => JSON.stringify([item.datasetId, item.caseId]));
@@ -240,7 +229,9 @@ export function inspectCaseDeclaration(repo: string, datasetId: string, caseId: 
             gaps.set(path, { path, reason: missing ? 'missing' : 'invalid' }); return null;
         }
     };
-    if (declaration.fixtureRoot) {
+    if (declaration.snapshotFiles) {
+        for (const [path, value] of Object.entries(declaration.snapshotFiles)) read(path, () => decodeFile(value).bytes);
+    } else if (declaration.fixtureRoot) {
         const fixture = declaration.fixture as DeclaredFixture, gold = declaration.gold as { sources: string[] };
         if (!Array.isArray(gold.sources) || gold.sources.some(path => typeof path !== 'string')) throw Error('Invalid Gold sources');
         const readMaterial = (path: string) => read(path, () => readDeclaredMaterial(repo, declaration.fixtureRoot!, fixture, path));

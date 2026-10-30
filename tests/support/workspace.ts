@@ -1,4 +1,4 @@
-import { createFileStore, createWorkspaceVerifier } from '@flowmate/core';
+import { readManagedArtifact, createWorkspaceVerifier } from '@flowmate/core';
 import type { DocumentRepository } from '../../packages/core/src/storage/repositories.ts';
 import { createDocumentService } from '../../packages/data/src/documents.ts';
 import { dirname, join } from 'node:path';
@@ -9,9 +9,14 @@ import type { Database } from 'bun:sqlite';
 export function createTestWorkspaceVerifier(store: { documents: DocumentRepository; db: Database }, root = dirname(dirname(store.db.filename))) {
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), logsDir: join(root, 'logs'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
-  const documents = createDocumentService({ paths, repository: store.documents, files: createFileStore(paths, store.documents),
+  const current = { repository: store.documents,
+    files: { read: (artifact: Parameters<typeof readManagedArtifact>[1], name?: string) => readManagedArtifact(paths, artifact, name, store.documents.contents!) } };
+  const documents = createDocumentService({ paths, files: { async publish() { throw Error('Workspace component inspection cannot import documents.'); } },
+    transaction: async operation => store.db.transaction(() => operation(current)).immediate(),
     allowedSourceRoot: join(root, 'source'), now: () => '2026-10-03T00:00:00.000Z' });
-  return createWorkspaceVerifier({ inspectMaterial: ref => documents.inspectForWorkspace(ref) });
+  return createWorkspaceVerifier({ inspectMaterial: (ref, scope) => documents.inspectForWorkspace(ref, scope ? {
+    repository: scope.documents, files: { read: (artifact, name) => readManagedArtifact(paths, artifact, name, scope.contents) },
+  } : current) });
 }
 
 /** Explicitly replace historical synthetic bytes with managed material for domain admission tests. */

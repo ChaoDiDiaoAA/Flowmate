@@ -13,7 +13,7 @@ type CommandTicket = { operationId: string; instanceId: string; nativeSessionId:
 export type ExtensionScope = ReturnType<typeof createScope>;
 export type LoadedExtensionSet = { result: LoadExtensionsResult | null; scopes: ExtensionScope[]; error: AppError | null };
 export function extensionAssembly(loaded: LoadedExtensionSet): ExtensionAssemblyEvidence {
-  return ExtensionAssemblyEvidenceSchema.parse({ version: 1, sdkVersion: '0.85.1', instances: loaded.scopes.flatMap(scope => scope.evidence().instances) });
+  return ExtensionAssemblyEvidenceSchema.parse({ version: 1, sdkVersion: VERSION, instances: loaded.scopes.flatMap(scope => scope.evidence().instances) });
 }
 function createScope(input: { selected: FrozenExtensions['included'][number]; nativeSessionId: string;
   assertCallOwner: (event: { toolName: string; toolCallId: string }, instanceId: string) => Result<CallTicket>;
@@ -90,7 +90,7 @@ function createScope(input: { selected: FrozenExtensions['included'][number]; na
     },
     evidence(): ExtensionAssemblyEvidence {
       if (view.state !== 'active' || view.admission !== 'open' || !view.activatedAt) throw new Error('Extension has no active assembly proof.');
-      return ExtensionAssemblyEvidenceSchema.parse({ version: 1, sdkVersion: '0.85.1', instances: [{ instanceId: view.instanceId, ref: view.ref, nativeSessionId: view.nativeSessionId,
+      return ExtensionAssemblyEvidenceSchema.parse({ version: 1, sdkVersion: VERSION, instances: [{ instanceId: view.instanceId, ref: view.ref, nativeSessionId: view.nativeSessionId,
         activatedAt: view.activatedAt, registeredTools: [...view.registeredTools], registeredCommands: [...view.registeredCommands], hookEvents: [...view.hookEvents] }] });
     },
     snapshot() { return ExtensionInstanceViewSchema.parse(structuredClone(view)); },
@@ -108,7 +108,7 @@ export async function loadControlledExtensions(input: { frozen: FrozenExtensions
   const loaded: LoadedExtensionSet = { result: null, scopes, error: null }; input.onCreated(loaded);
   let registrationFailure: AppError | null = null;
   try {
-    if (VERSION !== '0.85.1' || frozen.included.length < 1)
+    if (VERSION !== '1.4.0' || frozen.included.length < 1 || frozen.included.some(selected => selected.manifest.sdkVersion !== VERSION))
       throw appError('extension_incompatible', 'extension', 'Installed SDK or source tool is incompatible.');
     const factories = frozen.included.map((selected, index) => {
       const scope = scopes[index]!, manifest = selected.manifest;

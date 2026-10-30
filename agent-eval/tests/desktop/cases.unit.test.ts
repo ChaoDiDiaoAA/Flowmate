@@ -41,7 +41,7 @@ test('Case pagination and new feedback reject changed conditions while an alread
   const saved = invoke(service, 'addFeedback', input); expect(saved.ok).toBe(true);
   expect(saved.data.record.caseId).toBe(target.caseId); expect(saved.data.record.caseVersion).toBe(1);
   expect(JSON.stringify(saved.data)).not.toContain('conditions');
-  const file = join(feedbackDirectory(repo), 'review.json'), original = readFileSync(file, 'utf8');
+  const file = join(feedbackDirectory(repo), 'feedback.json'), original = readFileSync(file, 'utf8');
   cpSync(join(fixtureRepo, 'data'), join(repo, 'data'), { recursive: true });
   expect(invoke(service, 'catalog', { view: 'case', datasetId: target.datasetId, caseId: target.caseId,
     caseViewId: viewed.data.caseViewId, offset: 160 }).ok).toBe(false);
@@ -73,12 +73,12 @@ test('Trial feedback keeps the original strict completion rule and a saved opera
   const trial = { kind: 'run-feedback', executionId: 'unit', caseId: 'sample', trialId: 'trial-1' } as const;
   const input = { ...feedback, target: trial };
   const first = invoke(service, 'addFeedback', input); expect(first.ok).toBe(true);
-  const saved = readFileSync(join(directory, 'review.json'), 'utf8');
+  const saved = readFileSync(join(feedbackDirectory(repo), 'feedback.json'), 'utf8');
   writeFileSync(file, JSON.stringify({ ...report, endedAt: null, scoring: 'pending' }));
   expect(invoke(service, 'addFeedback', { ...input, operationId: 'synthetic-unfinished-trial-feedback' }).ok).toBe(false);
   const queried = invoke(service, 'feedback', { target: { kind: 'run-feedback', executionId: 'unit' }, operationId: feedback.operationId });
   expect(queried.ok).toBe(true); expect(queried.data.operation.id).toBe(feedback.operationId);
-  expect(readFileSync(join(directory, 'review.json'), 'utf8')).toBe(saved);
+  expect(readFileSync(join(feedbackDirectory(repo), 'feedback.json'), 'utf8')).toBe(saved);
 });
 
 test('catalog request identities and untrusted paths are rejected without creating evaluation records', () => {
@@ -110,7 +110,7 @@ test('duplicate feedback identities are faults rather than usable history and ca
   const viewed = invoke(service, 'catalog', { view: 'case', datasetId: target.datasetId, caseId: target.caseId });
   const input = { ...feedback, target: { ...target, caseViewId: viewed.data.caseViewId } };
   expect(invoke(service, 'addFeedback', input).ok).toBe(true);
-  const file = join(feedbackDirectory(repo), 'review.json'), original = readFileSync(file, 'utf8'), duplicate = JSON.parse(original);
+  const file = join(feedbackDirectory(repo), 'feedback.json'), original = readFileSync(file, 'utf8'), duplicate = JSON.parse(original);
   duplicate.records.push({ ...duplicate.records[0] }); writeFileSync(file, JSON.stringify(duplicate));
   expect(invoke(service, 'feedback', { target }).ok).toBe(false);
   expect(invoke(service, 'addFeedback', { ...input, operationId: 'synthetic-after-duplicate' }).ok).toBe(false);
@@ -118,7 +118,7 @@ test('duplicate feedback identities are faults rather than usable history and ca
 });
 
 test('a broken linked feedback sidecar is a fault rather than empty history', () => {
-  const { repo, service } = setup(), file = join(feedbackDirectory(repo), 'review.json');
+  const { repo, service } = setup(), file = join(feedbackDirectory(repo), 'feedback.json');
   mkdirSync(join(file, '..'), { recursive: true }); symlinkSync(join(repo, 'missing-synthetic-feedback'), file, 'file');
   expect(invoke(service, 'feedback', { target }).ok).toBe(false);
 });

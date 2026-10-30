@@ -189,9 +189,11 @@ test('two independent local Trials rebuild the same material projection without 
                 input: { prompt: researchPlan.question, materials: [{ sample: 'synthetic', file: 'policy.md', text: 'Declared synthetic source.' }] },
                 configuration: { modelCapabilities: syntheticNativeModel, model: 'fresh-model', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions' },
                 steps: [{ id: 'plan', action: 'research-plan', instruction: researchPlan.question }] };
+            const phases:string[]=[];
             const result = await executeCase({ readiness: () => ({ ready: true, reason: 'Synthetic engineering only' }),
                 prepare: (trial, signal) => prepareHostResearchTrial(trial, signal, { repo: REPO_ROOT, credential: 'synthetic-fresh' }) },
-                trial, 60000, 10000);
+                trial, 60000, 10000,undefined,phase=>phases.push(phase));
+            expect(phases).toContain('capturing');
             results.push(result);
             expect(result).toMatchObject({ stopFailed: false, execution: { status: 'completed', endpointReached: true,
                 evidence: { cleanup: { present: true, actual: { stopped: true } } } } });

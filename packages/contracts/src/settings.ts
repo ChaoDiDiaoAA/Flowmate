@@ -53,6 +53,7 @@ export type DesktopState = {
   modelCredentials: Readonly<Record<string, 'missing' | 'configured' | 'unavailable'>>;
   evaluationCredentials?: import('./evaluation.ts').EvaluationConfigurationSnapshot['credentials'];
   evaluationControl?: import('./evaluation.ts').EvaluationControlState | null;
+  backgroundService?: import('./background-service.ts').BackgroundServiceState;
   settings: ProductSettings;
   appVersion: string;
   userDataPath: string;
@@ -159,6 +160,11 @@ export type DesktopInvoiceExportResult = { outcome: 'cancelled' } | {
 
 export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & import('./evaluation.ts').EvaluationDesktopApi & import('./research.ts').ResearchQueryApi & Pick<import('./runtime.ts').Application, 'listExtensions' | 'updateExtensionSelection' | 'querySessionExtensions'
   | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
+  runEvaluationWorkflow(input: import('./evaluation-workflow.ts').EvaluationWorkflowRequest): Promise<import('./runtime.ts').Result<import('./evaluation-workflow.ts').EvaluationWorkflowResult>>;
+  personalAgent: import('./personal-agent.ts').PersonalAgentApi;
+  backgroundService: import('./background-service.ts').BackgroundServiceApi;
+  invoiceWorks: import('./personal-agent.ts').InvoiceWorksApi;
+  personalTasks: Omit<import('./personal-agent.ts').PersonalTasksApi, 'resume'>;
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   saveResearchExport(input: import('zod').z.infer<typeof import('./research.ts').ResearchReportRequestSchema>): Promise<import('./runtime.ts').Result<{ cancelled: boolean; destinationPath?: string }>>;
   readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
@@ -175,13 +181,13 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   saveSettings(settings: ProductSettings, credentialUpdate?: { modelId: string; apiKey: string }): Promise<import('./runtime.ts').Result<ProductSettings>>;
   callProvider(input: ProviderTestRequest): Promise<import('./runtime.ts').Result<{ requestId: string; runId: number }>>;
   cancelProvider(requestId: string): Promise<import('./runtime.ts').Result<{ accepted: boolean; runId: number | null }>>;
-  createSession(request?: import('./runtime.ts').CreateSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
+  createSession(request?: import('./runtime.ts').CreateSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').AgentSessionSnapshot>>;
   queryNativeTools(): Promise<import('./runtime.ts').Result<readonly import('./tools.ts').NativeToolAvailability[]>>;
   chooseWorkingDirectory(): Promise<import('./runtime.ts').Result<string | null>>;
   renameSession(request: import('./runtime.ts').RenameSessionRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
   deleteSession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<import('./runtime.ts').DeleteSessionResult>>;
   listSessions(request?: import('./runtime.ts').ListSessionsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionPage>>;
-  querySession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionSnapshot>>;
+  querySession(sessionId: import('./runtime.ts').DbId): Promise<import('./runtime.ts').Result<import('./runtime.ts').AgentSessionSnapshot>>;
   listSessionRuns(request: import('./runtime.ts').SessionRunsRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionRunsPage>>;
   listSessionMessages(request: import('./runtime.ts').SessionMessagesRequest): Promise<import('./runtime.ts').Result<import('./runtime.ts').SessionMessagesPage>>;
   queryPromptTrace(runId: import('./runtime.ts').DbId, callSequence?: number): Promise<import('./runtime.ts').Result<import('./diagnostics.ts').PromptTraceResult>>;

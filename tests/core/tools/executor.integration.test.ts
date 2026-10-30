@@ -3,10 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
-import { appError, ToolExecutionFailure, NativeToolOutputSchema, invoiceToolSchemas } from '@flowmate/contracts';
+import { appError, fail, ToolExecutionFailure, NativeToolOutputSchema, invoiceToolSchemas } from '@flowmate/contracts';
 import type { AppError, ToolDefinition, ToolExecutionContext, ToolEffect, ToolRuntimeObservation } from '@flowmate/contracts';
 import { deferCleanup } from '../../support/resources.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 import { createToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 
@@ -37,6 +37,147 @@ function makeRuntime(names: string[], options: { maxToolCalls?: number; maxResul
 }
 
 describe('P3 Tool Executor', () => {
+  it.each([['admission', 1], ['before-use', 2], ['terminal', 3]] as const)(
+    'recovers an actual %s COMMIT receipt lost before returning to the Executor', async (_stage, loseAt) => {
+      const store = makeRuntime(['read_fixture']);
+      let committed = 0, executions = 0, lost = false;
+      const database: Pick<typeof store, 'read' | 'transaction'> = {
+        read: operation => store.read(operation),
+        transaction: async operation => {
+          const receipt = await store.transaction(operation);
+          if (++committed === loseAt) { lost = true; throw Error('Controlled owned response loss after actual COMMIT'); }
+          return receipt;
+        },
+      };
+      const executor = createToolExecutor({ database, now: () => store.at,
+        definitions: [{ ...store.executor.listTools()[0]!, execute: async ({ value }) => { executions++; return { value }; } }] });
+      const context = store.context('owner-commit-response-lost');
+      const first = await executor.execute('read_fixture', { value: 11 }, context);
+      expect(lost).toBe(true);
+      expect(first).toMatchObject({ fatal: false, call: { status: 'succeeded', cleanup: { stopped: true } },
+        result: { status: 'succeeded', data: { value: 11 } } });
+      const duplicate = await executor.execute('read_fixture', { value: 11 }, context);
+      expect(duplicate.call).toEqual(first.call);
+      expect(duplicate).toMatchObject({ fatal: false, result: { status: 'succeeded', data: { value: 11 } } });
+      expect(executions).toBe(1);
+      expect(await store.read(scope => scope.db.query('SELECT COUNT(*) AS count FROM tool_calls').get())).toEqual({ count: 1 });
+      expect(executor.close()).toEqual({ stopped: true, closed: true, errors: [] });
+    });
+
+  it('finishes a real owned ToolCall and closes without a root recorder or permission callback', async () => {
+    const store = makeRuntime(['read_fixture']);
+    const database = { read: store.read, transaction: store.transaction };
+    const executor = createToolExecutor({ database, definitions: store.executor.listTools(), now: () => store.at });
+    expect(await executor.execute('read_fixture', { value: 7 }, store.context('owner-without-root')))
+      .toMatchObject({ fatal: false, result: { status: 'succeeded', data: { value: 7 } } });
+    expect(await store.read(scope => executor.queryCall(store.context('owner-without-root'), 'owner-without-root', scope.toolCalls)))
+      .toMatchObject({ ok: true, data: { status: 'succeeded', cleanup: { stopped: true } } });
+    expect(executor.close()).toEqual({ stopped: true, closed: true, errors: [] });
+  });
+
+  it('waits for the SQLite owner before admitting a tool against an archived Session', async () => {
+    const store = makeRuntime(['read_fixture']);
+    let executions = 0;
+    const executor = createToolExecutor({ database: store,  now: () => store.at,
+      definitions: [{ ...store.executor.listTools()[0]!, execute: async ({ value }) => { executions++; return { value }; } }] });
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const held = store.transaction(async scope => {
+      scope.db.query("UPDATE sessions SET status='archived' WHERE id=?").run(store.sessionId);
+      entered.resolve(); await release.promise;
+    });
+    await entered.promise;
+    let settled = false;
+    const execution = executor.execute('read_fixture', { value: 1 }, store.context('owner-archived')).then(result => { settled = true; return result; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false); expect(executions).toBe(0);
+    } finally { release.resolve(); await held; }
+    expect(await execution).toMatchObject({ fatal: true, result: { status: 'failed', error: { code: 'run_state_invalid' } } });
+    expect(executions).toBe(0);
+  });
+
+  it('executes business work outside the owner and waits for terminal acknowledgement', async () => {
+    const store = makeRuntime(['read_fixture']);
+    const entered = Promise.withResolvers<void>(), complete = Promise.withResolvers<void>();
+    const executor = createToolExecutor({ database: store,  now: () => store.at,
+      definitions: [{ ...store.executor.listTools()[0]!, execute: async ({ value }) => {
+        expect(store.db.inTransaction).toBe(false);
+        await store.read(scope => scope.toolCalls.get({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'owner-terminal' }));
+        entered.resolve(); await complete.promise; return { value };
+      } }] });
+    let settled = false;
+    const execution = executor.execute('read_fixture', { value: 2 }, store.context('owner-terminal')).then(result => { settled = true; return result; });
+    await entered.promise;
+    const heldEntered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const held = store.transaction(async () => { heldEntered.resolve(); await release.promise; });
+    await heldEntered.promise;
+    try {
+      complete.resolve(); await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+    } finally { complete.resolve(); release.resolve(); await held; }
+    expect(await execution).toMatchObject({ fatal: false, call: { status: 'succeeded' }, result: { status: 'succeeded', data: { value: 2 } } });
+  });
+
+  it('computes candidate facts synchronously from the current owner repository when the root alias cannot read', async () => {
+    const store = makeRuntime(['read_fixture']);
+    expect((await store.executor.execute('read_fixture', { value: 3 }, store.context('owner-facts'))).result.status).toBe('succeeded');
+    const executor = createToolExecutor({ definitions: store.executor.listTools(), now: () => store.at,
+      recorder: createToolRecorder({ ...store.toolCalls, list: () => fail(appError('storage_read_failed', 'storage', 'Root alias is unavailable.')) }, () => store.at) });
+    const facts = await store.read(scope => executor.candidateFacts(1, undefined, scope.toolCalls));
+    expect(facts).toMatchObject({ ok: true, data: { candidateIds: [], deliveredCandidateIds: [], stopped: true, cleanupErrors: [] } });
+  });
+
+  it.each(['before', 'after'] as const)('rolls back the owner transaction when the %s-tool terminal cannot be saved', async phase => {
+    const store = makeRuntime(['read_fixture']);
+    store.db.exec(`CREATE TABLE tool_owner_probe(phase TEXT);
+      CREATE TRIGGER reject_tool_terminal BEFORE UPDATE OF runtime_observation_json ON tool_calls
+      WHEN NEW.runtime_observation_json IS NOT NULL BEGIN SELECT RAISE(ABORT,'controlled terminal failure'); END;`);
+    let executions = 0;
+    const executor = createToolExecutor({  now: () => store.at,
+      definitions: [{ ...store.executor.listTools()[0]!, execute: async ({ value }) => { executions++; return { value }; } }],
+      database: { read: operation => store.read(operation), transaction: operation => store.transaction(scope => {
+        const call = scope.db.query("SELECT status FROM tool_calls WHERE native_tool_call_id='refusal-owner'").get() as { status: string } | null;
+        if (call?.status === (phase === 'before' ? 'requested' : 'running'))
+          scope.db.query('INSERT INTO tool_owner_probe(phase) VALUES(?)').run(phase);
+        return operation(scope);
+      }) } });
+    const result = await executor.execute('read_fixture', { value: phase === 'before' ? 'invalid' : 7 }, store.context('refusal-owner'));
+    expect(result).toMatchObject({ fatal: true, result: { status: 'failed', error: { category: 'storage' } } });
+    expect(executions).toBe(phase === 'before' ? 0 : 1);
+    expect(await store.read(scope => scope.db.query('SELECT * FROM tool_owner_probe').all())).toEqual([]);
+    expect(await store.read(scope => scope.toolCalls.get({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'refusal-owner' })))
+      .toMatchObject({ ok: true, data: { status: phase === 'before' ? 'requested' : 'running', result: null, runtimeObservation: null } });
+  });
+
+  it('freezes original tool arguments before waiting for the owner', async () => {
+    const store = makeRuntime(['read_fixture']);
+    const executor = createToolExecutor({ database: store, definitions: store.executor.listTools(), now: () => store.at });
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const held = store.transaction(async () => { entered.resolve(); await release.promise; });
+    await entered.promise;
+    const original = { value: 4 }, normalized = { value: 4 };
+    const execution = executor.execute('read_fixture', normalized, store.context('owner-fixed-args'), original);
+    original.value = 99; normalized.value = 99;
+    release.resolve(); await held;
+    expect(await execution).toMatchObject({ call: { args: { raw: { value: 4 }, final: { value: 4 } } },
+      result: { status: 'succeeded', data: { value: 4 } } });
+  });
+
+  it('fixes a queued original call before rejecting a conflicting concurrent duplicate', async () => {
+    const store = makeRuntime(['read_fixture']);
+    const executor = createToolExecutor({ database: store, definitions: store.executor.listTools(), now: () => store.at });
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const held = store.transaction(async () => { entered.resolve(); await release.promise; });
+    await entered.promise;
+    const original = executor.execute('read_fixture', { value: 5 }, store.context('owner-duplicate'), { value: 5 });
+    const conflict = executor.execute('read_fixture', { value: 6 }, store.context('owner-duplicate'), { value: 5 });
+    release.resolve(); await held;
+    await original;
+    expect(await conflict).toMatchObject({ fatal: true, result: { status: 'failed', error: { code: 'state_conflict' } } });
+    const saved = await store.read(scope => scope.toolCalls.get({ runId: 1, sessionId: store.sessionId, nativeToolCallId: 'owner-duplicate' }));
+    expect(saved).toMatchObject({ ok: true, data: { args: { raw: { value: 5 }, final: { value: 5 } } } });
+  });
+
   it('accepts the exact Agent plugin name through the existing Executor and rejects other capitalized definitions', async () => {
     const store = makeRuntime(['Agent']);
     expect(await store.executor.execute('Agent', { value: 42 }, store.context('delegate-name'))).toMatchObject({

@@ -1,9 +1,10 @@
 import { expect, test } from 'bun:test';
-import { appendFileSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { runLocal, type EvaluationProgress } from '../../src/execution/runner.ts';
 import { readReport } from '../../src/reports/store.ts';
+import { archiveFile, readArchive, writeArchivePart } from '../../src/reports/archive.ts';
 import type { AgentKernel } from '../../src/adapters/agent.ts';
 import { dataset, fixtureRepo, observed } from '../support/fixtures.ts';
 
@@ -56,27 +57,27 @@ test('progress is delivered before Agent completion and only announces saved Tri
     expect(events.find(e => e.type === 'scoring-end')).toMatchObject({ status: result.report.trials[0]!.status });
     const saved = events.find(e => e.type === 'trial-end');
     expect(saved).toMatchObject({ index: 1, total: 1, caseId: result.report.trials[0]!.caseId, status: result.report.trials[0]!.status,
-        evidenceDirectory: `evidence/${result.report.trials[0]!.trialId}/` });
+        evidenceDirectory: `run.json#/executions/${result.report.executionId}/trials/0` });
     expect(events.at(-1)).toMatchObject({ type: 'dataset-end', reportPath: result.file, stopped: false });
 });
 
-test('each Case and repetition keeps a separate evidence directory and matching report references', async () => {
+test('each Case and repetition keeps its original inline evidence and matching report references', async () => {
     const data = structuredClone(dataset); data.cases = data.cases.slice(0, 2);
     data.manifest.members = data.cases.map(t => `cases/${t.id}.json`); data.manifest.smoke = data.cases.map(t => t.id);
     const events: EvaluationProgress[] = [];
     const run = await runLocal(fixtureRepo, { dataset: data, repeat: 2, backend: 'local', judge: 'off', executionId: 'directories-' + randomUUID() },
         { env: {}, kernel: product(), onProgress: event => { events.push(event); } });
-    const evidence = join(dirname(run.file), 'evidence');
-    expect(readdirSync(evidence).sort()).toEqual(run.report.trials.map(t => t.trialId).sort());
-    const disk = JSON.parse(readFileSync(run.file, 'utf8'));
-    for (const trial of disk.trials) {
-        expect(trial.evidence.trial).toBe(`evidence/${trial.trialId}/trial.json`);
-        expect(readdirSync(join(evidence, trial.trialId)).filter(name => name !== 'artifacts').sort())
-            .toEqual(['events.jsonl', 'observation.json', 'trial.json']);
+    expect(readdirSync(dirname(archiveFile(run.file))).sort()).toEqual(['README.md', 'run.json']);
+    const disk = readArchive(run.file).executions[run.report.executionId] as { trials: Array<{ execution: unknown; judgeCalls: unknown }> };
+    for (const [index, trial] of disk.trials.entries()) {
+        expect(trial.execution).toEqual(run.report.trials[index]!.execution);
+        expect(trial.judgeCalls).toEqual(run.report.trials[index]!.judgeCalls);
     }
     expect(readReport(run.file).trials).toHaveLength(4);
     expect(events.filter(e => e.type === 'trial-end').map(e => [e.index, e.total])).toEqual([[1,4],[2,4],[3,4],[4,4]]);
     expect(events.filter(e => e.type === 'trial-end').map(e => [e.trialIndex,e.trialsPerCase])).toEqual([[1,2],[1,2],[2,2],[2,2]]);
+    expect(events.filter(e => e.type === 'trial-end').map(e => e.evidenceDirectory)).toEqual(
+        run.report.trials.map((_, index) => `run.json#/executions/${run.report.executionId}/trials/${index}`));
     expect(run.report.trialStatistics).toBeDefined();
     expect(events.at(-1)).toMatchObject({type:'dataset-end',statistics:readReport(run.file).trialStatistics});
 });
@@ -119,7 +120,10 @@ test('a save failure never emits a saved Trial or dataset completion', async () 
         { env: {}, kernel: product(), onProgress(event) {
             events.push(event);
             if (event.type === 'dataset-start') file = event.reportPath;
-            if (event.type === 'trial-phase' && event.phase === 'saving') appendFileSync(file, '\n');
+            if (event.type === 'trial-phase' && event.phase === 'saving') {
+                const newer = readReport(file); newer.trials[0]!.reason = 'Newer externally saved progress';
+                writeArchivePart(file, newer);
+            }
         } })).rejects.toThrow('Stale open report');
     expect(events.some(e => e.type === 'trial-end' || e.type === 'dataset-end')).toBe(false);
 });
@@ -129,9 +133,24 @@ test('cancellation reports remaining Trials as not run and ends with an explicit
     const data = structuredClone(dataset); data.cases = data.cases.slice(0, 2);
     data.manifest.members = data.cases.map(t => `cases/${t.id}.json`);
     const run = await runLocal(fixtureRepo, { dataset: data, backend: 'local', judge: 'off', executionId: 'cancel-progress-' + randomUUID() },
-        { env: {}, signal: controller.signal, kernel: product(async () => { controller.abort(); }), onProgress: event => { events.push(event); } });
+        { env: {}, signal: controller.signal, kernel: product(async () => { controller.abort(); }, result => {
+            result.evidence.runs = { present: true, actual: [{ runId: 1, sessionId: 1, kind: 'agent', status: 'completed',
+                startedAt: result.startedAt, endedAt: result.endedAt, stoppedAt: result.endedAt,
+                cleanup: { stopped: true, lateObservationRequired: false } }], source: 'Controlled fixture terminal actor and runtime stop receipt' };
+        }), onProgress: event => { events.push(event); } });
     expect(run.stopped).toBe(true);
     expect(events.filter(e => e.type === 'trial-end')).toHaveLength(2);
     expect(events.find(e => e.type === 'trial-end' && e.index === 2)).toMatchObject({ status: 'NOT_RUN' });
     expect(events.at(-1)).toMatchObject({ type: 'dataset-end', stopped: true, reason: '用户取消评测' });
+    expect(events.find(event => event.type === 'trial-cleanup')).toMatchObject({ stopConfirmed: true });
+});
+
+test('cancellation without original actor stop facts keeps stop unknown despite a successful Host close', async () => {
+    const controller = new AbortController(), events: EvaluationProgress[] = [];
+    const run = await runLocal(fixtureRepo, { dataset: singleCase(), backend: 'local', judge: 'off', executionId: 'cancel-missing-stop-' + randomUUID() },
+        { env: {}, signal: controller.signal, kernel: product(async () => { controller.abort(); }), onProgress: event => { events.push(event); } });
+    expect(run.stopped).toBe(true);
+    expect(run.report.trials[0]!.execution!.evidence.cleanup).toMatchObject({ present: true, actual: { closed: true, stopped: true } });
+    expect(events.find(event => event.type === 'trial-cleanup')).toMatchObject({ stopConfirmed: false });
+    expect(events.at(-1)).toMatchObject({ type: 'dataset-end', stopped: true, reason: expect.stringContaining('Prior Trial stopping unconfirmed:') });
 });

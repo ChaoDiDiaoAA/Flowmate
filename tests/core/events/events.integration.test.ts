@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import { createRuntimeEventStore, type EventWrite } from '../../../packages/core/src/events/store.ts';
 import { RuntimeEventsReadResultSchema } from '@flowmate/contracts';
@@ -45,7 +45,7 @@ describe('P6 runtime event migration', () => {
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(opened.data.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     expect(opened.data.db.query('PRAGMA busy_timeout').get()).toEqual({ timeout: 1000 });
     expect(opened.data.db.query('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'delete' });
@@ -62,21 +62,21 @@ describe('P6 runtime event migration', () => {
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(opened.data.db.query('SELECT * FROM runs WHERE id=24').get()).toEqual({ ...(before as Record<string, unknown>),
       current_context_snapshot_id: null, context_observations_json: null, parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null });
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(opened.data.db.query('SELECT COUNT(*) AS count FROM runtime_events WHERE run_id=24').get()).toEqual({ count: 0 });
   });
 
-  it('rolls back the entire migration when version 13 registration fails', () => {
+  it('rolls back the entire migration when version 13 registration fails', async () => {
     const productPaths = paths();
     const old = legacyTwelve(productPaths);
     const before = old.query('SELECT * FROM runs WHERE id=24').get();
     old.exec("CREATE TRIGGER reject_13 BEFORE INSERT ON schema_migrations WHEN NEW.version=13 BEGIN SELECT RAISE(ABORT,'fixture migration failure'); END;");
     old.close();
     const attempted = openDatabase(productPaths);
-    if (attempted.ok) attempted.data.close();
+    if (attempted.ok) await attempted.data.close();
     expect(attempted).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
     const inspected = new Database(productPaths.databaseFile);
     deferCleanup(() => inspected.close());
@@ -91,7 +91,7 @@ describe('P6 runtime event migration', () => {
     if (!opened.ok) throw new Error(opened.error.code);
     const product = opened.data; deferCleanup(() => product.close());
     const db = product.db;
-    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     const firstSession = product.sessions.create({ nativeSessionId: 'p6-ddl-first', title: 'First', at: stamp });
     const secondSession = product.sessions.create({ nativeSessionId: 'p6-ddl-second', title: 'Second', at: stamp });

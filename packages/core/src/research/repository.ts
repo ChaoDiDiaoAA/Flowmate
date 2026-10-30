@@ -1,4 +1,4 @@
-import type { Database } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import { readResearchContext, researchMaterialScope } from './context.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';

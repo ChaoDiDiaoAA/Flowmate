@@ -1,3 +1,4 @@
+import { openTestDatabase } from '../../support/database.ts';
 import { describe, expect, it } from 'bun:test';
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,7 +10,7 @@ import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import * as core from '../../../packages/core/src/index.ts';
 import * as pi from '../../../packages/runtime-pi/src/index.ts';
 import { canonicalResourceManifest, EMPTY_RESOURCE_SELECTION, ResourceManifestSchema, ResourceRefSchema, FrozenResourcesSchema, ok } from '../../../packages/contracts/src/index.ts';
-import type { ResourceDependency, ResourceSelection, ToolDefinition, AgentRunEvent, RunScope } from '../../../packages/contracts/src/index.ts';
+import type { ResourceDependency, ResourceSelection, ToolDefinition, AgentRunEvent, RunScope, Result } from '../../../packages/contracts/src/index.ts';
 import { mkdtempSync, createHttpProvider, deferCleanup } from '../../support/resources.ts';
 
 const tools = ['read', 'read_invoice_evidence', 'check_invoice_sources', 'normalize_invoice_values', 'validate_invoice_candidate'];
@@ -18,7 +19,7 @@ function fixture() {
   const resourceRoot = join(root, 'author'), bundleRoot = join(root, 'bundles');
   mkdirSync(resourceRoot);
   const storagePaths = resolveProductPaths(join(root, 'storage')); if (!storagePaths.ok) throw new Error(storagePaths.error.code);
-  const storage = core.openDatabase(storagePaths.data); if (!storage.ok) throw new Error(storage.error.code);
+  const storage = openTestDatabase(storagePaths.data); if (!storage.ok) throw new Error(storage.error.code);
   deferCleanup(() => storage.data.close()); const contents = storage.data.contents;
   function pack(kind: 'prompt' | 'skill', id = 'invoice', version = 'v1', body?: string, requires: ResourceDependency[] = []) {
     const dir = join(resourceRoot, kind === 'prompt' ? 'prompts' : 'skills', id);
@@ -40,10 +41,81 @@ function fixture() {
     expect(typeof inspect).toBe('function'); expect(typeof create).toBe('function');
     return create({ resourceRoot, bundleRoot, contents, registeredToolNames: tools, inspectNativeResources: inspect });
   };
-  return { root, resourceRoot, bundleRoot, pack, service, inspect, contents };
+  return { root, resourceRoot, bundleRoot, pack, service, inspect, contents, storage: storage.data };
 }
 
 describe('P11 real resource files and native discovery', () => {
+  it('constructs without root contents and requires explicit current originals for nonempty resource operations', async () => {
+    const f = fixture(), skill = f.pack('skill'), selection = { prompt: null, enabledSkills: [skill.ref] };
+    const hub = core.createResourceService({ resourceRoot: f.resourceRoot, bundleRoot: f.bundleRoot,
+      registeredToolNames: tools, inspectNativeResources: pi.inspectNativeResources });
+    expect(hub.catalog({ revision: 1, selection })).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
+    expect(hub.freeze({ selection: EMPTY_RESOURCE_SELECTION, settingsRevision: 1, activeToolNames: tools, requiredSkill: null }))
+      .toEqual({ ok: true, data: null });
+    const frozen = await f.storage.read(scope => hub.freeze({ selection, settingsRevision: 1,
+      activeToolNames: tools, requiredSkill: skill.ref }, scope.contents));
+    if (!frozen.ok || !frozen.data) throw Error('The explicit current contents did not freeze the bundle.');
+    const fixed = frozen.data;
+    expect(hub.verifyFrozen(fixed)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
+    expect(await f.storage.read(scope => hub.verifyFrozen(fixed, scope.contents))).toEqual({ ok: true, data: undefined });
+    expect(await f.storage.read(scope => hub.readFrozenFile(fixed, { ref: skill.ref, path: 'SKILL.md' }, scope.contents)))
+      .toMatchObject({ ok: true, data: { text: skill.bodyText } });
+  });
+  for (const operation of ['validate', 'author', 'frozen'] as const) {
+    it(`uses current owner contents for ${operation} resource queries after the default scope expires`, async () => {
+      const f = fixture(), skill = f.pack('skill');
+      const selection = { prompt: null, enabledSkills: [skill.ref] };
+      const hub = await f.storage.read(scope => core.createResourceService({ resourceRoot: f.resourceRoot,
+        bundleRoot: f.bundleRoot, contents: scope.contents, registeredToolNames: tools, inspectNativeResources: pi.inspectNativeResources }));
+      const frozen = await f.storage.read(scope => hub.freeze({ selection, settingsRevision: 1,
+        activeToolNames: tools, requiredSkill: skill.ref }, scope.contents));
+      if (!frozen.ok || !frozen.data) throw new Error('Expected an owned resource bundle.');
+      const fixed = frozen.data, file = { ref: skill.ref, path: 'SKILL.md' };
+      const result = await f.storage.read((scope): Result<unknown> => operation === 'validate'
+        ? hub.validateSelection(selection, [], scope.contents)
+        : operation === 'author' ? hub.readFile(file, selection, [], scope.contents)
+          : hub.readFrozenFile(fixed, file, scope.contents));
+      expect(result.ok).toBe(true);
+      if (operation !== 'validate') expect(result).toMatchObject({ ok: true, data: { text: expect.stringContaining('发票字段整理') } });
+    });
+  }
+  it('uses current SQL contents for admission and reuses its frozen combination after default contents expire', async () => {
+    const f = fixture(), prompt = f.pack('prompt'), skill = f.pack('skill');
+    const selection = { prompt: prompt.ref, enabledSkills: [skill.ref] };
+    const hub = await f.storage.read(scope => core.createResourceService({ resourceRoot: f.resourceRoot, bundleRoot: f.bundleRoot,
+      contents: scope.contents, registeredToolNames: tools, inspectNativeResources: pi.inspectNativeResources }));
+    const catalog = await f.storage.read(scope => hub.catalog({ revision: 1, selection }, scope.contents));
+    expect(catalog).toMatchObject({ ok: true, data: { diagnostics: [], items: [
+      { ref: prompt.ref, available: true }, { ref: skill.ref, available: true },
+    ] } });
+    const rows = () => f.storage.read(scope => scope.db.query('SELECT owner_kind,owner_id,relative_path,content FROM managed_file_contents ORDER BY owner_kind,owner_id,relative_path').all());
+    expect(await rows()).toHaveLength(6);
+    const freeze = (revision: number) => f.storage.read(scope => {
+      const result = hub.freeze({ selection, settingsRevision: revision, activeToolNames: tools, requiredSkill: skill.ref }, scope.contents);
+      expect(scope.db.inTransaction).toBe(false);
+      return result;
+    });
+    const first = await freeze(1);
+    expect(first.ok && first.data).toBeTruthy(); if (!first.ok || !first.data) throw new Error('Expected the first scoped bundle.');
+    const before = await rows(); expect(before).toHaveLength(13);
+    const path = join(first.data.bundleDirectory, 'bundle.json'), original = readFileSync(path);
+    const second = await freeze(2);
+    expect(second.ok && second.data).toBeTruthy(); if (!second.ok || !second.data) throw new Error('Expected the reused scoped bundle.');
+    expect(second.data.bundleId).toBe(first.data.bundleId);
+    expect(second.data.settingsRevision).toBe(2);
+    expect(readFileSync(path)).toEqual(original);
+    expect(await rows()).toEqual(before);
+    const frozen = second.data;
+    expect(await f.storage.read(scope => hub.verifyFrozen(frozen, scope.contents))).toEqual(ok(undefined));
+    expect(hub.verifyFrozen(frozen)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
+    const changed = Buffer.from(original); changed[changed.length - 1] = changed[changed.length - 1] === 32 ? 10 : 32;
+    writeFileSync(path, changed);
+    expect(await f.storage.read(scope => hub.verifyFrozen(frozen, scope.contents)))
+      .toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
+    expect(await freeze(3)).toMatchObject({ ok: false, error: { code: 'resource_bundle_unavailable' } });
+    expect(await rows()).toEqual(before);
+  });
+
   it('freezes a readiness index and injects scope-specific missing dependencies without exposing excluded bodies', () => {
     const f = fixture(), ready = f.pack('skill', 'ready', 'v1', undefined, [{ kind: 'tool', name: 'read' }]),
       missing = f.pack('skill', 'missing', 'v1', undefined, [{ kind: 'tool', name: 'write' }]);
@@ -79,6 +151,7 @@ describe('P11 real resource files and native discovery', () => {
       bundleDirectory: frozen.data.bundleDirectory, activeToolNames: ['read'] })).toMatchObject({ ok: false,
       error: { code: 'resource_bundle_unavailable' } });
   });
+  // Observe the existing 30s Run budget and cleanup; cancellation still must finish within 3s.
   it.each(['invoice-party-role-review', 'invoice-date-currency-review', 'invoice-line-calculation-review', 'invoice-candidate-issue-triage', 'invoice-review-handoff', 'all-five', 'all-five-budget', 'all-five-cancel'])
     ('delivers the new invoice Skill index and frozen files through the real Provider and dedicated tools: %s', async id => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-five-skill-run-'));
@@ -115,7 +188,7 @@ describe('P11 real resource files and native discovery', () => {
     let selection: ResourceSelection = EMPTY_RESOURCE_SELECTION;
     const created = await createApplication({ paths: paths.data, invoiceSourceRoot: sourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection }),
-      agentFactory: (tools, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
+      agentFactory: tools => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-sken-key' }) });
     if (!created.ok) throw new Error(created.error.code); const app = created.data; deferCleanup(() => app.close());
     const catalog = await app.listResources(); if (!catalog.ok) throw new Error(catalog.error.code);
@@ -176,7 +249,7 @@ describe('P11 real resource files and native discovery', () => {
     const run = await app.queryRun(accepted.data.runId); if (!run.ok || run.data.kind !== 'agent' || !('allowedTools' in run.data.scope)) throw new Error('Missing owned invoice Run');
     expect(run.data.scope.allowedTools).toContain('read_skill_resource');
     expect(view.data.frozen?.discoveredSkills.map(ref => ref.id).sort()).toEqual([...ids].sort());
-  });
+  }, 45000);
 
   it('loads the shipped seventeen flat Skills with real SDK metadata and excludes write-dependent SOPs from READ and Fill scopes', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-shipped-skills-'));
@@ -193,7 +266,7 @@ describe('P11 real resource files and native discovery', () => {
     for (const skill of skills) expect(skill).toMatchObject({ available: true, enabled: false, diagnostics: [],
       bodyFile: 'SKILL.md', disableModelInvocation: skill.ref.id === 'invoice-candidate-save' });
     await created.data.close();
-    const storage = core.openDatabase(paths.data); if (!storage.ok) throw new Error(storage.error.code);
+    const storage = openTestDatabase(paths.data); if (!storage.ok) throw new Error(storage.error.code);
     deferCleanup(() => storage.data.close());
     const service = core.createResourceService({ contents: storage.data.contents, resourceRoot: join(import.meta.dir, '../../../resources'),
       bundleRoot: join(root, 'library-bundles'), registeredToolNames: definitions.map(tool => tool.name), inspectNativeResources: pi.inspectNativeResources });
@@ -256,7 +329,7 @@ describe('P11 real resource files and native discovery', () => {
     const created = await createApplication({ paths: paths.data, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
       toolDefinitions: tools => { definitions = tools; return tools; },
-      agentFactory: (tools, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
+      agentFactory: tools => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'owned-skill-key' }) });
     if (!created.ok) throw new Error(created.error.code); const app = created.data;
     deferCleanup(async () => { release(); await app.close(); });
@@ -491,7 +564,7 @@ describe('P11 real resource files and native discovery', () => {
     deferCleanup(() => provider.stop());
     const created = await createApplication({ paths: paths.data, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision, selection }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: paths.data.runtimeDir, agentDir: paths.data.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-p11-key' }) });
     if (!created.ok) throw new Error(created.error.code);
     const app = created.data; deferCleanup(() => app.close());

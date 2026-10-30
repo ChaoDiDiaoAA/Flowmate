@@ -69,7 +69,7 @@ for(const scenario of ['success','still-fails','no-budget','extra-recovery','une
 },45000);
 
 for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel','commit-unknown'] as const) for (const committed of [true, false]) test(mode+', actual commit=' + committed, async () => {
-    const loss=mode==='loss',race=mode!=='loss'&&mode!=='replay';let cancelRequests=0,dropped=false;
+    const loss=mode==='loss',race=mode!=='loss'&&mode!=='replay';let cancelRequests=0,dropped=false,evidenceConflicts=0;
     const root = mkdtempSync(join(tmpdir(), 'eval-original-save-')), sample = 'synthetic-replay', text = 'Invoice SYN-REPLAY-1';
     mkdirSync(join(root, 'materials', sample), { recursive: true }); writeFileSync(join(root, 'materials', sample, 'source.md'), text);
     const  profile = { id: race?'invoice-save-cancel-race' as const:loss?'invoice-save-delivery-loss' as const:'invoice-save-replay' as const, version: 1 as const };
@@ -108,6 +108,9 @@ for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel'
     const spy = spyOn(HostClient.prototype, 'request').mockImplementation(function (this: HostClient, command, timeout) {
         if (command.type === 'replay_invoice_save') { owner = this; replayInput = structuredClone(command.input); }
         if(race&&command.type==='cancel_run')cancelRequests++;
+        if(mode==='replay'&&committed&&!evidenceConflicts&&command.type==='query_run_tool_evidence'&&command.input.expectedRevision!==undefined){
+            evidenceConflicts++;return Promise.resolve({ok:false,error:{code:'state_conflict',category:'runtime',message:'Original evidence changed during paging.',retryable:true}});
+        }
         if(mode==='commit-unknown'&&cancelRequests&&!dropped&&command.type==='query_run_tool_evidence'){
             dropped=true;return Promise.reject(new Error('Original commit query transport unavailable'));
         }
@@ -135,8 +138,13 @@ for(const mode of ['replay','loss','cancel-before-commit','commit-before-cancel'
         let result;
         try { result = await session.execute(new AbortController().signal); }
         catch(error) { if(committed&&!loss)throw error; expect(String(error)).toContain('Run did not complete: failed'); result=await session.snapshot(); }
+        if (loss && committed) expect(structuredClone(result.evidence['tool-evidence']?.actual)).toMatchObject({ calls: expect.arrayContaining([
+            expect.objectContaining({ tool: expect.objectContaining({ toolName: 'save_invoice_candidate', status: 'succeeded',
+                delivery: expect.objectContaining({ state: 'failed', error: expect.objectContaining({ message: 'Committed candidate model delivery failed.' }) }) }) }),
+        ]) });
         expect(result.evidence['case-controller']).toMatchObject({ present: true, actual: { exposure: { verified: committed }, ...(race?{cancelRequests:committed?1:0,...(committed?{linearization:mode,stopConfirmed:true,candidateCount:mode==='commit-unknown'?null:mode==='cancel-before-commit'?0:1}:{})}:loss?{recovery:{attempts:committed?1:0,reexecuted:false}}:{replay: { resends: committed ? 1 : 0 }}) } });
         expect(JSON.stringify(requests).includes(control.privateMarker)).toBe(false);
+        expect(evidenceConflicts).toBe(mode==='replay'&&committed?1:0);
         expect(requests).toHaveLength(committed&&loss?4:committed&&!race ? 3 : 2);
         if (committed) {
             expect(result.evidence.invoice).toMatchObject({ actual: { candidates: mode==='cancel-before-commit'?[]:[{ candidateId: 1, sequence: 1, fields: { invoiceNumber: { raw: 'SYN-REPLAY-1' } } }] } });

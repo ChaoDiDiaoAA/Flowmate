@@ -244,7 +244,7 @@ async function createTempWorkspace() {
   return { root, cwd, agentDir };
 }
 
-describe('Pi 0.85.1 AgentSession contract', () => {
+describe('Pi 1.4.0 AgentSession contract', () => {
   it('clones an empty-extension context before conversion and exposes the controlled identity transform', async () => {
     const originalFetch = globalThis.fetch;
     const harness = makeFetchHarness(); Reflect.set(globalThis, 'fetch', harness.fetch);
@@ -295,7 +295,8 @@ describe('Pi 0.85.1 AgentSession contract', () => {
         }
       });
       await session.prompt('Native reference probe.', { expandPromptTemplates: false });
-      expect(observations).toEqual([{ role: 'user', endedBeforePersist: true }, { role: 'assistant', endedBeforePersist: true }]);
+      expect(observations).toEqual([{ role: 'system', endedBeforePersist: true },
+        { role: 'user', endedBeforePersist: true }, { role: 'assistant', endedBeforePersist: true }]);
       await session.sendCustomMessage({ customType: 'sdk-order-probe', content: 'SDK fixture only.', display: false, details: {} });
       expect(observations.at(-1)).toEqual({ role: 'custom', endedBeforePersist: false });
       expect(harness.requests).toHaveLength(1);
@@ -318,11 +319,11 @@ describe('Pi 0.85.1 AgentSession contract', () => {
       'index.js',
     );
 
-    expect(rootPackage.dependencies['@earendil-works/pi-coding-agent']).toBe('0.85.1');
-    expect(rootPackage.dependencies['@earendil-works/pi-ai']).toBe('0.85.1');
-    expect(findPackageVersion(codingAgentEntry, '@earendil-works/pi-coding-agent')).toBe('0.85.1');
-    expect(findPackageVersion(aiEntry, '@earendil-works/pi-ai')).toBe('0.85.1');
-    expect(findPackageVersion(coreEntry, '@earendil-works/pi-agent-core')).toBe('0.85.1');
+    expect(rootPackage.dependencies['@earendil-works/pi-coding-agent']).toBe('1.4.0');
+    expect(rootPackage.dependencies['@earendil-works/pi-ai']).toBe('1.4.0');
+    expect(findPackageVersion(codingAgentEntry, '@earendil-works/pi-coding-agent')).toBe('1.4.0');
+    expect(findPackageVersion(aiEntry, '@earendil-works/pi-ai')).toBe('1.4.0');
+    expect(findPackageVersion(coreEntry, '@earendil-works/pi-agent-core')).toBe('1.4.0');
     expect(typeof createAgentSession).toBe('function');
   });
 
@@ -445,7 +446,7 @@ describe('Pi 0.85.1 AgentSession contract', () => {
       releaseFirstParallel.resolve();
       await agentEndStarted.promise;
       expect(executionEnds.map((entry) => [entry.callId, entry.isError])).toEqual([
-        ['parallel-2', false], ['parallel-1', false],
+        ['parallel-2', true], ['parallel-1', true],
       ]);
       expect(resultMessageOrder).toEqual(['parallel-1', 'parallel-2']);
       expect(executionEnds.every((entry) => entry.text.startsWith('prepared:'))).toBe(true);
@@ -474,6 +475,8 @@ describe('Pi 0.85.1 AgentSession contract', () => {
       expect(executionEnds.at(-1)).toMatchObject({ callId: 'native-error', isError: true, text: 'controlled-safe-failure' });
       expect(harness.requests).toHaveLength(6);
     } finally {
+      releaseFirstParallel.resolve(); releaseSecondParallel.resolve();
+      releaseMixedRead.resolve(); releaseMixedWrite.resolve(); releaseAgentEnd.resolve();
       if (session && !session.isIdle) await session.abort();
       session?.dispose();
       Reflect.set(globalThis, 'fetch', originalFetch);

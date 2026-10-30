@@ -192,3 +192,26 @@ test('the startup snapshot reads only the Agent key for a deterministic selectio
     expect(reads).toEqual(['a'.repeat(32), 'b'.repeat(32)]);
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
+
+test('native Judge saves without a key and startup reads only the Agent credential', async () => {
+  const f = await fixture(true);
+  const native = { provider: 'codex-cli', executable: 'codex', model: 'gpt-6.1-terra', reasoningEffort: 'medium', timeoutMs: 180000 };
+  try {
+    const saved = await save({ expectedRevision: 1, role: 'judge', connection: native }, f.ports);
+    expect(saved).toMatchObject({ ok: true, data: { evaluation: { judge: native } } });
+    if (!saved.ok) throw Error('Native Judge did not save');
+    expect(saved.data.evaluation!.judge).not.toHaveProperty('credentialRef');
+    expect(await f.ports.credentialStore('b'.repeat(32)).status()).toBe('missing');
+    const reads: string[] = [];
+    const store: Ports['credentialStore'] = reference => ({ ...f.ports.credentialStore(reference), read: () => {
+      reads.push(reference); return f.ports.credentialStore(reference).read();
+    } });
+    const snapshot = await implementation.evaluationConfigurationSnapshot(saved.data, store);
+    expect(snapshot.credentials.judge).toBe('configured');
+    expect(await implementation.prepareEvaluationCredentials({ settings: snapshot, plan: { judgeMaxGenerations: 1, judgeRequired: true } }, saved.data, store))
+      .toMatchObject({ ok: true, data: { credentials: { agent: 'synthetic-original-agent-key', judge: null } } });
+    expect(reads).toEqual(['a'.repeat(32)]);
+    expect(await save({ expectedRevision: 2, role: 'judge', connection: native, apiKey: 'inapplicable-key' }, f.ports))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});

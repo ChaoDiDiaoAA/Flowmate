@@ -1,121 +1,176 @@
 # Flowmate Agent 评测
 
-评测数据及保存产物无哈希，公开版本固定为 v1。已有真实运行记录保留；本次 Smoke 修复与 Badcase 工程修订只做数据、工程和受控验证，不追加真实 Agent／Judge、校准或平台上传。质量结论以对应 Execution 的实际条件和证据为准。
+[评测指南](../docs/public/EVALUATION.zh-CN.md) · [基准制作](../docs/public/EVALUATION-BENCHMARK.zh-CN.md) · [Langfuse 评测与问题定位操作指南](Langfuse评测与问题定位操作指南.md) · [源码职责](src/README.md)
 
-## 填写配置
+通过隔离本机 Host 执行真实产品任务，将原始执行、业务交付、质量评分和回归比较保存在同一次 Run 中。Langfuse 用于观察实际模型、工具、子 Agent 和评分；本地保存的原始证据用于复核比较与 Gate。
 
-唯一配置为 agent-eval/configs/.env，保存评测专用 Agent、Judge 和 Langfuse；文件忽略提交，不另建模板。首次使用时按下面内容创建：
+## 两个运行入口
+
+在仓库根目录执行。两个命令都实际调用被测模型和适用的独立 Judge，并上传、回读 Langfuse，可能产生模型费用：
+
+```powershell
+bun --no-env-file run eval:smoke
+bun --no-env-file run eval:full
+```
+
+| 入口 | Case 选集 | 模型与重复 | 被测 Trial 数 |
+|---|---|---|---|
+| Smoke | 7 题：业务 5、研究 2 | Sol 对照与 Luna 候选，各题各 1 次 | 14 |
+| Full | 原始 62 题：业务 50、研究 12 | 同上 | 124 |
+
+Smoke 的 Case ID 为 **FM-001、FM-002、FM-027、FM-033、FM-046、FM-051、FM-055**。完整执行两个入口共 **138 个被测 Trial**，不另加 canary。Judge 与挖掘调用不计入被测 Trial 数；没有适用语义项的 Trial 无需 Judge。
+
+两个入口按顺序完成：预检 → 真实执行 → 确定性检查及适用语义项的一次合并 Judge → 本地原始证据保存 → Langfuse 上传与回读 → 失败诊断 → 双模型比较 → 对应选集的 Baseline/Gate → 人类可读 README。预检先检查数据、配置、角色可用性和平台连接；预检通过不代表模型质量通过。
+
+质量 FAIL 是有效测量结果。执行与采证完整而质量失败，仍可完成比较与 Gate；缺失结果、评分故障、不可比条件或必要回读缺口须明确报告。不要为了得到全 PASS 重跑并覆盖失败。每题一次只能比较本轮观测，不能证明稳定性。
+
+普通 `eval -- run` 仍为单模型执行；不要用它的默认值推断上述两个双模型入口的行为。只补处理已有 Run 的上传时使用：
+
+```powershell
+bun --no-env-file run eval:upload -- --run-id <RunId>
+```
+
+此操作读取已存证据，不生成新的被测 Trial。上传结果未知时先回读原操作，不能盲目重发。
+
+## 模型与私有配置
+
+评测配置文件为被 Git 忽略的 `agent-eval/configs/.env`；同名系统环境变量优先。`--no-env-file` 避免 Bun 自动加载仓库根目录的环境文件，评测自身按约定读取专用配置。不要在公开 JSON、报告、截图或命令输出中保存密钥。
+
+| 职责 | 连接与模型 | 强度 |
+|---|---|---|
+| 双模型对照 | 现有本地网关，`gpt-6.1-sol`、`openai-completions` | `max` |
+| 双模型候选 | 现有本机网关 `http://127.0.0.1:8767/v1`，`openai-completions`、`gpt-6-luna` | `max` |
+| 独立 Judge | 现有本地 HTTP 网关，`gpt-6.1-terra` | `max` |
+| 候选挖掘 | 原生 Codex CLI，`gpt-6-luna` | `max` |
+| 候选真实重放 | 与被测候选相同的现有 Luna 网关 | `max` |
+
+Judge 使用现有网关 `http://127.0.0.1:8767/v1`；挖掘复用原生 Codex ChatGPT 登录及 `FLOWMATE_CODEX_EXECUTABLE`。原生可执行文件不用于 Judge，不修改全局 Codex 配置。挖掘、候选重放和正式发布由明确操作触发，Smoke/Full 不自动执行这些操作。
+
+下面仅为字段示例，空值需填入已有实际配置；不表示连接已验证：
 
 ```dotenv
-# 必填：评测专用 Flowmate Agent 接口根地址，保留服务要求的路径
-FLOWMATE_EVAL_AGENT_BASE_URL=
-# 必填：评测专用主模型密钥，不读取通用或桌面凭据
-FLOWMATE_EVAL_AGENT_API_KEY=
-# 必填：实际执行 Case、决定工具调用和生成回答的主模型名称
-FLOWMATE_EVAL_AGENT_MODEL=
-# 可选：接口协议，默认 openai-completions
-# 支持 openai-completions、openai-responses、anthropic-messages、google-generative-ai
+FLOWMATE_EVAL_AGENT_BASE_URL=http://127.0.0.1:8767/v1
+FLOWMATE_EVAL_AGENT_MODEL=gpt-6-luna
 FLOWMATE_EVAL_AGENT_API=openai-completions
-# 可选：与主模型相同的接口协议，默认 openai-completions
-# 旧 FLOWMATE_JUDGE_PROVIDER=anthropic / openai-compatible 在未设置 API 时仍兼容
+FLOWMATE_EVAL_AGENT_REASONING_EFFORT=max
+
+# 仅用于双模型对照，不改变默认 Luna Agent
+FLOWMATE_EVAL_CONTROL_MODEL=gpt-6.1-sol
+FLOWMATE_EVAL_CONTROL_API=openai-completions
+FLOWMATE_EVAL_CONTROL_BASE_URL=http://127.0.0.1:8767/v1
+FLOWMATE_EVAL_CONTROL_REASONING_EFFORT=max
+
+FLOWMATE_JUDGE_PROVIDER=openai-compatible
 FLOWMATE_JUDGE_API=openai-completions
-# 使用 Judge 评分时必填：服务接口地址
-FLOWMATE_JUDGE_BASE_URL=
-# 使用 Judge 评分时必填：评分模型名称
-FLOWMATE_JUDGE_MODEL=
-# 使用 Judge 评分时必填：独立评分密钥，不继承 Agent 密钥
-FLOWMATE_JUDGE_API_KEY=
-# 可选：请求超时，单位毫秒，默认 180000
+FLOWMATE_JUDGE_BASE_URL=http://127.0.0.1:8767/v1
+FLOWMATE_JUDGE_MODEL=gpt-6.1-terra
+FLOWMATE_JUDGE_REASONING_EFFORT=max
 FLOWMATE_JUDGE_TIMEOUT_MS=180000
-# 显式平台操作时必填：Langfuse 地址及项目凭据
+
+FLOWMATE_MINING_PROVIDER=codex-cli
+FLOWMATE_MINING_MODEL=gpt-6-luna
+FLOWMATE_MINING_REASONING_EFFORT=max
+FLOWMATE_MINING_TIMEOUT_MS=180000
+FLOWMATE_CODEX_EXECUTABLE=codex
+
 LANGFUSE_BASE_URL=
 LANGFUSE_PUBLIC_KEY=
 LANGFUSE_SECRET_KEY=
 ```
 
-主模型 URL／Key／Model 只用于评测隔离 Host，CLI 的 --model／--api／--base-url 可临时覆盖；同名系统环境变量优先于文件。桌面设置、根目录 .env 和通用模型凭据不参与。DeepSeek 的 /anthropic 地址须配 anthropic-messages；OpenAI 格式地址配 openai-completions。
+Sol、Luna 和 Terra 共用已有本地网关，分别承担对照、候选和评分角色；使用现有本机登录，不向网关转发旧外部服务凭据。报告分别记录请求配置、实际返回的模型信息和已知传输限制；未报告的内部重试、费用或用量保持未知。
 
-原生模型能力优先从 Pi SDK 精确匹配，未收录的 DeepSeek 从官方模型元数据读取并固定，不猜测容量或另设 Token／温度额度。Judge 独立配置，Anthropic 必填输出字段使用服务声明的原生能力。主模型、Judge 和平台密钥不交叉使用，不进入报告或日志。
-
-## 校验数据
-
-```bash
-bun run eval -- dataset validate --dir agent-eval/src/datasets
-bun run eval -- doctor --backend local
-```
-
-数据校验无需凭据。doctor 检查配置、数据和本机运行环境，必要时只读模型元数据，不生成回答或评分；未就绪返回非零状态。基线三个 TS 数据文件、附加专项、场景和 Fixture 的详细制作约定见[公开评测指南](../docs/public/EVALUATION.zh-CN.md)。本地Agent评测由CLI启动独立本机Host，不需要Docker或镜像。
-
-## 执行评测
-
-工程 E2E 使用测试环境和模拟模型，不读取真实评测凭据：
-
-```bash
-bun run test:e2e
-```
-
-以下命令会调用真实 Agent 和 Judge，有实际模型费用；本次工程修订不追加执行：
-
-```bash
-bun run eval:smoke
-bun run eval:full
-```
-
-Smoke 共14题（业务10＋研究4），Full 共62题（业务50＋研究12）。按业务→研究顺序执行，每题默认一次，两组各保存一个 Execution／报告，并输出对应 ID 和路径。普通失败继续执行；取消或停止未确认则阻断后续 Trial 和下一组。退出码0表示必要自动评分通过，1表示失败／错误／执行不完整，2表示必要评分待判，人工验收独立。
-
-Judge按Case的适用语义判据调用，不按Case数量强制调用。FM-028的精确号码、零工具、无Skill及无写入由本地检查判定，不生成语义计划，也不读取或准备Judge配置；其他61题各保留与原目标对应的语义判据，满足触发及证据条件后最多合并一次生成。FM-006的明细字段本地核验，但独立原行来源仍保留Judge。`--judge required`只要求选集中适用的必要语义评分可执行；纯确定性单题无需Judge凭据。`--judge off`保留必要语义项未测，不据此判通过。
-
-终端默认显示全局题目序号、Case ID、环境准备／Agent执行／停止清理／评分／保存阶段。阶段开始以 `▶` 标记，使用单调时钟每60秒以 `⏳` 提示当前阶段及累计等待时间（60秒、120秒等）；切换阶段重新计时，结束后停止提示。60秒仅控制日志频率，不改变任务或 Judge 超时。
-
-Agent结束后显示 `✅ Agent执行成功` 或 `❌ Agent执行失败`，超时、取消、未启动分别以 `⚠`、`⏹`、`⏭` 标明；Run completed、业务终点和质量通过分别核验。评分结束后显示 `✅ 通过（PASS）`、`❌ 失败（FAIL）`、`❌ 错误（ERROR）`、`⚠ 未判定（UNJUDGEABLE）` 或 `⏭ 未运行（NOT_RUN）`，并保留原因；业务 FAIL 同时有 Judge ERROR 时追加简短异常，详细 Schema／原响应保存在报告。每题保存成功后以 `💾` 显示状态、耗时和 `evidence/<trial-id>/`，业务组结束立即显示报告路径。进度写入 stderr；run／Smoke／Full结束不自动打印整段JSON，完整结果保存到report.json，显式status可查看。
-
-## 查看或上传结果
-
-```bash
-bun run eval -- status --execution-id <ID>
-bun run eval:upload -- --execution-id <ID>
-```
-
-Smoke／Full 始终本地执行，填写 Langfuse 配置不会触发上传。两组结果按各自 ID 单独上传；重复上传命令只补传已有结果，不重跑 Agent 或 Judge。兼容维护入口 resend --report <绝对路径>，与 --execution-id 二选一。
-
-新 Execution 根据 Dataset 声明全集保存到 `agent-eval/runs/business/<execution-id>/`、`research/<execution-id>/` 或 `mixed/<execution-id>/`；Smoke／单题选集不改变归属。目录包含 snapshot.json、report.json、逐Trial evidence 和派生 badcases.json／badcases.md。artifacts/、review.json 和 export.json 只在有实际业务产物、真实反馈或导出尝试时保存；校准在 `runs/calibration/<id>/summary.json` 及同目录 Badcase 文件，Case 审核在 `runs/case-reviews/review.json`。
-
-查看、比较、补传、审核和平台入口共享按 ID 查找，兼容旧 `runs/<execution-id>/` 与 `calibration-runs/<id>/`；同 ID 多处存在明确报冲突，不选最新或静默合并。既有两个 Execution 迁移完整目录，保留原始记录、ID、参数和分数，不重跑或重评。完整目录见[公开评测指南](../docs/public/EVALUATION.zh-CN.md#reports)，文件职责与生成条件见[公开评测指南](../docs/public/EVALUATION.zh-CN.md#reports)。
-
-`evidence/` 下每个 Trial 都有独立子目录，多个 Case 和重复尝试不会平铺或共用证据文件。取消、停止不明或运行异常时，终端显示原因及已有报告位置；仍在等待、单题已保存或已有目录均不表示整批评测通过。用 `status` 核对执行与评分状态；`pending` 表示尚未完成评分。
-
-trial 保存实际 InitialInput／附件与后续输入；events.jsonl 保留运行事件和 Run spans，详细工具参数、结果及关联以 observation.json 为准。原候选按本题模型、目标 Run 及成功提交回执核验，UI 当前选择、人工修改／接受独立记录；不能用人工最终结果代替原模型成果。
-
-Badcase 是报告层自动派生的 `flowmate-badcase-index/v1` 复核候选，与原分数和真实反馈独立。已发生 Trial 的 FAIL／ERROR／UNJUDGEABLE 和评分异常进入候选，计划未启动的 NOT_RUN 排除；有证据的 PASS 异常、恢复后通过、人工分歧和比较退步可补充候选。索引保存失败警告不改原判定；`status` 从原报告／证据只读重建候选视图，零模型／平台调用、不回写文件，索引不自动上传 Langfuse。实际归因与修复范围记 `agent-eval/records/<batch>/issues.md`，reruns.csv／exposure.csv 仅在对应真实事件后创建。
-
-**Smoke后如何执行专项：** badcases.json／md是待核验索引，不是可运行数据集。用户或Agent核验任务、Gold、评分器和证据后编辑专项声明，离线校验→必要Judge校准→单题→完整专项→显式重复→基线Smoke；不增加命令，也不自动付费执行。专项结果按新Execution保存到runs/business或research，由报告dataset.id及regressionOrigins关联原失败；完整分阶段命令、停止条件和方法引用见[公开评测指南](../docs/public/EVALUATION.zh-CN.md#regressions)。
-
-附加专项集由 `src/datasets/badcase/` 维护Case／Gold／Review引用及来源关联，不追加到默认Full62／Smoke14或`--dataset all`。当前业务专项 `flowmate-badcase-business-v1` 收录FM-045，研究专项 `flowmate-badcase-research-v1` 收录FM-051；FM-020／024因任务要求与通用完整字段／明细判据有范围歧义暂缓，原Case和旧分数不改。首批为工程核验，不代表独立真人认可或真实复测成功。
+可单独执行不生成任务答案的检查：
 
 ```powershell
-bun --no-env-file run eval -- dataset validate --dir agent-eval/src/datasets/badcase
-# 后续真实验证显式运行，业务／研究分别产生新的Execution：
-bun --no-env-file run eval -- run --dataset flowmate-badcase-business-v1 --selection full --judge required --backend local
-bun --no-env-file run eval -- run --dataset flowmate-badcase-research-v1 --selection full --case FM-051 --judge required --backend local
+bun --no-env-file run eval -- dataset validate --dir agent-eval/src/datasets
+bun --no-env-file run eval -- doctor --backend local
 ```
 
-专项仅支持full或单题，拒绝smoke／holdout；空专项在创建Execution前报“暂无可运行成员”。新Trial的`partition:badcase`、`regressionOrigins`和`executionKind`用于质量侧追溯，不进入Agent输入。`status`的`regressions`视图核对收录和实际reruns；受控尝试标记controlled，不能计作真实稳定效果。报告完成保存后，实际启动的专项Trial才登记来源批次reruns.csv；幂等登记，失败独立告警，不改原成绩。稳定证据还须匹配来源Case身份／版本和目标指标集合；status保留实际metricIds及matchesCurrentTarget，目标改变后的旧尝试不计当前稳定。稳定验证另行显式`--trials 3`，全部尝试／必要判据及目标指标通过且无评分故障，CSV与保存事实一致才认可；不是自动重试。已有业务失败、工程修复、收录和真实效果分别维护，专项不宣称独立holdout或总体发生率。
+## 保存位置
 
-Judge通过Pi SDK provider生成评分。Judge 复用现有 Pi SDK ModelRuntime.completeSimple、模型目录和原生能力解析；模型、凭据与主 Agent 独立，不装配业务工具。FLOWMATE_JUDGE_API 显式优先，未设置时兼容旧 PROVIDER 的 anthropic／openai-compatible 映射，均未设置时默认 openai-completions。默认及本次采用的超时为180000毫秒，可显式覆盖；取消有效，SDK 自动生成重试关闭，每 Trial 最多一次生成。
+每次双模型运行使用上海时间命名一个目录：
 
-### 2026-10-14 Smoke 评分协议修订
+```text
+agent-eval/
+  runs/
+    Run-<Shanghai date_time>-smoke-compare-01/
+      README.md
+      run.json
+      materials/                 # 仅确有二进制材料时创建
+    Run-<Shanghai date_time>-full-compare-01/
+      README.md
+      run.json
+  baselines.json                 # Baseline 集合
+  feedback.json                  # 首次真实人工反馈后创建
+  traces/
+    Trace-<date>-<entry>-<purpose>-01.json
+  src/datasets/
+    cases.ts
+    gold.ts
+    review.ts
+    gold-candidates/
+      Gold-<date>-<purpose>-01.json
+    bad-candidates/
+      Bad-<date>-<purpose>-01.json
+    regression-candidates/
+      Regression-<date>-<purpose>-01.json
+    published/
+      Benchmark-<name>/
+        Version-001-<date>/
+          benchmark.json
+          materials/             # 必要二进制材料
+```
 
-新生成沿业务／研究固定模板返回按指标 ID 组织的 JSON：results 各项含 metricId、counts（numerator／denominator／unassessable）及 failures（opportunityIndex／code）；研究比例由 atoms／links／chains 见证在本地计算。只接受完整 JSON 或一个完整 Markdown 围栏包住的 JSON，不从解释文字中截取对象、不修补错误计数。分母、范围、来源和计数逐项严格校验；单项缺项／重复／计数错误只影响该项，研究见证错误只影响依赖项；根结构不可识别或未知指标身份使本次 Judge 无效。每 Trial 最多一次生成；旧 r/f、packed 及 HTTP 按原格式和提示身份只读解释。
+以上是布局约定，候选、反馈和发布目录只在真实操作发生时产生，不预填草稿。
 
-数值评分复用仓库精确十进制工具，比较合法规范值，1 与 1.00 等价；字段覆盖 quantity、unitPrice、netAmount、taxRate、taxAmount、totalAmount。税率规范值使用百分数，10% 对应 10，不能将 0.1 自动修正。原值、规范值与 present／missing／ambiguous 状态分别保留；原始逗号金额不因替换字符串自动通过，未知格式不猜、缺失不填零。
+`run.json` 保存本次运行的配置与可比条件、每个 Trial 原始输入输出、实际模型/工具/子 Agent 观察、业务回执、确定性与 Judge 结果、比例分子分母、上传与回读状态，以及诊断、比较和 Gate。所用 Case、独立 Gold、scenario、评分规则快照在 Run 内各保存一次，Trial 通过身份引用。二进制材料确有需要时才放入 `materials/`。README 解释结论并链接原始证据。
 
-调查阶段 read／query 返回的完整 evidenceRef 可直接用于 Claim，包含确认计划及原始来源 Run／ToolCall；规划阶段引用为 null，确认后查询取得。工具反馈精确说明必填、允许字段、UTF-16 要求及 Report full／partial 合法值和必要条件，模型可在同一预算内纠正并保存 partial。引用与身份严格核验；已完整采证且确认无当前 Report 才计算已知缺失，采证不完整保持未知或错误。402／余额或计费拒绝保留原服务错误与可核用量，归运行基础设施，不直接判 Agent 能力失败。
+不再为模型、Trial、evidence、experiment、comparison、gate、export 各建一套目录或旁文件。Benchmark 的 Trace 已在 Run 中，不再复制成产品 Trace；独立产品 Trace 用平铺 JSON 和内部 UUID 关联。名称用于阅读，内部 ID 用于关联，不按名称猜测最新结果。
 
-执行开始保存参与运行的文件清单和实际内容条件，结束在内存比较；仅 Git 提交／dirty 元数据变化不使执行失效。实际文件变化保留原指标，整组标记失效并保存变化路径与原因，终端一次明确说明。持久产物继续无 hash／指纹。
+四类 HumanFeedback——Case 质量、保存 Run、Trace、候选审核——统一存入 `feedback.json`，保留原评分与目标身份；反馈不直接改写原始得分。候选编辑后的新版本须重新核验及批准。
 
-先文档、再实现和受控回归；真实 Judge 校准、代表性单题和 Smoke 另行执行并生成新 Execution。协议 ERROR 未解决不进入质量比较，工程夹具通过不证明真实模型遵循率。旧 Execution 保持只读，产品 FAIL、采证缺口与 Judge 故障分别记录。
+## 评分与回归
 
+确定性评分先检查实际行为和业务值；每个 Trial 的适用语义项合并为至多一次逻辑 Judge 提交。Gold 仅进入评分侧，不进入被测 Agent。缺项、重复项、不可判断和格式错误分别保留，不补成通过。一次逻辑 Judge 不等于底层网络请求次数。
 
-## Trial次数、Case指标及重复诊断
+Baseline 统一保存在 `baselines.json`，绑定明确 Run、模型组、选集和条件，不使用 `latest` 自动替换。完整、可比且已测量的 Agent FAIL 可以作为已知失败基线；缺失结果、Judge ERROR 或不可比条件不能。
 
-CLI统一--trials N（默认1，范围1–20），旧--repeat启动前拒绝。Case定义不加repetition／trialId；它们位于Trial记录。内部repeat／repetition和历史报告／CSV兼容。Smoke、Full、单题及专项共同支持；Full --trials 5计划310个Trial，Smoke为70。每次Trial显示结论，最终保存后每Case打印自己的适用指标一次，必需未测项仍显示，stderr不打印整段JSON。trialStatistics独立记录pass@k／pass^k及波动，不修改39项公式；旧status可只读派生，不重评分。完整命令、字段及解释见[重复试验说明](../docs/public/EVALUATION.zh-CN.md#trials)。受控测试不证明真实业务稳定性。
+| Gate 规则 | 要求 |
+|---|---|
+| 关键指标与每题必要断言 | 按正确优劣方向零退步 |
+| 已发布回归断言 | 所有实际重复均通过 |
+| 实际泄漏与禁止副作用 | 零 |
+| 其他归一化质量比例 | 最多绝对下降 `0.02`，同时显示分子/分母 |
+| 缺失、错误、不可比证据 | `blocked` |
+
+Smoke7 与 Full62 各自计算 Baseline/Gate，不能跨选集混算。Gate 的 `pass` 是相对所选基线未退化；两个模型都失败时也可能相对通过，绝不等于绝对质量合格。输出 `pass/fail/blocked` 及具体原因，不能只看命令退出状态。
+
+## 观察与复核
+
+Langfuse 中从 Score 进入 Trace，再回到 Session，核对实际模型请求响应、工具/子 Agent、业务回执与失败要求；也可以从 User 的 Sessions/Traces 比较同一 Case 的两组配置。远端接收成功不等于所有节点、正文和分数已完整回读。
+
+产品 capture、upload、mining 三开关独立且默认关闭；已填写凭据不自动上传产品轨迹。主动运行 Smoke/Full 所需的评测上传是这两个命令的明确动作。Langfuse 展示观察与评分，本地 README/`run.json` 给出比较和 Baseline/Gate；不把本地结论描述成 Langfuse 原生页面。
+
+详细实操、截图和本次实际执行结果见[中文操作指南](Langfuse评测与问题定位操作指南.md)。未执行步骤应保留未执行状态；工程测试或受控演示不能替代真实模型质量证据。
+
+## Metric 独立定义与校准
+
+**评分链：Metric 独立定义 → Rubric 评分规范 → Case 选择 → Trial 合并请求 → 按 Metric 返回 Scores。** 正式指标保持 **39 项**：默认 28 项语义、11 项本地或派生；另有 2 项语义诊断。实现目录为 **55 个活动定义＝25 个确定性／派生实现＋30 个独立语义定义**，按 10 个领域文件组织。实现数量不是指标数量，也不是模型请求次数。
+
+每个语义 Evaluator 只负责一个 Metric，独立维护版本、Rubric、适用性、证据要求、准备与校验；定义本身不持有模型客户端。Case 的 `scoring.judge` 仍使用 Metric ID；未被选择的项不会因适用性为 true 自动加入。工具预算为零等现有本地替代路径保持不变。Rubric 的多条判据不会自动成为额外指标。
+
+调度层先处理本地确定事实，再将剩余适用语义项按原顺序合并。研究事实、引用和链条共用原始见证框架，比例继续本地计算。单项坏计数、缺项或坏证据只使该 Metric ERROR；重复／未知 Metric ID 或根级坏 JSON 使整个模型批次出现契约错误。已确认的泄露和禁止副作用不被 Judge 覆盖。错误不触发拆分、额外请求或静默截断。
+
+新流程记录 `scoringVersion: 2`、`semantic-metric-batch` v1、`metric-json-independent/v1`、实际请求和各 Evaluator 版本。Metric 版本继续表示公式、方向和单位；Evaluator 版本表示该项评分规则。旧组定义、旧协议和原成绩只读保留，读取不使用当前 Rubric 重评。新旧评分条件不同，比较和 Gate 明确阻断。
+
+独立校准复用同一套定义、合并请求、解析和计数，不启动被测 Agent，不把本地安全兜底计作模型判断正确。单项选择只筛选执行目标，保留原始参考与标签；结果按 Metric ID 匹配。单项校准不能证明组合表现。修改一个 Evaluator 会使其单项及包含它的组合引用不匹配；公共协议或 Judge 配置改变影响相应引用。界面区分 `not-provided`、`insufficient-coverage`、`version-mismatch` 和 `matched`，展示参考、目标组合、Judge 任务及版本；`matched` 只表示范围和版本匹配，`acceptance` 仍为 `not-assessed`。
+
+以下是需要明确启动的真实校准入口，不随 Benchmark 或结果查询自动执行：
+
+```powershell
+bun --no-env-file run eval -- judge calibrate --dir <独立参考目录> --execution-id <校准身份> --metric tool-arguments
+bun --no-env-file run eval -- judge calibrate --dir <独立参考目录> --execution-id <校准身份>
+```
+
+第一条检查单项，第二条按参考中声明的组合合并评分。参考必须保留 tune／validation、来源组和 `agent-authored`／`human-reference` 身份。工程样例和模拟传输通过不代表真实语义校准或人工批准。

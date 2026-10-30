@@ -31,16 +31,43 @@ function fixture() {
     const definition = runtime.definitions.find(tool => tool.name === name)!;
     return definition.execute(definition.inputSchema.parse(input), { nativeToolCallId: `native-${name}`, signal }, ctx);
   }
-  return { root, working, runtime, execute };
+  return { root, working, runtime, execute, ctx };
 }
 
 describe('Pi native tool factory bridge', () => {
+  for (const disposition of ['allow', 'cancel', 'deadline'] as const) {
+    it(`waits for owned working directory and rechecks ${disposition} before the native side effect`, async () => {
+      const f = fixture(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+      const runtime = createNativeTools({ getWorkingDirectory: async () => { entered.resolve(); await release.promise; return ok(f.working); } });
+      const tool = runtime.definitions.find(definition => definition.name === 'write')!;
+      const controller = new AbortController();
+      let settled = false;
+      const running = tool.execute(tool.inputSchema.parse({ path: 'owner-marker.txt', content: 'committed directory' }),
+        { nativeToolCallId: 'owned-native-write', signal: controller.signal,
+          ...(disposition === 'deadline' ? { deadlineAt: performance.now() + 20 } : {}) }, f.ctx)
+        .then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+      try {
+        await entered.promise; await new Promise<void>(resolve => setImmediate(resolve));
+        expect(settled).toBe(false); expect(existsSync(join(f.working, 'owner-marker.txt'))).toBe(false);
+        if (disposition === 'cancel') controller.abort();
+        if (disposition === 'deadline') await new Promise(resolve => setTimeout(resolve, 25));
+      } finally { release.resolve(); }
+      const result = await running;
+      if (disposition === 'allow') {
+        expect('value' in result).toBe(true);
+        expect(readFileSync(join(f.working, 'owner-marker.txt'), 'utf8')).toBe('committed directory');
+      } else {
+        expect(result).toMatchObject({ error: { error: { code: disposition === 'cancel' ? 'tool_cancelled' : 'tool_timeout' } } });
+        expect(existsSync(join(f.working, 'owner-marker.txt'))).toBe(false);
+      }
+    });
+  }
   it('uses all eight SDK parameter schemas and ordinary Run context without a filesystem permission layer', async () => {
     const f = fixture();
     expect(f.runtime.definitions.map(tool => tool.name)).toEqual([...NATIVE_TOOL_NAMES]);
     for (const definition of f.runtime.definitions) {
       expect(getNativeToolParameters(definition)).toMatchObject({ type: 'object' });
-      expect(definition.version).toBe('pi-0.85.1');
+      expect(definition.version).toBe('pi-1.4.0');
     }
     expect(await f.execute('read', { path: 'note.txt', offset: 2, limit: 1 })).toMatchObject({ content: [{ text: expect.stringContaining('beta') }] });
     await f.execute('write', { path: 'nested/result.txt', content: 'hello\n' });

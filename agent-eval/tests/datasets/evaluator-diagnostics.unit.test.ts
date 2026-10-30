@@ -4,6 +4,7 @@ import {formalFixture} from '../support/formal.ts';
 import {compileFormalSemanticPlan} from '../../src/scoring/formal-rules.ts';
 import {judgeSelection} from '../../src/dataset-loader/local.ts';
 import {dataset} from '../support/fixtures.ts';
+import {caseDiagnosticsSchema} from '../../src/scoring/diagnostic-plans.ts';
 
 test('specialist check declarations stay separate from 39 formal metrics and reject unknown parameters',()=>{
     const task=structuredClone(formalFixture().task);
@@ -12,6 +13,13 @@ test('specialist check declarations stay separate from 39 formal metrics and rej
     expect(parsed.success).toBe(true);
     if(parsed.success)expect(parsed.data.expected.metrics).toHaveLength(39);
     expect(caseV2Schema.safeParse({...task,expected:{...task.expected,diagnostics:[{...diagnostics[0],params:{maxMs:1200,guess:true}}]}}).success).toBe(false);
+});
+
+test('a legacy group alias and a Metric declaration cannot select the same diagnostic twice',()=>{
+    const diagnostic={evaluatorId:'task-judge',required:true,reason:'Explain the observed fault',
+        params:{metricId:'diagnostic-partial-failure-explanation',denominator:1,evidence:['answer']}};
+    expect(caseDiagnosticsSchema.safeParse([{...diagnostic,evaluatorId:diagnostic.params.metricId}]).success).toBe(true);
+    expect(caseDiagnosticsSchema.safeParse([diagnostic,{...diagnostic,evaluatorId:diagnostic.params.metricId}]).success).toBe(false);
 });
 
 test('a required semantic diagnostic schedules Judge without adding a formal metric',()=>{

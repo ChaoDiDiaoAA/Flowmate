@@ -30,10 +30,10 @@ export type AssemblySelectionSnapshot = z.infer<typeof AssemblySelectionSnapshot
 const manifestCommon = { schemaVersion: z.literal(2), kind: z.literal('extension'),
   hooks: z.array(z.object({ event: ExtensionHookEventSchema, policy: z.enum(['critical', 'observer']) }).strict().readonly()).length(5).readonly() };
 export const ExtensionManifestSchema = z.discriminatedUnion('id', [z.object({ ...manifestCommon,
-  id: z.literal('invoice-assist'), version: z.literal('v1'), sdkVersion: z.literal('0.85.1'), entryId: z.literal('invoice-assist-v1'),
+  id: z.literal('invoice-assist'), version: z.literal('v1'), sdkVersion: z.enum(['0.85.1', '1.4.0']), entryId: z.literal('invoice-assist-v1'),
   tools: z.tuple([z.object({ name: z.literal('check_invoice_sources'), version: z.literal('1') }).strict().readonly()]).readonly(),
   commands: z.tuple([z.literal('invoice-assist')]).readonly(),
-}).strict(), z.object({ ...manifestCommon, id: z.literal('subagents'), version: z.literal('v1'), sdkVersion: z.literal('0.85.1'),
+}).strict(), z.object({ ...manifestCommon, id: z.literal('subagents'), version: z.literal('v1'), sdkVersion: z.enum(['0.85.1', '1.4.0']),
   entryId: z.literal('pi-subagents-managed-v1'), pluginVersion: z.literal('0.19.0'), patchVersion: z.enum(['flowmate-p13.1', 'flowmate-p13.2']),
   tools: z.tuple([z.object({ name: z.literal('Agent'), version: z.enum(['0.19.0-p13.1', '0.19.0-p13.2']) }).strict().readonly()]).readonly(),
   commands: z.array(z.literal('subagent')).max(1).readonly(),
@@ -82,7 +82,7 @@ function matchesRegistration(value: { ref: ExtensionRef; registeredTools: readon
 }
 const actualHooks = z.array(ExtensionHookEventSchema).length(5).readonly().refine(
   values => values.every((value, index) => value === EXTENSION_HOOKS[index].event), 'Actual Hooks must match the required set.');
-export const ExtensionAssemblyEvidenceSchema = z.object({ version: z.literal(1), sdkVersion: z.literal('0.85.1'),
+export const ExtensionAssemblyEvidenceSchema = z.object({ version: z.literal(1), sdkVersion: z.enum(['0.85.1', '1.4.0']),
   instances: z.array(z.object({ instanceId, ref: ExtensionRefSchema, nativeSessionId: opaque, activatedAt: timestamp,
     registeredTools, registeredCommands, hookEvents: actualHooks }).strict().refine(matchesRegistration, 'Wrong extension registrations.').readonly()).max(2).readonly(),
 }).strict().refine(value => new Set(value.instances.map(item => item.instanceId)).size === value.instances.length
@@ -91,6 +91,7 @@ export type ExtensionAssemblyEvidence = z.infer<typeof ExtensionAssemblyEvidence
 export function matchesExtensionAssembly(frozen: FrozenExtensions, assembly: ExtensionAssemblyEvidence, nativeSessionId?: string): boolean {
   return frozen.included.length === assembly.instances.length && assembly.instances.every((item, index) =>
     extensionRefKey(item.ref) === extensionRefKey(frozen.included[index].ref)
+    && frozen.included[index].manifest.sdkVersion === assembly.sdkVersion
     && matchesRegistration(item)
     && JSON.stringify(item.registeredCommands) === JSON.stringify(frozen.included[index].manifest.commands)
     && (nativeSessionId === undefined || item.nativeSessionId === nativeSessionId));

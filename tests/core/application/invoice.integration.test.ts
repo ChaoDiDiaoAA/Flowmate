@@ -59,7 +59,7 @@ function preparedP2Agent(onPrepare: () => void, onExecute: () => void): AgentPor
         sdk: { codingAgent: '0.85.1', ai: '0.85.1' }, parameters: receivedConfig.parameters, limits,
         native: { authSource: 'pi-native', modelsSelection: null }, agent: preparedFacts };
       return ok({ snapshot, async execute(input, signal) {
-        history.saveUser(nativeSessionId, input);
+        await history.saveUser(nativeSessionId, input);
         onExecute();
         if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
         const outcome: AgentNativeOutcome = { text: 'stopped', partial: false, stopReason: 'stop', responseId: null,
@@ -68,7 +68,7 @@ function preparedP2Agent(onPrepare: () => void, onExecute: () => void): AgentPor
             costSource: null, updatedAt: now() },
           tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
           stopped: true, cleanupErrors: [], agent: { nativeSessionId, turnCount: 1, modelCallCount: 1 } };
-        history.saveResult(nativeSessionId, input, outcome, false);
+        await history.saveResult(nativeSessionId, input, outcome, false);
         return outcome;
       } });
     },
@@ -87,8 +87,8 @@ describe('P3 Workspace and Run admission', () => {
     const opened = openTestDatabase(paths(mkdtempSync(join(tmpdir(), 'flowmate-app-invoice-'))));
     if (!opened.ok) throw new Error(opened.error.message);
     seedDocument(opened.data);
-    const workspace = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
-    const jobs = new JobService(opened.data.jobs, now);
+    const workspace = new WorkspaceService(opened.data, now, prepareTestWorkspaceVerifier(opened.data));
+    const jobs = new JobService(opened.data, now);
     const stubRuntime: RuntimeServicePort = {
       compactSession: async () => fail(appError('compaction_unavailable', 'runtime', 'Unused in invoice reads.')),
       querySessionCompaction: async () => fail(appError('compaction_unavailable', 'runtime', 'Unused in invoice reads.')),
@@ -100,7 +100,7 @@ describe('P3 Workspace and Run admission', () => {
       close: async () => ({ stopped: true, closed: true, errors: [] }),
     };
     const sessionAgent = preparedP2Agent(() => undefined, () => undefined);
-    const sessionService = new SessionService(opened.data.sessions, sessionAgent, () => stubRuntime.state(), now, opened.data.runs, opened.data.memory);
+    const sessionService = new SessionService(sessionAgent, () => stubRuntime.state(), now, opened.data);
     const productApplication = { documents: opened.data.documents, jobs: opened.data.jobs, candidates: opened.data.candidates,
       events: opened.data.businessEvents, importInvoiceMaterial: async () => opened.data.documents.get(1),
       importPreparedInvoiceMaterial: async () => ({ ok: false as const, error: appError('unused', 'input', 'unused') }),
@@ -161,10 +161,10 @@ describe('P3 Workspace and Run admission', () => {
         entries: [], leafId: null, unusable: false } });
     expect(native.ok).toBe(true);
     if (!native.ok) return;
-    const workspace = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
+    const workspace = new WorkspaceService(opened.data, now, prepareTestWorkspaceVerifier(opened.data));
     await workspace.update({ expectedRevision: 0, change: { kind: 'document', documentId: 1 } });
     await workspace.update({ expectedRevision: 1, change: { kind: 'session', sessionId: native.data.sessionId } });
-    const current = workspace.read();
+    const current = await workspace.read();
     expect(current.ok).toBe(true);
     if (!current.ok) return;
     let preparations = 0;
@@ -177,11 +177,11 @@ describe('P3 Workspace and Run admission', () => {
       leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts }));
     if (!watched.ok) throw new Error(watched.error.code);
     const tools = createToolExecutor({ definitions: [], recorder: createToolRecorder(opened.data.toolCalls, now), now });
-    const runtime = new RuntimeService({ memory: opened.data.memory, workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools,
+    const runtime = new RuntimeService({ database: opened.data, workspaceVerifier: createTestWorkspaceVerifier(opened.data),  agent, provider, tools,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
     const stale = { revision: current.data.revision - 1, documentRef: current.data.documentRef, jobId: current.data.jobId,
       candidateRef: current.data.candidateRef, sessionId: native.data.sessionId };
-    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs, opened.data.memory);
+    const sessionService = new SessionService(agent, () => runtime.state(), now, opened.data);
     const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService);
     expect(await app.startRun({ sessionId: native.data.sessionId, text: 'Review invoice', config, workspace: stale }))
       .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
@@ -223,10 +223,10 @@ describe('P3 Workspace and Run admission', () => {
     const agent = preparedP2Agent(() => { preparations += 1; }, () => { executions += 1; executionStarted(); });
     const toolExecutor = createToolExecutor({ definitions: [],
       recorder: createToolRecorder(opened.data.toolCalls, now), isSessionModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId), now });
-    const runtime = new RuntimeService({ memory: opened.data.memory, workspaceVerifier: createTestWorkspaceVerifier(opened.data), runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider, tools: toolExecutor,
+    const runtime = new RuntimeService({ database: opened.data, workspaceVerifier: createTestWorkspaceVerifier(opened.data),  agent, provider, tools: toolExecutor,
       log: { write: () => undefined, close: async () => undefined }, now, monotonicNow: () => performance.now() });
-    const sessionService = new SessionService(opened.data.sessions, agent, () => runtime.state(), now, opened.data.runs, opened.data.memory);
-    const workspaceService = new WorkspaceService(opened.data.workspace, now, prepareTestWorkspaceVerifier(opened.data));
+    const sessionService = new SessionService(agent, () => runtime.state(), now, opened.data);
+    const workspaceService = new WorkspaceService(opened.data, now, prepareTestWorkspaceVerifier(opened.data));
     const app = makeApplication(runtime, opened.data.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessionService,
       undefined, workspaceService);
     const session = await app.createSession({ expectedRevision: 0 });

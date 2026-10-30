@@ -47,7 +47,7 @@ const settingsSchema = z.object({
 }).strict().refine((settings) => {
   const ids = new Set(settings.models.map((model) => model.id));
   const refs = [...settings.models.map((model) => model.credentialRef),
-    ...[settings.evaluation.agent, settings.evaluation.judge].flatMap(role => role ? [role.credentialRef] : [])];
+    ...[settings.evaluation.agent, settings.evaluation.judge].flatMap(role => role && 'credentialRef' in role ? [role.credentialRef] : [])];
   return ids.size === settings.models.length && new Set(refs).size === refs.length
     && (settings.defaultModelId === null || ids.has(settings.defaultModelId));
 }, 'model IDs must be unique and the default must exist');

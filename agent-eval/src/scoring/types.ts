@@ -3,10 +3,12 @@ import type { CaseExecutionResult, GradeStatus } from '../types.ts';
 import type { JudgeConfig, Fetcher } from './judges/client.ts';
 import type { runJudge } from './judges/harness.ts';
 import type { CompactPlan } from './judges/compact.ts';
+import type { CalibrationReport } from './judges/calibration.ts';
+import type { EvaluationCalibrationView } from '../../../packages/contracts/src/evaluation.ts';
 export type EvaluatorKind = 'deterministic' | 'llm-judge';
 type CurrentJudgeCall = Omit<Awaited<ReturnType<typeof runJudge>>, 'transportStatus'> & {transportStatus?:number|null};
 type LegacyJudgeCall = Omit<CurrentJudgeCall, 'configuration' | 'stopReason' | 'rawStopReason' | 'usageSource' | 'responseComplete' | 'request' | 'compact'> & {
-    configuration: Omit<CurrentJudgeCall['configuration'], 'api' | 'sdk' | 'modelCapabilities' | 'protocolVersion'> & {
+    configuration: Omit<Extract<CurrentJudgeCall['configuration'], { sdk: unknown }>, 'api' | 'sdk' | 'modelCapabilities' | 'protocolVersion'> & {
         provider: 'anthropic' | 'openai-compatible'; api?: never; sdk?: never;  temperature?: number; maxTokens?: number;
         protocolVersion?: string;
         modelCapabilities?: { modelId: string; maxOutputTokens: number; source: 'anthropic-models-api' | 'deepseek-models-api' };
@@ -33,6 +35,7 @@ export type EvaluationScore = {
     evidence: string[];
     statistics?: MetricStatistics;
     judge?: { callId: string; criterion: number };
+    calibration?: EvaluationCalibrationView;
     actual?: unknown;
     expected?: unknown;
 };
@@ -41,7 +44,7 @@ export const isRequiredScore=(score:EvaluationScore)=>score.required&&score.stat
 /** Evaluator provenance is additive; original wire/count validators compare the measurement itself. */
 export function scoreMeasurement(score:EvaluationScore|undefined){
     if(!score)return score;
-    const {evaluatorId:_,evaluatorVersion:__,category:___,applicabilityReason:____,...measurement}=score;
+    const {evaluatorId:_,evaluatorVersion:__,category:___,applicabilityReason:____,calibration:_____,...measurement}=score;
     return measurement;
 }
 export type EvaluationContext = {
@@ -54,6 +57,7 @@ export type EvaluationContext = {
     signal?: AbortSignal;
     semanticRequired?: boolean;
     semanticPlan?: CompactPlan;
+    calibration?: CalibrationReport;
 };
 export type EvaluationValue = {
     value: number | null;
@@ -78,5 +82,19 @@ export type EvaluatorDefinition = {
     appliesTo?: (context: EvaluationContext, check: Check) => boolean;
     evidence: (check: Check, context: EvaluationContext) => string[];
     evaluate: (context: EvaluationContext, check: Check) => EvaluationValue | Promise<EvaluationValue>;
+};
+export type ScoringFacts = Omit<EvaluationContext, 'judge' | 'fetcher' | 'signal' | 'calibration'>;
+/** A definition prepares and validates one metric; only the Trial harness owns transport. */
+export type SemanticMetricDefinition = Omit<EvaluatorDefinition, 'kind' | 'outputs' | 'prepare' | 'parse' | 'appliesTo' | 'evaluate' | 'evaluateMany' | 'evidence'> & {
+    kind: 'llm-judge';
+    domain: string;
+    outputs: readonly [string];
+    rubric: { id: string; version: number; instructions: string };
+    prepare: (facts: ScoringFacts) => CompactPlan['criteria'];
+    appliesTo: (facts: ScoringFacts) => boolean;
+    parseResult: (score: EvaluationScore) => EvaluationScore;
+    evidence: (check: Check, facts: ScoringFacts) => string[];
+    evaluateMany: (facts: ScoringFacts) => EvaluationScore[];
+    evaluate: (facts: ScoringFacts, check: {metric: string; required: boolean}) => EvaluationValue;
 };
 export const verdict = (ok: boolean, reason: string, actual?: unknown, expected?: unknown): EvaluationValue => ({ value: ok ? 1 : 0, status: ok ? 'PASS' : 'FAIL', reason, actual, expected });

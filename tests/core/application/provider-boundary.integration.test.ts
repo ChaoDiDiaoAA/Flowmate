@@ -2,7 +2,8 @@ import { expect, it, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeApplication, openDatabase, RuntimeService } from '../../../packages/core/src/index.ts';
+import { makeApplication, RuntimeService } from '../../../packages/core/src/index.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { ok, type NativeOutcome, type ProviderPort, type ProviderRequest, type SafeConfigSnapshot } from '../../../packages/contracts/src/index.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 
@@ -11,10 +12,10 @@ function fixture(provider: ProviderPort) {
   const database = openDatabase({ root, databaseFile: join(root, 'data', 'trial.sqlite'),
     logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') });
   if (!database.ok) throw new Error(database.error.code);
-  const runtime = new RuntimeService({ memory: database.data.memory, runs: database.data.runs, provider,
+  const runtime = new RuntimeService({ database: database.data, provider,
     log: { write() {}, async close() {} }, now: () => new Date().toISOString(), monotonicNow: () => performance.now() });
   const app = makeApplication(runtime, database.data.runs, async () => {
-    database.data.close();
+    await database.data.close();
     return { stopped: true, closed: true, errors: [] };
   });
   deferCleanup(() => app.close());

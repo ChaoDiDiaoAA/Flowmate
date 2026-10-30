@@ -5,7 +5,6 @@ import { SKILL_RESOURCE_TOOL_NAMES } from '../../../packages/contracts/src/resou
 import { RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES } from '../../../packages/contracts/src/research.ts';
 import { SUBAGENT_ROLE } from '../../../packages/contracts/src/subagents.ts';
 import { metricCatalog } from '../scoring/catalog.ts';
-import { regressionOriginsSchema } from './regression-origin.ts';
 import {caseDiagnosticsSchema} from '../scoring/diagnostic-plans.ts';
 
 const text = z.string().trim().min(1);
@@ -41,7 +40,7 @@ export function validateConstraints(value: CaseConstraints, context: z.Refinemen
     if (value.maxToolCalls !== undefined && value.maxToolCalls < (value.requiredCapabilities?.length ?? 0))
         context.addIssue({ code: 'custom', message: 'Tool limit is lower than the minimum required calls' });
 }
-export const authorCaseSchema = z.object({
+export const authorCaseBaseSchema = z.object({
     id: z.string().regex(/^FM-\d{3}$/), name: z.string().regex(/^[a-z0-9]+(?:_[a-z0-9]+){2,}$/),
     category: z.enum(harnessCategories), difficulty: difficultySchema, purpose: z.enum(['capability', 'regression']),
     input: z.object({ prompt: userInput, turns: z.array(userTurnSchema).min(1).optional(),
@@ -50,18 +49,21 @@ export const authorCaseSchema = z.object({
         maxToolCalls: constraintShape.maxToolCalls.unwrap(), mustHaveEvidence: z.boolean(), expectedAnswerHint: text }).strict(),
     scoring: z.object({ deterministic: unique(metric), judge: z.array(metric).refine(values => new Set(values).size === values.length), manual: text }).strict(),
     risks: unique(text), tags: unique(text), source: caseSourceSchema,
-}).strict().superRefine((value, context) => {
+}).strict();
+function validateAuthorCase(value: z.infer<typeof authorCaseBaseSchema>, context: z.RefinementCtx) {
     validateConstraints(value.expected, context);
     if (new Set(value.input.turns?.map(turn => turn.id)).size !== (value.input.turns?.length ?? 0))
         context.addIssue({ code: 'custom', path: ['input', 'turns'], message: 'Duplicate user turn identity' });
+}
+export const generatedCaseSchema = authorCaseBaseSchema.superRefine(validateAuthorCase);
+export const candidateCaseSchema = authorCaseBaseSchema.omit({ id: true }).extend({ id: authorCaseBaseSchema.shape.id.optional() })
+    .superRefine((value, context) => validateAuthorCase({ ...value, id: value.id ?? 'FM-063' }, context));
+export const authorCaseSchema = authorCaseBaseSchema.superRefine((value, context) => {
+    validateAuthorCase(value, context);
     if (/\p{Script=Han}/u.test(JSON.stringify(value))) context.addIssue({ code: 'custom', message: 'Authored Case text must be English' });
 });
 export type AuthorCase = z.infer<typeof authorCaseSchema>;
-export const authorDatasetSchema = z.object({ version: z.literal('v1'), cases: z.array(authorCaseSchema),
-    suite: z.enum(['baseline', 'badcase']).optional(), regressionOrigins: regressionOriginsSchema.optional() }).strict()
-    .refine(dataset => dataset.cases.length > 0 || dataset.suite === 'badcase', 'Empty baseline Dataset')
-    .refine(dataset => new Set(dataset.cases.map(task => task.id)).size === dataset.cases.length, 'Duplicate Case identity')
-    .refine(dataset => dataset.suite === 'badcase' ? !!dataset.regressionOrigins &&
-        JSON.stringify(Object.keys(dataset.regressionOrigins).sort()) === JSON.stringify(dataset.cases.map(c => c.id).sort()) : !dataset.regressionOrigins,
-        'Regression origins must bind exactly the supplemental members');
+export const authorDatasetSchema = z.object({ version: z.literal('v1'), cases: z.array(authorCaseSchema).min(1),
+    suite: z.literal('baseline').optional() }).strict()
+    .refine(dataset => new Set(dataset.cases.map(task => task.id)).size === dataset.cases.length, 'Duplicate Case identity');
 export type AuthorDataset = z.infer<typeof authorDatasetSchema>;

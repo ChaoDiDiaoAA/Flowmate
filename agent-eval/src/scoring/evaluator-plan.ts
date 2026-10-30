@@ -1,6 +1,6 @@
 import type {LocalCase,Check} from '../dataset-loader/local.ts';
 import {metricCatalog} from './catalog.ts';
-import {semanticEvaluatorDefinitions} from './judges/evaluators.ts';
+import {semanticEvaluatorDefinitions, semanticEvaluator} from './judges/evaluators.ts';
 import {diagnosticApplicable,diagnosticEvaluatorIds} from './diagnostics.ts';
 
 const localOwners:Record<string,string>={
@@ -19,8 +19,7 @@ export function evaluatorForMetric(task:LocalCase,metricId:string):string{
         if(['skill-selection','progressive-reading'].includes(metricId))return'fact-check';
     }
     if(metricId.startsWith('diagnostic-')){
-        if(metricId==='diagnostic-partial-failure-explanation')return'task-judge';
-        if(metricId==='diagnostic-recovery-strategy')return'tool-use-judge';
+        if(semanticEvaluatorDefinitions.some(d=>d.id===metricId))return metricId;
         return metricId.slice('diagnostic-'.length);
     }
     if(metricId==='fact-check/required-subagent-roles')return'subagent-contract';
@@ -34,8 +33,8 @@ export type EvaluatorPlanEntry={evaluatorId:string;version:number;kind:'determin
 export function compileEvaluatorPlan(task:LocalCase,checks:readonly Check[]=task.expected.checks):EvaluatorPlanEntry[]{
     const entries=new Map<string,EvaluatorPlanEntry>();
     const add=(owner:string,output:EvaluatorPlanEntry['outputs'][number])=>{
-        const semantic=semanticEvaluatorDefinitions.some(d=>d.id===owner);
-        const entry=entries.get(owner)??{evaluatorId:owner,version:1,kind:semantic?'llm-judge' as const:'deterministic' as const,
+        const semantic=semanticEvaluatorDefinitions.find(d=>d.id===owner);
+        const entry=entries.get(owner)??{evaluatorId:owner,version:semantic?.version??1,kind:semantic?'llm-judge' as const:'deterministic' as const,
             applicable:false,reason:'No applicable requirements',outputs:[]};
         if(!entry.outputs.some(o=>o.metricId===output.metricId))entry.outputs.push(output);
         entry.applicable ||= output.applicable;
@@ -43,6 +42,7 @@ export function compileEvaluatorPlan(task:LocalCase,checks:readonly Check[]=task
         entries.set(owner,entry);
     };
     if('contract'in task)for(const plan of task.expected.metrics){
+        if(!Object.hasOwn(formalEvaluatorOwners,plan.metricId))throw Error('Unknown formal metric: '+plan.metricId);
         const criterion=task.expected.semantic?.criteria.find(c=>c.metricId===plan.metricId);
         add(evaluatorForMetric(task,plan.metricId),{metricId:plan.metricId,category:'formal',applicable:!plan.notApplicable,
             reason:plan.notApplicable??criterion?.rule??'Declared formal metric opportunity',required:plan.metricId==='task-success'||!!criterion?.required,
@@ -61,7 +61,7 @@ export function compileEvaluatorPlan(task:LocalCase,checks:readonly Check[]=task
         add(id,{metricId:'diagnostic-'+id,category:'diagnostic',applicable:true,reason:declared?.reason??'Declared Case constraint',required:declared?.required??false});
     }
     for(const diagnostic of task.expected.diagnostics??[])if('metricId'in diagnostic.params)
-        add(diagnostic.evaluatorId,{metricId:diagnostic.params.metricId,category:'diagnostic',applicable:true,reason:diagnostic.reason,
+        add(semanticEvaluator(diagnostic.params.metricId).id,{metricId:diagnostic.params.metricId,category:'diagnostic',applicable:true,reason:diagnostic.reason,
             required:diagnostic.required,denominator:diagnostic.params.denominator});
     return[...entries.values()];
 }

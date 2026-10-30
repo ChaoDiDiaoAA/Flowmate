@@ -8,9 +8,11 @@ import { acquireEvaluationWrite as acquire } from '../../src/reports/files.ts';
 import { addFeedback } from '../../src/review/local.ts';
 import { exportReport } from '../../src/langfuse/export.ts';
 import { saveReport } from '../../src/reports/store.ts';
-import { caseReviewDirectory, createRunDirectory } from '../../src/reports/paths.ts';
+import { createRunDirectory } from '../../src/reports/paths.ts';
+import { humanFeedbackFile } from '../../src/reports/feedback.ts';
 import { dataset, fixtureRepo, fixtureDirectory, reportFixture } from '../support/fixtures.ts';
 import { deferCleanup, mkdtempSync as ownedTemp } from '../../../tests/support/resources.ts';
+import { observationRowsFromOtlp } from '../langfuse/otlp-fixture.ts';
 
 const repository = resolve(import.meta.dir, '../../..');
 function processProgram(source: string) {
@@ -40,7 +42,7 @@ for (const kind of ['case-quality', 'run-feedback'] as const) test(`two real pro
     const report = reportFixture(); report.executionId = 'feedback-race'; report.trials[0]!.execution!.identity.executionId = report.executionId;
     saveReport(reportFile, report); originalReport = readFileSync(reportFile, 'utf8');
   }
-  const file = join(trial ? join(reportFile, '..') : caseReviewDirectory(repo, true), 'review.json');
+  const file = humanFeedbackFile(repo, true);
   const input = { ...(trial ? { executionId: 'feedback-race', trialId: 'trial-1', caseId: 'sample' } : { datasetId: 'facility-test', caseId: 'test-fields' }),
     id: 'synthetic-held-feedback', reviewer: 'synthetic-first-reviewer', verdict: 'bad', note: 'First independent synthetic finding.' };
   const files = join(repository, 'agent-eval/src/reports/files.ts').replaceAll('\\', '/'), review = join(repository, 'agent-eval/src/review/local.ts').replaceAll('\\', '/');
@@ -64,20 +66,29 @@ const save = files.atomicJson; spyOn(files, 'atomicJson').mockImplementation((pa
   expect(existsSync(file + '.write-lock')).toBe(false);
 }, 45_000);
 
-test('two real CLI processes preserve partial export receipts through a conflict and target-bound resend', async () => {
+test('two real CLI processes preserve partial export receipts through a conflict and target-bound visibility recheck', async () => {
   const repo = ownedTemp(join(tmpdir(), 'p16-export-processes-')), report = reportFixture();
   report.executionId = 'export-race'; report.trials[0]!.execution!.identity.executionId = report.executionId;
   const file = join(repo, 'agent-eval/runs/business/export-race/report.json'); saveReport(file, report);
   const original = readFileSync(file, 'utf8'), batches: string[][] = []; let projects = 0, partial = true, release!: () => void, entered!: () => void;
+  const observations: any[] = [], scores: any[] = []; let projectId = 'synthetic-process-project';
   const held = new Promise<void>(done => { release = done; }), querying = new Promise<void>(done => { entered = done; });
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     if (new URL(request.url).pathname.endsWith('/projects')) {
       if (++projects === 1) { entered(); await held; }
-      return Response.json({ data: [{ id: 'synthetic-process-project', name: 'Synthetic', organization: { id: 'synthetic-org', name: 'Synthetic' }, metadata: {} }] });
+      return Response.json({ data: [{ id: projectId, name: 'Synthetic', organization: { id: 'synthetic-org', name: 'Synthetic' }, metadata: {} }] });
     }
-    const body = await request.json() as { batch: Array<{ id: string }> }; batches.push(body.batch.map(event => event.id));
-    return Response.json({ successes: body.batch.filter((_, index) => !partial || index === 0).map(event => ({ id: event.id, status: 201 })),
-      errors: partial ? body.batch.slice(1).map(event => ({ id: event.id, status: 500, message: 'Synthetic partial response' })) : [] });
+    const path = new URL(request.url).pathname;
+    if (path.endsWith('/v2/observations')) return Response.json({
+      data: partial ? observations.filter(row => !row.parentObservationId) : observations, meta: {} });
+    if (path.endsWith('/v3/scores')) return Response.json({ data: partial ? [] : scores, meta: {} });
+    if (path.endsWith('/scores') && request.method === 'POST') {
+      const score = await request.json() as any; scores.push({ ...score, subject: { kind: 'trace', id: score.traceId } });
+      return Response.json({ id: score.id });
+    }
+    if (!path.endsWith('/otel/v1/traces')) return new Response(null, { status: 404 });
+    const rows = observationRowsFromOtlp(await request.json()); observations.push(...rows);
+    batches.push(rows.map(row => row.metadata.localObservationId)); return Response.json({});
   } });
   const configs = join(repo, 'agent-eval/configs'); mkdirSync(configs, { recursive: true });
   writeFileSync(join(configs, '.env'), `LANGFUSE_BASE_URL=http://127.0.0.1:${server.port}\nLANGFUSE_PUBLIC_KEY=synthetic-process-public\nLANGFUSE_SECRET_KEY=synthetic-process-secret\n`);
@@ -87,11 +98,23 @@ test('two real CLI processes preserve partial export receipts through a conflict
     expect(projects).toBe(1); expect(batches).toHaveLength(0); release();
     expect(await first.exited).toBe(0);
     const receipt = join(file, '../export.json'), before = JSON.parse(readFileSync(receipt, 'utf8'));
-    expect(before).toMatchObject({ status: 'partial', target: { projectId: 'synthetic-process-project' }, progress: { acceptedEventIds: batches[0]!.slice(0, 1) } });
+    const root = observations.find(row => !row.parentObservationId)!; expect(root.type).toBe('AGENT');
+    const rootId = root.metadata.localObservationId;
+    expect(before).toMatchObject({ status: 'partial', target: { baseUrl: `http://127.0.0.1:${server.port}`, projectId },
+      progress: { total: 2, acceptedEventIds: [rootId], rejectedEventIds: [] } });
+    expect(batches).toHaveLength(1); expect(scores).toHaveLength(1);
+    const stillUnknown = cliProcess(repo, args); expect(await stillUnknown.exited).toBe(0);
+    expect(JSON.parse(readFileSync(receipt, 'utf8')).status).toBe('partial');
+    expect(batches).toHaveLength(1); expect(scores).toHaveLength(1);
+    const retained = readFileSync(receipt, 'utf8'); projectId = 'another-process-project';
+    const wrongTarget = cliProcess(repo, args); expect(await wrongTarget.exited).toBe(1); expect(wrongTarget.stderr()).toContain('target');
+    expect(readFileSync(receipt, 'utf8')).toBe(retained); expect(batches).toHaveLength(1); expect(scores).toHaveLength(1);
+    projectId = 'synthetic-process-project';
     partial = false; const retry = cliProcess(repo, args); expect(await retry.exited).toBe(0);
     const after = JSON.parse(readFileSync(receipt, 'utf8'));
     expect(after).toMatchObject({ status: 'complete', target: before.target });
-    expect(batches[1]).toEqual(batches[0]!.slice(1)); expect(after.progress.acceptedEventIds).toEqual(batches[0]);
+    expect(batches).toHaveLength(1); expect(scores).toHaveLength(1);
+    expect(after.progress).toEqual({ total: 2, acceptedEventIds: [rootId, ...scores.map(score => score.id)], rejectedEventIds: [] });
     expect(readFileSync(file, 'utf8')).toBe(original);
   } finally { release(); await server.stop(true); }
 }, 45_000);
@@ -110,7 +133,7 @@ test('a sidecar writer excludes another operation until release without changing
 });
 
 test('shared feedback refuses an occupied file before appending a Case record', () => {
-  const file = join(caseReviewDirectory(fixtureRepo, true), 'review.json'), release = acquire(file);
+  const file = humanFeedbackFile(fixtureRepo, true), release = acquire(file);
   try {
     expect(() => addFeedback(fixtureRepo, { dataset, caseId: dataset.cases[0]!.id,
       reviewer: 'synthetic-reviewer', verdict: 'bad', note: 'Synthetic review' })).toThrow('write conflict');

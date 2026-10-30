@@ -14,7 +14,6 @@ import type {
   ProviderPort,
   SafeConfigSnapshot,
 } from '@flowmate/contracts';
-import type { SessionRepository } from '../../../packages/core/src/storage/repositories.ts';
 import { makeApplication, RuntimeService, SessionService } from '../../../packages/core/src/index.ts';
 import { openTestDatabase } from '../../support/database.ts';
 import { createAgentHistoryFixture } from './agent-history-fixture.ts';
@@ -39,7 +38,8 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolean; failSessionRelease?: boolean; legacyHistory?: boolean } = {}) {
+function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolean; failSessionRelease?: boolean; legacyHistory?: boolean;
+  systemPromptOverride?: string; thinkingLevelOverride?: 'max'; onPrepare?(): void } = {}) {
   const opened = openTestDatabase(dbPaths(mkdtempSync(join(tmpdir(), 'flowmate-app-agent-'))));
   if (!opened.ok) throw new Error(opened.error.message);
   let created = 0;
@@ -64,11 +64,12 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     },
     async prepare(nativeSessionId, receivedConfig, limits, signal): Promise<ReturnType<typeof ok<PreparedAgent>> | { ok: false; error: ReturnType<typeof appError> }> {
       preparations += 1;
+      options.onPrepare?.();
       if (signal.aborted) return { ok: false, error: appError('agent_cancelled', 'runtime', 'cancelled', false) };
       const record = records.get(nativeSessionId);
       if (!record) return { ok: false, error: appError('session_history_unavailable', 'session', 'missing', false) };
       const agentFacts: P5ChatAgentConfigFacts = {
-        policyVersion: 'p5-session-inputs-v1', nativeSessionId, systemPrompt: INVOICE_CHAT_SYSTEM_PROMPT, thinkingLevel: 'off',
+        policyVersion: 'p5-session-inputs-v1', nativeSessionId, systemPrompt: options.systemPromptOverride ?? INVOICE_CHAT_SYSTEM_PROMPT, thinkingLevel: options.thinkingLevelOverride ?? 'off',
         resourcePolicy: 'none', historyPolicy: 'memory-only', maxContextBytes: 524_288, maxOutputBytes: 262_144,
         maxAssistantContentBytes: 524_288, maxModelCalls: 12, sessionRetry: false,
       };
@@ -83,7 +84,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
         snapshot,
         async execute(input: AgentExecutionInput, _runSignal) {
           record.busy = true;
-          history.saveUser(nativeSessionId, input);
+          await history.saveUser(nativeSessionId, input);
           const outcome: AgentNativeOutcome = {
             text: input.text === 'first invoice summary' ? '发票 INV-1，金额 100 元，缺少日期。' : '根据上文，缺少开票日期。',
             partial: false, stopReason: 'stop', responseId: `response-${input.runId}`, responseModel: receivedConfig.modelRef.model,
@@ -91,7 +92,7 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
             tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
             stopped: true, cleanupErrors: [], agent: { nativeSessionId, turnCount: 1, modelCallCount: 1 },
           };
-          history.saveResult(nativeSessionId, input, outcome);
+          await history.saveResult(nativeSessionId, input, outcome);
           record.busy = false;
           return outcome;
         },
@@ -108,21 +109,13 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
     async prepare() { return { ok: false, error: appError('unused', 'provider', 'unused', false) }; },
     async close() { return { stopped: true, closed: true, errors: [] }; },
   };
-  const runtime = new RuntimeService({ memory: opened.data.memory, runs: opened.data.runs, sessions: opened.data.sessions, sessionInputs: opened.data.sessionInputs, agent, provider,
+  const runtime = new RuntimeService({ database: opened.data, agent, provider,
+    systemPromptOverride: options.systemPromptOverride,
+    thinkingLevelOverride: options.thinkingLevelOverride,
     log: { write: () => undefined, close: async () => undefined }, now: () => '2026-09-24T00:00:00.000Z', monotonicNow: () => performance.now() });
-  const sessionRepository: SessionRepository = options.failSessionInsert ? {
-    ...opened.data.sessions,
-    create: () => ({ ok: false, error: appError('storage_write_failed', 'storage', 'fixture session insert failure', true) }),
-    get: (sessionId) => opened.data.sessions.get(sessionId),
-    list: (request) => opened.data.sessions.list(request),
-    rename: (input) => opened.data.sessions.rename(input),
-    isModelUseBlocked: (sessionId) => opened.data.sessions.isModelUseBlocked(sessionId),
-    revokeDocumentUse: (input) => opened.data.sessions.revokeDocumentUse(input),
-    prepareDelete: (sessionId, at) => opened.data.sessions.prepareDelete(sessionId, at),
-    delete: (sessionId, at) => opened.data.sessions.delete(sessionId, at),
-  } : opened.data.sessions;
-  const sessionService = new SessionService(sessionRepository, agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z', opened.data.runs, opened.data.memory,
-    opened.data.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
+  if (options.failSessionInsert) opened.data.db.exec("CREATE TRIGGER reject_session_insert BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT,'controlled Session insert failure'); END;");
+  const sessionService = new SessionService(agent, () => runtime.state(), () => '2026-09-24T00:00:00.000Z', opened.data,
+     (request, submission, control) => runtime.start(request, control, submission));
   const promptTrace: PromptTraceBuffer = {
     begin() {}, append() {}, end() {}, clearSession(sessionId) { clearedTraceSessions.push(sessionId); },
     query() { if (options.failTraceQuery) throw new Error('diagnostic source failed'); return { availability: 'not-started', calls: [], droppedCalls: 0 }; },
@@ -133,6 +126,33 @@ function harness(options: { failSessionInsert?: boolean; failTraceQuery?: boolea
 }
 
 describe('P2 Application Agent entry', () => {
+  it('admits, starts and reads back a max reasoning Run through the actual SQLite repository', async () => {
+    const h = harness({ thinkingLevelOverride: 'max' }), session = await h.app.createSession();
+    if (!session.ok) throw Error(session.error.message);
+    const finished = deferred<void>();
+    try {
+      const accepted = await h.app.startRun({ sessionId: session.data.sessionId, text: 'Read original evidence without external work.',
+        config: { ...config, modelRef: { provider: 'evaluation-luna', model: 'gpt-6-luna' }, connection: {
+          api: 'openai-completions', baseUrl: 'http://127.0.0.1:8767/v1', contextWindow: 272000, maxTokens: 128000, reasoning: true } } },
+        { onEvent(event) { if (event.type === 'run_finished') finished.resolve(); } });
+      expect(accepted).toMatchObject({ ok: true }); if (!accepted.ok) return;
+      await finished.promise;
+      expect(h.db.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'completed', config: { agent: { thinkingLevel: 'max' } } } });
+      expect(h.counts().preparations).toBe(1);
+    } finally { await h.app.close(); }
+  });
+  it('freezes the trusted experiment prompt at admission before preparing or executing the model', async () => {
+    const prompt = 'Trusted experiment system prompt'; let admitted: unknown;
+    const h = harness({ systemPromptOverride: prompt, onPrepare() { const row = h.db.runs.get(1); if (row.ok) admitted = row.data.config; } });
+    const session = await h.app.createSession(); if (!session.ok) throw Error(session.error.message);
+    const done = deferred<void>();
+    const accepted = await h.app.startRun({ sessionId: session.data.sessionId, text: 'Original user evidence', config },
+      { onEvent(event) { if (event.type === 'run_finished') done.resolve(); } });
+    expect(accepted.ok).toBe(true); await done.promise;
+    expect(admitted).toMatchObject({ agent: { systemPrompt: prompt } });
+    expect(h.db.runs.get(1)).toMatchObject({ ok: true, data: { config: { agent: { systemPrompt: prompt } } } });
+    await h.app.close();
+  });
   it('rejects invalid message queries and reports legacy native history without preparing a model', async () => {
     const { app, counts } = harness({ legacyHistory: true });
     const created = await app.createSession({});

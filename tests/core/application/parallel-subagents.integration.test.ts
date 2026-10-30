@@ -35,8 +35,8 @@ for (const scenario of ['complete', 'cancel', 'workspace'] as const) it(`paralle
   let extensions: import('@flowmate/contracts').ExtensionRef[] = [];
   const app: Application = need(await createApplication({ paths, resourceRoot: resolve(import.meta.dir, '../../../resources'),
     resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: extensions } }),
-    agentFactory: (tools, resourceContents) => {
-      return new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+    agentFactory: tools => {
+      return new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-only' });
     } })); deferCleanup(() => app.close());
   extensions = need(await app.listExtensions()).items.filter(item => item.ref.id === 'subagents').map(item => item.ref);

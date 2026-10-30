@@ -1,11 +1,15 @@
 import { z } from 'zod';
-import { AppErrorSchema, EvaluationConfigurationSnapshotSchema, EvaluationEventSchema, EvaluationIdSchema,
+import { AppErrorSchema, EvaluationConnectionSchema, EvaluationConfigurationSnapshotSchema, EvaluationEventSchema, EvaluationIdSchema,
   evaluationRequests, evaluationResponses, type Result } from '@flowmate/contracts';
 import { langfuseConnectionSchema } from '../configuration.ts';
+import { EvaluationWorkflowRequestSchema, EvaluationWorkflowResultSchema } from '../../../packages/contracts/src/evaluation-workflow.ts';
 
 export const EVALUATION_FRAME_LIMIT = 4 * 1024 * 1024;
 const envelope = { version: z.literal(1), sessionId: EvaluationIdSchema, messageId: EvaluationIdSchema };
 const commandSchema = z.discriminatedUnion('type', [
+  z.object({ ...envelope, type: z.literal('evaluation_workflow'), input: EvaluationWorkflowRequestSchema,
+    context: z.object({ agentCredentials: z.array(z.object({ connection: EvaluationConnectionSchema,
+      apiKey: z.string().trim().min(1).max(4096) }).strict()).max(11) }).strict().optional() }).strict(),
   z.object({ ...envelope, type: z.literal('query_evaluation_catalog'), input: evaluationRequests.query_evaluation_catalog }).strict(),
   z.object({ ...envelope, type: z.literal('add_evaluation_feedback'), input: evaluationRequests.add_evaluation_feedback }).strict(),
   z.object({ ...envelope, type: z.literal('query_evaluation_feedback'), input: evaluationRequests.query_evaluation_feedback }).strict(),
@@ -27,6 +31,7 @@ const commandSchema = z.discriminatedUnion('type', [
 export type EvaluationWorkerCommand = z.infer<typeof commandSchema>;
 export type EvaluationWorkerOperation = EvaluationWorkerCommand['type'];
 export const evaluationWorkerResponses = { ...evaluationResponses,
+  evaluation_workflow: EvaluationWorkflowResultSchema,
   shutdown: z.object({ closed: z.boolean(), stopped: z.boolean() }).strict() } as const;
 export type EvaluationWorkerData<K extends EvaluationWorkerOperation> = z.infer<(typeof evaluationWorkerResponses)[K]>;
 export type EvaluationWorkerReply = { [K in EvaluationWorkerOperation]: { version: 1; type: 'response'; sessionId: string;
@@ -36,12 +41,14 @@ const outputSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), type: z.literal('event'), sessionId: EvaluationIdSchema, event: EvaluationEventSchema }).strict(),
   z.object({ ...envelope, type: z.literal('response'), sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER), operation: z.enum(['preview_evaluation', 'start_evaluation',
     'query_evaluation_control', 'cancel_evaluation', 'list_evaluation_executions', 'query_evaluation_result', 'compare_evaluation',
-    'query_evaluation_catalog', 'add_evaluation_feedback', 'query_evaluation_feedback', 'export_evaluation', 'shutdown']), result: z.unknown() }).strict(),
+    'query_evaluation_catalog', 'add_evaluation_feedback', 'query_evaluation_feedback', 'export_evaluation', 'evaluation_workflow', 'shutdown']), result: z.unknown() }).strict(),
   z.object({ version: z.literal(1), type: z.literal('protocol-error'), sessionId: EvaluationIdSchema, error: AppErrorSchema }).strict(),
 ]);
 export type EvaluationWorkerOutput = Exclude<z.infer<typeof outputSchema>, { type: 'response' }> | EvaluationWorkerReply;
 export function parseEvaluationWorkerCommand(input: unknown): EvaluationWorkerCommand | null {
-  const parsed = commandSchema.safeParse(input); return parsed.success ? parsed.data : null;
+  const parsed = commandSchema.safeParse(input);
+  if (!parsed.success || parsed.data.type === 'evaluation_workflow' && parsed.data.context && parsed.data.input.action !== 'experiment.run') return null;
+  return parsed.data;
 }
 export function parseEvaluationWorkerOutput(input: unknown): EvaluationWorkerOutput | null {
   const parsed = outputSchema.safeParse(input); if (!parsed.success) return null;

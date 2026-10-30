@@ -26,7 +26,7 @@ test('reports missing actual SDK command dependencies without downloading tools 
   const entry = new URL('../../packages/runtime-pi/src/native-tools.ts', import.meta.url).href;
   const child = Bun.spawn([process.execPath, '--no-env-file', '-e',
     `const {createNativeTools}=await import(${JSON.stringify(entry)}); const tools=createNativeTools({getWorkingDirectory:()=>({ok:true,data:process.cwd()})}); process.stdout.write(JSON.stringify(tools.availability));`],
-    { cwd: root, env: { PATH: '', SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP,
+    { cwd: root, env: { PATH: '', SystemRoot: join(root, 'missing-windows'), ProgramFiles: join(root, 'missing-program-files'), TEMP: process.env.TEMP, TMP: process.env.TMP,
       PI_CODING_AGENT_DIR: join(root, 'pi'), PI_OFFLINE: '1' }, stdout: 'pipe', stderr: 'pipe' });
   const output = await new Response(child.stdout).text(), error = await new Response(child.stderr).text();
   expect(await child.exited).toBe(0); expect(error).toBe('');

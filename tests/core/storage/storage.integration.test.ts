@@ -59,7 +59,7 @@ const input = {
 };
 
 describe('P1 SQLite storage', () => {
-  it('[F-run-state-contract] persists only permitted provider Run transitions and immutable terminal facts', () => {
+  it('[F-run-state-contract] persists only permitted provider Run transitions and immutable terminal facts', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-storage-'));
     const opened = openDatabase(makePaths(root));
     expect(opened.ok).toBe(true);
@@ -159,10 +159,10 @@ describe('P1 SQLite storage', () => {
       error: { code: 'late-failure', category: 'provider', message: 'Late failure', retryable: false } }))
       .toEqual({ ok: true, data: false });
     expect(opened.data.runs.get(runId)).toEqual(afterUnknown);
-    opened.data.close();
+    await opened.data.close();
   });
 
-  it.each(['failed', 'cancelled'] as const)('[F-single-owner] rejects a second active provider run and keeps a %s terminal immutable', (status) => {
+  it.each(['failed', 'cancelled'] as const)('[F-single-owner] rejects a second active provider run and keeps a %s terminal immutable', async (status) => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-storage-'));
     const opened = openDatabase(makePaths(root));
     expect(opened.ok).toBe(true);
@@ -208,7 +208,7 @@ describe('P1 SQLite storage', () => {
       output: { ...terminal.output!, text: 'Late success', partial: false, stopReason: 'stop' } }))
       .toEqual({ ok: true, data: false });
     expect(opened.data.runs.get(first.data)).toEqual(saved);
-    opened.data.close();
+    await opened.data.close();
   });
 
   it.each(['created', 'running'] as const)('[F-crash-reopen] recovers a committed %s row after a real Bun process crash without replay', async (state) => {
@@ -219,10 +219,10 @@ describe('P1 SQLite storage', () => {
       `import { openDatabase } from ${JSON.stringify(moduleUrl.href)};`,
       `const opened = openDatabase(${JSON.stringify(makePaths(root))});`,
       "if (!opened.ok) throw new Error(opened.error.code);",
-      `const created = opened.data.runs.create(${JSON.stringify({ goal: input.goal, input, config, usage, cleanup, createdAt: '2026-09-21T00:00:00.000Z' })});`,
+      `const created = await opened.data.transaction(store => store.runs.create(${JSON.stringify({ goal: input.goal, input, config, usage, cleanup, createdAt: '2026-09-21T00:00:00.000Z' })}));`,
       "if (!created.ok) throw new Error(created.error.code);",
       ...(state === 'running' ? [
-        `const started = opened.data.runs.start(created.data, ${JSON.stringify(config)}, '2026-09-21T00:00:00.010Z');`,
+        `const started = await opened.data.transaction(store => store.runs.start(created.data, ${JSON.stringify(config)}, '2026-09-21T00:00:00.010Z'));`,
         "if (!started.ok) throw new Error(started.error.code);",
       ] : []),
       "console.log('ready:' + created.data);",
@@ -267,21 +267,21 @@ describe('P1 SQLite storage', () => {
         expect(snapshot.data.input).toEqual(input);
       }
       expect(reopened.data.db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 1 });
-      reopened.data.close();
+      await reopened.data.close();
       const again = openDatabase(makePaths(root));
       expect(again.ok).toBe(true);
       if (again.ok) {
         expect(again.data.runs.get(runId)).toEqual(snapshot);
-        again.data.close();
+        await again.data.close();
       }
     }
   }, 10_000);
 
-  it('[F-schema-version] rejects an unsupported schema and a corrupt database instead of creating a replacement', () => {
+  it('[F-schema-version] rejects an unsupported schema and a corrupt database instead of creating a replacement', async () => {
     const unsupportedRoot = mkdtempSync(join(tmpdir(), 'flowmate-storage-schema-'));
     const unsupported = openDatabase(makePaths(unsupportedRoot));
     expect(unsupported.ok).toBe(true);
-    if (unsupported.ok) unsupported.data.close();
+    if (unsupported.ok) await unsupported.data.close();
     const raw = new Database(makePaths(unsupportedRoot).databaseFile);
     raw.exec('UPDATE schema_migrations SET version=99 WHERE id=1');
     raw.close();
@@ -298,7 +298,7 @@ describe('P1 SQLite storage', () => {
     if (!corrupt.ok) expect(corrupt.error.code).toBe('storage_open_failed');
   });
 
-  it('[F-run-json-version] rejects valid JSON with an unsupported Run record version', () => {
+  it('[F-run-json-version] rejects valid JSON with an unsupported Run record version', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-storage-json-version-'));
     const opened = openDatabase(makePaths(root));
     expect(opened.ok).toBe(true);
@@ -311,7 +311,7 @@ describe('P1 SQLite storage', () => {
     const queried = opened.data.runs.get(created.data);
 
     expect(queried).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
-    opened.data.close();
+    await opened.data.close();
   });
 
   it('[F-disk-write-failure] reports a real closed-database write failure', () => {
@@ -344,7 +344,7 @@ describe('P1 SQLite storage', () => {
     const first = openDatabase(makePaths(root));
     expect(first.ok).toBe(true);
     if (!first.ok) return;
-    first.data.close();
+    await first.data.close();
 
     const databaseFile = makePaths(root).databaseFile;
     writeFileSync(join(root, '.env'), 'FLOWMATE_LLM_API_KEY=synthetic-child-dotenv\n');

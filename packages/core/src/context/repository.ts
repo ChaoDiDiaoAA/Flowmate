@@ -1,7 +1,8 @@
 import { ResearchContextSchema } from '@flowmate/contracts';
 import { readResearchContext } from '../research/context.ts';
 import { createNativeOriginReader, NativeOriginFault } from '../memory/origins.ts';
-import { SQLiteError, type Database } from 'bun:sqlite';
+import { SQLiteError } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { createManagedFileContents } from '../storage/managed-file-contents.ts';

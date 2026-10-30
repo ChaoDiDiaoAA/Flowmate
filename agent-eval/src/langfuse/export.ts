@@ -5,6 +5,9 @@ import { langfuseConfig, langfuseConnection, agentModelCapabilitiesSchema, type 
 import { readReport, readExportState, type LocalReport } from '../reports/store.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
 import { z } from 'zod';
+import { buildObservationTree, sendObservationTree } from './otel.ts';
+import { queryLangfuseObservations, matchObservationTree } from './read.ts';
+import { writeExportState } from '../reports/archive.ts';
 export type Event = {
     id: string;
     type: string;
@@ -124,6 +127,7 @@ export async function exportReport(report: LocalReport, path: string, transport?
 }
 async function exportOwnedReport(report: LocalReport, path: string, transport: ((events: Event[]) => Promise<void | Receipt>) | undefined, repo: string,
     options: ExportOptions) {
+    if (!transport) return exportOtelReport(report, path, repo, options);
     if (!['flowmate-agent-run/v1', 'flowmate-agent-run/v2'].includes(report.contract))
         throw new Error('Historical exports are disabled');
     if (report.endedAt === null || report.scoring !== 'complete')
@@ -156,13 +160,11 @@ async function exportOwnedReport(report: LocalReport, path: string, transport: (
             rejectedEventIds: events.filter(e => rejected.has(e.id)).map(e => e.id) });
         const record = (status: LocalReport['export']['status'], error?: string) => {
             const next: LocalReport['export'] = { backend: 'langfuse', status, target, progress: progress(), error, url: target.baseUrl };
-            atomicJson(join(dirname(path), 'export.json'), publicVersions(next));
+            writeExportState(path, next);
             report.export = next;
         };
         if (!previous.target) record('pending');
-        const send = transport ?? ((batch: Event[]) => client!.api.ingestion.batch({
-            batch: batch as Parameters<NonNullable<typeof client>['api']['ingestion']['batch']>[0]['batch'],
-        }, { maxRetries: 0 }));
+        const send = transport;
         try {
             for (let i = 0; i < events.length; i += 50) {
                 const batch = events.slice(i, i + 50).filter(e => !accepted.has(e.id)); if (!batch.length) continue;
@@ -184,4 +186,89 @@ async function exportOwnedReport(report: LocalReport, path: string, transport: (
         try { await client?.shutdown(); }
         catch { throw Error('Langfuse client shutdown failed; query the original saved export state'); }
     }
+}
+
+async function exportOtelReport(report: LocalReport, path: string, repo: string, options: ExportOptions) {
+    const endedAt = report.endedAt;
+    if (report.history || !endedAt || report.scoring !== 'complete') throw Error('Export requires complete original saved report facts');
+    const saved = readReport(path);
+    if (JSON.stringify(publicReport(saved)) !== JSON.stringify(publicReport(report))) throw Error('Export requires the original saved report facts');
+    report.export = readExportState(path, saved.export);
+    const previous = structuredClone(report.export), nodes = buildObservationTree(report);
+    const scoreTimestamp = previous.progress?.scoreTimestamp ?? (!previous.target ? endedAt : undefined);
+    if (scoreTimestamp && Date.parse(scoreTimestamp) !== Date.parse(endedAt)) throw Error('Score timestamp differs from its original execution');
+    const scores = report.trials.flatMap(trial => trial.scores.filter(score => score.value !== null).map(score => ({
+        id: [trial.traceId, score.metricId, score.version].join(':'), traceId: trial.traceId, name: score.name, value: score.value!,
+        timestamp: new Date(scoreTimestamp ?? endedAt),
+        dataType: 'NUMERIC' as const, source: 'API' as const, environment: report.environment, metadata: { executionId: report.executionId,
+            trialId: trial.trialId, caseId: trial.caseId, caseVersion: trial.caseVersion, ...scoreSummary(score) } })));
+    const identities = [...nodes.map(node => node.id), ...scores.map(score => score.id)], accepted = new Set(previous.progress?.acceptedEventIds ?? []);
+    const knownScores = new Set(previous.progress?.knownScoreIds ?? [...accepted].filter(id => scores.some(score => score.id === id)));
+    if (!previous.target && (previous.progress || previous.backend === 'langfuse' && previous.status !== 'pending')) throw Error('Historical export target is unavailable; original receipts are read-only');
+    if (previous.target && (!previous.progress || previous.progress.total !== identities.length) ||
+        [...accepted].some(id => !identities.includes(id)) || [...knownScores].some(id => !scores.some(score => score.id === id)))
+        throw Error('Export progress differs from original OTEL observation identities');
+    const connection = options.connection === undefined ? langfuseConfig(repo) : langfuseConnection(options.connection);
+    const client = await platformClient(repo, connection);
+    try {
+        const projects = projectsSchema.safeParse(await (options.queryProjects ? options.queryProjects() : client.api.projects.get({ maxRetries: 0 })));
+        if (!projects.success || projects.data.data.length !== 1) throw Error('Langfuse target requires a unique project');
+        const target = { baseUrl: connection.baseUrl, projectId: projects.data.data[0]!.id };
+        if (previous.target && (previous.target.baseUrl !== target.baseUrl || previous.target.projectId !== target.projectId))
+            throw Error('Langfuse target differs from the original export');
+        const record = (status: LocalReport['export']['status'], error?: string) => {
+            const next: LocalReport['export'] = { backend: 'langfuse', status, target, url: target.baseUrl, error,
+                progress: { total: identities.length, acceptedEventIds: identities.filter(id => accepted.has(id)), rejectedEventIds: [],
+                    ...(scoreTimestamp ? { scoreTimestamp } : {}), knownScoreIds: scores.filter(score => knownScores.has(score.id)).map(score => score.id) } };
+            writeExportState(path, next); report.export = next;
+        };
+        // Persist before sending: after any interruption, query visibility instead of duplicating v4 observations.
+        if (!previous.target) record('pending', 'OTEL submission started; remote visibility unconfirmed');
+        let failure: string | undefined;
+        if (!previous.target) {
+            try {
+                await sendObservationTree(nodes, connection);
+            } catch (error) { failure = scanEvidence(String(error)).value; }
+        }
+        const readScores = async () => {
+            for (const score of scores) accepted.delete(score.id);
+            for (const trial of report.trials) {
+                let cursor: string | undefined; const cursors = new Set<string>();
+                do {
+                    const page = await client.api.scoresV3.getManyV3({ traceId: trial.traceId, fields: 'subject', source: 'API', limit: 100, cursor }, { maxRetries: 0 });
+                    for (const row of page.data) {
+                        if (row.source !== 'API' || row.subject?.kind !== 'trace') continue;
+                        const expected = scores.find(score => score.id === row.id && score.traceId === row.subject!.id);
+                        if (!expected) continue;
+                        knownScores.add(row.id);
+                        const at = new Date(row.timestamp).getTime();
+                        if (expected.name === row.name && expected.value === row.value && (!scoreTimestamp || at === Date.parse(scoreTimestamp))) accepted.add(row.id);
+                    }
+                    cursor = page.meta.cursor ?? undefined;
+                    if (cursor && cursors.has(cursor)) throw Error('Repeated Langfuse score cursor');
+                    if (cursor) cursors.add(cursor);
+                } while (cursor);
+            }
+        };
+        try {
+            const observations = await queryLangfuseObservations(connection, { from: new Date(Math.min(...nodes.map(node => Date.parse(node.start))) - 1).toISOString(),
+                to: new Date(Math.max(...nodes.map(node => Date.parse(node.end))) + 1).toISOString(), traceIds: [...new Set(nodes.map(node => node.traceId))] });
+            const observationsMatch = matchObservationTree(nodes, observations);
+            for (const node of nodes) accepted.delete(node.id);
+            for (const id of observationsMatch.matchedIds) accepted.add(id);
+            failure = observationsMatch.complete ? undefined : observationsMatch.gaps.join('; ');
+            await readScores();
+            const missing = scoreTimestamp ? scores.filter(score => !knownScores.has(score.id)) : [];
+            if (missing.length) {
+                // Score identity also includes name and timestamp; never overwrite a remotely observed drift.
+                try { for (const score of missing) await client.api.scores.create(score, { maxRetries: 0 }); }
+                catch (error) { failure = scanEvidence(String(error)).value; }
+                await readScores();
+            }
+        } catch (error) { failure = scanEvidence(String(error)).value; }
+        const complete = accepted.size === identities.length && !failure;
+        record(complete ? 'complete' : accepted.size ? 'partial' : 'pending', complete ? undefined :
+            'Remote visibility unconfirmed; recheck the saved target without resending observations' + (failure ? ': ' + failure : ''));
+        return report.export;
+    } finally { await client.shutdown(); }
 }

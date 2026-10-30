@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Result, UsageRecord, TokenColumns, NativeSessionHistory, SessionInputRequest, P3AgentConfigFacts, ToolRuntimeObservation } from '@flowmate/contracts';
 import { appError, fail, ok } from '@flowmate/contracts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { createRuntimeEventStore } from '../../../packages/core/src/events/store.ts';
 import { createRunRepository, createSessionRepository, createToolCallRepository } from '../../../packages/core/src/storage/repositories.ts';
 import { createSessionInputLedger } from '../../../packages/core/src/sessions/input-ledger.ts';

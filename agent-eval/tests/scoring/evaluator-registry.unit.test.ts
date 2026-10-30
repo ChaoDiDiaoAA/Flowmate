@@ -9,7 +9,8 @@ import {formalFixture} from '../support/formal.ts';
 test('every formal requirement resolves to an executable registered evaluator without counting compatibility judges',()=>{
     const registry=createRegistry(), definitions=registry.list();
     expect(definitions.filter(d=>d.kind==='deterministic')).toHaveLength(25);
-    expect(definitions.filter(d=>d.kind==='llm-judge')).toHaveLength(10);
+    expect(definitions.filter(d=>d.kind==='llm-judge')).toHaveLength(30);
+    expect(definitions.filter(d=>d.kind==='llm-judge').every(d=>d.outputs?.length===1&&d.outputs[0]===d.id)).toBe(true);
     expect(definitions.some(d=>d.id==='answer-relevance')).toBe(false);
     for(const metric of metricCatalog){
         const owner=registry.get(formalEvaluatorOwners[metric.id]!);
@@ -17,6 +18,13 @@ test('every formal requirement resolves to an executable registered evaluator wi
         expect(typeof owner.appliesTo).toBe('function');
     }
     expect(registry.get('answer-relevance').kind).toBe('llm-judge');
+    expect(()=>registry.get('task-judge')).toThrow('Unknown metric');
+});
+
+test('an unknown formal metric is rejected when compiling the plan rather than after dispatch',()=>{
+    const context=formalFixture();
+    context.task.expected.metrics.push({metricId:'unregistered',version:1,unit:'Trial',denominator:1});
+    expect(()=>compileEvaluatorPlan(context.task)).toThrow('Unknown formal metric');
 });
 
 test('registered runtime evaluators can independently judge their declared original metrics',async()=>{

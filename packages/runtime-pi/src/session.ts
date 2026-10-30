@@ -1,5 +1,5 @@
 import { RESEARCH_PLANNING_SYSTEM_PROMPT, RESEARCH_INVESTIGATION_SYSTEM_PROMPT } from '@flowmate/contracts';
-import { FrozenInputDefinitionsSchema, InputCommandOwnerSchema, InputCommandReceiptSchema } from '@flowmate/contracts';
+import { FrozenInputDefinitionsSchema, InputCommandOwnerSchema, InputCommandReceiptSchema, AppErrorSchema } from '@flowmate/contracts';
 import { nativeFileResultIncludes } from '@flowmate/shared';
 import {
   createAssistantMessageEventStream,
@@ -8,7 +8,10 @@ import {
 import { isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isContextOverflow } from '@earendil-works/pi-ai/utils/overflow';
+import { getSupportedThinkingLevels } from '@earendil-works/pi-ai/compat';
+import { getCurrentSystemMessage, getCurrentSystemPrompt, getCurrentTools, normalizeContext } from '@earendil-works/pi-ai/utils/transcript';
 import { isDeepStrictEqual } from 'node:util';
+import type { ModelTraceObservation } from '@flowmate/contracts';
 import {
   createAgentSession,
   sessionEntryToContextMessages,
@@ -48,7 +51,7 @@ import type {
   NativeHistoryRecoverySeed,
   HistoryCommitState,
   HistoryCommitReceipt,
-  NativeHistoryWrite,
+  NativeHistoryWriter,
   NativeDerivedContextBinding,
   NativeInputContextBinding,
   NativeToolResultContextBinding,
@@ -194,12 +197,14 @@ type SessionRecord = {
   workingDirectory?: string;
   resourceKey?: string | null;
   resourceLoader?: Extract<ReturnType<typeof createRunResourceLoader>, { ok: true }>['data'];
+  resourceContents?: Pick<ManagedFileContents, 'read'>;
   sessionInputs?: boolean;
   dispatchTail?: Promise<void>;
   preparing: boolean;
   running: boolean;
   unusable: boolean;
-  historyWriter?: (write: NativeHistoryWrite) => Result<HistoryCommitReceipt>;
+  historyWriter?: NativeHistoryWriter;
+  historyTail?: Promise<void>;
   memory?: PiMemoryAdapter;
   recoverySeed?: NativeHistoryRecoverySeed;
   receipt?: HistoryCommitState;
@@ -219,6 +224,7 @@ type SessionRecord = {
 function inMemorySettings(): SettingsManager {
   return SettingsManager.inMemory({
     compaction: { enabled: false, reserveTokens: RUNTIME_CONFIG.compaction.reserveTokens, keepRecentTokens: RUNTIME_CONFIG.compaction.keepRecentTokens },
+    cacheWarming: 'off',
     retry: { enabled: false, maxRetries: 0, baseDelayMs: 1, provider: { maxRetries: 0, maxRetryDelayMs: 0 } },
     transport: 'sse',
     enableSkillCommands: false,
@@ -387,6 +393,8 @@ async function wireToolDefinitions(api: string, request: Parameters<FetchLike>[0
 export class PiAgentAdapter implements AgentPort {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
+    systemPromptOverride?: string; thinkingLevelOverride?: import('@earendil-works/pi-ai').ModelThinkingLevel;
+    observeModel?: (value: ModelTraceObservation) => void;
     resourceBundleRoot?: string; resourceContents?: Pick<ManagedFileContents, 'read'>;
     sessionSetup?: (session: AgentSession) => void };
   private readonly toolsByName: ReadonlyMap<string, ToolDefinition<any, any>>;
@@ -395,6 +403,8 @@ export class PiAgentAdapter implements AgentPort {
   private subagentCallbacks?: SubagentCallbacks;
 
   public constructor(dependencies: PiProviderDependencies & { cwd?: string; agentDir?: string; promptTrace?: PromptTraceBuffer; tools?: readonly ToolDefinition<any, any>[];
+    systemPromptOverride?: string; thinkingLevelOverride?: import('@earendil-works/pi-ai').ModelThinkingLevel;
+    observeModel?: (value: ModelTraceObservation) => void;
     resourceBundleRoot?: string; resourceContents?: Pick<ManagedFileContents, 'read'>;
     sessionSetup?: (session: AgentSession) => void } = {}) {
     this.dependencies = dependencies;
@@ -476,8 +486,8 @@ export class PiAgentAdapter implements AgentPort {
     const messages = new WeakMap<object, NativeInputContextBinding>();
     const nativeObjects = new WeakMap<object, { entryId: string; original: unknown }>();
     const assembled: AgentSession['messages'] = [];
-    for (const entry of record.manager.buildContextEntries()) {
-      for (const canonical of sessionEntryToContextMessages(entry)) {
+    for (const { sourceEntry: entry, messages: projected } of record.manager.buildSessionProjection().entries) {
+      for (const canonical of projected) {
         if (projection && assembled.length >= projection.length) continue;
         const message = projection?.[assembled.length] ?? canonical;
         if (!isDeepStrictEqual(message, canonical))
@@ -503,9 +513,42 @@ export class PiAgentAdapter implements AgentPort {
     return ok(undefined);
   }
 
-  public watchSession(nativeSessionId: string, commit: HistoryCommitState, seed: NativeHistoryRecoverySeed, save: (write: NativeHistoryWrite) => Result<HistoryCommitReceipt>): Result<void> {
+  private enqueueHistory(record: SessionRecord, action: () => void | Promise<void>): void {
+    const previous = record.historyTail, gate = Promise.withResolvers<void>();
+    record.historyTail = gate.promise;
+    const finish = () => { if (record.historyTail === gate.promise) delete record.historyTail; gate.resolve(); };
+    const failed = (cause: unknown) => {
+      const parsed = AppErrorSchema.safeParse(cause);
+      record.historyFailure ??= parsed.success ? parsed.data
+        : appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true);
+      record.unusable = true;
+      if (record.active) {
+        try { this.failToolRun(record, record.active, record.historyFailure); }
+        catch { /* The confirmed failure still blocks execution; cleanup is checked by the owner. */ }
+      }
+    };
+    const run = () => {
+      try {
+        if (record.historyFailure) throw record.historyFailure;
+        const result = action();
+        if (result === undefined) finish();
+        else void result.then(finish, cause => { try { failed(cause); } finally { finish(); } });
+      } catch (cause) { try { failed(cause); } finally { finish(); } throw cause; }
+    };
+    // Install the gate before invoking a synchronous writer: its commit observers may append again.
+    if (previous) void previous.then(() => { try { run(); } catch { /* failure is retained above */ } });
+    else run();
+  }
+
+  private async waitForHistory(record: SessionRecord): Promise<void> {
+    while (record.historyTail) await record.historyTail;
+    if (record.historyFailure) throw record.historyFailure;
+  }
+
+  public watchSession(nativeSessionId: string, commit: HistoryCommitState, seed: NativeHistoryRecoverySeed, save: NativeHistoryWriter): Result<void> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
+    if (record.historyTail) return fail(appError('agent_session_busy', 'session', 'Conversation history is still being saved.', true));
     const initial = this.exportSession(nativeSessionId);
     if (!initial.ok || typeof save !== 'function' || !validateRecovery(initial.data, seed, commit).ok
       || record.recoverySeed && record.recoverySeed.sessionId !== seed.sessionId
@@ -519,99 +562,104 @@ export class PiAgentAdapter implements AgentPort {
     record.persistenceWatched = true;
     const manager = record.manager;
     const original = manager._persist.bind(manager);
-    manager._persist = (entry) => {
-      original(entry);
+    manager._persist = (nativeEntry) => {
+      original(nativeEntry);
       if (record.historyFailure) throw new Error('native_history_write_failed');
       const active = record.active;
-      const ordinal = entry.type === 'message' && active ? active.liveOrdinals.get(entry.message) : undefined;
-      const inputId = entry.type === 'message' && active && entry.message.role === 'user'
-        ? active.inputMessages.get(entry.message) : undefined;
-      const acknowledged = record.memory!.lastSavedHistory.entries.find(saved => saved.id === entry.id);
-      const resultInputIds = !acknowledged && entry.type === 'message' && active && active.input.inputId !== undefined
-        && entry.message.role === 'assistant' && entry.message.stopReason === 'stop'
-        && textFrom(entry.message).trim().length > 0
-        && !entry.message.content.some(part => part.type === 'toolCall') && !active.failure
-        ? [...active.openInputIds] : undefined;
-      const context = !acknowledged && entry.type === 'message' && active && ordinal !== undefined
-        ? { entryId: entry.id, runId: active.runId, ...(inputId === undefined ? {} : { inputId }),
-          ...(inputId !== undefined && active.inputs.get(inputId)?.expansion ? { resourceExpansion: {
-            ...active.inputs.get(inputId)!.expansion!, inputId, nativeEntryId: entry.id } } : {}),
-          ...(resultInputIds?.length ? { resultInputIds } : {}) } : undefined;
-      const snapshot = this.exportSession(nativeSessionId);
-      let saved: Result<HistoryCommitReceipt>;
-      let source: NativeInputContextBinding | undefined;
-      if (!acknowledged && entry.type === 'message' && active && entry.message.role === 'user' && ordinal !== undefined) {
-        const state = inputId === undefined ? undefined : active.inputs.get(inputId);
-        source = { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null,
-          snapshotId: state?.contextSnapshotId ?? null };
-        const previous = record.contextEntries.get(entry.id);
-        if (previous && !isDeepStrictEqual(previous, source)) {
-          const error = appError('context_binding_conflict', 'runtime', 'Input entry provenance conflicts.');
-          this.failToolRun(record, active, error); throw error;
+      const ordinal = nativeEntry.type === 'message' && active ? active.liveOrdinals.get(nativeEntry.message) : undefined;
+      const inputId = nativeEntry.type === 'message' && active && nativeEntry.message.role === 'user'
+        ? active.inputMessages.get(nativeEntry.message) : undefined;
+      const state = inputId === undefined ? undefined : active?.inputs.get(inputId);
+      const snapshotId = state?.contextSnapshotId ?? null;
+      const expansion = state?.expansion ? structuredClone(state.expansion) : undefined;
+      const entry = structuredClone(nativeEntry), snapshot = structuredClone(this.exportSession(nativeSessionId));
+      this.enqueueHistory(record, () => {
+        const acknowledged = record.memory!.lastSavedHistory.entries.find(saved => saved.id === entry.id);
+        const resultInputIds = !acknowledged && entry.type === 'message' && active && active.input.inputId !== undefined
+          && entry.message.role === 'assistant' && entry.message.stopReason === 'stop'
+          && textFrom(entry.message).trim().length > 0
+          && !entry.message.content.some(part => part.type === 'toolCall') && !active.failure
+          ? [...active.openInputIds] : undefined;
+        const context = !acknowledged && entry.type === 'message' && active && ordinal !== undefined
+          ? { entryId: entry.id, runId: active.runId, ...(inputId === undefined ? {} : { inputId }),
+            ...(inputId !== undefined && expansion ? { resourceExpansion: {
+              ...expansion, inputId, nativeEntryId: entry.id } } : {}),
+            ...(resultInputIds?.length ? { resultInputIds } : {}) } : undefined;
+        let saved: ReturnType<NativeHistoryWriter>;
+        let source: NativeInputContextBinding | undefined;
+        if (!acknowledged && entry.type === 'message' && active && entry.message.role === 'user' && ordinal !== undefined) {
+          source = { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null,
+            snapshotId };
+          const previous = record.contextEntries.get(entry.id);
+          if (previous && !isDeepStrictEqual(previous, source)) {
+            const error = appError('context_binding_conflict', 'runtime', 'Input entry provenance conflicts.');
+            this.failToolRun(record, active, error); throw error;
+          }
         }
-      }
-      if (!acknowledged && entry.type === 'message' && entry.message.role === 'user' && !active)
-        source = { nativeEntryId: entry.id, originRunId: null, inputId: null, snapshotId: null };
-      // A repeat acknowledgement retains its original association. Only actual live identity
-      // can assert an association again; idle confirmation must not invent a legacy owner.
-      let confirmationError: ReturnType<typeof appError> | undefined;
-      if (acknowledged && !isDeepStrictEqual(acknowledged, entry))
-        confirmationError = appError('session_history_invalid', 'session', 'The confirmed native entry changed.');
-      if (acknowledged && active && entry.type === 'message' && (ordinal !== undefined || inputId !== undefined)) {
-        const origin = record.recoverySeed!.origins.find(value => value.nativeEntryId === entry.id);
-        const originalInput = record.recoverySeed!.inputs.find(value => value.nativeEntryId === entry.id);
-        const state = inputId === undefined ? undefined : active.inputs.get(inputId);
-        if (origin?.originRunId !== active.runId || entry.message.role === 'user' && !isDeepStrictEqual(originalInput,
-          { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null, snapshotId: state?.contextSnapshotId ?? null }))
-          confirmationError = appError('context_binding_conflict', 'runtime', 'Confirmed entry provenance conflicts.');
-      }
-      try {
-        saved = confirmationError ? fail(confirmationError)
-          : snapshot.ok ? record.memory!.save(snapshot.data, context ? [context] : [], source ? [source] : []) : snapshot;
-      }
-      catch { saved = fail(appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true)); }
-      if (!saved.ok) {
-        record.historyFailure = saved.error;
-        record.unusable = true;
-        if (active) {
-          if (entry.type === 'message' && ordinal !== undefined) this.publishMessage(record, active, entry.message, ordinal, 'failed', 'ended');
-          this.failToolRun(record, active, record.historyFailure);
+        if (!acknowledged && entry.type === 'message' && entry.message.role === 'user' && !active)
+          source = { nativeEntryId: entry.id, originRunId: null, inputId: null, snapshotId: null };
+        // A repeat acknowledgement retains its original association. Only actual live identity
+        // can assert an association again; idle confirmation must not invent a legacy owner.
+        let confirmationError: ReturnType<typeof appError> | undefined;
+        if (acknowledged && !isDeepStrictEqual(acknowledged, entry))
+          confirmationError = appError('session_history_invalid', 'session', 'The confirmed native entry changed.');
+        if (acknowledged && active && entry.type === 'message' && (ordinal !== undefined || inputId !== undefined)) {
+          const origin = record.recoverySeed!.origins.find(value => value.nativeEntryId === entry.id);
+          const originalInput = record.recoverySeed!.inputs.find(value => value.nativeEntryId === entry.id);
+          if (origin?.originRunId !== active.runId || entry.message.role === 'user' && !isDeepStrictEqual(originalInput,
+            { nativeEntryId: entry.id, originRunId: active.runId, inputId: inputId ?? null, snapshotId }))
+            confirmationError = appError('context_binding_conflict', 'runtime', 'Confirmed entry provenance conflicts.');
         }
-        throw new Error('native_history_write_failed');
-      }
-      record.lastSavedHistory = structuredClone(record.memory!.lastSavedHistory);
-      record.receipt = structuredClone(record.memory!.commit); record.recoverySeed = structuredClone(record.memory!.seed);
-      if (acknowledged) return;
-      if (active && entry.type === 'message' && entry.message.role === 'toolResult') {
-        const request = active.toolRequests.get(entry.message.toolCallId);
-        for (const read of request?.resourceReads ?? []) {
-          const receipt = { ...read, nativeEntryId: entry.id };
-          const result = active.input.contextHooks!.recordResourceRead!(receipt);
-          if (!result.ok) { this.failToolRun(record, active, result.error); throw new Error(result.error.code); }
-          Object.assign(read, receipt);
+        try {
+          saved = confirmationError ? fail(confirmationError)
+            : snapshot.ok ? record.memory!.save(snapshot.data, context ? [context] : [], source ? [source] : []) : snapshot;
         }
-      }
-      if (entry.type === 'message') record.nativeObjects?.set(entry.message, { entryId: entry.id, original: structuredClone(entry.message) });
-      if (entry.type === 'custom_message' && record.session?.isIdle) {
-        // Fixed 0.85.1 idle custom push precedes this append: its actual array tail is the source object.
-        const actual = record.session.messages.at(-1);
-        if (actual?.role === 'custom' && !record.nativeObjects?.has(actual) && actual.customType === entry.customType
-          && actual.display === entry.display && isDeepStrictEqual(actual.content, entry.content) && isDeepStrictEqual(actual.details, entry.details))
-          record.nativeObjects?.set(actual, { entryId: entry.id, original: structuredClone(actual) });
-      }
-      if (source && entry.type === 'message') {
-        const frozen = Object.freeze(structuredClone(source));
-        record.contextEntries.set(entry.id, frozen); record.contextMessages.set(entry.message, frozen);
-      }
-      if (active && inputId !== undefined) active.openInputIds.add(inputId);
-      if (active && entry.type === 'message' && resultInputIds?.length) {
-        active.resultBindings.set(entry.message, { inputIds: resultInputIds, entryId: entry.id });
-        for (const completedId of resultInputIds) active.openInputIds.delete(completedId);
-      }
-      if (active && entry.type === 'message' && ordinal !== undefined) {
-        record.liveBindings.set(entry.id, { entryId: entry.id, runId: active.runId, liveOrdinal: ordinal });
-        this.publishMessage(record, active, entry.message, ordinal, 'saved', 'ended', entry.id);
-      }
+        catch { saved = fail(appError('storage_write_failed', 'storage', 'Native conversation history could not be saved.', true)); }
+        const confirm = (saved: Result<HistoryCommitReceipt>): void | Promise<void> => {
+          if (!saved.ok) {
+            record.historyFailure = saved.error;
+            record.unusable = true;
+            if (active) {
+              if (entry.type === 'message' && ordinal !== undefined) this.publishMessage(record, active, entry.message, ordinal, 'failed', 'ended');
+              this.failToolRun(record, active, record.historyFailure);
+            }
+            throw new Error('native_history_write_failed');
+          }
+          record.lastSavedHistory = structuredClone(record.memory!.lastSavedHistory);
+          record.receipt = structuredClone(record.memory!.commit); record.recoverySeed = structuredClone(record.memory!.seed);
+          if (acknowledged) return;
+          const finish = () => {
+            if (entry.type === 'message' && nativeEntry.type === 'message') record.nativeObjects?.set(nativeEntry.message, { entryId: entry.id, original: structuredClone(entry.message) });
+            if (source && nativeEntry.type === 'message') {
+              const frozen = Object.freeze(structuredClone(source));
+              record.contextEntries.set(entry.id, frozen); record.contextMessages.set(nativeEntry.message, frozen);
+            }
+            if (active && inputId !== undefined) active.openInputIds.add(inputId);
+            if (active && nativeEntry.type === 'message' && resultInputIds?.length) {
+              active.resultBindings.set(nativeEntry.message, { inputIds: resultInputIds, entryId: entry.id });
+              for (const completedId of resultInputIds) active.openInputIds.delete(completedId);
+            }
+            if (active && entry.type === 'message' && ordinal !== undefined) {
+              record.liveBindings.set(entry.id, { entryId: entry.id, runId: active.runId, liveOrdinal: ordinal });
+              this.publishMessage(record, active, entry.message, ordinal, 'saved', 'ended', entry.id, inputId);
+            }
+          };
+          const reads = active && entry.type === 'message' && entry.message.role === 'toolResult'
+            ? active.toolRequests.get(entry.message.toolCallId)?.resourceReads : undefined;
+          // Without resource receipts, native append errors and acknowledgements remain synchronous.
+          if (active && reads?.length) return (async () => {
+            for (const read of reads) {
+              const receipt = { ...read, nativeEntryId: entry.id };
+              const result = await active.input.contextHooks!.recordResourceRead!(receipt);
+              if (!result.ok) { this.failToolRun(record, active, result.error); throw result.error; }
+              Object.assign(read, receipt);
+            }
+            finish();
+          })();
+          finish();
+        };
+        return 'ok' in saved ? confirm(saved) : saved.then(confirm);
+      });
     };
     return ok(undefined);
   }
@@ -632,8 +680,8 @@ export class PiAgentAdapter implements AgentPort {
   }
 
   private publishMessage(record: SessionRecord, active: ActiveExecution, message: unknown, ordinal: number, persistence: SessionMessageView['persistence'],
-    phase: SessionMessageView['phase'], entryId: string | null = null): void {
-    const inputId = message && typeof message === 'object' ? active.inputMessages.get(message) : undefined;
+    phase: SessionMessageView['phase'], entryId: string | null = null, committedInputId?: number): void {
+    const inputId = committedInputId ?? (message && typeof message === 'object' ? active.inputMessages.get(message) : undefined);
     const productInput = inputId === undefined ? undefined : active.inputs.get(inputId);
     if (productInput?.resourceBinding?.requiredSkill && persistence !== 'saved') return;
     const resourceExpansion = productInput && record.recoverySeed?.resourceExpansions?.find(value => value.inputId === productInput.inputId && value.nativeEntryId === entryId);
@@ -655,7 +703,7 @@ export class PiAgentAdapter implements AgentPort {
     const record = this.sessions.get(nativeSessionId);
     const availability: AgentPortAvailability = !record ? 'missing'
       : record.unusable ? 'unusable'
-        : record.preparing || record.running || record.compacting || record.session?.isCompacting ? 'busy' : 'ready';
+        : record.preparing || record.running || record.compacting || record.historyTail || record.session?.isCompacting ? 'busy' : 'ready';
     return { availability };
   }
 
@@ -674,7 +722,9 @@ export class PiAgentAdapter implements AgentPort {
       const reserve = record?.snapshot?.compactionPolicy?.reserveTokens ?? RUNTIME_CONFIG.compaction.reserveTokens;
       const thresholdTokens = contextWindow !== null && contextWindow > reserve ? contextWindow - reserve : null;
       const sdkUsage = sameCommitted ? current.getContextUsage() : undefined;
-      const estimate = messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+      const system = getCurrentSystemMessage(messages);
+      const estimate = (system ? estimateTokens(system) : 0)
+        + messages.reduce((sum, message) => message.role === 'system' ? sum : sum + estimateTokens(message), 0);
       const rawTokens = sdkUsage?.tokens ?? estimate;
       const tokens = Number.isSafeInteger(rawTokens) && rawTokens >= 0 ? rawTokens : null;
       const path = manager.getBranch();
@@ -695,7 +745,7 @@ export class PiAgentAdapter implements AgentPort {
   public async moveSessionLeaf(nativeSessionId: string, targetEntryId: string): Promise<Result<NativeSessionHistory>> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
-    if (record.preparing || record.running || record.compacting || record.session && !record.session.isIdle)
+    if (record.preparing || record.running || record.compacting || record.historyTail || record.session && !record.session.isIdle)
       return fail(appError('agent_session_busy', 'session', 'Conversation is busy.'));
     const snapshot = this.exportSession(nativeSessionId);
     if (!snapshot.ok) return snapshot;
@@ -717,7 +767,7 @@ export class PiAgentAdapter implements AgentPort {
   public restoreSessionLeaf(nativeSessionId: string, committed: NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void> {
     const record = this.sessions.get(nativeSessionId);
     if (!record || record.unusable || this.closed) return fail(appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
-    if (record.preparing || record.running || record.compacting || record.session && !record.session.isIdle)
+    if (record.preparing || record.running || record.compacting || record.historyTail || record.session && !record.session.isIdle)
       return fail(appError('agent_session_busy', 'session', 'Conversation is busy.'));
     try {
       const current = this.exportSession(nativeSessionId);
@@ -757,8 +807,10 @@ export class PiAgentAdapter implements AgentPort {
       || input.contextSnapshotId !== undefined && (!Number.isSafeInteger(input.contextSnapshotId) || input.contextSnapshotId <= 0))
       return fail(appError('context_binding_unknown', 'runtime', 'Input context association is unavailable.'));
     try {
-      const dispatched = await this.dispatchInput(record, active, input, () => input.mode === 'steer'
-        ? record.session!.steer(this.nativeInputText(input)) : record.session!.followUp(this.nativeInputText(input)), true);
+      const dispatched = await this.dispatchInput(record, active, input, async () => {
+        if (input.mode === 'steer') await record.session!.steer(this.nativeInputText(input));
+        else await record.session!.followUp(this.nativeInputText(input));
+      }, true);
       await dispatched.execution;
       return ok(undefined);
     } catch (error) {
@@ -787,11 +839,7 @@ export class PiAgentAdapter implements AgentPort {
       }
       if (active.admissionClosed || active.signal.aborted || slot.streaming && !session.isStreaming)
         throw appError('input_admission_closed', 'runtime', 'The Run is no longer accepting inputs.');
-      const allowed = active.input.verifyInputUse?.(slot.inputId) ?? fail(appError('tool_access_denied', 'runtime', 'Input authorization is unavailable.'));
-      if (!allowed.ok || active.signal.aborted) {
-        const error = !allowed.ok ? allowed.error : appError('agent_cancelled', 'runtime', 'Agent execution was cancelled.');
-        this.failToolRun(record, active, error); throw error;
-      }
+      // Dispatch awaits product authorization; the model boundary rechecks it before use.
       if (!matchesResourceBinding(active.input.resources ?? null, state.resourceBinding)) {
         const error = appError('resource_evidence_conflict', 'runtime', 'Input resources do not match the active Run.');
         this.failToolRun(record, active, error); throw error;
@@ -836,8 +884,11 @@ export class PiAgentAdapter implements AgentPort {
         || streaming && !record.session?.isStreaming)
         throw appError('input_admission_closed', 'runtime', 'The Run is no longer accepting inputs.');
       if (active.inputs.has(input.inputId)) throw appError('state_conflict', 'input', 'This input has already been dispatched.');
-      const allowed = active.input.verifyInputUse?.(input.inputId) ?? fail(appError('tool_access_denied', 'runtime', 'Input authorization is unavailable.'));
+      const allowed = await active.input.verifyInputUse?.([input.inputId]) ?? fail(appError('tool_access_denied', 'runtime', 'Input authorization is unavailable.'));
       if (!allowed.ok) throw allowed.error;
+      if (record.active !== active || active.admissionClosed || active.signal.aborted || active.failure
+        || streaming && !record.session?.isStreaming)
+        throw appError('input_admission_closed', 'runtime', 'The Run is no longer accepting inputs.');
       const state: InputDispatchState = { ...input, started: false };
       active.inputs.set(input.inputId, state);
       let captured!: () => void;
@@ -897,15 +948,17 @@ export class PiAgentAdapter implements AgentPort {
       ? !activeToolNames.includes('check_invoice_sources') : !activeToolNames.includes('Agent'))))
       return fail(appError('extension_incompatible', 'extension', 'Extension is not eligible for this Run.'));
     const resources = options?.resources ?? null;
+    const resourceContents = options?.resourceContents ?? this.dependencies.resourceContents;
     const inputDefinitions = options?.inputDefinitions ? FrozenInputDefinitionsSchema.parse(options.inputDefinitions) : null;
     const resourceKey = JSON.stringify([resources?.bundleId ?? null, resources?.skillIndex ?? null, inputDefinitions, options?.chatDelegation ?? false, options?.researchPhase ?? null, [...activeToolNames].sort()]);
     const roleIndex = activeToolNames.includes('Agent') && inputDefinitions ? inputDefinitions.roles.map(role => '- '+role.id+': '+role.description.slice(0,160)+'; '+(role.tools.every(name=>activeToolNames.includes(name)) ? 'available' : 'unavailable: required tools missing')).join('\n') : undefined;
-    const loader = createRunResourceLoader({ contents: this.dependencies.resourceContents, fixedSystemPrompt: options?.researchPhase ? options.researchPhase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
-      : policy === 'p3' && !options?.chatDelegation ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT, frozen: resources,
+    const loader = createRunResourceLoader({ contents: resourceContents, fixedSystemPrompt: this.dependencies.systemPromptOverride ?? (options?.researchPhase ? options.researchPhase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : policy === 'fill' ? INVOICE_FILL_FORM_SYSTEM_PROMPT
+      : policy === 'p3' && !options?.chatDelegation ? INVOICE_TOOLS_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT), frozen: resources,
       activeToolNames,
       roleIndex, templates: inputDefinitions?.templates,
       bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleId ?? '') });
     if (!loader.ok) return loader;
+    let preparedLoader = loader.data;
     if (record.session && !record.session.isIdle) return fail(appError('agent_session_busy', 'session', 'The native Session has not stopped.'));
 
     const previousSettings = record.manager.buildSessionContext();
@@ -914,6 +967,7 @@ export class PiAgentAdapter implements AgentPort {
     let replacingSession = false;
     let sessionCreationStarted = false;
     try {
+      await this.waitForHistory(record);
       const reuseRuntime = canReuseRuntime(record.config, config) && record.runtime;
       if (reuseRuntime && record.config && record.snapshot?.native.authSource === 'pi-runtime-api-key'
         && record.config.modelRef.provider !== config.modelRef.provider) {
@@ -925,7 +979,15 @@ export class PiAgentAdapter implements AgentPort {
       }
       const prepared = await prepareModelRuntime(config, limits, signal, this.dependencies, reuseRuntime || undefined);
       if (!prepared.ok) return prepared;
-      const { runtime, model } = prepared.data;
+      const { runtime } = prepared.data;
+      const thinkingLevelOverride = this.dependencies.thinkingLevelOverride;
+      const thinkingLevel = thinkingLevelOverride ?? record.session?.thinkingLevel ?? 'off';
+      const selectedModel = prepared.data.model;
+      const verifiedLocalMax = thinkingLevel === 'max' && ['gpt-6-luna', 'gpt-6.1-sol'].includes(selectedModel.id) && selectedModel.reasoning
+        && selectedModel.api === 'openai-completions' && selectedModel.baseUrl.replace(/\/+$/, '') === 'http://127.0.0.1:8767/v1';
+      const model = verifiedLocalMax ? { ...selectedModel, thinkingLevelMap: { ...selectedModel.thinkingLevelMap, max: 'max' } } : selectedModel;
+      if (thinkingLevelOverride !== undefined && !getSupportedThinkingLevels(model).includes(thinkingLevelOverride))
+        return fail(appError('agent_thinking_level_unsupported', 'input', 'The selected model does not support the requested thinking level; no fallback.'));
       const authSource = prepared.data.snapshot.native.authSource;
       if (frozenExtensions?.included.some(item => item.ref.id === 'subagents')
         && !observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch))
@@ -983,10 +1045,11 @@ export class PiAgentAdapter implements AgentPort {
           }
           extensionResult = loaded.result;
         }
-        const assembledLoader = createRunResourceLoader({ contents: this.dependencies.resourceContents, fixedSystemPrompt: loader.data.getSystemPrompt()!, frozen: resources,
+        const assembledLoader = createRunResourceLoader({ contents: resourceContents, fixedSystemPrompt: loader.data.getSystemPrompt()!, frozen: resources,
           activeToolNames, roleIndex, templates: inputDefinitions?.templates,
           bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), resources?.bundleId ?? ''), extensionResult });
         if (!assembledLoader.ok) return assembledLoader;
+        preparedLoader = assembledLoader.data;
         sessionCreationStarted = true;
         const created = await createAgentSession({
           cwd,
@@ -1007,7 +1070,7 @@ export class PiAgentAdapter implements AgentPort {
               if (requests.length === 1) requests[0]!.failureStage = 'sdk_arguments';
             },
           )) : [],
-          thinkingLevel: 'off',
+          thinkingLevel,
         });
         session = created.session; record.session = session;
         record.resourceLoader = assembledLoader.data;
@@ -1049,6 +1112,11 @@ export class PiAgentAdapter implements AgentPort {
         }
       }
       if (session) {
+        if (thinkingLevelOverride !== undefined) {
+          session.setThinkingLevel(thinkingLevelOverride, { persist: false });
+          if (session.thinkingLevel !== thinkingLevelOverride)
+            return fail(appError('agent_thinking_level_unsupported', 'input', 'The SDK changed the requested thinking level; no fallback.'));
+        }
         const appended = record.manager.getEntries().slice(prepareStartCount);
         const effectiveModel = session.model;
         if (effectiveModel && (previousSettings.model?.provider !== effectiveModel.provider || previousSettings.model?.modelId !== effectiveModel.id)
@@ -1060,6 +1128,7 @@ export class PiAgentAdapter implements AgentPort {
         if (record.historyFailure) return fail(record.historyFailure);
       }
       if (session) {
+        await this.waitForHistory(record);
         const seeded = this.reseedContext(record);
         if (!seeded.ok) return seeded;
         session.agent.toolExecution = 'parallel';
@@ -1077,6 +1146,7 @@ export class PiAgentAdapter implements AgentPort {
         const args = inputDefinitions.command.originalText.replace(/^\/subagent\s+/, '');
         scope.beginInputCommand(args, owner);
         try { await command.handler(args, session.extensionRunner.createCommandContext());
+          await this.waitForHistory(record);
           const receipt = scope.finishInputCommand(); if (!receipt || !isDeepStrictEqual(receipt, owner)) throw new Error('Input command has no bound receipt.');
           inputCommandReceipt = InputCommandReceiptSchema.parse({ ...receipt, nativeSessionId, instanceId: scope.view.instanceId,
             originalText: inputDefinitions.command.originalText, role: inputDefinitions.command.requiredRoles[0] });
@@ -1090,7 +1160,8 @@ export class PiAgentAdapter implements AgentPort {
       record.workingDirectory = cwd;
       record.resourceKey = resourceKey;
       record.extensionKey = extensionKey;
-      record.resourceLoader ??= loader.data;
+      record.resourceLoader = preparedLoader;
+      record.resourceContents = resourceContents;
       record.sessionInputs = options?.sessionInputs === true;
       replacingSession = false;
       if (signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 准备已取消。'));
@@ -1112,7 +1183,7 @@ export class PiAgentAdapter implements AgentPort {
       record.snapshot = { ...snapshot, ...(inputDefinitions ? { inputDefinitions: structuredClone(inputDefinitions) } : {}),
         ...(inputCommandReceipt ? { inputCommandReceipt } : {}), historyPolicyVersion: 'p9-native-history-v1', ...(options?.runtimeBudget ? { version: 2 as const } : {}), agent,
         ...(resources ? { resources: Object.freeze(structuredClone(resources)) } : {}),
-        ...(frozenExtensions ? { extensions: structuredClone(frozenExtensions), extensionAssembly: record.extensions ? extensionAssembly(record.extensions) : { version: 1 as const, sdkVersion: '0.85.1' as const, instances: [] } } : {}),
+        ...(frozenExtensions ? { extensions: structuredClone(frozenExtensions), extensionAssembly: extensionAssembly(record.extensions ?? { result: null, scopes: [], error: null }) } : {}),
         ...(options?.compactionPolicy ? { compactionPolicy: Object.freeze(structuredClone(options.compactionPolicy)) } : {}) };
       if (options?.compactionPolicy && !record.compactionBridge) {
         const bridge = this.installCompaction(record, session);
@@ -1124,9 +1195,10 @@ export class PiAgentAdapter implements AgentPort {
         execute: (input, executionSignal, observe) => this.execute(record, nativeSessionId, input, executionSignal, observe),
       });
     } catch (error) {
+      try { await this.waitForHistory(record); } catch { /* Retain the confirmed history failure while completing cleanup. */ }
       if (record.extensions) {
-        const failure = error && typeof error === 'object' && 'code' in error ? error as ReturnType<typeof appError>
-          : appError('extension_load_failed', 'extension', 'Controlled Extension assembly failed.', true);
+        const failure = record.historyFailure ?? (error && typeof error === 'object' && 'code' in error ? error as ReturnType<typeof appError>
+          : appError('extension_load_failed', 'extension', 'Controlled Extension assembly failed.', true));
         for (const scope of record.extensions.scopes) scope.fail(failure);
         await this.disposeManagedSession(record); return fail(failure);
       }
@@ -1138,19 +1210,20 @@ export class PiAgentAdapter implements AgentPort {
     }
   }
 
-  private publishCompaction(record: SessionRecord, update: Partial<CompactionObservation>): Result<void> {
+  private async publishCompaction(record: SessionRecord, update: Partial<CompactionObservation>): Promise<Result<void>> {
     const operation = record.compaction;
     if (!operation) return fail(appError('compaction_unavailable', 'runtime', 'No compaction operation is bound.'));
     operation.observation = { ...operation.observation, ...update,
       observationSequence: operation.observation.observationSequence + 1 };
-    if (operation.observation.runId !== null) {
+    const observation = structuredClone(operation.observation);
+    if (observation.runId !== null) {
       const save = record.active?.input.contextHooks?.compaction;
       let saved: Result<void>;
-      try { saved = save ? save({ operationId: operation.observation.operationId, runId: operation.observation.runId,
+      try { saved = save ? await save({ operationId: observation.operationId, runId: observation.runId,
         sessionId: operation.control.sessionId, nativeSessionId: operation.observation.nativeSessionId,
-        reason: operation.observation.reason as 'threshold' | 'overflow', baseline: operation.baseline,
+        reason: observation.reason as 'threshold' | 'overflow', baseline: operation.baseline,
         firstKeptEntryId: operation.firstKeptEntryId, splitTurn: operation.splitTurn,
-        observation: structuredClone(operation.observation), calls: structuredClone(operation.calls) })
+        observation, calls: structuredClone(operation.calls) })
         : fail(appError('context_binding_unknown', 'runtime', 'Automatic compaction evidence cannot be saved.')); }
       catch { saved = fail(appError('storage_write_failed', 'storage', 'Compaction evidence could not be saved.', true)); }
       if (!saved.ok) {
@@ -1160,22 +1233,24 @@ export class PiAgentAdapter implements AgentPort {
         return saved;
       }
     }
-    try { operation.control.observe(structuredClone(operation.observation)); }
+    try { operation.control.observe(observation); }
     catch { /* Readonly query retains facts when temporary observation delivery fails. */ }
     return ok(undefined);
   }
 
-  private verifyNativeCompaction(record: SessionRecord): Result<void> {
+  private async verifyNativeCompaction(record: SessionRecord): Promise<Result<void>> {
     const operation = record.compaction;
     if (!operation || !record.compacting) return fail(appError('compaction_unavailable', 'runtime', 'No trusted compaction operation is active.'));
+    const permission = await operation.control.verifyUse();
+    if (!permission.ok) return permission;
+    if (record.compaction !== operation || !record.compacting)
+      return fail(appError('compaction_unavailable', 'runtime', 'Compaction operation ownership was lost.'));
     if (record.historyFailure || record.unusable) return fail(record.historyFailure ?? appError('agent_session_unusable', 'session', 'Native history is unusable.'));
     if (record.receipt?.commitRevision === Number.MAX_SAFE_INTEGER)
       return fail(appError('storage_write_failed', 'storage', 'Conversation history commit revision is exhausted.', false));
     if (operation.control.signal.aborted || operation.scope?.signal.aborted)
       return fail(appError('compaction_cancelled', 'runtime', 'Compaction was cancelled.'));
     if (operation.control.remainingMs() <= 0) return fail(appError('compaction_timeout', 'runtime', 'Compaction deadline expired.'));
-    const permission = operation.control.verifyUse();
-    if (!permission.ok) return permission;
     const window = record.session?.model?.contextWindow;
     if (!Number.isSafeInteger(window) || window! <= RUNTIME_CONFIG.compaction.reserveTokens)
       return fail(appError('compaction_capacity_exceeded', 'runtime', 'The model window cannot provide required summary headroom.'));
@@ -1187,12 +1262,14 @@ export class PiAgentAdapter implements AgentPort {
 
   private installCompaction(record: SessionRecord, session: AgentSession) {
     return installNativeCompactionBridge(session, {
-      beforeAuto: ({ reason }) => {
+      beforeAuto: async ({ reason }) => {
+        try { await this.waitForHistory(record); }
+        catch { return fail(record.historyFailure!); }
         const active = record.active, policy = record.snapshot?.compactionPolicy;
         if (!active || record.compacting || !policy?.autoEnabled || !active.input.contextHooks?.compaction
           || !record.receipt || !record.lastSavedHistory || !record.recoverySeed)
           return fail(appError('compaction_unavailable', 'runtime', 'Automatic compaction has no qualified Run binding.'));
-        const valid = this.verifyModelUse(record);
+        const valid = await this.verifyModelUse(record);
         if (!valid.ok) { this.failToolRun(record, active, valid.error); return valid; }
         const inspected = this.inspectSessionCompaction({ history: record.lastSavedHistory, seed: record.recoverySeed, commit: record.receipt });
         if (!inspected.ok) return inspected;
@@ -1211,13 +1288,14 @@ export class PiAgentAdapter implements AgentPort {
           observation, baseline: structuredClone(record.receipt), purposes: [], calls: [], usages: [],
           streams: new Set(), firstKeptEntryId: null, splitTurn: null };
         record.compacting = true;
-        const saved = this.publishCompaction(record, {});
+        const saved = await this.publishCompaction(record, {});
         if (!saved.ok) record.compacting = false;
         return saved;
       },
       withSummary: async (scope, run) => {
+        await this.waitForHistory(record);
         const operation = record.compaction;
-        const valid = this.verifyNativeCompaction(record);
+        const valid = await this.verifyNativeCompaction(record);
         if (!valid.ok || !operation || scope.reason !== operation.observation.reason
           || !isDeepStrictEqual(record.receipt, operation.baseline)) {
           const error = !valid.ok ? valid.error : appError('compaction_unavailable', 'runtime', 'Summary is outside its trusted operation.');
@@ -1234,16 +1312,16 @@ export class PiAgentAdapter implements AgentPort {
           operation.failure = appError('agent_model_call_budget', 'runtime', 'The remaining model budget cannot complete this native summary.');
           throw operation.failure;
         }
-        const saved = this.publishCompaction(record, {});
+        const saved = await this.publishCompaction(record, {});
         if (!saved.ok) { operation.scope = undefined; throw saved.error; }
         try { return await run(); }
         finally { operation.scope = undefined; }
       },
-      onGenerated: result => {
+      onGenerated: async result => {
         const operation = record.compaction!;
-        const recorded = this.publishCompaction(record, { generated: true });
+        const recorded = await this.publishCompaction(record, { generated: true });
         if (!recorded.ok) throw recorded.error;
-        const valid = this.verifyNativeCompaction(record);
+        const valid = await this.verifyNativeCompaction(record);
         if (!valid.ok) { operation.failure = valid.error; throw valid.error; }
         if (!operation.scope || result.firstKeptEntryId !== operation.scope.preparation.firstKeptEntryId
           || !Number.isSafeInteger(result.tokensBefore) || result.tokensBefore < 0 || !result.summary.trim()
@@ -1252,7 +1330,7 @@ export class PiAgentAdapter implements AgentPort {
           throw operation.failure;
         }
       },
-      onAppend: entryId => {
+      onAppend: entryId => this.enqueueHistory(record, async () => {
         const operation = record.compaction;
         const entry = record.manager.getEntry(entryId);
         if (!operation || !operation.observation.generated || !entry || entry.type !== 'compaction'
@@ -1264,14 +1342,16 @@ export class PiAgentAdapter implements AgentPort {
           record.unusable = true;
           throw error;
         }
-        const recorded = this.publishCompaction(record, { entryId, saved: structuredClone(record.receipt) });
+        const recorded = await this.publishCompaction(record, { entryId, saved: structuredClone(record.receipt) });
         if (!recorded.ok) throw recorded.error;
-      },
-      afterAuto: ({ willRetry, sdkWantsContinue }) => {
+      }),
+      afterAuto: async ({ willRetry, sdkWantsContinue }) => {
         const operation = record.compaction, active = record.active;
         if (!operation || !active || operation.observation.runId !== active.runId || !record.compacting)
           return fail(appError('compaction_unavailable', 'runtime', 'Automatic compaction operation is unavailable.'));
-        const valid = this.verifyNativeCompaction(record);
+        try { await this.waitForHistory(record); }
+        catch { operation.failure ??= record.historyFailure; }
+        const valid = await this.verifyNativeCompaction(record);
         if (!valid.ok) operation.failure ??= valid.error;
         const canonical = record.manager.buildSessionContext().messages;
         const last = canonical.at(-1);
@@ -1301,7 +1381,7 @@ export class PiAgentAdapter implements AgentPort {
           && operation.observation.nativeOutcome !== 'cancelled' && (!operation.failure || !operation.observation.generated);
         const mayContinue = qualified && budgetAvailable;
         if (!qualified) operation.failure ??= appError('compaction_capacity_exceeded', 'runtime', 'The Run cannot continue from this compaction result.');
-        const saved = this.publishCompaction(record, { phase: stopped ? 'ended' : 'stopping', stopped, capacity, mayContinue,
+        const saved = await this.publishCompaction(record, { phase: stopped ? 'ended' : 'stopping', stopped, capacity, mayContinue,
           nativeOutcome: operation.observation.nativeOutcome === 'pending' ? 'failed' : operation.observation.nativeOutcome,
           stopRequested: active.signal.aborted || operation.observation.stopRequested, error: operation.failure ?? null });
         if (stopped) record.compacting = false;
@@ -1314,14 +1394,26 @@ export class PiAgentAdapter implements AgentPort {
       },
       onEvent: event => {
         if (!record.compacting || !record.compaction || (event.type !== 'compaction_start' && event.type !== 'compaction_end')) return;
-        if (event.type === 'compaction_start') this.publishCompaction(record, { phase: 'compacting' });
-        else {
-          this.publishCompaction(record, { nativeOutcome: event.result ? 'succeeded' : event.aborted ? 'cancelled' : 'failed' });
-          if (event.result && record.compaction.observation.saved && record.compaction.observation.runId === null) {
+        const operation = record.compaction;
+        // A failed history append can close the evidence tail after the SDK already generated its result.
+        if (event.type === 'compaction_end' && event.result && operation.observation.runId !== null)
+          operation.observation = { ...operation.observation, nativeOutcome: 'succeeded' };
+        const recordEvent = () => {
+          if (record.compaction !== operation) return ok(undefined);
+          if (event.type === 'compaction_start') return this.publishCompaction(record, { phase: 'compacting' });
+          if (!event.result && event.errorMessage && event.reason !== 'manual') operation.failure ??= record.historyFailure
+            ?? appError('compaction_failed', 'runtime', 'Native compaction failed before a checkpoint was saved.');
+          const failure = operation.failure ?? record.historyFailure;
+          const failed = failure && failure.code !== 'compaction_cancelled' && failure.code !== 'agent_cancelled';
+          const saved = this.publishCompaction(record, { nativeOutcome: event.result ? 'succeeded' : failed ? 'failed' : event.aborted ? 'cancelled' : 'failed' });
+          if (event.result && operation.observation.saved && operation.observation.runId === null) {
             const seeded = this.reseedContext(record);
-            if (!seeded.ok) { record.compaction.failure = seeded.error; record.unusable = true; }
+            if (!seeded.ok) { operation.failure = seeded.error; record.unusable = true; }
           }
-        }
+          return saved;
+        };
+        if (operation.observation.runId === null) void recordEvent();
+        else this.enqueueHistory(record, async () => { await recordEvent(); });
       },
     });
   }
@@ -1338,7 +1430,7 @@ export class PiAgentAdapter implements AgentPort {
       usage: { version: 1, source: 'not-requested', reason: 'not-started', sdkValues: null, attempts: 0, attemptsComplete: true,
         costSource: null, updatedAt: new Date().toISOString() },
       tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } };
-    if (!record || record.unusable || record.preparing || record.running || record.compacting || !record.session?.isIdle
+    if (!record || record.unusable || record.preparing || record.running || record.compacting || record.historyTail || !record.session?.isIdle
       || !record.compactionBridge || !record.receipt || record.recoverySeed?.sessionId !== control.sessionId || this.closed) {
       const error = appError('compaction_unavailable', 'runtime', 'The prepared idle native Session cannot compact.');
       return { observation: { ...initial, phase: 'ended', nativeOutcome: 'failed', stopped: true, error }, stopped: true, cleanupErrors: [] };
@@ -1348,12 +1440,12 @@ export class PiAgentAdapter implements AgentPort {
     record.compaction = operation; record.compacting = true;
     const session = record.session;
     const cancel = () => {
-      this.publishCompaction(record, { phase: 'stopping', stopRequested: true, mayContinue: false });
+      void this.publishCompaction(record, { phase: 'stopping', stopRequested: true, mayContinue: false });
       session.abortCompaction();
     };
     control.signal.addEventListener('abort', cancel, { once: true });
     try {
-      const allowed = this.verifyNativeCompaction(record);
+      const allowed = await this.verifyNativeCompaction(record);
       if (!allowed.ok) { operation.failure = allowed.error; throw allowed.error; }
       await session.compact();
     } catch (error) {
@@ -1363,6 +1455,12 @@ export class PiAgentAdapter implements AgentPort {
           ? appError('compaction_not_needed', 'runtime', 'There is no eligible history to compact.')
           : appError('compaction_failed', 'runtime', 'Native compaction failed.'));
     } finally {
+      try { await this.waitForHistory(record); }
+      catch { operation.failure ??= record.historyFailure; }
+      if (operation.observation.saved && !record.historyFailure) {
+        const seeded = this.reseedContext(record);
+        if (!seeded.ok) { operation.failure ??= seeded.error; record.unusable = true; }
+      }
       control.signal.removeEventListener('abort', cancel);
     }
     await Promise.allSettled([...operation.streams]);
@@ -1373,7 +1471,7 @@ export class PiAgentAdapter implements AgentPort {
       if (view.ok) capacity = view.data.capacity;
       else operation.failure ??= view.error;
     }
-    const qualified = this.verifyNativeCompaction(record);
+    const qualified = await this.verifyNativeCompaction(record);
     if (!qualified.ok) operation.failure ??= qualified.error;
     const unchanged = isDeepStrictEqual(record.receipt, operation.baseline);
     const saved = operation.observation.generated ? operation.observation.saved !== null : unchanged;
@@ -1381,7 +1479,7 @@ export class PiAgentAdapter implements AgentPort {
       && !control.signal.aborted && operation.observation.nativeOutcome !== 'cancelled';
     if (capacity.fitsEstimate !== true && !operation.failure)
       operation.failure = appError('compaction_capacity_exceeded', 'runtime', 'The compacted context still cannot fit this model window.');
-    this.publishCompaction(record, { phase: stopped ? 'ended' : 'stopping', stopped, capacity, mayContinue,
+    await this.publishCompaction(record, { phase: stopped ? 'ended' : 'stopping', stopped, capacity, mayContinue,
       stopRequested: control.signal.aborted || operation.observation.stopRequested,
       nativeOutcome: operation.observation.nativeOutcome === 'pending' ? control.signal.aborted ? 'cancelled' : 'failed' : operation.observation.nativeOutcome,
       error: operation.failure ?? null });
@@ -1409,15 +1507,16 @@ export class PiAgentAdapter implements AgentPort {
       session.abortCompaction();
       throw error;
     };
-    const verify = () => {
-      const valid = this.verifyNativeCompaction(record);
+    const verify = async () => {
+      const valid = await this.verifyNativeCompaction(record);
       if (!valid.ok) reject(valid.error);
+      const messages = context.messages.filter(message => message.role !== 'system');
       if (record.compaction !== operation || operation.scope !== scope || !sameModel(record.model, model)
-        || context.tools?.length || context.messages.length !== 1 || context.messages[0]?.role !== 'user')
+        || getCurrentTools(context.messages).length || messages.length !== 1 || messages[0]?.role !== 'user')
         reject(appError('compaction_unavailable', 'runtime', 'Summary request is outside its trusted native scope.'));
     };
     try {
-      verify();
+      await verify();
       const purpose = operation.purposes[callIndex];
       if (!purpose || callIndex >= operation.control.maxModelCalls)
         reject(appError('agent_model_call_budget', 'runtime', 'Native summary exceeded its reserved model budget.'));
@@ -1439,14 +1538,14 @@ export class PiAgentAdapter implements AgentPort {
           answerRequestSequence: null, operationId: operation.observation.operationId };
         try { this.dependencies.promptTrace?.begin(trace); } catch { /* Diagnostics are optional. */ }
       }
-      const prepared = this.publishCompaction(record, {});
+      const prepared = await this.publishCompaction(record, {});
       if (!prepared.ok) reject(prepared.error);
       let resources: ReturnType<PiAgentAdapter['resourceRequest']> | undefined;
-      const saveResources = (layer?: 'sdk' | 'wire', facts?: ResourceInclusion[]) => {
+      const saveResources = async (layer?: 'sdk' | 'wire', facts?: ResourceInclusion[]) => {
         const save = active?.input.contextHooks?.recordResourceRequest;
         if (!save || !resources) return;
         if (layer && facts) resources.evidence = refineResourceEvidence(resources.evidence, layer, facts);
-        const saved = save(resources.evidence); if (!saved.ok) reject(saved.error);
+        const saved = await save(resources.evidence); if (!saved.ok) reject(saved.error);
       };
       if (active?.input.contextHooks?.recordResourceRequest) {
         const sources = purpose === 'history' ? scope.preparation.messagesToSummarize : scope.preparation.turnPrefixMessages;
@@ -1459,7 +1558,7 @@ export class PiAgentAdapter implements AgentPort {
             if (!source) reject(appError('resource_evidence_conflict', 'runtime', 'Summary input provenance is unavailable.'));
             includedBindings.push(source!);
           } else if (entry && message.role === 'toolResult') {
-            const source = active.input.contextHooks!.resolveToolResult({ sessionId: active.sessionId, nativeToolCallId: message.toolCallId });
+            const source = await active.input.contextHooks!.resolveToolResult({ sessionId: active.sessionId, nativeToolCallId: message.toolCallId });
             if (!source.ok) reject(source.error); else includedToolResults.push(source.data);
           }
         }
@@ -1470,23 +1569,23 @@ export class PiAgentAdapter implements AgentPort {
         try { resources = this.resourceRequest(record, context, { callSequence: modelCallIndex, includedBindings,
           includedToolResults, includedNativeContexts }, operation.observation.operationId, previous?.id ?? null);
           if (resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleIds.length === 0) resources = undefined;
-          saveResources(); }
+          await saveResources(); }
         catch { reject(operation.failure ?? appError('resource_evidence_conflict', 'runtime', 'Actual summary resource provenance is unavailable.')); }
       }
-      const update = (value: Partial<SummaryCallEvidence>) => {
+      const update = async (value: Partial<SummaryCallEvidence>) => {
         call = { ...call!, ...value };
         operation.calls[callIndex] = call;
-        const saved = this.publishCompaction(record, {});
+        const saved = await this.publishCompaction(record, {});
         if (!saved.ok) reject(saved.error);
       };
       const baseFetch: FetchLike = options?.fetch as FetchLike | undefined ?? this.dependencies.fetch
         ?? ((request, init) => globalThis.fetch(request, init));
       const fetch: FetchLike = async (request, init) => {
-        verify();
+        await verify();
         const wire = await checkWire(codec, request, init);
         if (!wire.ok) reject(wire.error);
-        verify();
-        if (resources) saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
+        if (resources) await saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
+        await verify();
         const reserved = active?.input.reserveModelRequest?.(); if (reserved && !reserved.ok) reject(reserved.error);
         attempt++;
         if (active) active.attempts++;
@@ -1494,35 +1593,42 @@ export class PiAgentAdapter implements AgentPort {
         const evidence = { attempt, preparedAt: now().at, enteredAt: null as string | null, responseAt: null as string | null,
           responseStatus: null as number | null, transportErrorCode: null as 'provider_transport_error' | null,
           nativeRequestId: null as string | null, wireInclusion: wire.data.inclusion, wireReason: wire.data.reason };
-        update({ attempts: [...call!.attempts, evidence] });
+        await update({ attempts: [...call!.attempts, evidence] });
         let pending: Promise<Response>;
         try { pending = baseFetch(request, init); } catch (error) { pending = Promise.reject(error); }
+        const settled = pending.then(response => ({ response }), error => ({ error }));
         const enteredAt = now().at;
-        update({ attempts: call!.attempts.map(value => value.attempt === attempt ? { ...value, enteredAt } : value) });
+        await update({ attempts: call!.attempts.map(value => value.attempt === attempt ? { ...value, enteredAt } : value) });
         try {
-          const response = await pending;
+          const outcome = await settled;
+          if ('error' in outcome) throw outcome.error;
+          const response = outcome.response;
           const responseAt = now().at;
-          update({ attempts: call!.attempts.map(value => value.attempt === attempt
+          await update({ attempts: call!.attempts.map(value => value.attempt === attempt
             ? { ...value, responseAt, responseStatus: response.status } : value) });
           return response;
         } catch (error) {
-          update({ attempts: call!.attempts.map(value => value.attempt === attempt
+          await update({ attempts: call!.attempts.map(value => value.attempt === attempt
             ? { ...value, transportErrorCode: 'provider_transport_error' } : value) });
           throw error;
         }
       };
       const onPayload = async (payload: unknown, requestedModel: StreamModel) => {
-        verify();
+        await verify();
         if (!sameModel(model, requestedModel)) reject(appError('context_binding_conflict', 'runtime', 'Summary payload model changed.'));
         const replacement = await options?.onPayload?.(payload, requestedModel);
-        verify();
+        await verify();
         const fact = checkPayload(codec, replacement === undefined ? payload : replacement);
         if (!fact.ok) reject(fact.error);
         const sdkPayload = { observedAt: call!.sdkPayload?.observedAt ?? now().at, ...fact.data };
         if (call!.sdkPayload && !isDeepStrictEqual(call!.sdkPayload, sdkPayload))
           reject(appError('context_payload_mismatch', 'runtime', 'Summary payload identity changed.'));
-        update({ sdkPayload });
-        if (resources) saveResources('sdk', checkResourcePayload(model.api, replacement === undefined ? payload : replacement, resources.texts));
+        await update({ sdkPayload });
+        if (resources) await saveResources('sdk', checkResourcePayload(model.api, replacement === undefined ? payload : replacement, resources.texts));
+        try { this.dependencies.observeModel?.({ runId: operation.observation.runId, operationId: operation.observation.operationId, sessionId: operation.observation.sessionId,
+          callSequence: modelCallIndex, purpose: purpose === 'history' ? 'summary-history' : 'summary-turn-prefix',
+          phase: 'request', at: now().at, model: model.id, api: model.api, data: replacement === undefined ? payload : replacement }); }
+        catch { /* capture observers cannot interrupt compaction */ }
         return replacement;
       };
       const onResponse = async (response: { status: number; headers: Record<string, string> }, requestedModel: StreamModel) => {
@@ -1533,7 +1639,7 @@ export class PiAgentAdapter implements AgentPort {
           if (!slot || slot.responseStatus !== response.status)
             reject(appError('context_binding_conflict', 'runtime', 'Summary SDK response has no observed HTTP request.'));
           const nativeRequestId = sdkRequestId(response.headers);
-          update({ attempts: call!.attempts.map(value => value.attempt === slot!.attempt ? { ...value, nativeRequestId } : value) });
+          await update({ attempts: call!.attempts.map(value => value.attempt === slot!.attempt ? { ...value, nativeRequestId } : value) });
         }
       };
       const timeoutMs = Math.floor(Math.min(record.snapshot!.limits.timeoutMs, operation.control.remainingMs()));
@@ -1551,22 +1657,26 @@ export class PiAgentAdapter implements AgentPort {
         else if (!operation.failure) output.push(event);
       }
       finalMessage ??= await stream.result();
+      try { this.dependencies.observeModel?.({ runId: operation.observation.runId, operationId: operation.observation.operationId, sessionId: operation.observation.sessionId,
+        callSequence: modelCallIndex, purpose: purpose === 'history' ? 'summary-history' : 'summary-turn-prefix',
+        phase: 'response', at: now().at, model: model.id, api: model.api, data: finalMessage }); }
+      catch { /* capture observers cannot interrupt compaction */ }
       complete = !signal.aborted && finalMessage.stopReason === 'stop';
       const normalized = normalizeUsage(finalMessage, { attempts: attempt, complete }, record.config!.connection === undefined);
       if (normalized.usage.version !== 1) reject(appError('compaction_failed', 'runtime', 'Summary usage format is incompatible.'));
-      update({ usage: normalized.usage, tokens: normalized.tokens });
+      await update({ usage: normalized.usage, tokens: normalized.tokens });
       const callUsage = { callSequence: call.modelCallIndex, usage: normalized.usage, tokens: normalized.tokens, complete };
       operation.usages.push(callUsage);
       if (active) active.modelCallUsages.push(callUsage);
       const totals = aggregateUsage(operation.usages, operation.calls.reduce((sum, value) => sum + value.attempts.length, 0),
         operation.usages.every(value => value.complete), now().at);
-      this.publishCompaction(record, totals);
+      await this.publishCompaction(record, totals);
       if (!complete) operation.failure ??= appError(signal.aborted ? 'compaction_cancelled' : 'compaction_failed',
         'runtime', 'Native summary did not complete safely.');
       if (finalMessage.content.some(part => part.type === 'toolCall'))
         operation.failure ??= appError('compaction_failed', 'runtime', 'Native summary attempted a tool call.');
       if (operation.failure) throw operation.failure;
-      verify();
+      await verify();
       output.push({ type: 'done', reason: 'stop', message: finalMessage });
       output.end(finalMessage);
     } catch {
@@ -1582,7 +1692,7 @@ export class PiAgentAdapter implements AgentPort {
   }
 
   private wrapStream(record: SessionRecord, session: AgentSession, nativeStream: AgentStream): AgentStream {
-    return (model, context, options) => {
+    return async (model, context, options) => {
       const scope = record.compacting ? record.compaction?.scope : undefined;
       if (scope) {
         const output = createAssistantMessageEventStream();
@@ -1594,7 +1704,7 @@ export class PiAgentAdapter implements AgentPort {
       const active = record.active;
       if (!active) return errorStream(model, appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
       if (active.signal.aborted) return errorStream(model, appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'), 'aborted');
-      const allowed = this.verifyModelUse(record);
+      const allowed = await this.verifyModelUse(record);
       const valid = this.validateMessages(record, context.messages);
       if (!allowed.ok || !valid.ok) {
         const error = !allowed.ok ? allowed.error : !valid.ok ? valid.error : appError('session_history_invalid', 'session', 'Invalid model messages.');
@@ -1619,7 +1729,7 @@ export class PiAgentAdapter implements AgentPort {
         return errorStream(model, error);
       }
       // Awareness is a request-local copy; native history and the saved system prompt remain authoritative.
-      const requestContext = this.withRuntimeAwareness(active, context, modelCallLimit, remainingMs);
+      const requestContext = await this.withRuntimeAwareness(active, context, modelCallLimit, remainingMs);
       const contextLimit = active.p3 ? RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes : maxContextBytes;
       let contextSize: number;
       try {
@@ -1638,7 +1748,7 @@ export class PiAgentAdapter implements AgentPort {
       active.modelCallIndex += 1;
       let requestBinding: RequestContextBinding | undefined;
       if (active.input.contextHooks) {
-        const binding = this.bindContext(record, active, context, model);
+        const binding = await this.bindContext(record, active, context, model);
         if (!binding.ok) { this.failToolRun(record, active, binding.error); return errorStream(model, binding.error); }
         requestBinding = binding.data;
       }
@@ -1653,7 +1763,7 @@ export class PiAgentAdapter implements AgentPort {
         callSequence: active.callSequence,
         model: model.id,
         messageCount: requestContext.messages.length,
-        toolCount: requestContext.tools?.length ?? 0,
+        toolCount: getCurrentTools(requestContext.messages).length,
         contextBytes: contextSize,
       });
       const output = createAssistantMessageEventStream();
@@ -1664,7 +1774,7 @@ export class PiAgentAdapter implements AgentPort {
     };
   }
 
-  private bindContext(record: SessionRecord, active: ActiveExecution, context: StreamContext, model: StreamModel): Result<RequestContextBinding> {
+  private async bindContext(record: SessionRecord, active: ActiveExecution, context: StreamContext, model: StreamModel): Promise<Result<RequestContextBinding>> {
     const hooks = active.input.contextHooks!;
     const includedBindings: NativeInputContextBinding[] = [];
     const includedToolResults: NativeToolResultContextBinding[] = [];
@@ -1679,7 +1789,7 @@ export class PiAgentAdapter implements AgentPort {
           includedBindings.push(source);
           }
         } else if (message.role === 'toolResult') {
-          const source = hooks.resolveToolResult({ sessionId: active.sessionId, nativeToolCallId: message.toolCallId });
+          const source = await hooks.resolveToolResult({ sessionId: active.sessionId, nativeToolCallId: message.toolCallId });
           if (!source.ok) return source;
           const parsed = NativeToolResultContextBindingSchema.safeParse(source.data);
           if (!parsed.success || parsed.data.nativeToolCallId !== message.toolCallId)
@@ -1716,26 +1826,26 @@ export class PiAgentAdapter implements AgentPort {
       for (const source of binding.includedToolResults) { if (source.context) Object.freeze(source.context); Object.freeze(source); }
       for (const source of binding.includedNativeContexts) { Object.freeze(source.referenceEntryIds); Object.freeze(source); }
       Object.freeze(binding.includedNativeContexts); Object.freeze(binding.includedBindings); Object.freeze(binding.includedToolResults); Object.freeze(binding);
-      const saved = hooks.bind({ binding, api: model.api,
+      const saved = await hooks.bind({ binding, api: model.api,
         transport: observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch) ? 'observed-fetch' : 'not-observable', at: now().at });
       return saved.ok ? ok(binding) : saved;
     } catch { return fail(appError('context_binding_unknown', 'runtime', 'Request provenance could not be confirmed.')); }
   }
 
-  private withRuntimeAwareness(active: ActiveExecution, context: StreamContext, maxModelCalls: number,
-    remainingMs: number | undefined): StreamContext {
+  private async withRuntimeAwareness(active: ActiveExecution, context: StreamContext, maxModelCalls: number,
+    remainingMs: number | undefined): Promise<StreamContext> {
     if (active.input.budgetAwareness === false || !active.input.runtimeBudget) return context;
     const budget = active.input.runtimeBudget;
     const strategy = active.input.runtimeStrategy;
     const allowed = active.toolBinding?.context.scope.allowedTools ?? [];
-    const diagnostics = [...active.toolRequests.entries()].slice(-8).flatMap(([id, request]) => {
-      if (!allowed.includes(request.name)) return [];
-      const saved = active.toolBinding?.queryCall?.(id);
-      if (!saved?.ok || !saved.data.runtimeObservation) return [{ tool: request.name, missingEvidence: true }];
+    const diagnostics = await Promise.all([...active.toolRequests.entries()].slice(-8)
+      .filter(([, request]) => allowed.includes(request.name)).map(async ([id, request]) => {
+      const saved = await active.toolBinding?.queryCall?.(id);
+      if (!saved?.ok || !saved.data.runtimeObservation) return { tool: request.name, missingEvidence: true };
       const observation = saved.data.runtimeObservation;
-      return [{ tool: request.name, diagnosticCode: observation.diagnosticCode, failureStage: observation.failureStage,
-        missingEvidence: observation.afterDomain === 'unknown' || observation.afterDomain === 'invalid' }];
-    });
+      return { tool: request.name, diagnosticCode: observation.diagnosticCode, failureStage: observation.failureStage,
+        missingEvidence: observation.afterDomain === 'unknown' || observation.afterDomain === 'invalid' };
+    }));
     const facts = {
       remainingModelCalls: Math.max(0, maxModelCalls - active.modelCallIndex),
       remainingToolCalls: Math.max(0, budget.maxToolCalls - active.toolRequests.size),
@@ -1745,21 +1855,22 @@ export class PiAgentAdapter implements AgentPort {
           fallbackReason: group?.fallbackReason ?? (strategy ? null : 'no-calibration') }; }),
       diagnostics, experience: strategy?.experience.items ?? [],
     };
-    return { ...context, systemPrompt: context.systemPrompt + '\n\nRuntime awareness (advisory, current request only):\n'
-      + JSON.stringify(facts) + '\nUse only the allowed tools above. Prefer a cheaper allowed read or narrower query when it supplies the missing evidence. '
-      + 'Stop with an explicit evidence gap when no legal alternative can meet the goal. Validation does not save a candidate.' };
+    return normalizeContext({ messages: [...context.messages, { role: 'system', timestamp: Date.now(), content: '',
+      sections: { flowmateRuntimeAwareness: 'Runtime awareness (advisory, current request only):\n' + JSON.stringify(facts)
+        + '\nUse only the allowed tools above. Prefer a cheaper allowed read or narrower query when it supplies the missing evidence. '
+        + 'Stop with an explicit evidence gap when no legal alternative can meet the goal. Validation does not save a candidate.' } }] });
   }
 
-  private rejectPiFeedback(record: SessionRecord, active: ActiveExecution, nativeToolCallId: string,
+  private async rejectPiFeedback(record: SessionRecord, active: ActiveExecution, nativeToolCallId: string,
     error: ReturnType<typeof appError>) {
     const request = active.toolRequests.get(nativeToolCallId);
-    const saved = active.toolBinding?.recordDelivery(nativeToolCallId, { version: 1, state: 'failed',
+    const saved = await active.toolBinding?.recordDelivery(nativeToolCallId, { version: 1, state: 'failed',
       messageObservedAt: request?.messageObservedAt ?? null, includedInCallSequence: null, requestDispatchedAt: null, error });
     this.failToolRun(record, active, saved?.ok ? error : appError('storage_write_failed', 'storage', 'Tool feedback failure could not be saved.', true));
     return { content: [{ type: 'text' as const, text: error.message }], details: {}, isError: true };
   }
 
-  private verifyModelUse(record: SessionRecord, settledCompactionFailure = false): Result<void> {
+  private async verifyModelUse(record: SessionRecord, settledCompactionFailure = false): Promise<Result<void>> {
     const active = record.active;
     if (!active) return fail(appError('agent_unbound_execution', 'runtime', 'Agent 请求缺少有效 Run 绑定。'));
     const registry = this.verifyChildRegistry(record);
@@ -1771,12 +1882,17 @@ export class PiAgentAdapter implements AgentPort {
     if (active.failure && !settledCompactionFailure) return fail(active.failure);
     if (active.signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'));
     try {
-      const allowed = active.input.verifyModelUse();
+      const allowed = await active.input.verifyModelUse();
       if (!allowed.ok) return allowed;
-      for (const state of active.inputs.values()) if (state.started) {
-        const inputAllowed = active.input.verifyInputUse?.(state.inputId);
+      const inputIds = [...active.inputs.values()].filter(state => state.started).map(state => state.inputId);
+      if (inputIds.length) {
+        const inputAllowed = await active.input.verifyInputUse?.(inputIds);
         if (!inputAllowed?.ok) return inputAllowed ?? fail(appError('tool_access_denied', 'runtime', 'Input authorization is unavailable.'));
       }
+      if (record.active !== active) return fail(appError('agent_unbound_execution', 'runtime', 'Agent execution ownership was lost.'));
+      if (record.historyFailure || record.unusable) return fail(record.historyFailure ?? appError('agent_session_unusable', 'session', 'Conversation cannot be continued.'));
+      if (active.failure && !settledCompactionFailure) return fail(active.failure);
+      if (active.signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'Agent 执行已取消。'));
       return ok(undefined);
     }
     catch { return fail(appError('storage_read_failed', 'storage', 'Session 使用权限无法确认。', true, active.runId, active.sessionId)); }
@@ -1830,7 +1946,8 @@ export class PiAgentAdapter implements AgentPort {
     return fail(error);
   }
 
-  private observeAgentEvent(record: SessionRecord, active: ActiveExecution, event: PiAgentEvent, eventSignal?: PiAgentEventSignal): void {
+  private async observeAgentEvent(record: SessionRecord, active: ActiveExecution, event: PiAgentEvent, eventSignal?: PiAgentEventSignal): Promise<void> {
+    if (event.type === 'message_end' || event.type === 'turn_end') await this.waitForHistory(record);
     if (active.multiCall && event.type === 'message_end' && event.message.role === 'assistant' && active.callSequence > 0) {
       const normalized = normalizeUsage(event.message, { attempts: Math.max(0, active.attempts - active.attemptsAtCallStart),
         complete: active.complete && event.message.stopReason !== 'error' && event.message.stopReason !== 'aborted' }, record.config?.connection === undefined);
@@ -1844,7 +1961,7 @@ export class PiAgentAdapter implements AgentPort {
     const binding = active.toolBinding;
     if (!active.p3 || !binding) return;
     const signal = eventSignal ?? active.signal;
-    const ensureRequest = (name: string, raw: unknown, nativeToolCallId: string, requestBinding?: RequestContextBinding): ToolRequestState | null => {
+    const ensureRequest = async (name: string, raw: unknown, nativeToolCallId: string, requestBinding?: RequestContextBinding): Promise<ToolRequestState | null> => {
       if (!this.guardInheritedTool(record, nativeToolCallId).ok) return null;
       const prior = active.toolRequests.get(nativeToolCallId);
       if (prior) {
@@ -1859,10 +1976,10 @@ export class PiAgentAdapter implements AgentPort {
         this.failToolRun(record, active, appError('context_binding_unknown', 'runtime', 'The tool has no confirmed generating request.'));
         return null;
       }
-      const observed = binding.observeRequest(name, raw, { nativeToolCallId, signal, ...(requestBinding ? { requestBinding } : {}) });
+      const observed = await binding.observeRequest(name, raw, { nativeToolCallId, signal, ...(requestBinding ? { requestBinding } : {}) });
       if (!observed.ok) {
         this.failToolRun(record, active, observed.error);
-        // Pi 0.85.1 awaits this listener after saving the generating assistant.
+        // Pi awaits this listener after saving the generating assistant.
         // Abort alone still enters its tool batch and appends an unowned result.
         // Reject the awaited event so Pi takes its actual aborted-assistant path.
         throw new Error(observed.error.code);
@@ -1872,7 +1989,7 @@ export class PiAgentAdapter implements AgentPort {
       active.toolRequests.set(nativeToolCallId, state);
       return state;
     };
-    const rejectUninvoked = (state: ToolRequestState, nativeToolCallId: string, feedbackText?: string) => {
+    const rejectUninvoked = async (state: ToolRequestState, nativeToolCallId: string, feedbackText?: string) => {
       if (state.invoked || state.terminal) return;
       const definition = this.toolsByName.get(state.name);
       const error = !definition
@@ -1886,7 +2003,7 @@ export class PiAgentAdapter implements AgentPort {
             : state.failureStage === 'sdk_before'
               ? appError(state.sdkBlocked ? 'tool_sdk_blocked' : 'tool_sdk_before_failed', 'tool', 'The SDK rejected this tool before execution.', false, active.runId, active.sessionId, nativeToolCallId)
               : appError('tool_execution_not_started', 'tool', 'The SDK did not start this tool execution.', false, active.runId, active.sessionId, nativeToolCallId);
-      const rejected = binding.rejectRequest(state.name, state.raw, { nativeToolCallId, signal,
+      const rejected = await binding.rejectRequest(state.name, state.raw, { nativeToolCallId, signal,
         ...(state.requestBinding ? { requestBinding: state.requestBinding } : {}) },
         feedbackText === undefined ? error : { ...error, message: feedbackText }, state.failureStage ?? 'unknown');
       if (!rejected.ok) this.failToolRun(record, active, rejected.error);
@@ -1903,17 +2020,17 @@ export class PiAgentAdapter implements AgentPort {
         this.failToolRun(record, active, appError('context_binding_unknown', 'runtime', 'The terminal assistant has no generating request.'));
         return;
       }
-      for (const call of calls) ensureRequest(call.name, call.arguments, call.id, requestBinding);
+      for (const call of calls) await ensureRequest(call.name, call.arguments, call.id, requestBinding);
       if (event.message.stopReason === 'stop' && calls.length === 0) active.finalAssistantMessage = event.message;
     }
 
     if (event.type === 'tool_execution_start') {
-      ensureRequest(event.toolName, event.args, event.toolCallId);
+      await ensureRequest(event.toolName, event.args, event.toolCallId);
     }
 
     if (event.type === 'tool_execution_end') {
       const state = active.toolRequests.get(event.toolCallId);
-      if (state) rejectUninvoked(state, event.toolCallId,
+      if (state) await rejectUninvoked(state, event.toolCallId,
         event.result.content.flatMap((part: AgentToolResult<unknown>['content'][number]) => part.type === 'text' ? [part.text] : []).join('\n'));
     }
 
@@ -1921,7 +2038,7 @@ export class PiAgentAdapter implements AgentPort {
       const state = active.toolRequests.get(event.message.toolCallId);
       if (state && !state.messageObserved && state.requestObservedAtSequence === null) {
         const observedAt = now().at;
-        const saved = binding.recordDelivery(event.message.toolCallId, { version: 1, state: 'message_observed',
+        const saved = await binding.recordDelivery(event.message.toolCallId, { version: 1, state: 'message_observed',
           messageObservedAt: observedAt, includedInCallSequence: null, requestDispatchedAt: null, error: null });
         if (!saved.ok) this.failToolRun(record, active,
           appError('storage_write_failed', 'storage', '工具结果观察事实无法保存。', true, active.runId));
@@ -1934,7 +2051,7 @@ export class PiAgentAdapter implements AgentPort {
 
     if (event.type === 'agent_end') {
       for (const [nativeToolCallId, state] of active.toolRequests) {
-        rejectUninvoked(state, nativeToolCallId);
+        await rejectUninvoked(state, nativeToolCallId);
         if (state.invoked && !state.terminal) {
           this.failToolRun(record, active, appError('tool_execution_unconfirmed', 'runtime', '工具执行尚未完成。', true, active.runId));
         }
@@ -1945,6 +2062,7 @@ export class PiAgentAdapter implements AgentPort {
   private installExecutionHooks(record: SessionRecord, session: AgentSession, activeToolNames: readonly string[]): void {
     const beforeToolCall = session.agent.beforeToolCall;
     session.agent.beforeToolCall = async (context, hookSignal) => {
+      await this.waitForHistory(record);
       const registry = this.verifyChildRegistry(record);
       if (!registry.ok) {
         if (record.active) this.failToolRun(record, record.active, registry.error);
@@ -1987,7 +2105,7 @@ export class PiAgentAdapter implements AgentPort {
         const feedback = structuredClone(request?.feedback ?? context.result);
         const result = await afterToolCall?.(context, hookSignal);
         if (!active) return result;
-        const saved = active.toolBinding?.queryCall?.(context.toolCall.id);
+        const saved = await active.toolBinding?.queryCall?.(context.toolCall.id);
         if (saved && (!saved.ok || saved.data.result === null)) {
           return this.rejectPiFeedback(record, active, context.toolCall.id,
             appError('storage_read_failed', 'storage', 'The saved tool outcome could not be verified.', true));
@@ -2018,12 +2136,38 @@ export class PiAgentAdapter implements AgentPort {
     session.setActiveToolsByName([...activeToolNames]);
     session.agent.streamFunction = this.wrapStream(record, session, session.agent.streamFunction);
     this.installInputCapture(record, session);
+    session.subscribe(event => {
+      if (record.active && event.type === 'turn_end') {
+        // Pi rebuilds its next-turn loadout before prepareRequest observes it.
+        const registry = this.verifyChildRegistry(record);
+        if (!registry.ok) this.failToolRun(record, record.active, registry.error);
+      }
+      if (record.active || event.type !== 'message_end' || event.message.role !== 'custom') return;
+      const messages = [...session.messages];
+      this.enqueueHistory(record, () => {
+        const seeded = this.reseedContext(record, undefined, messages);
+        if (!seeded.ok) throw seeded.error;
+      });
+    });
+    const nativePrepareRequest = session.agent.prepareRequest;
+    session.agent.prepareRequest = async (request, signal) => {
+      await this.waitForHistory(record);
+      const update = await nativePrepareRequest?.(request, signal);
+      await this.waitForHistory(record);
+      const seeded = this.reseedContext(record, undefined, update?.context?.messages ?? request.context.messages);
+      if (!seeded.ok) {
+        if (record.active) this.failToolRun(record, record.active, seeded.error);
+        throw seeded.error;
+      }
+      return update ?? undefined;
+    };
     const nativeConvert = session.agent.convertToLlm.bind(session.agent);
     session.agent.convertToLlm = async (messages) => {
+      await this.waitForHistory(record);
       const rejectConversion = (error: ReturnType<typeof appError>): never => {
         if (record.active) this.failToolRun(record, record.active, error); throw error;
       };
-      const allowed = this.verifyModelUse(record);
+      const allowed = await this.verifyModelUse(record);
       const valid = this.validateMessages(record, messages, true);
       if (!allowed.ok || !valid.ok) {
         const error = !allowed.ok ? allowed.error : !valid.ok ? valid.error : appError('session_history_invalid', 'session', 'Invalid model messages.');
@@ -2047,9 +2191,9 @@ export class PiAgentAdapter implements AgentPort {
         if (expected.length === 0) continue;
         const output = converted[outputIndex++];
         if (!output || !isDeepStrictEqual(output, expected[0])
-          || ['user', 'assistant', 'toolResult'].includes(message.role) && output !== message)
+          || ['system', 'user', 'assistant', 'toolResult'].includes(message.role) && output !== message)
           rejectConversion(appError('context_binding_unknown', 'runtime', 'Converted context no longer preserves its source.'));
-        if (!['user', 'assistant', 'toolResult'].includes(message.role)) {
+        if (!['system', 'user', 'assistant', 'toolResult'].includes(message.role)) {
           const proof = nativeProof[inputIndex], entry = proof && record.manager.getEntry(proof.entryId);
           const origin = record.recoverySeed?.origins.find(o => o.nativeEntryId === proof?.entryId);
           if (!entry || !origin || !['message', 'custom_message', 'branch_summary', 'compaction'].includes(entry.type))
@@ -2092,7 +2236,7 @@ export class PiAgentAdapter implements AgentPort {
       || !isDeepStrictEqual(DelegateArgsSchema.parse(captured.call.arguments), DelegateArgsSchema.parse(args))
       || !record.extensions?.scopes.some(scope => scope.view.instanceId === ticket.instanceId
         && scope.view.ref.id === 'subagents' && scope.view.state === 'active' && scope.view.admission === 'open')) throw reject();
-    const saved = record.active.toolBinding?.queryCall?.(context.nativeToolCallId);
+    const saved = await record.active.toolBinding?.queryCall?.(context.nativeToolCallId);
     if (!saved?.ok || saved.data.status !== 'running' || saved.data.toolName !== 'Agent' || !this.subagentCallbacks) throw reject();
     if (!Number.isFinite(context.deadlineAt)) throw reject();
     captured.control = this.managedChildControl(record, captured.call, saved.data.toolCallId, context.deadlineAt!, context.signal,
@@ -2149,7 +2293,10 @@ export class PiAgentAdapter implements AgentPort {
           || !parent.model || !parent.runtime || !parent.config || parent.active?.runId !== child.parentRunId)
           throw appError('subagent_origin_invalid', 'runtime', 'Child history or parent model is not bound.');
         const cwd = child.config.workingDirectory ?? parent.workingDirectory!;
-        const loader = createRunResourceLoader({ contents: this.dependencies.resourceContents, fixedSystemPrompt: child.config.agent.systemPrompt,
+        if ((child.input.resources?.bundleId ?? null) !== (parent.snapshot?.resources?.bundleId ?? null)
+          || child.input.resources && !parent.resourceContents)
+          throw appError('resource_bundle_unavailable', 'storage', 'Child resources do not match the parent bundle snapshot.');
+        const loader = createRunResourceLoader({ contents: parent.resourceContents, fixedSystemPrompt: child.config.agent.systemPrompt,
           frozen: child.input.resources ?? null, activeToolNames: child.scope.allowedTools, visibleSkillRefs: child.input.visibleSkillRefs, child: true,
           bundleDirectory: join(this.dependencies.resourceBundleRoot ?? join(this.dependencies.agentDir ?? cwd, 'resource-bundles'), child.input.resources?.bundleId ?? '') });
         if (!loader.ok) throw loader.error;
@@ -2159,7 +2306,7 @@ export class PiAgentAdapter implements AgentPort {
           throw appError('subagent_tool_denied', 'tool', 'Child registry would exceed the read-only scope.');
         return { promptText: child.input.promptText!, options: { cwd, agentDir: this.dependencies.agentDir ?? cwd,
           modelRuntime: parent.runtime, model: parent.model, sessionManager: record.manager,
-          settingsManager: inMemorySettings(), resourceLoader: loader.data, thinkingLevel: 'off', noTools: 'all',
+          settingsManager: inMemorySettings(), resourceLoader: loader.data, thinkingLevel: parent.session!.thinkingLevel, noTools: 'all',
           tools: [...child.scope.allowedTools], customTools: definitions.map(definition => toPiTool(definition!,
             (id, input, toolSignal) => this.executePiTool(record, definition!, id, input, toolSignal), raw => {
               const requests = [...record.active?.toolRequests.values() ?? []].filter(call => call.name === definition!.name && call.sdkRaw === raw && !call.invoked);
@@ -2171,6 +2318,7 @@ export class PiAgentAdapter implements AgentPort {
             const installed = session.getAllTools().map(tool => tool.name);
             if (session.sessionManager !== record.manager || session.sessionManager.getSessionId() !== child.childNativeSessionId
               || !session.model || !sameModel(session.model, parent.model!)
+              || session.thinkingLevel !== parent.session!.thinkingLevel
               || !session.systemPrompt.startsWith(`${loader.data.getSystemPrompt()}\n`)
               || installed.length !== child.scope.allowedTools.length || new Set(installed).size !== installed.length
               || installed.some(name => !child.scope.allowedTools.includes(name))
@@ -2178,11 +2326,11 @@ export class PiAgentAdapter implements AgentPort {
               throw appError('subagent_tool_denied', 'tool', 'The actual child assembly differs from its frozen registry.');
             record.runtime = parent.runtime; record.model = parent.model; record.config = structuredClone(parent.config!);
             record.snapshot = { ...child.config, agent: { ...child.config.agent, systemPrompt: session.systemPrompt } };
-            record.policy = 'p3'; record.workingDirectory = cwd; record.resourceLoader = loader.data;
+            record.policy = 'p3'; record.workingDirectory = cwd; record.resourceLoader = loader.data; record.resourceContents = parent.resourceContents;
             record.resourceKey = child.input.resources?.bundleId ?? null; record.sessionInputs = true;
             this.installExecutionHooks(record, session, child.scope.allowedTools);
             const seeded = this.reseedContext(record); if (!seeded.ok) throw seeded.error;
-            const started = child.start(session.systemPrompt); if (!started.ok) throw started.error;
+            const started = await child.start(session.systemPrompt); if (!started.ok) throw started.error;
             const originalPrompt = session.prompt.bind(session);
             let prompted = false;
             session.prompt = async (text, options) => {
@@ -2206,6 +2354,7 @@ export class PiAgentAdapter implements AgentPort {
     input: unknown,
     toolSignal?: AbortSignal,
   ) {
+    await this.waitForHistory(record);
     const active = record.active;
     const binding = active?.toolBinding;
     if (!active || !active.p3 || !binding) throw new Error('工具调用缺少有效 Run 绑定。');
@@ -2216,7 +2365,7 @@ export class PiAgentAdapter implements AgentPort {
         const error = appError('context_binding_unknown', 'runtime', 'The tool has no original request state.');
         this.failToolRun(record, active, error); throw new Error(error.message);
       }
-      const observed = binding.observeRequest(definition.name, input, { nativeToolCallId, signal: active.signal });
+      const observed = await binding.observeRequest(definition.name, input, { nativeToolCallId, signal: active.signal });
       if (!observed.ok) {
         this.failToolRun(record, active, observed.error);
         throw new Error(observed.error.message);
@@ -2263,9 +2412,9 @@ export class PiAgentAdapter implements AgentPort {
       throw new Error(error.message);
     }
     if (result.status === 'succeeded' && (definition.name === 'list_skill_resources' || definition.name === 'read_skill_resource')) {
-      const owner = binding.queryCall?.(nativeToolCallId);
-      const verified = active.input.resources && record.resourceLoader && this.dependencies.resourceContents
-        ? verifySkillToolOutput(active.input.resources, record.resourceLoader, this.dependencies.resourceContents, definition.name, input, result.data) : null;
+      const owner = await binding.queryCall?.(nativeToolCallId);
+      const verified = active.input.resources && record.resourceLoader && record.resourceContents
+        ? verifySkillToolOutput(active.input.resources, record.resourceLoader, record.resourceContents, definition.name, input, result.data) : null;
       if (!verified?.ok || !owner?.ok || !request.requestBinding || !active.input.contextHooks?.recordResourceRead) {
         const failure = verified && !verified.ok ? verified.error
           : appError('resource_evidence_conflict', 'runtime', 'Original Skill read identity is unavailable.');
@@ -2276,11 +2425,11 @@ export class PiAgentAdapter implements AgentPort {
         requestSequence: request.requestBinding!.requestSequence, ref: file.ref, bundleId: active.input.resources!.bundleId,
         path: file.path, deliveredContent, operation: definition.name as 'list_skill_resources' | 'read_skill_resource',
         fullBody: file.fullBody, nativeEntryId: null, at: now().at }));
-      request.resourceReads = receipts;
       for (const receipt of receipts) {
-        const saved = active.input.contextHooks.recordResourceRead(receipt);
+        const saved = await active.input.contextHooks.recordResourceRead(receipt);
         if (!saved.ok) { this.failToolRun(record, active, saved.error); throw saved.error; }
       }
+      request.resourceReads = receipts;
     }
     if (getNativeToolParameters(definition) || definition.name === 'Agent') {
       const native = NativeToolOutputSchema.safeParse(result.data);
@@ -2288,7 +2437,7 @@ export class PiAgentAdapter implements AgentPort {
         if (result.status !== 'succeeded') active.nativeFailures.add(nativeToolCallId);
         request.feedback = { content: native.data.content, details: native.data.details };
         if (result.status === 'succeeded' && operation && managed.length) {
-          const owner = binding.queryCall?.(nativeToolCallId);
+          const owner = await binding.queryCall?.(nativeToolCallId);
           if (!owner?.ok || !request.requestBinding) {
             const error = appError('resource_evidence_conflict', 'runtime', 'Original managed read identity is unavailable.');
             this.failToolRun(record, active, error); throw error;
@@ -2301,16 +2450,17 @@ export class PiAgentAdapter implements AgentPort {
               if (!verified.ok) { this.failToolRun(record, active, verified.error); throw verified.error; }
             }
             const deliveredContent = JSON.stringify(native.data.content);
-            request.resourceReads = managed.filter(file => nativeFileResultIncludes(operation, file.relativePath, text)).map(file => ({
+            const receipts = managed.filter(file => nativeFileResultIncludes(operation, file.relativePath, text)).map(file => ({
               toolCallId: owner.data.toolCallId, nativeToolCallId, requestSequence: request.requestBinding!.requestSequence,
               ref: file.ref, bundleId: active.input.resources!.bundleId, path: file.path, deliveredContent, operation,
               fullBody: operation !== 'read' ? false : file.text === null ? null : text === file.text,
               nativeEntryId: null, at: now().at,
             }));
-            for (const receipt of request.resourceReads) {
-              const saved = active.input.contextHooks!.recordResourceRead!(receipt);
+            for (const receipt of receipts) {
+              const saved = await active.input.contextHooks!.recordResourceRead!(receipt);
               if (!saved.ok) { this.failToolRun(record, active, saved.error); throw saved.error; }
             }
+            request.resourceReads = receipts;
           } catch (error) {
             if (!active.failure) this.failToolRun(record, active, appError('resource_bundle_unavailable', 'storage', 'Managed content could not be verified after reading.', true));
             throw error;
@@ -2325,7 +2475,7 @@ export class PiAgentAdapter implements AgentPort {
     return request.feedback;
   }
 
-  private observeOutgoingToolResults(record: SessionRecord, active: ActiveExecution, context: StreamContext): boolean {
+  private async observeOutgoingToolResults(record: SessionRecord, active: ActiveExecution, context: StreamContext): Promise<boolean> {
     const binding = active.toolBinding;
     if (!active.p3 || !binding) return true;
     for (const message of context.messages) {
@@ -2334,7 +2484,7 @@ export class PiAgentAdapter implements AgentPort {
       if (!request || request.requestObservedAtSequence !== null) continue;
       if (!request.messageObserved) {
         const messageObservedAt = now().at;
-        const messageObserved = binding.recordDelivery(message.toolCallId, { version: 1, state: 'message_observed',
+        const messageObserved = await binding.recordDelivery(message.toolCallId, { version: 1, state: 'message_observed',
           messageObservedAt, includedInCallSequence: null, requestDispatchedAt: null, error: null });
         if (!messageObserved.ok) {
           this.failToolRun(record, active,
@@ -2345,7 +2495,7 @@ export class PiAgentAdapter implements AgentPort {
         request.messageObservedAt = messageObservedAt;
       }
       const dispatchedAt = now().at;
-      const observed = binding.recordDelivery(message.toolCallId, { version: 1, state: 'request_observed',
+      const observed = await binding.recordDelivery(message.toolCallId, { version: 1, state: 'request_observed',
         messageObservedAt: request.messageObservedAt, includedInCallSequence: active.callSequence, requestDispatchedAt: dispatchedAt, error: null });
       if (!observed.ok) {
         this.failToolRun(record, active,
@@ -2428,7 +2578,7 @@ export class PiAgentAdapter implements AgentPort {
     }
     return { texts, evidence: ResourceRequestEvidenceSchema.parse({ purpose: compactionOperationId === null ? 'answer' : 'compaction', callSequence: binding.callSequence,
       compactionOperationId, bundleId: compactionOperationId === null ? frozen?.bundleId ?? null : null, referencedBundleIds: [...bundles],
-      systemPrompt: context.systemPrompt ?? '', inputIds: binding.includedBindings.flatMap(source => source.inputId === null ? [] : [source.inputId]),
+      systemPrompt: getCurrentSystemPrompt(context.messages), inputIds: binding.includedBindings.flatMap(source => source.inputId === null ? [] : [source.inputId]),
       toolCallIds: binding.includedToolResults.map(source => source.toolCallId), contentChecks: checks, at: now().at }) };
   }
 
@@ -2465,29 +2615,29 @@ export class PiAgentAdapter implements AgentPort {
     if (!codecResult.ok) { failStream(codecResult.error); return; }
     const codec = codecResult.data;
     const modelIdentity = { api: model.api, provider: model.provider, model: model.id };
-    const recordEvidence = (update: ContextEvidenceUpdate): Result<void> => {
+    const recordEvidence = async (update: ContextEvidenceUpdate): Promise<Result<void>> => {
       if (!requestBinding) return ok(undefined);
       let saved: Result<void>;
-      try { saved = active.input.contextHooks!.record(requestBinding, update); }
+      try { saved = await active.input.contextHooks!.record(requestBinding, update); }
       catch { saved = fail(appError('storage_write_failed', 'storage', 'Request evidence could not be saved.', true)); }
       if (!saved.ok) failStream(saved.error);
       return saved;
     };
-    const requireEvidence = (update: ContextEvidenceUpdate) => {
-      const saved = recordEvidence(update); if (!saved.ok) throw new Error(saved.error.code);
+    const requireEvidence = async (update: ContextEvidenceUpdate) => {
+      const saved = await recordEvidence(update); if (!saved.ok) throw new Error(saved.error.code);
     };
     let resources: ReturnType<PiAgentAdapter['resourceRequest']> | undefined;
-    const saveResources = (layer?: 'sdk' | 'wire', facts?: ResourceInclusion[]) => {
+    const saveResources = async (layer?: 'sdk' | 'wire', facts?: ResourceInclusion[]) => {
       const save = active.input.contextHooks?.recordResourceRequest;
       if (!resources || !save) return;
       if (layer && facts) resources.evidence = refineResourceEvidence(resources.evidence, layer, facts);
-      const saved = save(resources.evidence);
+      const saved = await save(resources.evidence);
       if (!saved.ok) { failStream(saved.error); throw new Error(saved.error.code); }
     };
     if (requestBinding && active.input.contextHooks?.recordResourceRequest) {
       try { resources = this.resourceRequest(record, context, requestBinding);
         if (resources.evidence.bundleId === null && resources.evidence.contentChecks.length === 0 && resources.evidence.referencedBundleIds.length === 0) resources = undefined;
-        saveResources(); }
+        await saveResources(); }
       catch { if (!active.failure) failStream(appError('resource_evidence_conflict', 'runtime', 'Actual resource request provenance is unavailable.')); return; }
     }
     let localAttempt = 0;
@@ -2508,16 +2658,16 @@ export class PiAgentAdapter implements AgentPort {
         this.failToolRun(record, active, error);
         throw new Error(error.code);
       }
-      const allowed = this.verifyModelUse(record);
+      const allowed = await this.verifyModelUse(record);
       if (!allowed.ok) {
         this.failToolRun(record, active, allowed.error);
         throw new Error(allowed.error.code);
       }
-      if (!this.observeOutgoingToolResults(record, active, context)) throw new Error('tool_result_delivery_failed');
-      if (resources) saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
+      if (!await this.observeOutgoingToolResults(record, active, context)) throw new Error('tool_result_delivery_failed');
+      if (resources) await saveResources('wire', await checkResourceWire(model.api, request, init, resources.texts));
       const toolDefinitions = requestBinding ? await wireToolDefinitions(model.api, request, init) : undefined;
       const attempt = ++localAttempt;
-      if (requestBinding) requireEvidence({ kind: 'attempt-prepared', evidence: { attempt, preparedAt: now().at,
+      if (requestBinding) await requireEvidence({ kind: 'attempt-prepared', evidence: { attempt, preparedAt: now().at,
         enteredAt: null, responseAt: null, responseStatus: null, transportErrorCode: null, nativeRequestId: null,
         wireInclusion: wire.data.inclusion, wireReason: wire.data.reason,
         ...(toolDefinitions === undefined ? {} : { toolDefinitions }) } });
@@ -2530,12 +2680,12 @@ export class PiAgentAdapter implements AgentPort {
       try { launched = baseFetch(request, init); } catch (error) { launched = Promise.reject(error); }
       // Attach immediately: an entered-write rejection must not abandon a rejected launched request.
       const settled = launched.then(response => ({ response }), error => ({ error }));
-      const entered = requestBinding ? recordEvidence({ kind: 'attempt-entered', attempt, at: now().at }) : ok(undefined);
+      const entered = requestBinding ? await recordEvidence({ kind: 'attempt-entered', attempt, at: now().at }) : ok(undefined);
       const outcome = await settled;
       if ('response' in outcome) {
         const response = outcome.response;
         const responseAt = now().at;
-        const recorded = requestBinding ? recordEvidence({ kind: 'response', attempt, at: responseAt,
+        const recorded = requestBinding ? await recordEvidence({ kind: 'response', attempt, at: responseAt,
           status: response.status, nativeRequestId: null }) : ok(undefined);
         active.responseStatus = response.status;
         active.responseStarted = true;
@@ -2550,7 +2700,7 @@ export class PiAgentAdapter implements AgentPort {
         const failure = active.failure ?? (active.signal.aborted ? appError('agent_cancelled', 'runtime', 'The request was cancelled.')
           : appError('provider_transport_error', 'provider', 'The request transport failed.'));
         const safeCode = ContextSafeErrorCodeSchema.safeParse(failure.code);
-        requireEvidence({ kind: 'transport-failed', attempt, at: now().at, code: safeCode.success ? safeCode.data : 'provider_transport_error' });
+        await requireEvidence({ kind: 'transport-failed', attempt, at: now().at, code: safeCode.success ? safeCode.data : 'provider_transport_error' });
         failStream(failure);
       } else if (!active.failure) active.failure = this.providerError(active, outcome.error, true);
       throw outcome.error;
@@ -2565,9 +2715,12 @@ export class PiAgentAdapter implements AgentPort {
         const toolDefinitions = deliveredToolDefinitions(model.api, outgoing);
         const fact = { kind: 'sdk-payload' as const, at: sdkPayloadFact?.at ?? now().at, ...inclusion.data,
           ...(toolDefinitions === undefined ? {} : { toolDefinitions }) };
-        requireEvidence(fact); sdkPayloadFact ??= fact;
+        await requireEvidence(fact); sdkPayloadFact ??= fact;
       }
-      if (resources) saveResources('sdk', checkResourcePayload(model.api, outgoing, resources.texts));
+      if (resources) await saveResources('sdk', checkResourcePayload(model.api, outgoing, resources.texts));
+      try { this.dependencies.observeModel?.({ runId: active.runId, sessionId: active.sessionId,
+        callSequence, purpose: 'agent', phase: 'request', at: now().at, model: model.id, api: model.api, data: outgoing }); }
+      catch { /* capture observers cannot interrupt an authorized run */ }
       if (outgoing && typeof outgoing === 'object') {
         const body = outgoing as Record<string, unknown>;
         const generation = body.generationConfig as Record<string, unknown> | undefined;
@@ -2588,7 +2741,7 @@ export class PiAgentAdapter implements AgentPort {
           || consumedResponse && !isDeepStrictEqual(consumedResponse, captured) ? 'context_binding_conflict' : null;
         if (code) { const error = appError(code, 'runtime', 'The SDK response does not match its original request.'); failStream(error); throw new Error(code); }
         if (!consumedResponse) {
-          requireEvidence({ kind: 'response', attempt: slot!.attempt, at: slot!.responseAt, status: slot!.status, nativeRequestId: captured.nativeRequestId });
+          await requireEvidence({ kind: 'response', attempt: slot!.attempt, at: slot!.responseAt, status: slot!.status, nativeRequestId: captured.nativeRequestId });
           consumedResponse = captured;
         }
       }
@@ -2641,6 +2794,11 @@ export class PiAgentAdapter implements AgentPort {
         }
         const message = event.type === 'done' ? event.message : event.type === 'error' ? event.error
           : 'partial' in event ? event.partial : undefined;
+        if (event.type === 'done' || event.type === 'error') {
+          try { this.dependencies.observeModel?.({ runId: active.runId, sessionId: active.sessionId,
+            callSequence, purpose: 'agent', phase: 'response', at: now().at, model: model.id, api: model.api, data: message }); }
+          catch { /* capture observers cannot interrupt an authorized run */ }
+        }
         if (message) {
           try {
             active.assistantContentBytes = contentBytes(message);
@@ -2887,19 +3045,21 @@ export class PiAgentAdapter implements AgentPort {
         for (const block of event.message.content) if (block.type === 'toolCall' && !this.guardInheritedTool(record, block.id).ok) return;
       if (event.type === 'agent_end' || event.type === 'agent_settled') this.closeInputAdmission(active);
       if (event.type === 'turn_start') active.turnOrdinal += 1;
-      if (event.type === 'turn_end' && input.inputId !== undefined && !active.failure && !record.historyFailure) {
+      if (event.type === 'turn_end' && input.inputId !== undefined && !active.failure && !record.historyFailure) this.enqueueHistory(record, async () => {
+        if (active.failure || record.historyFailure) return;
         const result = active.resultBindings.get(event.message);
         if (result) {
           try {
-            const completed = input.completeInputResult!(result.inputIds, result.entryId);
+            const completed = await input.completeInputResult!(result.inputIds, result.entryId);
             if (!completed.ok) this.failToolRun(record, active, completed.error);
           } catch { this.failToolRun(record, active, appError('storage_write_failed', 'storage', 'Input result completion could not be saved.', true)); }
           active.resultBindings.delete(event.message);
         }
-      }
+      });
       if (event.type === 'message_start' || event.type === 'message_update' || event.type === 'message_end') {
         if (record.historyFailure) return;
         const message = event.message;
+        if (message.role === 'system') return;
         let ordinal = active.liveOrdinals.get(message);
         const assistant = message.role === 'assistant';
         if (event.type === 'message_start') {
@@ -2944,6 +3104,10 @@ export class PiAgentAdapter implements AgentPort {
     let promptSettled = false;
     try {
       try {
+        await this.waitForHistory(record);
+        // The SDK reprojects from storage on prompt; reject corrupt working state before that replacement.
+        const valid = this.validateMessages(record, session.messages, true);
+        if (!valid.ok) { this.failToolRun(record, active, valid.error); throw valid.error; }
         if (input.inputId !== undefined) {
           const dispatchedInput = { inputId: input.inputId, text: input.text, promptText: input.promptText!, contextSnapshotId: input.contextSnapshotId,
             ...(input.resourceBinding ? { resourceBinding: input.resourceBinding } : {}) };
@@ -2956,6 +3120,7 @@ export class PiAgentAdapter implements AgentPort {
       await record.dispatchTail;
       await Promise.all([...active.streams]);
       await active.abortPromise;
+      await this.waitForHistory(record);
     } catch {
       active.failure ??= signal.aborted
         ? appError('agent_cancelled', 'runtime', 'Agent 执行已取消。')
@@ -2965,6 +3130,8 @@ export class PiAgentAdapter implements AgentPort {
       session.setAutoCompactionEnabled(false);
       this.closeInputAdmission(active);
       await record.dispatchTail;
+      try { await this.waitForHistory(record); }
+      catch { active.failure = record.historyFailure ?? active.failure; }
       if (session.isIdle) {
         active.queueCleared = false;
         try {
@@ -3036,11 +3203,11 @@ export class PiAgentAdapter implements AgentPort {
         && stopped && !signal.aborted && !record.historyFailure && !record.unusable
         && (isDeepStrictEqual(record.receipt, compaction.observation.generated ? compaction.observation.saved : compaction.baseline)
           || committedNativeFailure)
-        && this.verifyModelUse(record, true).ok && this.validateMessages(record, session.messages, true).ok;
+        && (await this.verifyModelUse(record, true)).ok && this.validateMessages(record, session.messages, true).ok;
       if (active.promptEntered && active.failure && !intactCompactionFailure) record.unusable = true;
       if (record.memory && !record.historyFailure) {
         const snapshot = this.exportSession(nativeSessionId);
-        const saved = snapshot.ok ? record.memory.save(snapshot.data, []) : snapshot;
+        const saved = snapshot.ok ? await record.memory.save(snapshot.data, []) : snapshot;
         if (!saved.ok) {
           record.unusable = true; record.historyFailure = saved.error; active.failure = saved.error;
           active.stopReason = saved.error.code; this.stop(record, active); await active.abortPromise;
@@ -3098,7 +3265,7 @@ export class PiAgentAdapter implements AgentPort {
     if (record.disposing) return record.disposing;
     const scopes = record.extensions?.scopes ?? [];
     for (const scope of scopes) scope.view.admission = 'closed';
-    if (record.running || record.compacting || record.commanding || record.session && !record.session.isIdle)
+    if (record.running || record.compacting || record.commanding || record.historyTail || record.session && !record.session.isIdle)
       return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Agent Session has not stopped.', true)] };
     if (scopes.some(scope => !scope.view.cleanup.ownedCallbacksSettled))
       return { stopped: false, closed: false, errors: [appError('extension_cleanup_failed', 'runtime', 'Extension callbacks or factory have not settled.', true)] };
@@ -3111,6 +3278,7 @@ export class PiAgentAdapter implements AgentPort {
           if (scopes.some(scope => scope.phaseError('session_shutdown') || !scope.view.cleanup.shutdownAcknowledged || !scope.view.cleanup.ownedCallbacksSettled))
             throw new Error('Native shutdown was not acknowledged.');
         }
+        try { await this.waitForHistory(record); } catch { /* Unusable history still permits disposal after its writes settle. */ }
         record.compactionBridge?.dispose(); record.compactionBridge = undefined;
         if (record.session && !scopes.some(scope => scope.view.cleanup.sdkDisposed)) {
           record.session.dispose(); for (const scope of scopes) scope.view.cleanup.sdkDisposed = true;
@@ -3148,6 +3316,7 @@ export class PiAgentAdapter implements AgentPort {
       const runner = record.session.extensionRunner, command = runner.getCommand(request.name);
       if (!command || request.arguments !== '') throw new Error('Command is unavailable.');
       await command.handler(request.arguments, runner.createCommandContext());
+      await this.waitForHistory(record);
       const receipt = scope.finishCommand();
       if (!receipt || scope.view.state !== 'active' || scope.view.admission !== 'open') throw new Error('Command has no current receipt.');
       return ok(receipt);
@@ -3169,7 +3338,7 @@ export class PiAgentAdapter implements AgentPort {
   public async releaseSession(nativeSessionId: string): Promise<CloseReport> {
     const record = this.sessions.get(nativeSessionId);
     if (!record) return { stopped: true, closed: true, errors: [] };
-    if (record.preparing || record.running || record.compacting || record.commanding || (record.session && !record.session.isIdle))
+    if (record.preparing || record.running || record.compacting || record.commanding || record.historyTail || (record.session && !record.session.isIdle))
       return { stopped: false, closed: false, errors: [appError('stop_unconfirmed', 'runtime', 'Agent Session is still executing.', true)] };
     const report = await this.disposeManagedSession(record);
     if (report.closed) this.sessions.delete(nativeSessionId);

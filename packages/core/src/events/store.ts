@@ -1,4 +1,4 @@
-import { Database } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor } from '../storage/write-coordinator.ts';
 import { appError, RuntimeEventSchema, RuntimeEventsQuerySchema, RuntimeEventsReadResultSchema } from '@flowmate/contracts';
 import type { DbId, RuntimeEvent, RuntimeEventsQuery, RuntimeEventsReadResult,
   RuntimeEventReadContext, RunEventPayload, ToolEventPayload, InputEventPayload } from '@flowmate/contracts';
@@ -74,14 +74,14 @@ export function reportEventObserverFailure(): void {
   try { console.warn('runtime_event_observer_failed'); } catch { /* diagnostics cannot undo COMMIT */ }
 }
 
-export function createRuntimeEventStore(db: Database) {
+export function createRuntimeEventStore(db: SynchronousDatabaseExecutor,
+  listeners = new Set<(refs: readonly CommittedEventRef[]) => void>()) {
   let depth = 0;
   const pending: CommittedEventRef[] = [];
-  const listeners = new Set<(refs: readonly CommittedEventRef[]) => void>();
 
   function withTransaction<T>(write: () => T): T {
     // An unrelated outer transaction cannot publish before its own COMMIT.
-    if (depth === 0 && db.inTransaction) throw new EventFault('state_conflict');
+    if (depth === 0 && db.inTransaction && !db.afterCommit) throw new EventFault('state_conflict');
     const mark = pending.length;
     depth += 1;
     let value: T;
@@ -90,9 +90,12 @@ export function createRuntimeEventStore(db: Database) {
     finally { depth -= 1; }
     if (depth === 0) {
       const committed = Object.freeze(pending.splice(0).map(ref => Object.freeze(ref)));
-      if (committed.length) for (const listener of [...listeners]) {
-        try { listener(committed); } catch { reportEventObserverFailure(); }
-      }
+      const publish = () => {
+        if (committed.length) for (const listener of [...listeners]) {
+          try { listener(committed); } catch { reportEventObserverFailure(); }
+        }
+      };
+      if (db.inTransaction) db.afterCommit!(publish); else publish();
     }
     return value;
   }

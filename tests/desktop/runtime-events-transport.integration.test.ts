@@ -7,8 +7,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Database } from 'bun:sqlite';
-import { openDatabase } from '@flowmate/core';
-import type { DbHandle } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
+import type { TestDbHandle } from '../support/database.ts';
 import { resolveProductPaths } from '@flowmate/shared';
 import type { Result, RuntimeSubscriptionInfo, RuntimeEventsReadResult, RuntimeEventCursor, SafeConfigSnapshot } from '@flowmate/contracts';
 import { mkdtemp } from '../support/resources.ts';
@@ -16,7 +16,7 @@ import { HostClient } from '../../apps/desktop/main/host-client.ts';
 import { drainEventReadQueue, enqueueEventRead } from '../../apps/desktop/renderer/src/event-state.ts';
 
 async function fixture(prepareHost?: (root: string) => void,
-  prepareStore?: (store: DbHandle, runId: number, config: SafeConfigSnapshot) => void) {
+  prepareStore?: (store: TestDbHandle, runId: number, config: SafeConfigSnapshot) => void) {
   const root = await mkdtemp(join(tmpdir(), 'flowmate-p6-transport-'));
   const paths = resolveProductPaths(root);
   if (!paths.ok) throw new Error(paths.error.code);
@@ -33,7 +33,7 @@ async function fixture(prepareHost?: (root: string) => void,
       attemptsComplete: false, costSource: null, updatedAt: at },
     cleanup: { version: 1, stopped: false, stopReason: null, lateObservationRequired: false, errors: [] }, createdAt: at });
   if (created.ok) prepareStore?.(opened.data, created.data, config);
-  opened.data.close();
+  await opened.data.close();
   if (!created.ok) throw new Error(created.error.code);
   prepareHost?.(root);
   const client = new HostClient();

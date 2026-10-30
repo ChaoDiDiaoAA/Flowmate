@@ -1,7 +1,9 @@
 import type { StoredCandidateDraft, DocumentRef, InvoiceIssue } from './invoice.ts';
 import type { DbId } from './runtime.ts';
-import { StoredCandidateDraftSchema, DocumentRefSchema, InvoiceIssueSchema, invoiceHeaderFields, invoiceLineFields,
+import { StoredCandidateDraftSchema, DocumentRefSchema, InvoiceIssueSchema,
   MAX_INVOICE_LINES, MAX_INVOICE_PAGES } from './invoice.ts';
+import { InvoiceCandidateFieldPathSchema } from './invoice.ts';
+export { InvoiceCandidateFieldPathSchema } from './invoice.ts';
 import { z } from 'zod';
 
 const idSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -9,12 +11,7 @@ const idSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export type WorkspaceView = 'original' | 'parsed' | 'candidate';
 export type GoalMode = 'answer' | 'save-candidate' | 'fill-form';
 
-const candidateFieldPath = z.string().max(256).refine(path => {
-  const header = /^fields\.([A-Za-z]+)$/.exec(path);
-  if (header) return invoiceHeaderFields.some(name => name === header[1]);
-  const line = /^lines\.(0|[1-9]\d*)\.([A-Za-z]+)$/.exec(path);
-  return !!line && Number(line[1]) < MAX_INVOICE_LINES && invoiceLineFields.some(name => name === line[2]);
-}, 'Unregistered candidate field path.');
+const candidateFieldPath = InvoiceCandidateFieldPathSchema;
 const selectionBase = { formatVersion: z.literal(1), targetId: idSchema };
 export const WorkspaceSelectionSchema = z.union([
   z.object({ ...selectionBase, kind: z.literal('field'), target: z.literal('document'),

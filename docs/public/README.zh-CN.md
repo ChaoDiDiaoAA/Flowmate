@@ -2,11 +2,15 @@
 
 # Flowmate 文档
 
-Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久会话、授权本地资料处理、证据研究与发票复核。这些文档说明仓库中的实际实现，不代表模型质量达标或发行认证。
+Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久会话、授权本地资料处理、证据研究、发票复核，以及用于持续发票事项的独立 **Personal Agent**。**Chats**、**Invoices**、**Deep Research** 继续使用 AgentSession，Personal Agent 使用 Pi Durable。这些文档说明仓库中的实际实现，不代表模型质量达标或发行认证。
+
+本次工程版本交付覆盖应用运行期间已验证的能力。关闭桌面后持续执行、Windows 开机恢复仍属系统服务目标；真实 Windows SCM 验收延期，这些系统行为尚未验证。
 
 ## 从这里开始
 
 使用者路线：[快速开始](getting-started.zh-CN.md) → [业务流程](workflows.zh-CN.md) → [Skills 与扩展](skills-and-extensions.zh-CN.md)。需要委派任务时先阅读 [Subagent](subagents.zh-CN.md)，迁移本地数据前阅读[打包与恢复](packaging-and-recovery.zh-CN.md)。
+
+持续整理一组发票时，从 **Personal Agent** 进入[持续发票事项流程](workflows.zh-CN.md#personal-agent)：固定选择已解析发票，逐票跟踪 Todo、补料和候选复核，直到每张票都有明确最终处置。
 
 开发者路线：[产品范围](PRD.zh-CN.md) → [架构](architecture.zh-CN.md) → [Agent Runtime](agent-runtime.zh-CN.md) → [Subagent](subagents.zh-CN.md) → [开发指南](development.zh-CN.md)。[评测指南](EVALUATION.zh-CN.md)解释工程验证与真实模型试验的区别。
 
@@ -15,13 +19,15 @@ Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久�
 | 专题 | 解决的问题 |
 |---|---|
 | [产品范围](PRD.zh-CN.md) | 面向谁、主要流程与当前限制 |
-| [快速开始](getting-started.zh-CN.md) | 开发启动、配置模型与第一次对话 |
+| [快速开始](getting-started.zh-CN.md) | 开发启动、配置模型、第一次对话与 Personal Agent 入口 |
 | [架构](architecture.zh-CN.md) | Electron、Bun Host、各包职责及数据流 |
 | [Agent Runtime](agent-runtime.zh-CN.md) | Session、Run、Context、工具、预算、停止与恢复 |
 | [Subagent](subagents.zh-CN.md) | 角色准备、委派、父子归属及生命周期 |
-| [业务流程](workflows.zh-CN.md) | 本地问答、Deep Research 与发票复核的输入和交付 |
+| [业务流程](workflows.zh-CN.md) | 本地问答、Deep Research、单票复核与 Personal Agent 持续事项 |
 | [Skills 与扩展](skills-and-extensions.zh-CN.md) | 资源发现、依赖就绪、模板与受控扩展 |
-| [评测指南](EVALUATION.zh-CN.md) | 数据集、独立 Judge、报告、回归及 Langfuse |
+| [评测指南](EVALUATION.zh-CN.md) | 目的、轨迹、评分、双模型 Smoke/Full 与 Baseline/Gate |
+| [基准制作](EVALUATION-BENCHMARK.zh-CN.md) | 真实来源候选、独立 Gold、校验与版本发布 |
+| [Langfuse 操作指南](../../agent-eval/Langfuse评测与问题定位操作指南.md) | 用真实证据定位失败与比较配置 |
 | [UI 系统](UI-SYSTEM.zh-CN.md) | 布局、可观察状态、交互与可访问性约定 |
 | [开发指南](development.zh-CN.md) | 仓库结构、测试入口与必要依赖补丁 |
 | [打包与恢复](packaging-and-recovery.zh-CN.md) | Windows 产物、数据目录、诊断、备份与恢复验证 |

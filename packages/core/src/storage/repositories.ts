@@ -1,15 +1,24 @@
 import { createManagedFileContents } from './managed-file-contents.ts';
+import { verifyInvoiceWorkCandidateScope, verifyInvoiceWorkToolScope } from '../personal-agent/tool-scope.ts';
+import { readInvoiceCandidateChildReports } from '../personal-agent/candidate-evidence.ts';
 import type { ManagedFileContents } from './managed-file-contents.ts';
 import { readResearchContext, researchMaterialScope } from '../research/context.ts';
 import { createNativeOriginReader, NativeOriginFault, verifyNativeForkCopy } from '../memory/origins.ts';
 import { evidenceReadFailure, readTransaction } from './reads.ts';
 import { MemoryCommitFault, commitInTransaction, loadNativeHistoryInTransaction, markUnusableInTransaction } from '../memory/persistence.ts';
-import { SQLiteError, type Database } from 'bun:sqlite';
+import { SQLiteError } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from './write-coordinator.ts';
 import { join, isAbsolute } from 'node:path';
 import { verifyFrozenResourceMetadata } from '../skill-hub/index.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { completeSessionInputs, createSessionInputLedger, finishSessionInputs, recoverSessionInputs } from '../sessions/input-ledger.ts';
+import { DurableRunConfigSnapshotSchema, DurableRunOutputSchema, DurableRunScopeSchema, DurableWorkBudgetSchema,
+  DurableSubagentConfigSnapshotSchema, DurableSubagentRunScopeSchema, DurableSubagentRunOutputSchema,
+  PersonalAgentConfigurationSchema, SessionRuntimeKindSchema, invoiceExportName } from '@flowmate/contracts';
+export { invoiceExportName } from '@flowmate/contracts';
+import type { DurableRunConfigSnapshot, DurableRunOutput, DurableRunScope, SessionRuntimeKind,
+  DurableSubagentConfigSnapshot, DurableSubagentRunScope, DurableSubagentRunOutput, DurableSubagentObservation, AgentSessionSubagentRunSnapshot } from '@flowmate/contracts';
+import { completeSessionInputs, createSessionInputLedger, finishSessionInputs, recoverSessionInputs, legacyRecoverySessionIds } from '../sessions/input-ledger.ts';
 import type { InputResultBatch, FrozenSessionInputAdmission } from '../sessions/input-ledger.ts';
 import type { RuntimeEventStore } from '../events/store.ts';
 import { requireValidWorkspace, sameWorkspaceSelection } from '../workspace/verification.ts';
@@ -25,6 +34,7 @@ import type {
   ChatScope,
   CleanupRecord,
   DbId,
+  DocumentRef,
   InputRecord,
   InputRecordV1,
   OutputRecord,
@@ -141,6 +151,16 @@ export type NewAgentRun = Omit<NewProviderRun, 'config'> & {
   collectResourceEvidence?: true;
 };
 
+export type NewDurableRun = {
+  workId: DbId;
+  attemptId: DbId;
+  input: InputRecordV1;
+  config: DurableRunConfigSnapshot;
+  usage: UsageRecord;
+  cleanup: CleanupRecord;
+  createdAt: string;
+};
+
 export type NewWorkspaceAgentRun = {
   sessionId: DbId;
   expected: WorkspaceExpectation;
@@ -173,9 +193,8 @@ export type WorkspaceRunAdmission = {
   formTarget?: InvoiceFormTarget;
 };
 
-export type SessionRow = {
+type SessionRowFacts = {
   sessionId: DbId;
-  nativeSessionId: string;
   title: string;
   status: SessionStatus;
   createdAt: string;
@@ -187,7 +206,14 @@ export type SessionRow = {
   deletePending: boolean;
 };
 
-export type NewSession = { nativeSessionId: string; title: string; at: string; expectedRevision?: number; nativeHistory?: NativeSessionHistory };
+export type AgentSessionRow = SessionRowFacts & { runtimeKind: 'agent_session'; nativeSessionId: string; durableConversationId: null };
+export type DurableSessionRow = SessionRowFacts & { runtimeKind: 'durable'; nativeSessionId: null; durableConversationId: DbId | null };
+export type SessionRow = AgentSessionRow | DurableSessionRow;
+export type NewAgentSession = { runtimeKind?: 'agent_session'; nativeSessionId: string; title: string; at: string;
+  expectedRevision?: number; nativeHistory?: NativeSessionHistory };
+export type NewDurableSession = { runtimeKind: 'durable'; nativeSessionId: null; title: string; at: string;
+  expectedRevision?: never; nativeHistory?: never };
+export type NewSession = NewAgentSession | NewDurableSession;
 
 export type AgentOutputRecord = OutputRecord & { agent: AgentFacts; nativeOutcomeFacts?: string };
 
@@ -268,10 +294,12 @@ export interface JobRepository {
   hide(jobId: DbId, at: string): Result<JobSnapshot>;
   create(input: StartTaskRecord): Result<TaskOperation>;
   queryOperation(clientSequence: DbId, at: string): Result<TaskOperation | null>;
+  prepareInvoiceWorkItem(input: { workId: DbId; itemId: DbId; expectedRevision: number; at: string }): Result<JobSnapshot>;
 }
 
 export type NewToolCall = {
   context: ContextReference | null;
+  invoiceWorkScope?: RunScope;
   runId: DbId;
   sessionId: DbId;
   nativeToolCallId: string;
@@ -310,7 +338,7 @@ export interface BusinessEventRepository {
   getByOperation(input: { type: BusinessEventType; operationRef: string; result?: 'succeeded' | 'failed' }): Result<BusinessEventSnapshot | null>;
 }
 
-export type SessionHistorySnapshot = { row: SessionRow; bundle: NativeHistoryRecoveryBundle; blocked: boolean;
+export type SessionHistorySnapshot = { row: AgentSessionRow; bundle: NativeHistoryRecoveryBundle; blocked: boolean;
   associations: { entries: { entry_id: string; run_id: number | null }[]; inputs: Record<string, unknown>[] } };
 export interface SessionRepository {
   isSubagentSession(sessionId: DbId): Result<boolean>;
@@ -319,9 +347,12 @@ export interface SessionRepository {
     qualify: (snapshot: SessionHistorySnapshot) => Result<void> }): Result<DbId>;
   markHistoryUnusable(sessionId: DbId): Result<void>;
   readHistorySnapshot<T>(sessionId: DbId, read: (value: SessionHistorySnapshot) => Result<T>, writeInputIds?: readonly DbId[]): Result<T>;
+  create(input: NewAgentSession): Result<AgentSessionRow>;
+  create(input: NewDurableSession): Result<DurableSessionRow>;
   create(input: NewSession): Result<SessionRow>;
+  bindDurableConversation(sessionId: DbId, nativeConversationId: DbId, at: string): Result<DurableSessionRow>;
   get(sessionId: DbId): Result<SessionRow>;
-  list(request: NormalizedListSessionsRequest): Result<{ items: SessionRow[]; next: SessionCursor | null }>;
+  list(request: NormalizedListSessionsRequest): Result<{ items: AgentSessionRow[]; next: SessionCursor | null }>;
   rename(input: { sessionId: DbId; title: string; at: string }): Result<SessionRow>;
   isModelUseBlocked(sessionId: DbId): Result<boolean>;
   revokeDocumentUse(input: { documentId: DbId; at: string }): Result<{ affectedSessionIds: DbId[] }>;
@@ -335,7 +366,7 @@ export interface SessionRepository {
 
 export type TerminalWrite = {
   status: 'completed' | 'failed' | 'cancelled';
-  output: OutputRecord | AgentOutputRecord | null;
+  output: OutputRecord | AgentOutputRecord | DurableRunOutput | DurableSubagentRunOutput | null;
   error: AppError | null;
   usage: UsageRecord;
   tokens: TokenColumns;
@@ -349,19 +380,25 @@ export type TerminalWrite = {
   confirmedUnconsumedInputIds?: readonly DbId[];
 };
 
+export type RunInputUse = { content: SessionInputContentV2;
+  binding?: { runId: DbId; sessionId: DbId; contextSnapshotId: DbId | null } };
 export interface RunRepository {
   create(input: NewProviderRun): Result<DbId>;
   createAgent(input: NewAgentRun): Result<DbId>;
+  createDurable(input: NewDurableRun): Result<DbId>;
+  createDurableSubagent(input: NewDurableSubagentRun): Result<{ runId: DbId; sessionId: DbId }>;
+  verifyDurableSubagentAdmission(childRunId: DbId): Result<void>;
+  confirmDurableSubagentStop(input: { observation: DurableSubagentObservation; at: string }): Result<boolean>;
+  confirmDurableDelegationStop(input: { observation: DurableSubagentObservation; at: string }): Result<boolean>;
   createSubagent(input: NewSubagentRun): Result<{ runId: DbId; sessionId: DbId; contextSnapshotId: DbId; inputId: DbId }>;
   getByOriginToolCall(originToolCallId: DbId): Result<RunSnapshot | null>;
   listSubagents(input: { parentRunId: DbId; beforeRunId?: DbId; limit: number }): Result<SubagentPage>;
   querySubagent(input: QuerySubagentRequest): Result<SubagentDetail>;
   createWorkspaceAgent(input: NewWorkspaceAgentRun, verify: WorkspaceVerifier): Result<WorkspaceRunAdmission>;
   freezeInput(input: { runId: DbId; sessionId: DbId; text: string; expected?: WorkspaceExpectation; at: string }, verify: WorkspaceVerifier | undefined): Result<FrozenSessionInputAdmission>;
-  verifyInputUse(content: SessionInputContentV2, verify: WorkspaceVerifier | undefined,
-    binding?: { runId: DbId; sessionId: DbId; contextSnapshotId: DbId | null }): Result<void>;
+  verifyInputUse(inputs: readonly RunInputUse[], verify: WorkspaceVerifier | undefined): Result<void>;
   listBySession(request: NormalizedSessionRunsRequest): Result<{ items: AgentRunSnapshot[]; nextBeforeRunId: DbId | null }>;
-  start(runId: DbId, config: SafeConfigSnapshot, startedAt: string): Result<void>;
+  start(runId: DbId, config: SafeConfigSnapshot | DurableRunConfigSnapshot | DurableSubagentConfigSnapshot, startedAt: string): Result<void>;
   recordCancel(runId: DbId, requestedAt: string): Result<boolean>;
   finish(runId: DbId, terminal: TerminalWrite): Result<boolean>;
   get(runId: DbId): Result<RunSnapshot>;
@@ -371,6 +408,8 @@ export interface RunRepository {
 export type NewSubagentRun = { origin: SubagentOrigin; pluginAgentId: string; nativeSessionId: string; args: DelegateArgs;
   scope: RunScope; config: Omit<SubagentConfig, 'subagent'> & { subagent: Omit<SubagentConfig['subagent'], 'childInputId'> };
   history: NativeSessionHistory; at: string };
+export type NewDurableSubagentRun = { parentRunId: DbId; originToolCallId: DbId; nativeToolTaskId: number;
+  args: DelegateArgs; scope: DurableSubagentRunScope; config: DurableSubagentConfigSnapshot; at: string };
 
 type RunRow = {
   id: number;
@@ -462,7 +501,7 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
   const commonInvalid = typeof agent.nativeSessionId !== 'string'
     || agent.nativeSessionId.length < 1 || agent.nativeSessionId.length > 128
     || typeof agent.systemPrompt !== 'string'
-    || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(String(agent.thinkingLevel))
+    || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(String(agent.thinkingLevel))
     || !['none', 'p11-resources-v1'].includes(String(agent.resourcePolicy))
     || Object.hasOwn(agent, 'extensionPolicy') && !['none', 'p12-managed-extensions-v1', 'p13-managed-extensions-v1'].includes(String(agent.extensionPolicy))
     || agent.historyPolicy !== 'memory-only'
@@ -490,7 +529,12 @@ function validatedAgentConfig(value: unknown): Record<string, unknown> {
   return agent;
 }
 
-function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
+function validatedConfig(value: unknown, kind: RunRow['kind'] = 'provider', runtimeKind: SessionRuntimeKind = 'agent_session'): Record<string, unknown> {
+  if (runtimeKind === 'durable') {
+    if (kind === 'subagent') return DurableSubagentConfigSnapshotSchema.parse(value);
+    if (kind !== 'agent') throw new Error('invalid_durable_run_kind');
+    return DurableRunConfigSnapshotSchema.parse(value);
+  }
   const raw = object(value, 'config');
   if (Object.hasOwn(raw, 'contextPolicyVersion') && (raw.contextPolicyVersion !== 'p8-context-v1' || kind === 'provider')) throw new Error('invalid_context_policy');
   const record = versioned(raw.version === 2 ? { ...raw, version: 1 } : raw, 'config', ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'limits', 'native']);
@@ -578,7 +622,10 @@ function validatedAgentFacts(value: unknown, runtime = false): Record<string, un
   return agent;
 }
 
-function validatedScope(value: unknown): ChatScope | RunScope | LegacyRunScope {
+function validatedScope(value: unknown, runtimeKind?: 'agent_session'): ChatScope | RunScope | LegacyRunScope;
+function validatedScope(value: unknown, runtimeKind: 'durable'): DurableRunScope;
+function validatedScope(value: unknown, runtimeKind: SessionRuntimeKind = 'agent_session'): ChatScope | RunScope | LegacyRunScope | DurableRunScope {
+  if (runtimeKind === 'durable') return DurableRunScopeSchema.parse(value);
   const record = object(value, 'scope');
   if (record.version === 3) {
     const { allowedWritePaths, commandAccess, ...base } = record;
@@ -602,7 +649,12 @@ function validatedScope(value: unknown): ChatScope | RunScope | LegacyRunScope {
   return record as unknown as ChatScope;
 }
 
-function validatedOutput(value: unknown, kind: RunRow['kind'] = 'provider'): Record<string, unknown> {
+function validatedOutput(value: unknown, kind: RunRow['kind'] = 'provider', runtimeKind: SessionRuntimeKind = 'agent_session'): Record<string, unknown> {
+  if (runtimeKind === 'durable') {
+    if (kind === 'subagent') return DurableSubagentRunOutputSchema.parse(value);
+    if (kind !== 'agent') throw new Error('invalid_durable_run_kind');
+    return DurableRunOutputSchema.parse(value);
+  }
   const raw = object(value, 'output');
   if (raw.nativeOutcomeFacts !== undefined && (kind !== 'subagent' || raw.version !== 2
     || typeof raw.nativeOutcomeFacts !== 'string' || raw.nativeOutcomeFacts.length === 0)) throw new Error('invalid_subagent_completion_facts');
@@ -643,17 +695,16 @@ function validatedError(value: unknown): AppError | null {
 
 function sessionRow(value: unknown, hasHistory = false): SessionRow {
   const row = value as {
-    id: number; native_session_id: string; title: string; status: string; created_at: string; updated_at: string; metadata_json: string;
+    id: number; native_session_id: unknown; runtime_kind?: unknown; durable_conversation_id?: unknown;
+    title: string; status: string; created_at: string; updated_at: string; metadata_json: string;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id <= 0
-    || typeof row.native_session_id !== 'string' || row.native_session_id.length < 1 || row.native_session_id.length > 128
     || typeof row.title !== 'string' || row.title.trim().length < 1 || [...row.title].length > 120
     || !['active', 'archived'].includes(row.status)
     || typeof row.created_at !== 'string' || typeof row.updated_at !== 'string') throw new Error('invalid_session_row');
   const blocked = parseSessionModelUse(row.metadata_json);
-  return {
+  const facts: SessionRowFacts = {
     sessionId: row.id,
-    nativeSessionId: row.native_session_id,
     title: row.title,
     status: row.status as SessionRow['status'],
     createdAt: row.created_at,
@@ -664,6 +715,16 @@ function sessionRow(value: unknown, hasHistory = false): SessionRow {
     nativeUnusable: false,
     deletePending: parseSessionMetadata(row.metadata_json).delete_pending === true,
   };
+  const kind = row.runtime_kind === undefined ? 'agent_session' : row.runtime_kind;
+  if (kind === 'agent_session') {
+    if (typeof row.native_session_id !== 'string' || row.native_session_id.length < 1 || row.native_session_id.length > 128
+      || row.durable_conversation_id !== undefined && row.durable_conversation_id !== null) throw Error('invalid_session_row');
+    return { ...facts, runtimeKind: 'agent_session', nativeSessionId: row.native_session_id, durableConversationId: null };
+  }
+  if (kind !== 'durable' || row.native_session_id !== null || row.durable_conversation_id !== null
+    && (typeof row.durable_conversation_id !== 'number' || !Number.isSafeInteger(row.durable_conversation_id) || row.durable_conversation_id < 1))
+    throw Error('invalid_session_row');
+  return { ...facts, runtimeKind: 'durable', nativeSessionId: null, durableConversationId: row.durable_conversation_id };
 }
 
 function parseSessionMetadata(value: string): Record<string, unknown> {
@@ -1533,6 +1594,19 @@ function readTaskInput(value: unknown): StartTaskRecord {
     documentRef: DocumentRefSchema.parse(record.documentRef), goal: record.goal, at: '' };
 }
 
+function insertInvoiceJob(db: Database, input: { documentRef: DocumentRef; goal: string; inputJson: unknown; at: string }): DbId {
+  const inserted = db.query("INSERT INTO jobs(document_id,goal,input_json,status,created_at,updated_at) VALUES (?,?,?,'pending',?,?)")
+    .run(input.documentRef.id, input.goal, asJson(input.inputJson), input.at, input.at);
+  const jobId = Number(inserted.lastInsertRowid);
+  if (!Number.isSafeInteger(jobId) || jobId <= 0) throw new Error('unsafe_job_id');
+  return jobId;
+}
+
+function recordJobStarted(db: Database, input: { jobId: DbId; documentId: DbId; operationRef: string; at: string; actor: 'user' | 'system' }): void {
+  db.query("INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,result,safe_summary) VALUES ('task_started',?,?,?,?,?,'succeeded','Task started')")
+    .run(input.at, input.actor, input.operationRef, input.documentId, input.jobId);
+}
+
 export function createJobRepository(db: Database): JobRepository {
   const operationRef = (sequence: DbId) => `workspace:1:start-task:${sequence}`;
   const taskResult = (jobId: DbId, at: string): TaskOperation => {
@@ -1550,6 +1624,55 @@ export function createJobRepository(db: Database): JobRepository {
       } catch {
         return fail(appError('storage_corrupt', 'storage', 'Job 事实无法读取。'));
       }
+    },
+
+    prepareInvoiceWorkItem(input) {
+      const prepared = transaction(db, () => {
+        if (![input.workId, input.itemId].every(value => Number.isSafeInteger(value) && value > 0)
+          || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0
+          || !Number.isFinite(Date.parse(input.at))) return fail(appError('input_invalid', 'input', 'Invoice job preparation is invalid.'));
+        const owner = db.query('SELECT i.document_id,i.document_version,i.revision,i.disposition,i.job_id,'
+          + 'w.status work_status,w.revision work_revision FROM invoice_work_items i JOIN invoice_works w ON w.id=i.work_id '
+          + 'WHERE i.work_id=? AND i.id=?').get(input.workId, input.itemId) as {
+            document_id: number; document_version: string; revision: number; disposition: string; job_id: number | null;
+            work_status: string; work_revision: number;
+          } | null;
+        if (!owner) return fail(appError('invoice_work_item_not_found', 'input', 'Invoice work item does not exist.'));
+        const reference = 'invoice-work:' + input.workId + ':item:' + input.itemId + ':prepare';
+        const prior = db.query("SELECT job_id FROM business_events WHERE type='task_started' AND operation_ref=?")
+          .get(reference) as { job_id: number | null } | null;
+        if (prior) {
+          const original = prior.job_id === null ? null : readJob(db, prior.job_id);
+          if (!original || original.documentRef.id !== owner.document_id || original.documentRef.version !== owner.document_version
+            || owner.job_id !== original.jobId) throw new Error('invoice_work_job_receipt_conflict');
+          const stored = db.query('SELECT input_json FROM jobs WHERE id=?').get(original.jobId) as { input_json: string };
+          const facts = object(readJson(stored.input_json, 'invoice_work_job_input'), 'invoice_work_job_input');
+          if (facts.version !== 2 || facts.workId !== input.workId || facts.itemId !== input.itemId)
+            throw new Error('invoice_work_job_owner_conflict');
+          return ok(original);
+        }
+        if (owner.work_status !== 'open' || owner.disposition !== 'unresolved' || owner.revision !== input.expectedRevision
+          || !revisionCanAdvance(owner.revision) || !revisionCanAdvance(owner.work_revision))
+          return fail(appError('state_conflict', 'input', 'Invoice work item changed before preparing its Job.'));
+        const documentRef = DocumentRefSchema.parse({ id: owner.document_id, version: owner.document_version });
+        const document = db.query('SELECT version,status,hidden_at FROM documents WHERE id=?')
+          .get(documentRef.id) as { version: string; status: string; hidden_at: string | null } | null;
+        if (!document || document.version !== documentRef.version) return fail(appError('document_not_found', 'input', 'Document version does not exist.'));
+        if (document.status !== 'available' || document.hidden_at !== null)
+          return fail(appError('input_unavailable', 'input', 'Invoice is unavailable for processing.', true));
+        const goal = '持续整理当前发票，并准备人工复核。';
+        const jobId = insertInvoiceJob(db, { documentRef, goal,
+          inputJson: { version: 2, workId: input.workId, itemId: input.itemId, documentRef, goal }, at: input.at });
+        if (db.query('UPDATE invoice_work_items SET job_id=?,candidate_id=NULL,candidate_sequence=NULL,revision=revision+1,updated_at=? WHERE work_id=? AND id=? AND revision=?')
+          .run(jobId, input.at, input.workId, input.itemId, input.expectedRevision).changes !== 1) throw new Error('invoice_work_job_cas_failed');
+        if (db.query('UPDATE invoice_works SET revision=revision+1,updated_at=? WHERE id=? AND revision=?')
+          .run(input.at, input.workId, owner.work_revision).changes !== 1) throw new Error('invoice_work_job_work_cas_failed');
+        recordJobStarted(db, { jobId, documentId: documentRef.id, operationRef: reference, at: input.at, actor: 'system' });
+        const result = readJob(db, jobId);
+        if (!result) throw new Error('invoice_work_job_missing');
+        return ok(result);
+      });
+      return prepared.ok ? prepared.data : prepared;
     },
 
     list(input) {
@@ -1638,16 +1761,11 @@ export function createJobRepository(db: Database): JobRepository {
         if (!revisionCanAdvance(workspace.revision)) return fail(appError('state_conflict', 'input', 'Workspace revision 已到上限。'));
         const inputJson = { version: 1, clientSequence: input.clientSequence, expectedRevision: input.expectedRevision,
           documentRef: input.documentRef, goal: input.goal };
-        const inserted = db.query(`INSERT INTO jobs(document_id,goal,input_json,status,created_at,updated_at)
-          VALUES (?,?,?,'pending',?,?)`).run(input.documentRef.id, input.goal, asJson(inputJson), input.at, input.at);
-        const jobId = Number(inserted.lastInsertRowid);
-        if (!Number.isSafeInteger(jobId) || jobId <= 0) throw new Error('unsafe_job_id');
+        const jobId = insertInvoiceJob(db, { documentRef: input.documentRef, goal: input.goal, inputJson, at: input.at });
         const updated = db.query(`UPDATE workspace SET active_job_id=?,active_view='original',selection_json=NULL,
           revision=revision+1,updated_at=? WHERE id=1 AND revision=?`).run(jobId, input.at, input.expectedRevision).changes;
         if (updated !== 1) throw new Error('workspace_task_cas_failed');
-        db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,result,safe_summary)
-          VALUES ('task_started',?,'user',?,?,?,'succeeded','Task started')`)
-          .run(input.at, operationRef(input.clientSequence), input.documentRef.id, jobId);
+        recordJobStarted(db, { jobId, documentId: input.documentRef.id, operationRef: operationRef(input.clientSequence), at: input.at, actor: 'user' });
         return ok(taskResult(jobId, input.at));
       });
       return created.ok ? created.data : created;
@@ -1697,6 +1815,12 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
     return ok(toolCallSnapshot(db, row));
   });
   const trustedContext = (context: ProductToolContext): Result<string> => {
+    const runtime = db.query<{ scope_json: string }, [number]>('SELECT scope_json FROM runs WHERE id=?').get(context.runId);
+    if (runtime && [4, 5].includes(Number(object(readJson(runtime.scope_json, 'run_scope'), 'run_scope').version))) {
+      const scope = verifyInvoiceWorkToolScope(db, context);
+      return !scope.ok ? scope : scope.data.workingDirectory === null
+        ? fail(appError('tool_access_denied', 'runtime', 'The phase has no working directory.')) : ok(scope.data.workingDirectory);
+    }
     const permitted = verifyChildToolParent(db, context); if (!permitted.ok) return permitted;
     const permission = createSessionRepository(db).isModelUseBlocked(context.sessionId);
     if (!permission.ok) return permission;
@@ -1730,6 +1854,10 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
         const raw = JSON.stringify(input.rawArguments);
         if (raw === undefined || !NATIVE_TOOL_NAMES.includes(input.toolName as (typeof NATIVE_TOOL_NAMES)[number])
           && Buffer.byteLength(raw, 'utf8') > TOOL_CONFIG.payload.maxRawArgumentsBytes) return fail(appError('tool_result_too_large', 'input', 'ToolCall 参数超过记录上限。'));
+        const owner = db.query<{ scope_json: string; session_id: number }, [number]>('SELECT scope_json,session_id FROM runs WHERE id=?').get(input.runId);
+        const durable = owner && [4, 5].includes(Number(object(readJson(owner.scope_json, 'run_scope'), 'run_scope').version));
+        if (!durable && input.invoiceWorkScope !== undefined) return fail(appError('tool_access_denied', 'runtime', 'AgentSession tools cannot claim an invoice Work phase.'));
+        if (!durable) {
         const reader = createNativeOriginReader(db);
         const nativeCalls = (reader.history(input.sessionId)?.history.entries ?? []).flatMap(entry =>
           entry.type === 'message' && entry.message.role === 'assistant'
@@ -1739,24 +1867,34 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           const origin = reader.resolve(input.sessionId, nativeCalls[0]!.id);
           if (origin.originSessionId !== input.sessionId || origin.originRunId !== input.runId) throw new NativeOriginFault();
         }
+        }
         const existing = db.query('SELECT * FROM tool_calls WHERE session_id=? AND native_tool_call_id=?')
           .get(input.sessionId, input.nativeToolCallId);
         if (existing) {
           const call = toolCallSnapshot(db, existing);
+          const binding = durable ? db.query<{ scope_json: string }, [number]>('SELECT scope_json FROM invoice_work_tool_calls WHERE tool_call_id=?').get(call.toolCallId) : null;
           if (call.runId !== input.runId || call.toolName !== input.toolName || call.toolVersion !== input.toolVersion
             || call.effect !== input.effect || stableJson(call.args.raw) !== stableJson(input.rawArguments)
-            || !sameContextReference(call.context, input.context)) {
+            || !sameContextReference(call.context, input.context)
+            || durable && (!binding || stableJson(readJson(binding.scope_json, 'invoice_tool_scope')) !== stableJson(input.invoiceWorkScope))) {
             return fail(appError('state_conflict', 'runtime', '原生 ToolCall ID 已属于不同的执行请求。'));
           }
           return ok(call);
         }
         const run = db.query("SELECT session_id,status FROM runs WHERE id=? AND kind IN ('agent','subagent')").get(input.runId) as { session_id: number; status: string } | null;
         if (!run || run.session_id !== input.sessionId) return fail(appError('tool_access_denied', 'runtime', 'ToolCall 与可信 Agent Run 不匹配.'));
+        if (durable) {
+          if (input.context !== null || !input.invoiceWorkScope) return fail(appError('tool_access_denied', 'runtime', 'Durable tools require their original invoice phase scope.'));
+          const verified = verifyInvoiceWorkToolScope(db, { runId: input.runId, sessionId: input.sessionId, scope: input.invoiceWorkScope });
+          if (!verified.ok) return verified;
+        }
+        if (!durable) {
         try { readToolContext(db, { run_id: input.runId, session_id: input.sessionId,
           context_snapshot_id: input.context?.snapshotId ?? null, request_sequence: input.context?.requestSequence ?? null }); }
         catch (error) {
           if (error instanceof SQLiteError || error instanceof NativeOriginFault) throw error;
           return fail(appError('context_binding_unknown', 'runtime', 'ToolCall generating request could not be verified.'));
+        }
         }
         if (!['created', 'running'].includes(run.status)) return fail(appError('run_state_invalid', 'runtime', 'Run 已停止接纳新的 ToolCall。'));
         const id = writeTransaction(() => {
@@ -1768,6 +1906,8 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
                 requestDispatchedAt: null, error: null }),
               JSON.stringify({ version: 1, stopReason: null, stopped: false, errors: [] }), input.requestedAt,
               input.context?.snapshotId ?? null, input.context?.requestSequence ?? null);
+          if (durable) db.query('INSERT INTO invoice_work_tool_calls(tool_call_id,phase_id,scope_json) VALUES(?,?,?)')
+            .run(Number(inserted.lastInsertRowid), input.invoiceWorkScope!.invoiceWork!.phaseId, JSON.stringify(input.invoiceWorkScope));
           const counted = db.query("UPDATE runs SET tool_call_count=tool_call_count+1 WHERE id=? AND status IN ('created','running')")
             .run(input.runId).changes;
           if (counted !== 1) throw new Error('tool_call_run_closed');
@@ -1854,6 +1994,11 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
 
     verifyUse(context) {
       try {
+        const runtime = db.query<{ scope_json: string }, [number]>('SELECT scope_json FROM runs WHERE id=?').get(context.runId);
+        if (runtime && [4, 5].includes(Number(object(readJson(runtime.scope_json, 'run_scope'), 'run_scope').version))) {
+          const verified = verifyInvoiceWorkToolScope(db, context);
+          return verified.ok ? ok(undefined) : verified;
+        }
         const permitted = verifyChildToolParent(db, context); if (!permitted.ok) return permitted;
         const row = db.query(`SELECT run.session_id,run.scope_json,run.status,run.cancel_requested_at,
           session.status AS session_status,session.metadata_json FROM runs run JOIN sessions session ON session.id=run.session_id
@@ -1881,7 +2026,16 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           LEFT JOIN jobs job ON job.id=run.job_id WHERE run.id=? AND run.session_id=?`).get(call.data.runId, call.data.sessionId) as
           { job_id: number | null; scope_json: string; job_document_id: number | null } | null;
         if (!run) return fail(appError('storage_corrupt', 'storage', 'Original output ownership could not be verified.'));
-        const scope = RunScopeSchema.parse(readJson(run.scope_json, 'run_scope'));
+        const durable = [4, 5].includes(Number(object(readJson(run.scope_json, 'run_scope'), 'run_scope').version))
+          ? db.query<{ scope_json: string; job_id: number; document_id: number }, [number]>(`SELECT t.scope_json,i.job_id,i.document_id
+          FROM invoice_work_tool_calls t JOIN invoice_work_phases p ON p.id=t.phase_id
+          JOIN invoice_work_items i ON i.id=p.item_id AND i.work_id=p.work_id WHERE t.tool_call_id=?`).get(input.toolCallId) : null;
+        const scope = RunScopeSchema.parse(readJson(durable?.scope_json ?? run.scope_json, 'run_scope'));
+        if (durable) {
+          const verified = verifyInvoiceWorkToolScope(db, { runId: call.data.runId, sessionId: call.data.sessionId, scope });
+          if (!verified.ok) return verified;
+          run.job_id = durable.job_id; run.job_document_id = durable.document_id;
+        }
         const args = call.data.args.final as Record<string, unknown> | null;
         const expectedDocumentId = args?.documentId ?? run.job_document_id ?? (input.data as { documentRef?: { id: number } })?.documentRef?.id;
         let checked = false;
@@ -1968,6 +2122,10 @@ export function createToolCallRepository(db: Database, events?: RuntimeEventStor
           const changed = db.query("UPDATE tool_calls SET status='running',started_at=? WHERE id=? AND status='requested' AND json_type(args_json,'$.final')!='null'")
             .run(input.startedAt, input.toolCallId).changes;
           if (changed >= 1) {
+            if (db.query(`SELECT r.id FROM runs r JOIN tool_calls t ON t.run_id=r.id WHERE t.id=? AND json_extract(r.scope_json,'$.version')=4`)
+              .get(input.toolCallId)) db.query(`UPDATE jobs SET status='running',status_reason=NULL,updated_at=? WHERE status='pending' AND id IN (
+              SELECT i.job_id FROM invoice_work_tool_calls t JOIN invoice_work_phases p ON p.id=t.phase_id
+              JOIN invoice_work_items i ON i.id=p.item_id AND i.work_id=p.work_id WHERE t.tool_call_id=?)`).run(input.startedAt, input.toolCallId);
             appendToolState(db, events, input.toolCallId, 'tool_started');
             return byId(input.toolCallId);
           }
@@ -2231,7 +2389,14 @@ function invoiceRequestFacts(value: unknown): string {
   return stableJson(value);
 }
 function executionReleased(db: Database, jobId: DbId): boolean {
-  const runs = db.query('SELECT status,cleanup_json FROM runs WHERE job_id=? OR status IN (\'created\',\'running\')').all(jobId) as
+  if (hasTable(db, 'invoice_work_attempts') && hasTable(db, 'invoice_work_phases') && hasTable(db, 'invoice_work_items')
+    && db.query(`SELECT 1 FROM invoice_work_attempts attempt JOIN runs run ON run.id=attempt.run_id
+      JOIN invoice_work_phases phase ON phase.attempt_id=attempt.id AND phase.work_id=attempt.work_id
+      JOIN invoice_work_items item ON item.id=phase.item_id AND item.work_id=phase.work_id
+      WHERE item.job_id=? AND phase.closed_at IS NULL LIMIT 1`).get(jobId)) return false;
+  const legacySessions = JSON.stringify(legacyRecoverySessionIds(db));
+  const runs = db.query(`SELECT status,cleanup_json FROM runs WHERE job_id=? OR (status IN ('created','running')
+    AND (session_id IS NULL OR session_id IN (SELECT value FROM json_each(?))))`).all(jobId, legacySessions) as
     Array<{ status: string; cleanup_json: string }>;
   if (runs.some(run => {
     if (run.status === 'created' || run.status === 'running') return true;
@@ -2287,9 +2452,6 @@ function invoiceEvent(db: Database, type: BusinessEventType, operationRef: strin
   const row = db.query("SELECT * FROM business_events WHERE type=? AND operation_ref=? AND result='succeeded'").get(type, operationRef);
   return row ? businessEventSnapshot(row) : null;
 }
-function invoiceExportName(candidate: CandidateSnapshot, format: ExportInvoiceCandidateRequest['format']): string {
-  return `outputs/invoice-${candidate.jobId}-result-${candidate.sequence}.${format === 'markdown' ? 'md' : format}`;
-}
 function findInvoiceExport(db: Database, input: ExportInvoiceCandidateRequest): Result<InvoiceExportReference | null> {
   if (!ExportInvoiceCandidateRequestSchema.safeParse(input).success) return fail(appError('input_invalid', 'input', '导出参数无效。'));
   try {
@@ -2327,6 +2489,21 @@ function recordInvoiceEvent(db: Database, type: BusinessEventType, operationRef:
 }
 
 export function createCandidateRepository(db: Database): InvoiceEditRepository {
+  const runForCandidate = (input: { runId: DbId; invoiceWork?: RunScope['invoiceWork'] }): Result<{ job_id: number | null } | null> => {
+    const run = db.query("SELECT job_id,session_id,scope_json FROM runs WHERE id=? AND kind='agent'").get(input.runId) as
+      { job_id: number | null; session_id: number; scope_json: string } | null;
+    if (run && object(readJson(run.scope_json, 'run_scope'), 'run_scope').version === 4) {
+      if (!input.invoiceWork) return fail(appError('tool_access_denied', 'runtime', 'Candidate reads require their original invoice phase.'));
+      const binding = db.query<{ scope_json: string }, [number]>('SELECT scope_json FROM invoice_work_tool_calls WHERE phase_id=? LIMIT 1').get(input.invoiceWork.phaseId);
+      if (!binding) return fail(appError('tool_access_denied', 'runtime', 'Candidate reads have no original invoice phase ToolCall.'));
+      const savedScope = RunScopeSchema.parse(readJson(binding.scope_json, 'invoice_tool_scope'));
+      if (!isDeepStrictEqual(savedScope.invoiceWork, input.invoiceWork)) return fail(appError('tool_access_denied', 'runtime', 'Candidate read phase does not match.'));
+      const verified = verifyInvoiceWorkToolScope(db, { runId: input.runId, sessionId: run.session_id, scope: savedScope });
+      if (!verified.ok) return verified;
+      run.job_id = verified.data.jobId;
+    } else if (input.invoiceWork) return fail(appError('tool_access_denied', 'runtime', 'AgentSession cannot claim a Durable phase.'));
+    return ok(run);
+  };
   const readDecision = (candidateId: DbId, jobId: DbId, at: string): InvoiceCandidateDecisionResponse => {
     const candidate = candidateSnapshot(db, queryCandidateRow(db, candidateId, jobId)).snapshot;
     const job = readJob(db, jobId);
@@ -2507,29 +2684,43 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         const draft = CandidateDraftSchema.parse(input.candidate);
         const checks = z.array(CheckResultSchema).max(MAX_INVOICE_CHECKS).parse(input.checks);
         const issues = z.array(InvoiceIssueSchema).max(MAX_INVOICE_ISSUES).parse(input.issues);
-        const finalArgs = JSON.stringify({ documentId: input.documentId, candidate: draft });
+        const finalArgs = JSON.stringify({ documentId: input.documentId, candidate: draft,
+          ...(input.childReportRefs === undefined ? {} : { childReportRefs: input.childReportRefs }) });
         if (Buffer.byteLength(finalArgs, 'utf8') > 256 * 1024) return fail(appError('tool_result_too_large', 'input', '候选参数超过保存上限。'));
         const committed = transaction(db, () => {
-          const facts = db.query(`SELECT run.status AS run_status,run.session_id,run.job_id,run.scope_json,
+          const owner = db.query<{ scope_json: string }, [number, number]>('SELECT scope_json FROM runs WHERE id=? AND session_id=?')
+            .get(input.runId, input.sessionId);
+          const durable = owner && object(readJson(owner.scope_json, 'run_scope'), 'run_scope').version === 4;
+          let invoiceScope: import('../personal-agent/tool-scope.ts').InvoiceWorkToolScope | null = null;
+          if (durable) {
+            const original = db.query<{ scope_json: string }, [number, string]>(`SELECT b.scope_json FROM invoice_work_tool_calls b
+              JOIN tool_calls t ON t.id=b.tool_call_id WHERE t.run_id=? AND t.native_tool_call_id=?`).get(input.runId, input.nativeToolCallId);
+            if (!original) return { ok: false as const, error: appError('tool_access_denied', 'runtime', 'The candidate has no original invoice phase ToolCall.') };
+            const verified = verifyInvoiceWorkCandidateScope(db, { runId: input.runId, sessionId: input.sessionId,
+              scope: RunScopeSchema.parse(readJson(original.scope_json, 'invoice_tool_scope')) });
+            if (!verified.ok) return verified;
+            invoiceScope = verified.data;
+          }
+          const facts = db.query(`SELECT run.status AS run_status,run.session_id,job.id AS job_id,run.scope_json,
               job.document_id,job.status AS job_status,document.version AS document_version,document.status AS document_status,
               session.metadata_json,tool.id AS tool_call_id,tool.status AS tool_status,tool.tool_name,tool.native_tool_call_id,tool.args_json,
               tool.context_snapshot_id,tool.request_sequence
             FROM runs run JOIN sessions session ON session.id=run.session_id
             JOIN tool_calls tool ON tool.run_id=run.id AND tool.session_id=run.session_id
-            JOIN jobs job ON job.id=run.job_id JOIN documents document ON document.id=job.document_id
-            WHERE run.id=? AND run.session_id=? AND tool.native_tool_call_id=?`).get(input.runId, input.sessionId, input.nativeToolCallId) as {
+            JOIN jobs job ON job.id=COALESCE(run.job_id,?) JOIN documents document ON document.id=job.document_id
+            WHERE run.id=? AND run.session_id=? AND tool.native_tool_call_id=?`).get(invoiceScope?.jobId ?? null, input.runId, input.sessionId, input.nativeToolCallId) as {
               run_status: string; session_id: number; job_id: number; scope_json: string; document_id: number; tool_call_id: number;
               job_status: string; document_version: string; document_status: string; metadata_json: string;
               tool_status: string; tool_name: string; native_tool_call_id: string; args_json: string;
               context_snapshot_id: number | null; request_sequence: number | null;
             } | null;
-          if (!facts || facts.run_status !== 'running' || facts.job_status !== 'running' || facts.document_status !== 'available') {
+          if (!facts || facts.run_status !== 'running' || !(invoiceScope ? ['running','waiting'] : ['running']).includes(facts.job_status) || facts.document_status !== 'available') {
             return { ok: false as const, error: appError('state_conflict', 'runtime', 'Run、Job 或正式材料已不可提交候选。') };
           }
           if (facts.document_id !== input.documentId || facts.tool_status !== 'running' || facts.tool_name !== 'save_invoice_candidate') {
             return { ok: false as const, error: appError('tool_access_denied', 'runtime', '候选保存与可信工具调用不匹配。') };
           }
-          const scope = RunScopeSchema.safeParse(readJson(facts.scope_json, 'run_scope'));
+          const scope = RunScopeSchema.safeParse(invoiceScope?.scope ?? readJson(facts.scope_json, 'run_scope'));
           if (!scope.success || !scope.data.allowedTools.includes('save_invoice_candidate')
             || !scope.data.allowedDocumentIds.includes(input.documentId)) {
             return { ok: false as const, error: appError('tool_access_denied', 'runtime', '当前 Run 无权保存此材料的候选。') };
@@ -2540,6 +2731,12 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           const storedArgs = object(readJson(facts.args_json, 'tool_call_arguments'), 'tool_call_arguments');
           if (storedArgs.version !== 1 || stableJson(storedArgs.final) !== stableJson(JSON.parse(finalArgs))) {
             return { ok: false as const, error: appError('state_conflict', 'runtime', '候选与已固定的 ToolCall 参数不一致。') };
+          }
+          if (input.childReportRefs !== undefined) {
+            const phase = invoiceScope?.scope.invoiceWork;
+            if (!phase) return { ok: false as const, error: appError('tool_access_denied', 'runtime', 'Only the original Personal Master can adopt its child reports.') };
+            const reports = readInvoiceCandidateChildReports(db, { ...phase, runId: input.runId }, input.childReportRefs, draft, null);
+            if (!reports.ok) return reports;
           }
           const toolContext = readToolContext(db, { run_id: input.runId, session_id: input.sessionId,
             context_snapshot_id: facts.context_snapshot_id, request_sequence: facts.request_sequence });
@@ -2563,6 +2760,16 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
             toolContext?.snapshotId ?? null, toolContext?.requestSequence ?? null);
           const candidateId = Number(inserted.lastInsertRowid);
           if (!Number.isSafeInteger(candidateId) || candidateId < 1) throw new Error('unsafe_candidate_id');
+          if (invoiceScope) {
+            const phase = invoiceScope.scope.invoiceWork!;
+            if (db.query(`UPDATE invoice_work_items SET candidate_id=?,candidate_sequence=?,revision=revision+1,updated_at=?
+              WHERE id=? AND work_id=? AND job_id=? AND disposition='unresolved' AND revision<9007199254740991`)
+              .run(candidateId, sequence, input.at, phase.itemId, phase.workId, facts.job_id).changes !== 1) throw new Error('invoice_work_candidate_item_changed');
+            if (db.query('UPDATE invoice_works SET revision=revision+1,updated_at=? WHERE id=? AND status=\'open\' AND revision<9007199254740991')
+              .run(input.at, phase.workId).changes !== 1) throw new Error('invoice_work_candidate_work_changed');
+            db.query("UPDATE jobs SET current_candidate_id=?,status='waiting',status_reason='Candidate prepared for human review.',updated_at=? WHERE id=?")
+              .run(candidateId, input.at, facts.job_id);
+          }
           db.query(`INSERT INTO business_events(type,occurred_at,actor_source,operation_ref,document_id,job_id,candidate_id,run_id,result,safe_summary)
             VALUES ('candidate_generated',?,'agent',?,?,?,?,?,'succeeded','Invoice candidate generated')`)
             .run(input.at, `tool-call-id:${facts.tool_call_id}`, input.documentId, facts.job_id, candidateId, input.runId);
@@ -2622,7 +2829,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
           || input.beforeSequence !== null && (!Number.isSafeInteger(input.beforeSequence) || input.beforeSequence < 1)) {
           return fail(appError('input_invalid', 'input', '候选分页参数无效。'));
         }
-        const run = db.query("SELECT job_id FROM runs WHERE id=? AND kind='agent'").get(input.runId) as { job_id: number | null } | null;
+        const owned = runForCandidate(input); if (!owned.ok) return owned;
+        const run = owned.data;
         if (!run?.job_id) return fail(appError('state_conflict', 'runtime', '当前 Run 没有归属 Job。'));
         const rows = input.beforeSequence === null
           ? db.query('SELECT * FROM invoice_candidates WHERE job_id=? ORDER BY sequence DESC LIMIT ?').all(run.job_id, input.limit + 1)
@@ -2643,7 +2851,8 @@ export function createCandidateRepository(db: Database): InvoiceEditRepository {
         if (!Number.isSafeInteger(input.runId) || input.runId < 1 || !Number.isSafeInteger(input.candidateId) || input.candidateId < 1) {
           return fail(appError('input_invalid', 'input', 'Candidate ID 无效。'));
         }
-        const run = db.query("SELECT job_id FROM runs WHERE id=? AND kind='agent'").get(input.runId) as { job_id: number | null } | null;
+        const owned = runForCandidate(input); if (!owned.ok) return owned;
+        const run = owned.data;
         if (!run?.job_id) return fail(appError('candidate_not_found', 'input', 'Candidate 不存在。'));
         const row = queryCandidateRow(db, input.candidateId, run.job_id);
         if (!row) return fail(appError('candidate_not_found', 'input', 'Candidate 不存在。'));
@@ -2675,14 +2884,108 @@ function verifyInputCommandOwner(db: Database, row: RunRow, config: Record<strin
       && instance.registeredCommands.includes('subagent'))) throw new Error('invalid_input_command_owner');
 }
 
+type DurableRunWorkRow = { id: number; session_id: number; agent_revision: number; configuration_json: string;
+  budget_json: string; current_attempt_id: number | null; status: string; goal: string };
+type DurableRunAttemptRow = { id: number; work_id: number; run_id: number | null; stop_requested_at: string | null; stopped_at: string | null };
+
+function runRuntimeKind(db: Database, row: Pick<RunRow, 'kind' | 'session_id'>): SessionRuntimeKind {
+  if (row.kind === 'provider') return 'agent_session';
+  const session = db.query<{ runtime_kind?: SessionRuntimeKind }, [number | null]>('SELECT * FROM sessions WHERE id=?').get(row.session_id);
+  if (!session) throw new Error('invalid_run_session_reference');
+  return SessionRuntimeKindSchema.parse(session.runtime_kind ?? 'agent_session');
+}
+
+function durableConfigMatchesWork(config: DurableRunConfigSnapshot, owner: DurableRunWorkRow): boolean {
+  const fixed = PersonalAgentConfigurationSchema.parse(readJson(owner.configuration_json, 'durable_configuration'));
+  const authorization = DurableWorkBudgetSchema.parse(readJson(owner.budget_json, 'durable_budget'));
+  return config.durable.workId === owner.id && config.durable.configurationRevision === owner.agent_revision
+    && isDeepStrictEqual(config.resources, fixed.resources) && isDeepStrictEqual(config.extensions, fixed.extensions)
+    && config.workingDirectory === fixed.workingDirectory
+    && (['maxModelCalls', 'maxToolCalls', 'toolTimeoutMs', 'maxToolFeedbackBytes'] as const)
+      .every(key => config.runtimeBudget[key] <= authorization.runtimeBudget[key])
+    && config.limits.timeoutMs <= authorization.limits.timeoutMs && config.limits.stopGraceMs <= authorization.limits.stopGraceMs;
+}
+
+function durableSessionAllowsRun(db: Database, sessionId: DbId): boolean {
+  const session = db.query<{ runtime_kind: SessionRuntimeKind; native_session_id: string | null; status: string;
+    hidden_at: string | null; metadata_json: string }, [number]>('SELECT * FROM sessions WHERE id=?').get(sessionId);
+  return session !== null && session.runtime_kind === 'durable' && session.native_session_id === null && session.hidden_at === null
+    && session.status === 'active' && parseSessionMetadata(session.metadata_json).delete_pending !== true && !parseSessionModelUse(session.metadata_json);
+}
+
+function durableRunOwner(db: Database, row: RunRow, config: DurableRunConfigSnapshot, scope: DurableRunScope) {
+  const attempt = db.query<DurableRunAttemptRow, [number]>('SELECT * FROM invoice_work_attempts WHERE run_id=?').get(row.id);
+  const owner = attempt && db.query<DurableRunWorkRow, [number]>('SELECT * FROM invoice_works WHERE id=?').get(attempt.work_id);
+  if (row.kind !== 'agent' || row.job_id != null || row.parent_run_id != null || !attempt || !owner
+    || owner.session_id !== row.session_id || config.durable.attemptId !== attempt.id || scope.attemptId !== attempt.id
+    || scope.workId !== owner.id || row.goal !== owner.goal || !durableConfigMatchesWork(config, owner)) throw new Error('invalid_durable_run_owner');
+  const fixed = PersonalAgentConfigurationSchema.parse(readJson(owner.configuration_json, 'durable_configuration'));
+  if (!isDeepStrictEqual(scope.allowedTools, fixed.tools)) throw new Error('invalid_durable_run_scope');
+  return { owner, attempt };
+}
+
+function durableSubagentParent(db: Database, config: DurableSubagentConfigSnapshot, scope: DurableSubagentRunScope) {
+  const conflict = () => new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'The Durable child differs from its original parent delegation.'));
+  const origin = { parentRunId: scope.parentRunId, originToolCallId: scope.originToolCallId, phaseId: scope.phaseId,
+    itemId: scope.itemId, parentRequestId: scope.parentRequestId, role: scope.role };
+  if (!isDeepStrictEqual(origin, config.subagent) || config.durable.workId !== scope.workId || config.durable.attemptId !== scope.attemptId) throw conflict();
+  const parentRow = db.query<RunRow, [number]>('SELECT * FROM runs WHERE id=?').get(scope.parentRunId);
+  if (!parentRow || parentRow.kind !== 'agent' || runRuntimeKind(db, parentRow) !== 'durable') throw conflict();
+  const parent = snapshotFromRow(db, parentRow), parentConfig = DurableRunConfigSnapshotSchema.parse(parent.config);
+  const binding = db.query<{ scope_json: string; work_id: number; attempt_id: number; item_id: number | null; request_id: string }, [number, number, number]>(`SELECT b.scope_json,
+    p.work_id,p.attempt_id,p.item_id,p.request_id FROM invoice_work_tool_calls b JOIN invoice_work_phases p ON p.id=b.phase_id
+    JOIN invoice_work_attempts a ON a.id=p.attempt_id AND a.work_id=p.work_id
+    WHERE b.tool_call_id=? AND b.phase_id=? AND a.run_id=?`).get(scope.originToolCallId, scope.phaseId, parentRow.id);
+  const tool = createToolCallRepository(db).getById(scope.originToolCallId);
+  if (!binding || !tool.ok || tool.data.runId !== parentRow.id || tool.data.sessionId !== parentRow.session_id || tool.data.toolName !== 'Agent'
+    || !/^durable-task:[1-9][0-9]*$/.test(tool.data.nativeToolCallId)
+    || !Number.isSafeInteger(Number(tool.data.nativeToolCallId.slice('durable-task:'.length)))
+    || binding.work_id !== scope.workId || binding.attempt_id !== scope.attemptId || binding.item_id !== scope.itemId
+    || binding.request_id !== scope.parentRequestId || !DurableRunScopeSchema.parse(parent.scope).allowedTools.includes('Agent')) throw conflict();
+  const args = DelegateArgsSchema.parse(tool.data.args.final), parentScope = RunScopeSchema.parse(readJson(binding.scope_json, 'parent_tool_scope'));
+  if (args.subagent_type !== scope.role || !parentScope.allowedTools.includes('Agent')
+    || scope.allowedTools.some((name: string) => !parentScope.allowedTools.includes(name))
+    || scope.allowedDocumentIds.some((id: number) => !parentScope.allowedDocumentIds.includes(id))
+    || scope.allowedArtifactIds.some((id: number) => !parentScope.allowedArtifactIds.includes(id))
+    || scope.allowedResourcePaths.some((path: string) => !parentScope.allowedResourcePaths.includes(path))
+    || ['name', 'revision', 'requestedModel', 'resolvedModel', 'api', 'endpoint', 'sdk', 'parameters', 'durable', 'resources', 'extensions', 'workingDirectory']
+      .some(key => !isDeepStrictEqual(Reflect.get(config, key), Reflect.get(parentConfig, key)))
+    || (Object.keys(parentConfig.runtimeBudget) as Array<keyof typeof parentConfig.runtimeBudget>)
+      .some(key => config.runtimeBudget[key] > parentConfig.runtimeBudget[key])
+    || config.limits.timeoutMs > parentConfig.limits.timeoutMs || config.limits.stopGraceMs > parentConfig.limits.stopGraceMs) throw conflict();
+  return { parentRow, parent, parentScope, tool: tool.data, args };
+}
+
+function durableSubagentOwner(db: Database, row: RunRow, config: DurableSubagentConfigSnapshot, scope: DurableSubagentRunScope) {
+  const original = durableSubagentParent(db, config, scope);
+  const session = db.query<{ runtime_kind: string; native_session_id: string | null }, [number | null]>('SELECT * FROM sessions WHERE id=?').get(row.session_id);
+  const input = validatedInput(readJson(row.input_json, 'input'));
+  if (row.kind !== 'subagent' || row.job_id != null || row.parent_run_id !== scope.parentRunId || row.origin_tool_call_id !== scope.originToolCallId
+    || row.plugin_agent_id !== original.tool.nativeToolCallId || row.session_id === original.parentRow.session_id
+    || session?.runtime_kind !== 'durable' || session.native_session_id !== null || row.current_context_snapshot_id != null || row.context_observations_json != null
+    || input.version !== 1 || input.goal !== original.args.description || input.text !== original.args.prompt || row.goal !== original.args.description)
+    throw new Error('invalid_durable_child_owner');
+  return original;
+}
+
+function verifyDurableSubagentParent(db: Database, original: ReturnType<typeof durableSubagentParent>) {
+  if (original.parentRow.status !== 'running' || original.parentRow.cancel_requested_at !== null || original.tool.status !== 'running')
+    throw new MemoryCommitFault(appError('subagent_parent_closed', 'runtime', 'The original parent is no longer accepting child execution.'));
+  const allowed = verifyInvoiceWorkToolScope(db, { runId: original.parentRow.id, sessionId: Number(original.parentRow.session_id), scope: original.parentScope });
+  if (!allowed.ok) throw new MemoryCommitFault(allowed.error);
+}
+
 function snapshotFromRow(db: Database, row: RunRow): RunSnapshot {
-  const context = readRunContextOwner(db, row);
-  const output = row.output_json === null ? null : validatedOutput(readJson(row.output_json, 'output'), row.kind);
+  const runtimeKind = runRuntimeKind(db, row);
+  const context = runtimeKind === 'durable' ? { pointer: row.current_context_snapshot_id ?? null } : readRunContextOwner(db, row);
+  const output = row.output_json === null ? null : validatedOutput(readJson(row.output_json, 'output'), row.kind, runtimeKind);
   const error = validatedError(readJson(row.error_json ?? 'null', 'error'));
   const input = validatedInput(readJson(row.input_json, 'input'));
-  const config = validatedConfig(readJson(row.config_json, 'config'), row.kind);
-  verifyInputCommandOwner(db, row, config, row.started_at !== null);
-  if (row.kind === 'agent' && row.status === 'running' && Object.hasOwn(config, 'extensions') && !Object.hasOwn(config, 'extensionAssembly')) throw new Error('missing_extension_assembly');
+  const config = validatedConfig(readJson(row.config_json, 'config'), row.kind, runtimeKind);
+  if (runtimeKind === 'agent_session') {
+    verifyInputCommandOwner(db, row, config, row.started_at !== null);
+    if (row.kind === 'agent' && row.status === 'running' && Object.hasOwn(config, 'extensions') && !Object.hasOwn(config, 'extensionAssembly')) throw new Error('missing_extension_assembly');
+  }
   const usage = validatedUsage(readJson(row.usage_json, 'usage'));
   const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
   const base = {
@@ -2716,6 +3019,31 @@ function snapshotFromRow(db: Database, row: RunRow): RunSnapshot {
   }
   if (!Number.isSafeInteger(row.session_id) || Number(row.session_id) <= 0 || row.scope_json === null) {
     throw new Error('invalid_agent_session_reference');
+  }
+  if (runtimeKind === 'durable') {
+    if (row.kind === 'subagent') {
+      const frozen = DurableSubagentConfigSnapshotSchema.parse(config), scope = DurableSubagentRunScopeSchema.parse(readJson(row.scope_json, 'scope'));
+      durableSubagentOwner(db, row, frozen, scope);
+      if (output !== null) {
+        const value = DurableSubagentRunOutputSchema.parse(output);
+        if (value.durable.workId !== scope.workId || value.durable.attemptId !== scope.attemptId || !isDeepStrictEqual(value.subagent, frozen.subagent))
+          throw new Error('invalid_durable_child_output_owner');
+      }
+      return { ...base, kind: 'subagent', runtimeKind: 'durable', jobId: null, sessionId: Number(row.session_id), scope,
+        parentRunId: scope.parentRunId, originToolCallId: scope.originToolCallId };
+    }
+    const frozen = DurableRunConfigSnapshotSchema.parse(config), scope = DurableRunScopeSchema.parse(readJson(row.scope_json, 'scope'));
+    durableRunOwner(db, row, frozen, scope);
+    if (input.version !== 1 || input.goal !== row.goal || !Number.isSafeInteger(input.messageTimestamp)) throw new Error('invalid_durable_run_input');
+    if (output !== null) {
+      const value = DurableRunOutputSchema.parse(output);
+      if (!isDeepStrictEqual(value.durable, { workId: scope.workId, attemptId: scope.attemptId })) throw new Error('invalid_durable_output_owner');
+    }
+    if (context.pointer !== null) {
+      const snapshot = db.query<{ run_id: number; session_id: number }, [number]>('SELECT run_id,session_id FROM context_snapshots WHERE id=?').get(context.pointer);
+      if (!snapshot || snapshot.run_id !== row.id || snapshot.session_id !== row.session_id) throw new Error('invalid_durable_context_owner');
+    }
+    return { ...base, kind: 'agent', runtimeKind: 'durable', jobId: null, sessionId: Number(row.session_id), scope };
   }
   if (row.kind === 'subagent') {
     const provenance = SubagentProvenanceSchema.parse(config.subagent), scope = RunScopeSchema.parse(readJson(row.scope_json, 'scope'));
@@ -2879,6 +3207,38 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
     } catch (error) { return fail(error instanceof NativeOriginFault ? error.error
       : appError('storage_read_failed', 'storage', 'Session authorization could not be read.', true)); }
   };
+  function create(input: NewAgentSession): Result<AgentSessionRow>;
+  function create(input: NewDurableSession): Result<DurableSessionRow>;
+  function create(input: NewSession): Result<SessionRow>;
+  function create(input: NewSession): Result<SessionRow> {
+    if (input.runtimeKind === 'durable' && (input.nativeSessionId !== null || input.nativeHistory !== undefined || input.expectedRevision !== undefined))
+      return fail(appError('input_invalid', 'input', 'Durable Sessions cannot contain Pi identity, history or Workspace admission.'));
+    const created = writeTransaction(() => {
+      if (input.expectedRevision !== undefined) {
+        const workspace = ensureWorkspace(db, input.at) as { revision: number };
+        if (workspace.revision !== input.expectedRevision || !revisionCanAdvance(workspace.revision)) return null;
+      }
+      const result = input.runtimeKind === 'durable'
+        ? db.query("INSERT INTO sessions(runtime_kind,native_session_id,title,created_at,updated_at,metadata_json) VALUES ('durable',NULL,?,?,?,?)")
+          .run(input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }))
+        : db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at,metadata_json) VALUES (?,?,?,?,?)')
+          .run(input.nativeSessionId, input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }));
+      const id = Number(result.lastInsertRowid);
+      if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_session_id');
+      if (input.nativeHistory) commitInTransaction(db, { sessionId: id, expected: null, header: input.nativeHistory.header,
+        appendEntries: input.nativeHistory.entries, leafId: input.nativeHistory.leafId, unusable: input.nativeHistory.unusable, contexts: [] }, events);
+      if (input.expectedRevision !== undefined) {
+        const changed = db.query(`UPDATE workspace SET active_session_id=?,revision=revision+1,updated_at=?
+          WHERE id=1 AND revision=?`).run(id, input.at, input.expectedRevision).changes;
+        if (changed !== 1) throw new Error('workspace_revision_raced');
+      }
+      return readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(id));
+    });
+    if (!created.ok) return created;
+    return created.data === null
+      ? fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true))
+      : ok(created.data);
+  }
   return {
     isSubagentSession(sessionId) {
       try { return ok(db.query("SELECT id FROM runs WHERE kind='subagent' AND session_id=? LIMIT 1").get(sessionId) !== null); }
@@ -2933,31 +3293,25 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
       const result = writeTransaction(() => markUnusableInTransaction(db, sessionId));
       return result.ok ? ok(undefined) : result;
     },
-    create(input) {
-      const created = writeTransaction(() => {
-        if (input.expectedRevision !== undefined) {
-          const workspace = ensureWorkspace(db, input.at) as { revision: number };
-          if (workspace.revision !== input.expectedRevision || !revisionCanAdvance(workspace.revision)) return null;
+    create,
+    bindDurableConversation(sessionId, nativeConversationId, at) {
+      return writeTransaction(() => {
+        const conflict = () => new MemoryCommitFault(appError('state_conflict', 'session', 'The original Durable Conversation binding differs.'));
+        if (!Number.isSafeInteger(nativeConversationId) || nativeConversationId < 1) throw conflict();
+        const current = this.get(sessionId); if (!current.ok) throw new MemoryCommitFault(current.error);
+        if (current.data.runtimeKind !== 'durable') throw conflict();
+        if (current.data.durableConversationId !== null) {
+          if (current.data.durableConversationId !== nativeConversationId) throw conflict();
+          return current.data;
         }
-        const result = db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at,metadata_json) VALUES (?,?,?,?,?)')
-          .run(input.nativeSessionId, input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }));
-        const id = Number(result.lastInsertRowid);
-        if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_session_id');
-        if (input.nativeHistory) commitInTransaction(db, { sessionId: id, expected: null, header: input.nativeHistory.header,
-          appendEntries: input.nativeHistory.entries, leafId: input.nativeHistory.leafId, unusable: input.nativeHistory.unusable, contexts: [] }, events);
-        if (input.expectedRevision !== undefined) {
-          const changed = db.query(`UPDATE workspace SET active_session_id=?,revision=revision+1,updated_at=?
-            WHERE id=1 AND revision=?`).run(id, input.at, input.expectedRevision).changes;
-          if (changed !== 1) throw new Error('workspace_revision_raced');
-        }
-        return readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(id));
+        if (db.query('SELECT id FROM sessions WHERE durable_conversation_id=? AND id!=?').get(nativeConversationId, sessionId)) throw conflict();
+        if (db.query("UPDATE sessions SET durable_conversation_id=?,updated_at=? WHERE id=? AND runtime_kind='durable' AND durable_conversation_id IS NULL")
+          .run(nativeConversationId, at, sessionId).changes !== 1) throw conflict();
+        const bound = readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(sessionId));
+        if (bound.runtimeKind !== 'durable') throw conflict();
+        return bound;
       });
-      if (!created.ok) return created;
-      return created.data === null
-        ? fail(appError('state_conflict', 'input', 'Workspace 已变化，请重新读取。', true))
-        : ok(created.data);
     },
-
     get(sessionId) {
       try {
         const row = db.query('SELECT * FROM sessions WHERE id=?').get(sessionId);
@@ -2978,11 +3332,13 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
         return readTransaction(db, () => {
           const raw = db.query('SELECT * FROM sessions WHERE id=? AND hidden_at IS NULL').get(sessionId);
           if (!raw) return fail(appError('session_not_found', 'session', 'Session does not exist.'));
+          const owner = sessionRow(raw);
+          if (owner.runtimeKind !== 'agent_session') return fail(appError('session_runtime_mismatch', 'session', 'This Session belongs to the Durable business runtime.'));
           const origins = createNativeOriginReader(db);
           const bundle = origins.bundle(sessionId);
           // The bundle already passed the same strict native-history reader. Reuse
           // its state instead of loading and validating that body a second time.
-          const row: SessionRow = { ...sessionRow(raw), hasBusinessHistory: hasBusinessHistory(db, sessionId),
+          const row: AgentSessionRow = { ...owner, hasBusinessHistory: hasBusinessHistory(db, sessionId),
             historyState: bundle.history ? 'recoverable' : 'legacy-read-only', nativeUnusable: bundle.history?.unusable ?? false };
           const authorization = readAuthorization(sessionId, origins);
           if (!authorization.ok) return authorization;
@@ -3043,14 +3399,20 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
 
     list(request) {
       try {
+        const engine = db.query<{ name: string }, []>('PRAGMA table_info(sessions)').all().some(column => column.name === 'runtime_kind')
+          ? " AND runtime_kind='agent_session'" : '';
         const rows = request.before
           ? db.query(`SELECT * FROM sessions
-              WHERE hidden_at IS NULL AND NOT EXISTS(SELECT 1 FROM runs child WHERE child.kind='subagent' AND child.session_id=sessions.id)
+              WHERE hidden_at IS NULL${engine} AND NOT EXISTS(SELECT 1 FROM runs child WHERE child.kind='subagent' AND child.session_id=sessions.id)
                 AND (updated_at < ? OR (updated_at = ? AND id < ?))
               ORDER BY updated_at DESC,id DESC LIMIT ?`)
             .all(request.before.updatedAt, request.before.updatedAt, request.before.sessionId, request.limit + 1)
-          : db.query("SELECT * FROM sessions WHERE hidden_at IS NULL AND NOT EXISTS(SELECT 1 FROM runs child WHERE child.kind='subagent' AND child.session_id=sessions.id) ORDER BY updated_at DESC,id DESC LIMIT ?").all(request.limit + 1);
-        const mapped = (rows as unknown[]).map((row) => readSessionRow(db, row));
+          : db.query(`SELECT * FROM sessions WHERE hidden_at IS NULL${engine} AND NOT EXISTS(SELECT 1 FROM runs child WHERE child.kind='subagent' AND child.session_id=sessions.id) ORDER BY updated_at DESC,id DESC LIMIT ?`).all(request.limit + 1);
+        const mapped = (rows as unknown[]).map(raw => {
+          const row = readSessionRow(db, raw);
+          if (row.runtimeKind !== 'agent_session') throw Error('invalid_legacy_session_list');
+          return row;
+        });
         const hasMore = mapped.length > request.limit;
         const items = hasMore ? mapped.slice(0, request.limit) : mapped;
         const last = items.at(-1);
@@ -3260,7 +3622,7 @@ function appendRunState(db: Database, events: RuntimeEventStore | undefined, run
 
 export function createRunRepository(db: Database, events?: RuntimeEventStore): RunRepository {
   const writeTransaction = <T>(fn: () => T) => transaction(db, fn, events);
-  const childFacts = (child: Extract<RunSnapshot, { kind: 'subagent' }>, parent: AgentRunSnapshot) => {
+  const childFacts = (child: AgentSessionSubagentRunSnapshot, parent: AgentRunSnapshot) => {
     const original = createToolCallRepository(db).getById(child.originToolCallId);
     const session = createSessionRepository(db).get(child.sessionId);
     if (!original.ok) throw new MemoryCommitFault(original.error);
@@ -3278,8 +3640,8 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const parent = this.get(input.parentRunId), child = this.get(input.childRunId);
         if (!parent.ok) return parent;
         if (!child.ok) return child;
-        if (parent.data.kind !== 'agent' || parent.data.sessionId !== input.parentSessionId
-          || child.data.kind !== 'subagent' || child.data.parentRunId !== parent.data.runId)
+        if (parent.data.kind !== 'agent' || 'runtimeKind' in parent.data || parent.data.sessionId !== input.parentSessionId
+          || child.data.kind !== 'subagent' || 'runtimeKind' in child.data || child.data.parentRunId !== parent.data.runId)
           return fail(appError('subagent_identity_conflict', 'runtime', 'The child and parent identities do not match.'));
         const facts = childFacts(child.data, parent.data);
         const history = createSessionRepository(db).readHistoryForDisplay(child.data.sessionId);
@@ -3295,7 +3657,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
       return writeTransaction(() => {
         const args = DelegateArgsSchema.parse(input.args), binding = RequestContextBindingSchema.parse(input.origin.requestBinding), origin = input.origin;
         const parentRow = db.query('SELECT * FROM runs WHERE id=?').get(origin.parentRunId) as RunRow | null;
-        if (!parentRow || parentRow.kind !== 'agent' || parentRow.session_id !== origin.parentSessionId || parentRow.status !== 'running'
+        if (!parentRow || parentRow.kind !== 'agent' || runRuntimeKind(db, parentRow) !== 'agent_session' || parentRow.session_id !== origin.parentSessionId || parentRow.status !== 'running'
           || parentRow.cancel_requested_at !== null || binding.runId !== parentRow.id || binding.sessionId !== parentRow.session_id
           || binding.nativeSessionId !== origin.parentNativeSessionId) throw new MemoryCommitFault(appError('subagent_origin_invalid', 'runtime', 'Parent admission is closed or has a different identity.'));
         const parent = snapshotFromRow(db, parentRow), parentScope = RunScopeSchema.parse(parent.scope);
@@ -3378,17 +3740,109 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         return ok(row ? snapshotFromRow(db, row) : null);
       }); } catch (error) { return evidenceReadFailure(error, 'Child origin could not be read.'); }
     },
+    createDurableSubagent(input) {
+      const parsedConfig = DurableSubagentConfigSnapshotSchema.safeParse(input.config), parsedScope = DurableSubagentRunScopeSchema.safeParse(input.scope), args = DelegateArgsSchema.safeParse(input.args);
+      if (!parsedConfig.success || !parsedScope.success || !args.success || !z.string().datetime().safeParse(input.at).success
+        || !Number.isSafeInteger(input.nativeToolTaskId) || input.nativeToolTaskId < 1 || parsedScope.data.parentRunId !== input.parentRunId
+        || parsedScope.data.originToolCallId !== input.originToolCallId) return fail(appError('input_invalid', 'input', 'Durable child admission facts are invalid.'));
+      return writeTransaction(() => {
+        const config = parsedConfig.data, scope = parsedScope.data, original = durableSubagentParent(db, config, scope);
+        if (original.tool.nativeToolCallId !== `durable-task:${input.nativeToolTaskId}` || !isDeepStrictEqual(args.data, original.args))
+          throw new MemoryCommitFault(appError('subagent_identity_conflict', 'runtime', 'The original native ToolTask already has another delegation.'));
+        const existing = db.query<RunRow, [number]>('SELECT * FROM runs WHERE origin_tool_call_id=?').get(input.originToolCallId);
+        if (existing) {
+          const saved = snapshotFromRow(db, existing);
+          if (saved.kind !== 'subagent' || !('runtimeKind' in saved) || saved.runtimeKind !== 'durable'
+            || !isDeepStrictEqual(saved.scope, scope) || !isDeepStrictEqual(saved.config, config))
+            throw new MemoryCommitFault(appError('subagent_identity_conflict', 'runtime', 'The original ToolCall owns a different child admission.'));
+          return { runId: saved.runId, sessionId: saved.sessionId };
+        }
+        verifyDurableSubagentParent(db, original);
+        if (db.query<{ count: number }, [number]>(`SELECT COUNT(*) count FROM runs WHERE parent_run_id=?
+          AND (status IN ('created','running') OR stopped_at IS NULL OR COALESCE(json_extract(cleanup_json,'$.stopped'),0)!=1
+            OR COALESCE(json_extract(cleanup_json,'$.lateObservationRequired'),1)!=0)`).get(input.parentRunId)!.count >= 4)
+          throw new MemoryCommitFault(appError('subagent_busy', 'runtime', 'Four child executions are already owned.', true));
+        const session = createSessionRepository(db, events).create({ runtimeKind: 'durable', nativeSessionId: null, title: args.data.description.slice(0, 80), at: input.at });
+        if (!session.ok) throw new MemoryCommitFault(session.error);
+        // Keep the existing identity constraint using the actual native creator task key.
+        const inserted = db.query(`INSERT INTO runs(kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,
+          created_at,parent_run_id,origin_tool_call_id,plugin_agent_id) VALUES('subagent',?,NULL,?,'created',?,?,?,?,?,?,?,?,?)`)
+          .run(session.data.sessionId, asJson(scope), args.data.description,
+            asJson({ version: 1, goal: args.data.description, text: args.data.prompt, messageTimestamp: Date.parse(input.at) }), asJson(config),
+            asJson({ version: 1, stopped: false, stopReason: null, errors: [], lateObservationRequired: false }),
+            asJson({ version: 1, source: 'not-requested', reason: 'durable-child-not-started', sdkValues: null, attempts: 0,
+              attemptsComplete: true, costSource: null, updatedAt: input.at }), input.at, input.parentRunId, input.originToolCallId, original.tool.nativeToolCallId);
+        const runId = Number(inserted.lastInsertRowid); appendRunState(db, events, runId, 'run_created');
+        return { runId, sessionId: session.data.sessionId };
+      });
+    },
+    verifyDurableSubagentAdmission(childRunId) {
+      try { return readTransaction(db, () => {
+        const row = db.query<RunRow, [number]>('SELECT * FROM runs WHERE id=?').get(childRunId);
+        if (!row || row.kind !== 'subagent' || runRuntimeKind(db, row) !== 'durable' || !['created', 'running'].includes(row.status) || row.cancel_requested_at !== null)
+          return fail(appError('subagent_parent_closed', 'runtime', 'The original child admission is no longer active.'));
+        const config = DurableSubagentConfigSnapshotSchema.parse(readJson(row.config_json, 'config')), scope = DurableSubagentRunScopeSchema.parse(readJson(row.scope_json ?? 'null', 'scope'));
+        const original = durableSubagentOwner(db, row, config, scope); verifyDurableSubagentParent(db, original);
+        if (!durableSessionAllowsRun(db, Number(row.session_id))) return fail(appError('session_scope_revoked', 'session', 'The original child Session is unavailable.'));
+        return ok(undefined);
+      }); } catch (error) { return error instanceof MemoryCommitFault ? fail(error.error) : evidenceReadFailure(error, 'The original child admission could not be verified.'); }
+    },
+    confirmDurableSubagentStop(input) {
+      return writeTransaction(() => {
+        const observed = input.observation, conflict = () => new MemoryCommitFault(appError('source_invalid', 'runtime', 'The stop observation does not identify the original closed child execution.'));
+        const row = db.query<RunRow, [number]>('SELECT * FROM runs WHERE id=?').get(observed.childRunId);
+        if (!row || row.kind !== 'subagent' || runRuntimeKind(db, row) !== 'durable' || !['completed', 'failed', 'cancelled'].includes(row.status)
+          || !z.string().datetime().safeParse(input.at).success || Date.parse(input.at) < Date.parse(row.ended_at!)
+          || !Number.isSafeInteger(observed.nativeToolTaskId) || observed.nativeToolTaskId < 1
+          || observed.execution !== 'closed' || observed.creation === 'unknown') throw conflict();
+        const config = DurableSubagentConfigSnapshotSchema.parse(readJson(row.config_json, 'config')), scope = DurableSubagentRunScopeSchema.parse(readJson(row.scope_json ?? 'null', 'scope'));
+        const original = durableSubagentOwner(db, row, config, scope);
+        const session = db.query<{ durable_conversation_id: number | null }, [number | null]>('SELECT durable_conversation_id FROM sessions WHERE id=?').get(row.session_id);
+        if (observed.workId !== scope.workId || observed.attemptId !== scope.attemptId || observed.requestId !== scope.parentRequestId
+          || observed.sessionId !== original.parentRow.session_id || observed.childSessionId !== row.session_id
+          || observed.originToolCallId !== scope.originToolCallId || original.tool.nativeToolCallId !== `durable-task:${observed.nativeToolTaskId}`
+          || !session || observed.creation === 'created' && (session.durable_conversation_id === null || session.durable_conversation_id !== observed.nativeConversationId)
+          || observed.creation === 'not-started' && (session.durable_conversation_id !== null || observed.nativeConversationId !== null || observed.nativeSubmissionId !== null)) throw conflict();
+        const cleanup = validatedCleanup(readJson(row.cleanup_json, 'cleanup'));
+        if (row.stopped_at !== null && cleanup.stopped && !cleanup.lateObservationRequired) return true;
+        const changed = db.query(`UPDATE runs SET stopped_at=COALESCE(stopped_at,?),cleanup_json=? WHERE id=?
+          AND status IN ('completed','failed','cancelled')`).run(input.at,
+          asJson({ ...cleanup, stopped: true, stopReason: 'native-stop-confirmed', lateObservationRequired: false }), row.id).changes;
+        return changed === 1;
+      });
+    },
+    confirmDurableDelegationStop(input) {
+      return writeTransaction(() => {
+        const observed = input.observation, conflict = () => new MemoryCommitFault(appError('source_invalid', 'runtime', 'The original delegation has no complete creator and child stop evidence.'));
+        if (observed.creatorExecution !== 'closed' || observed.execution !== 'closed') throw conflict();
+        const child = this.get(observed.childRunId);
+        if (!child.ok) throw new MemoryCommitFault(child.error);
+        if (child.data.kind !== 'subagent' || !('runtimeKind' in child.data) || child.data.runtimeKind !== 'durable'
+          || child.data.stoppedAt === null || child.data.cleanup.stopped !== true || child.data.cleanup.lateObservationRequired !== false) throw conflict();
+        // Reuse the original closed-scope identity check after its first stop fact is fixed.
+        const confirmed = this.confirmDurableSubagentStop(input); if (!confirmed.ok) throw new MemoryCommitFault(confirmed.error);
+        const original = createToolCallRepository(db).getById(observed.originToolCallId);
+        if (!original.ok) throw new MemoryCommitFault(original.error);
+        const call = original.data;
+        if (call.toolName !== 'Agent' || !['succeeded', 'failed', 'cancelled'].includes(call.status) || call.endedAt === null
+          || Date.parse(input.at) < Date.parse(call.endedAt) || call.cleanup.nativeProcesses?.some(process => !process.stopped)) throw conflict();
+        if (call.cleanup.stopped && call.stoppedAt !== null) return true;
+        return db.query(`UPDATE tool_calls SET cleanup_json=?,stopped_at=COALESCE(stopped_at,?)
+          WHERE id=? AND status IN ('succeeded','failed','cancelled')`).run(asJson({ ...call.cleanup, stopped: true,
+          stopReason: 'native-stop-confirmed' }), input.at, call.toolCallId).changes >= 1;
+      });
+    },
     listSubagents(input) {
       try { return readTransaction(db, () => {
         const request = z.object({ parentRunId: z.number().int().positive(), beforeRunId: z.number().int().positive().optional(),
           limit: z.number().int().min(1).max(100) }).strict().parse(input);
         const parent = this.get(request.parentRunId);
         if (!parent.ok) return parent;
-        if (parent.data.kind !== 'agent') return fail(appError('subagent_origin_invalid', 'runtime', 'Only a root Agent owns children.'));
+        if (parent.data.kind !== 'agent' || 'runtimeKind' in parent.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Legacy child queries require an AgentSession root.'));
         const rows = db.query("SELECT * FROM runs WHERE kind='subagent' AND parent_run_id=? AND (? IS NULL OR id<?) ORDER BY id DESC LIMIT ?")
           .all(request.parentRunId, request.beforeRunId ?? null, request.beforeRunId ?? null, request.limit + 1) as RunRow[];
         const items = rows.slice(0, request.limit).map(row => {
-          const child = snapshotFromRow(db, row); if (child.kind !== 'subagent') throw new Error('invalid_child');
+          const child = snapshotFromRow(db, row); if (child.kind !== 'subagent' || 'runtimeKind' in child) throw new Error('invalid_child');
           return childFacts(child, parent.data as AgentRunSnapshot).summary;
         });
         const tokens = (db.query(`SELECT input_tokens AS inputTokens,output_tokens AS outputTokens,total_tokens AS totalTokens,
@@ -3425,6 +3879,55 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         return id;
       });
       return result;
+    },
+
+    createDurable(input) {
+      const config = DurableRunConfigSnapshotSchema.safeParse(input.config);
+      const record = z.object({ version: z.literal(1), goal: z.string(), text: z.string(),
+        messageTimestamp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict().safeParse(input.input);
+      if (!config.success || !record.success || !z.string().datetime().safeParse(input.createdAt).success
+        || !Number.isSafeInteger(input.workId) || input.workId <= 0 || !Number.isSafeInteger(input.attemptId) || input.attemptId <= 0
+        || Buffer.byteLength(JSON.stringify(record.data), 'utf8') > 262_144)
+        return fail(appError('input_invalid', 'input', 'Durable product Run facts are invalid.'));
+      return writeTransaction(() => {
+        validatedUsage(input.usage); validatedCleanup(input.cleanup);
+        const attempt = db.query<DurableRunAttemptRow, [number]>('SELECT * FROM invoice_work_attempts WHERE id=?').get(input.attemptId);
+        const owner = db.query<DurableRunWorkRow, [number]>('SELECT * FROM invoice_works WHERE id=?').get(input.workId);
+        if (!attempt || !owner || attempt.work_id !== owner.id)
+          throw new MemoryCommitFault(appError('state_conflict', 'input', 'The product attempt does not belong to this Work.'));
+        const fixed = PersonalAgentConfigurationSchema.parse(readJson(owner.configuration_json, 'durable_configuration'));
+        const scope = DurableRunScopeSchema.parse({ version: 4, workId: owner.id, attemptId: attempt.id, allowedTools: fixed.tools });
+        if (attempt.run_id !== null) {
+          const saved = db.query<RunRow, [number]>('SELECT * FROM runs WHERE id=?').get(attempt.run_id);
+          if (!saved || runRuntimeKind(db, saved) !== 'durable') throw new Error('invalid_durable_run_binding');
+          const snapshot = snapshotFromRow(db, saved);
+          if (!isDeepStrictEqual(snapshot.config, config.data) || !isDeepStrictEqual(snapshot.input, record.data)
+            || !isDeepStrictEqual(snapshot.scope, scope))
+            throw new MemoryCommitFault(appError('state_conflict', 'input', 'This attempt already owns another Run admission.'));
+          return saved.id;
+        }
+        if (owner.status !== 'open' || owner.current_attempt_id !== attempt.id || attempt.stop_requested_at !== null || attempt.stopped_at !== null
+          || config.data.durable.attemptId !== attempt.id || !durableConfigMatchesWork(config.data, owner) || record.data.goal !== owner.goal
+          || input.cleanup.stopped)
+          throw new MemoryCommitFault(appError('state_conflict', 'input', 'The product attempt no longer permits this Run admission.'));
+        if (!durableSessionAllowsRun(db, owner.session_id))
+          throw new MemoryCommitFault(appError('state_conflict', 'session', 'The Work requires its usable Durable Session.'));
+        if (db.query(`SELECT run.id FROM runs run JOIN sessions session ON session.id=run.session_id
+          WHERE session.runtime_kind='durable' AND run.kind='agent' AND run.status IN ('created','running') LIMIT 1`).get())
+          throw new MemoryCommitFault(appError('runtime_busy', 'runtime', 'A Durable product Run is already active.', true));
+        const inserted = db.query(`INSERT INTO runs
+          (kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)
+          VALUES ('agent',?,NULL,?,'created',?,?,?,?,?,?)`)
+          .run(owner.session_id, asJson(scope), owner.goal, asJson(record.data), asJson(config.data), asJson(input.cleanup), asJson(input.usage), input.createdAt);
+        const id = Number(inserted.lastInsertRowid);
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error('unsafe_run_id');
+        if (db.query(`UPDATE invoice_work_attempts SET run_id=? WHERE id=? AND work_id=? AND run_id IS NULL
+          AND stop_requested_at IS NULL AND stopped_at IS NULL`).run(id, attempt.id, owner.id).changes !== 1)
+          throw new MemoryCommitFault(appError('state_conflict', 'input', 'The product attempt changed before Run binding.'));
+        appendRunState(db, events, id, 'run_created');
+        db.query('UPDATE sessions SET updated_at=? WHERE id=?').run(input.createdAt, owner.session_id);
+        return id;
+      });
     },
 
     createAgent(input) {
@@ -3569,115 +4072,137 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
       } catch { return fail(appError('storage_read_failed', 'storage', 'Input admission facts cannot be read.', true)); }
     },
 
-    verifyInputUse(content, verify, binding) {
-      try {
-        let child: Extract<RunSnapshot, { kind: 'subagent' }> | undefined;
-        if (binding) {
-          const raw = db.query('SELECT * FROM runs WHERE id=?').get(binding.runId) as RunRow | null;
-          if (!raw || raw.kind === 'provider' || raw.session_id !== binding.sessionId) return corruptWorkspace();
-          if (raw.kind === 'subagent') {
-            const snapshot = snapshotFromRow(db, raw); if (snapshot.kind !== 'subagent') return corruptWorkspace(); child = snapshot;
+    verifyInputUse(inputs, verify) {
+      try { return readTransaction(db, () => {
+        const owners: ContextOwnerCache = new Map();
+        const verifyOne = ({ content, binding }: RunInputUse): Result<void> => {
+          let child: AgentSessionSubagentRunSnapshot | undefined;
+          if (binding) {
+            const raw = db.query('SELECT * FROM runs WHERE id=?').get(binding.runId) as RunRow | null;
+            if (!raw || raw.kind === 'provider' || raw.session_id !== binding.sessionId) return corruptWorkspace();
+            if (raw.kind === 'subagent') {
+              const snapshot = snapshotFromRow(db, raw); if (snapshot.kind !== 'subagent' || 'runtimeKind' in snapshot) return corruptWorkspace(); child = snapshot;
+            }
+            const original = readRunContextOwner(db, raw, owners);
+            if ((binding.contextSnapshotId === null) !== (original.observations === null)) return corruptWorkspace();
+            if (binding.contextSnapshotId !== null) {
+              const snapshot = readContextSnapshotOwner(db, binding.contextSnapshotId, raw);
+              const expectedPrompt = snapshot.json.goalMode === 'fill-form'
+                ? `${formatExecutionPrompt({ text: content.text, goalMode: 'fill-form', business: true,
+                  workspaceInput: content.workspaceInput!, workspaceContext: content.workspaceContext! })}\n\nFlowmate Context reference:\n${JSON.stringify({ snapshotId: snapshot.id,
+                  policyVersion: snapshot.json.policyVersion, projectionMode: 'fill-reference', gaps: snapshot.json.modelProjection.gaps })}`
+                : formatContextPrompt(snapshot, raw.kind === 'subagent');
+              if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
+                || !isDeepStrictEqual(snapshot.json.research, content.research)
+                || !isDeepStrictEqual(snapshot.json.inputCommand, content.inputCommand)
+                || content.inputCommand && !isDeepStrictEqual(content.inputCommand,
+                  FrozenInputDefinitionsSchema.parse(validatedConfig(readJson(raw.config_json, 'config'), raw.kind).inputDefinitions).command)
+                || !isDeepStrictEqual(snapshot.json.resourceBinding, content.resourceBinding)
+                || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
+                || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds) || content.promptText !== expectedPrompt) return corruptWorkspace();
+            }
           }
-          const original = readRunContextOwner(db, raw);
-          if ((binding.contextSnapshotId === null) !== (original.observations === null)) return corruptWorkspace();
-          if (binding.contextSnapshotId !== null) {
-            const snapshot = readContextSnapshotOwner(db, binding.contextSnapshotId, raw);
-            const expectedPrompt = snapshot.json.goalMode === 'fill-form'
-              ? `${formatExecutionPrompt({ text: content.text, goalMode: 'fill-form', business: true,
-                workspaceInput: content.workspaceInput!, workspaceContext: content.workspaceContext! })}\n\nFlowmate Context reference:\n${JSON.stringify({ snapshotId: snapshot.id,
-                policyVersion: snapshot.json.policyVersion, projectionMode: 'fill-reference', gaps: snapshot.json.modelProjection.gaps })}`
-              : formatContextPrompt(snapshot, raw.kind === 'subagent');
-            if (snapshot.json.text !== content.text || !isDeepStrictEqual(snapshot.json.workspaceContext, content.workspaceContext)
-              || !isDeepStrictEqual(snapshot.json.research, content.research)
-              || !isDeepStrictEqual(snapshot.json.inputCommand, content.inputCommand)
-              || content.inputCommand && !isDeepStrictEqual(content.inputCommand,
-                FrozenInputDefinitionsSchema.parse(validatedConfig(readJson(raw.config_json, 'config'), raw.kind).inputDefinitions).command)
-              || !isDeepStrictEqual(snapshot.json.resourceBinding, content.resourceBinding)
-              || !isDeepStrictEqual(snapshot.json.allowedDocumentIds, content.allowedDocumentIds)
-              || !isDeepStrictEqual(snapshot.json.allowedArtifactIds, content.allowedArtifactIds) || content.promptText !== expectedPrompt) return corruptWorkspace();
+          if (child) {
+            if (content.workspaceContext !== null || content.workspaceInput !== null
+              || !isDeepStrictEqual(content.allowedDocumentIds, child.scope.allowedDocumentIds)
+              || !isDeepStrictEqual(content.allowedArtifactIds, child.scope.allowedArtifactIds)) return corruptWorkspace();
+            const parent = verifyChildToolParent(db, { runId: child.runId, sessionId: child.sessionId, scope: child.scope });
+            if (!parent.ok) return parent;
+            if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Material verification is unavailable.', true));
+            for (const id of child.scope.allowedDocumentIds) {
+              const document = createDocumentRepository(db).get(id); if (!document.ok) return document;
+              if (document.data.status !== 'available' || document.data.isHidden || !child.scope.allowedArtifactIds.includes(document.data.parsedArtifactId))
+                return fail(appError('input_unavailable', 'input', 'Frozen child material is unavailable.', true));
+              const verified = verify({ documentRef: document.data.documentRef, jobId: null, candidateRef: null, candidate: null, selection: null });
+              if (!verified.ok) return verified;
+              const valid = requireValidWorkspace(verified.data); if (!valid.ok) return valid;
+            }
+            return ok(undefined);
           }
-        }
-        if (child) {
-          if (content.workspaceContext !== null || content.workspaceInput !== null
-            || !isDeepStrictEqual(content.allowedDocumentIds, child.scope.allowedDocumentIds)
-            || !isDeepStrictEqual(content.allowedArtifactIds, child.scope.allowedArtifactIds)) return corruptWorkspace();
-          const parent = verifyChildToolParent(db, { runId: child.runId, sessionId: child.sessionId, scope: child.scope });
-          if (!parent.ok) return parent;
-          if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Material verification is unavailable.', true));
-          for (const id of child.scope.allowedDocumentIds) {
-            const document = createDocumentRepository(db).get(id); if (!document.ok) return document;
-            if (document.data.status !== 'available' || document.data.isHidden || !child.scope.allowedArtifactIds.includes(document.data.parsedArtifactId))
-              return fail(appError('input_unavailable', 'input', 'Frozen child material is unavailable.', true));
-            const verified = verify({ documentRef: document.data.documentRef, jobId: null, candidateRef: null, candidate: null, selection: null });
-            if (!verified.ok) return verified;
-            const valid = requireValidWorkspace(verified.data); if (!valid.ok) return valid;
+          if (content.research) {
+            if (!binding || content.workspaceContext !== null || content.workspaceInput !== null
+              || !isDeepStrictEqual(content.research, readResearchContext(db, binding.runId))) return corruptWorkspace();
+            const scope = researchMaterialScope(db, content.research.binding.sourcePolicy);
+            if (!isDeepStrictEqual(content.allowedDocumentIds, scope.allowedDocumentIds)
+              || !isDeepStrictEqual(content.allowedArtifactIds, scope.allowedArtifactIds)) return corruptWorkspace();
+            return ok(undefined);
           }
-          return ok(undefined);
-        }
-        if (content.research) {
-          if (!binding || content.workspaceContext !== null || content.workspaceInput !== null
-            || !isDeepStrictEqual(content.research, readResearchContext(db, binding.runId))) return corruptWorkspace();
-          const scope = researchMaterialScope(db, content.research.binding.sourcePolicy);
-          if (!isDeepStrictEqual(content.allowedDocumentIds, scope.allowedDocumentIds)
-            || !isDeepStrictEqual(content.allowedArtifactIds, scope.allowedArtifactIds)) return corruptWorkspace();
-          return ok(undefined);
-        }
-        const frozen = content.workspaceContext;
-        if (frozen === null) return content.workspaceInput === null && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
-          ? ok(undefined) : fail(appError('storage_corrupt', 'storage', 'Chat input contains Workspace references.'));
-        const business = WorkspaceInputSchema.safeParse(content.workspaceInput);
-        if (!business.success || business.data.documentRef?.id !== frozen.documentRef?.id || business.data.documentRef?.version !== frozen.documentRef?.version
-          || business.data.job?.id !== (frozen.jobId ?? undefined) || business.data.candidate?.id !== frozen.candidateRef?.id
-          || business.data.candidate?.sequence !== frozen.candidateRef?.sequence
-          || content.allowedDocumentIds.length !== (frozen.documentRef ? 1 : 0)
-          || content.allowedArtifactIds.length !== (frozen.documentRef ? 1 : 0))
-          return fail(appError('storage_corrupt', 'storage', 'Frozen Workspace projection is inconsistent.'));
-        if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
-        const documents = createDocumentRepository(db);
-        if (frozen.documentRef !== null) {
-          const document = documents.get(frozen.documentRef.id);
-          if (!document.ok) return document;
-          if (document.data.status !== 'available' || document.data.isHidden)
-            return fail(appError('input_unavailable', 'input', 'Frozen input material is unavailable.', true));
-          if (document.data.documentRef.version !== frozen.documentRef.version
-            || !content.allowedDocumentIds.includes(frozen.documentRef.id)
-            || !content.allowedArtifactIds.includes(document.data.parsedArtifactId))
-            return fail(appError('state_conflict', 'input', 'Frozen input material references changed.'));
-        }
-        for (const id of content.allowedArtifactIds) {
-          const artifact = documents.getArtifact(id);
-          if (!artifact.ok) return artifact;
-        }
-        let candidate: WorkspaceInput['candidate'] = null;
-        if (frozen.jobId !== null) {
-          const job = readJob(db, frozen.jobId);
-          const visibility = db.query('SELECT hidden_at FROM jobs WHERE id=?').get(frozen.jobId) as { hidden_at: string | null } | null;
-          if (!job || job.documentRef.id !== frozen.documentRef?.id || job.documentRef.version !== frozen.documentRef.version
-            || visibility?.hidden_at !== null)
-            return fail(appError('state_conflict', 'input', 'Frozen input task references changed.'));
-          if (job.status === 'completed') return fail(appError('job_completed', 'input', 'The input task has already completed.'));
-          if (frozen.candidateRef !== null) {
-            const row = queryCandidateRow(db, frozen.candidateRef.id, frozen.jobId);
-            if (!row || candidateSnapshot(db, row).snapshot.sequence !== frozen.candidateRef.sequence)
-              return fail(appError('state_conflict', 'input', 'Frozen input candidate references changed.'));
-            candidate = workspaceCandidate(db, frozen);
+          const frozen = content.workspaceContext;
+          if (frozen === null) return content.workspaceInput === null && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
+            ? ok(undefined) : fail(appError('storage_corrupt', 'storage', 'Chat input contains Workspace references.'));
+          const business = WorkspaceInputSchema.safeParse(content.workspaceInput);
+          if (!business.success || business.data.documentRef?.id !== frozen.documentRef?.id || business.data.documentRef?.version !== frozen.documentRef?.version
+            || business.data.job?.id !== (frozen.jobId ?? undefined) || business.data.candidate?.id !== frozen.candidateRef?.id
+            || business.data.candidate?.sequence !== frozen.candidateRef?.sequence
+            || content.allowedDocumentIds.length !== (frozen.documentRef ? 1 : 0)
+            || content.allowedArtifactIds.length !== (frozen.documentRef ? 1 : 0))
+            return fail(appError('storage_corrupt', 'storage', 'Frozen Workspace projection is inconsistent.'));
+          if (typeof verify !== 'function') return fail(appError('workspace_unavailable', 'storage', 'Workspace verifier is unavailable.', true));
+          const documents = createDocumentRepository(db);
+          if (frozen.documentRef !== null) {
+            const document = documents.get(frozen.documentRef.id);
+            if (!document.ok) return document;
+            if (document.data.status !== 'available' || document.data.isHidden)
+              return fail(appError('input_unavailable', 'input', 'Frozen input material is unavailable.', true));
+            if (document.data.documentRef.version !== frozen.documentRef.version
+              || !content.allowedDocumentIds.includes(frozen.documentRef.id)
+              || !content.allowedArtifactIds.includes(document.data.parsedArtifactId))
+              return fail(appError('state_conflict', 'input', 'Frozen input material references changed.'));
           }
-        }
-        if (frozen.candidateRef !== null && frozen.jobId === null) return fail(appError('storage_corrupt', 'storage', 'Frozen candidate has no task.'));
-        const verified = verify({ documentRef: frozen.documentRef, jobId: frozen.jobId, candidateRef: frozen.candidateRef,
-          candidate, selection: frozen.selection });
-        return verified.ok ? requireValidWorkspace(verified.data) : verified;
-      } catch (error) { return workspaceReadFailure<void>(error); }
+          for (const id of content.allowedArtifactIds) {
+            const artifact = documents.getArtifact(id);
+            if (!artifact.ok) return artifact;
+          }
+          let candidate: WorkspaceInput['candidate'] = null;
+          if (frozen.jobId !== null) {
+            const job = readJob(db, frozen.jobId);
+            const visibility = db.query('SELECT hidden_at FROM jobs WHERE id=?').get(frozen.jobId) as { hidden_at: string | null } | null;
+            if (!job || job.documentRef.id !== frozen.documentRef?.id || job.documentRef.version !== frozen.documentRef.version
+              || visibility?.hidden_at !== null)
+              return fail(appError('state_conflict', 'input', 'Frozen input task references changed.'));
+            if (job.status === 'completed') return fail(appError('job_completed', 'input', 'The input task has already completed.'));
+            if (frozen.candidateRef !== null) {
+              const row = queryCandidateRow(db, frozen.candidateRef.id, frozen.jobId);
+              if (!row || candidateSnapshot(db, row).snapshot.sequence !== frozen.candidateRef.sequence)
+                return fail(appError('state_conflict', 'input', 'Frozen input candidate references changed.'));
+              candidate = workspaceCandidate(db, frozen);
+            }
+          }
+          if (frozen.candidateRef !== null && frozen.jobId === null) return fail(appError('storage_corrupt', 'storage', 'Frozen candidate has no task.'));
+          const verified = verify({ documentRef: frozen.documentRef, jobId: frozen.jobId, candidateRef: frozen.candidateRef,
+            candidate, selection: frozen.selection });
+          return verified.ok ? requireValidWorkspace(verified.data) : verified;
+        };
+        for (const input of inputs) { const checked = verifyOne(input); if (!checked.ok) return checked; }
+        return ok(undefined);
+      }); } catch (error) { return workspaceReadFailure<void>(error); }
     },
 
     start(runId, config, startedAt) {
       try {
-        const owner = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
-        if (!owner) return fail(appError('run_state_invalid', 'runtime', 'Run does not exist.', false, runId));
-        const checked = validatedConfig(config, owner.kind);
-        verifyInputCommandOwner(db, owner, checked, true);
-        if (owner.kind === 'agent' && Object.hasOwn(checked, 'extensions') && !Object.hasOwn(checked, 'extensionAssembly')) throw new Error('missing_extension_assembly');
         const saved = writeTransaction(() => {
+          const owner = db.query<RunRow, [number]>('SELECT * FROM runs WHERE id=?').get(runId);
+          if (!owner) return fail(appError('run_state_invalid', 'runtime', 'Run does not exist.', false, runId));
+          const runtimeKind = runRuntimeKind(db, owner), checked = validatedConfig(config, owner.kind, runtimeKind);
+          if (runtimeKind === 'durable' && owner.kind === 'subagent') {
+            const frozen = DurableSubagentConfigSnapshotSchema.parse(checked), scope = DurableSubagentRunScopeSchema.parse(readJson(owner.scope_json ?? 'null', 'scope'));
+            const original = durableSubagentOwner(db, owner, frozen, scope); verifyDurableSubagentParent(db, original);
+            const session = db.query<{ durable_conversation_id: number | null }, [number | null]>('SELECT durable_conversation_id FROM sessions WHERE id=?').get(owner.session_id);
+            if (!isDeepStrictEqual(frozen, readJson(owner.config_json, 'config')) || !z.string().datetime().safeParse(startedAt).success
+              || owner.cancel_requested_at !== null || !session?.durable_conversation_id || !durableSessionAllowsRun(db, Number(owner.session_id)))
+              return fail(appError('state_conflict', 'runtime', 'The original Durable child admission is no longer startable.', false, runId));
+          } else if (runtimeKind === 'durable') {
+            const frozen = DurableRunConfigSnapshotSchema.parse(checked);
+            const scope = DurableRunScopeSchema.parse(readJson(owner.scope_json ?? 'null', 'scope'));
+            const binding = durableRunOwner(db, owner, frozen, scope);
+            if (!isDeepStrictEqual(frozen, readJson(owner.config_json, 'config')) || !z.string().datetime().safeParse(startedAt).success
+              || owner.cancel_requested_at !== null || binding.owner.status !== 'open' || binding.owner.current_attempt_id !== binding.attempt.id
+              || binding.attempt.stop_requested_at !== null || binding.attempt.stopped_at !== null || !durableSessionAllowsRun(db, binding.owner.session_id))
+              return fail(appError('state_conflict', 'runtime', 'The original Durable Run admission is no longer startable.', false, runId));
+          } else {
+            verifyInputCommandOwner(db, owner, checked, true);
+            if (owner.kind === 'agent' && Object.hasOwn(checked, 'extensions') && !Object.hasOwn(checked, 'extensionAssembly')) throw new Error('missing_extension_assembly');
+          }
           const changed = db
             .query("UPDATE runs SET status='running', config_json=?, started_at=? WHERE id=? AND status='created'")
             .run(asJson(config), startedAt, runId).changes;
@@ -3713,6 +4238,32 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
     finish(runId, terminal) {
       const result = writeTransaction(() => {
         const current = db.query('SELECT * FROM runs WHERE id=?').get(runId) as RunRow | null;
+        const runtimeKind = current ? runRuntimeKind(db, current) : 'agent_session';
+        if (current && runtimeKind === 'durable') {
+          if (terminal.nativeHistoryUnusable !== undefined || terminal.inputResults !== undefined || terminal.confirmedUnconsumedInputIds !== undefined)
+            throw new MemoryCommitFault(appError('input_invalid', 'input', 'Durable Run terminal facts cannot contain Pi history or input acknowledgements.'));
+          if (current.kind === 'subagent') {
+            const config = DurableSubagentConfigSnapshotSchema.parse(readJson(current.config_json, 'config'));
+            const scope = DurableSubagentRunScopeSchema.parse(readJson(current.scope_json ?? 'null', 'scope'));
+            durableSubagentOwner(db, current, config, scope);
+            if (terminal.output !== null) {
+              const output = DurableSubagentRunOutputSchema.parse(terminal.output);
+              if (output.durable.workId !== scope.workId || output.durable.attemptId !== scope.attemptId || !isDeepStrictEqual(output.subagent, config.subagent))
+                throw new MemoryCommitFault(appError('state_conflict', 'input', 'The terminal output belongs to another Durable child.'));
+            }
+          } else {
+            const config = DurableRunConfigSnapshotSchema.parse(readJson(current.config_json, 'config'));
+            const scope = DurableRunScopeSchema.parse(readJson(current.scope_json ?? 'null', 'scope'));
+            durableRunOwner(db, current, config, scope);
+            if (terminal.output !== null) {
+              const output = DurableRunOutputSchema.parse(terminal.output);
+              if (output.durable.workId !== scope.workId || output.durable.attemptId !== scope.attemptId)
+                throw new MemoryCommitFault(appError('state_conflict', 'input', 'The terminal output belongs to another Durable attempt.'));
+            }
+          }
+          validatedUsage(terminal.usage); validatedCleanup(terminal.cleanup);
+          if (terminal.error !== null) validAppError(terminal.error, 'durable_error', false);
+        }
         if (terminal.nativeHistoryUnusable !== undefined && typeof terminal.nativeHistoryUnusable !== 'boolean'
           || terminal.nativeHistoryUnusable === true && current?.kind === 'provider') throw new Error('invalid_native_history_terminal');
         if (current && ['completed', 'failed', 'cancelled'].includes(current.status)) {
@@ -3783,7 +4334,7 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
             .run(jobStatus, reason, terminal.endedAt, active.job_id).changes;
           if (jobChanged !== 1) throw new Error('job_terminal_state_invalid');
         }
-        if (changed === 1 && hasTable(db, 'session_inputs')) {
+        if (changed === 1 && runtimeKind === 'agent_session' && hasTable(db, 'session_inputs')) {
           for (const batch of terminal.inputResults ?? []) completeSessionInputs(db, runId, batch.inputIds, batch.resultEntryId, terminal.endedAt, events);
           finishSessionInputs(db, runId, terminal.status, terminal.error, terminal.endedAt, terminal.confirmedUnconsumedInputIds, events);
         }
@@ -3871,12 +4422,15 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
         const error = asJson({ version: 1, ...appError('runtime_interrupted', 'runtime', '上一次进程退出，Run 未收口。') });
         const cleanup = asJson({ version: 1, stopped: false, stopReason: 'process-exit', errors: [], lateObservationRequired: true });
         const recovered = writeTransaction(() => {
-          const activeRuns = events ? db.query("SELECT id FROM runs WHERE status IN ('created','running') ORDER BY CASE WHEN kind='subagent' THEN 0 ELSE 1 END,id").all() as { id: number }[] : [];
+          const legacySessions = JSON.stringify(legacyRecoverySessionIds(db));
+          const activeRuns = events ? db.query("SELECT id FROM runs WHERE status IN ('created','running') AND (session_id IS NULL OR session_id IN (SELECT value FROM json_each(?))) ORDER BY CASE WHEN kind='subagent' THEN 0 ELSE 1 END,id").all(legacySessions) as { id: number }[] : [];
           const activeTools = events && hasTable(db, 'tool_calls')
-            ? db.query("SELECT id FROM tool_calls WHERE status IN ('requested','running') ORDER BY id").all() as { id: number }[] : [];
+            ? db.query("SELECT id FROM tool_calls WHERE status IN ('requested','running') AND session_id IN (SELECT value FROM json_each(?)) ORDER BY id").all(legacySessions) as { id: number }[] : [];
           if (hasTable(db, 'session_native_history')) {
             const affected = db.query(`SELECT DISTINCT session_id FROM runs WHERE kind IN ('agent','subagent') AND status IN ('created','running')
-              UNION SELECT DISTINCT session_id FROM tool_calls WHERE status IN ('requested','running')`).all() as { session_id: number }[];
+                AND session_id IN (SELECT value FROM json_each(?))
+              UNION SELECT DISTINCT session_id FROM tool_calls WHERE status IN ('requested','running')
+                AND session_id IN (SELECT value FROM json_each(?))`).all(legacySessions, legacySessions) as { session_id: number }[];
             for (const row of affected) markUnusableInTransaction(db, row.session_id);
           }
           if (hasTable(db, 'tool_calls')) db.query(`UPDATE tool_calls SET status='failed',
@@ -3896,14 +4450,14 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
                   WHERE json_extract(process.value,'$.stopped')=0) THEN NULL
                 WHEN json_extract(cleanup_json,'$.stopped')=1 AND stopped_at IS NOT NULL THEN stopped_at
                 ELSE NULL END
-            WHERE status IN ('requested','running')`).run(endedAt);
+            WHERE status IN ('requested','running') AND session_id IN (SELECT value FROM json_each(?))`).run(endedAt, legacySessions);
           for (const call of activeTools) appendToolState(db, events, call.id, 'tool_failed', 'recovery');
           // A stopped tool with an unreadable required result makes only its own
           // persisted conversation unsafe to resume. Diagnostic delivery failures
           // are still readable records and do not disable unrelated Sessions.
           if (hasTable(db, 'tool_calls') && hasTable(db, 'session_native_history')) {
-            const calls = db.query("SELECT * FROM tool_calls WHERE status IN ('succeeded','failed','cancelled')")
-              .all() as Array<{ session_id: number; status: string; result_json: string | null }>;
+            const calls = db.query("SELECT * FROM tool_calls WHERE status IN ('succeeded','failed','cancelled') AND session_id IN (SELECT value FROM json_each(?))")
+              .all(legacySessions) as Array<{ session_id: number; status: string; result_json: string | null }>;
             for (const call of calls) {
               try {
                 const envelope = readToolEnvelope(call.result_json);
@@ -3917,11 +4471,12 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           if (hasTable(db, 'jobs')) db.query(`UPDATE jobs SET status='failed',status_reason='runtime_interrupted',updated_at=?
             WHERE status!='completed' AND id IN (
               SELECT job_id FROM runs WHERE kind='agent' AND status IN ('created','running') AND job_id IS NOT NULL
-            )`).run(endedAt);
-          const children = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE kind='subagent' AND status IN ('created','running')")
-            .run(error, cleanup, endedAt).changes;
-          const roots = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE kind!='subagent' AND status IN ('created','running')")
-            .run(error, cleanup, endedAt).changes;
+                AND session_id IN (SELECT value FROM json_each(?))
+            )`).run(endedAt, legacySessions);
+          const children = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE kind='subagent' AND status IN ('created','running') AND session_id IN (SELECT value FROM json_each(?))")
+            .run(error, cleanup, endedAt, legacySessions).changes;
+          const roots = db.query("UPDATE runs SET status='failed',error_json=?,cleanup_json=?,ended_at=? WHERE kind!='subagent' AND status IN ('created','running') AND (session_id IS NULL OR session_id IN (SELECT value FROM json_each(?)))")
+            .run(error, cleanup, endedAt, legacySessions).changes;
           const changed = children + roots;
           for (const run of activeRuns) appendRunState(db, events, run.id, 'run_failed', 'recovery');
           if (hasTable(db, 'session_inputs')) recoverSessionInputs(db, endedAt,
@@ -3988,7 +4543,8 @@ export function inspectRuntimeRecovery(db: Database): AppError | null {
   const blocked = (message: string) => appError('runtime_recovery_blocked', 'runtime', message, true,
     currentRunId, currentSessionId, currentToolCallId);
   try {
-    const runs = db.query('SELECT id,session_id,cleanup_json FROM runs ORDER BY id').all() as Array<{
+    const legacySessions = JSON.stringify(legacyRecoverySessionIds(db));
+    const runs = db.query('SELECT id,session_id,cleanup_json FROM runs WHERE session_id IS NULL OR session_id IN (SELECT value FROM json_each(?)) ORDER BY id').all(legacySessions) as Array<{
       id: number; session_id: number | null; cleanup_json: string;
     }>;
     for (const run of runs) {
@@ -3998,7 +4554,7 @@ export function inspectRuntimeRecovery(db: Database): AppError | null {
       if (!saved.stopped || saved.lateObservationRequired) return blocked(
         '原 Run 的实际停止或必要观察尚未确认；可查看原记录，取得实际停止及必要保存证据前不开放新执行。');
     }
-    const calls = db.query('SELECT run_id,session_id,native_tool_call_id,cleanup_json FROM tool_calls ORDER BY id').all() as Array<{
+    const calls = db.query('SELECT run_id,session_id,native_tool_call_id,cleanup_json FROM tool_calls WHERE session_id IN (SELECT value FROM json_each(?)) ORDER BY id').all(legacySessions) as Array<{
       run_id: number; session_id: number; native_tool_call_id: string; cleanup_json: string;
     }>;
     for (const call of calls) {

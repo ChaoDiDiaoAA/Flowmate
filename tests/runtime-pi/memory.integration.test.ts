@@ -1,12 +1,12 @@
 import { Database } from 'bun:sqlite';
 import { createApplication } from '../../apps/composition.ts';
-import { openDatabase } from '@flowmate/core';
+import { openTestDatabase as openDatabase, testDatabase, type TestDbHandle } from '../support/database.ts';
+import * as bootstrap from '../../packages/core/src/storage/bootstrap.ts';
 import { CandidateDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
 import type { Application, ProviderConfig, Result, SessionInputRequest, AgentRunEvent } from '@flowmate/contracts';
-import { RuntimeService } from '../../packages/core/src/runtime/service.ts';
 import { deferCleanup, waitFor } from '../support/resources.ts';
 import { z } from 'zod';
-import { expect, it } from 'bun:test';
+import { expect, it, spyOn } from 'bun:test';
 import { SessionManager, sessionEntryToContextMessages } from '@earendil-works/pi-coding-agent';
 import type { NativeSessionHistory, NativeHistoryRecoverySeed } from '@flowmate/contracts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
@@ -283,7 +283,7 @@ it('P9 T04 denies inherited tool IDs before actual request and executor effects'
     const assistantMessage = f.session().messages.find(m => m.role === 'assistant' && m.content.some(b => b.type === 'toolCall'))!;
     if (assistantMessage.role !== 'assistant') throw new Error('assistant required');
     const toolCall = assistantMessage.content.find(b => b.type === 'toolCall')!; if (toolCall.type !== 'toolCall') throw new Error('call required');
-    expect(await f.session().agent.beforeToolCall!({ assistantMessage, toolCall, args: {}, context: { messages: f.session().messages, systemPrompt: '', tools: [] } })).toMatchObject({ block: true });
+    expect(await f.session().agent.beforeToolCall!({ assistantMessage, toolCall, args: {}, context: { messages: f.session().messages } })).toMatchObject({ block: true });
     const outcome = await prepared.data.execute({ runId: 9, sessionId: 7, text: 'call probe', goal: 'test', messageTimestamp: 4, verifyModelUse: () => ok(undefined),
       toolBinding: { context: { runId: 9, sessionId: 7, scope: { version: 2, allowedTools: ['probe'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] } },
         observeRequest: () => { observed++; return ok(undefined); }, rejectRequest: () => { rejected++; return ok(undefined); }, recordDelivery: () => ok(undefined),
@@ -487,16 +487,17 @@ async function t09Fixture(ownedRoot?: string) {
   const config = (model = 'M1', retries: 0 | 1 = 0): ProviderConfig => ({ version: 1, name: 'T07', revision: 1,
     modelRef: { provider: 't07-loopback', model }, native: { authPath: join(root, 'unused.json'), modelsPath },
     parameters: { maxRetries: retries, maxRetryDelayMs: 100 } });
-  let ownedStore: any;
+  let ownedStore!: TestDbHandle;
   let app!: Application, adapter!: PiAgentAdapter, sdk!: AgentSession, ownedDb!: Database;
-  const runtimeState = RuntimeService.prototype.state;
-  RuntimeService.prototype.state = function (...args) {
-    ownedStore = (this as any).dependencies.contextService.options.store; ownedDb = ownedStore.db; return runtimeState.apply(this, args);
-  };
-  deferCleanup(() => { RuntimeService.prototype.state = runtimeState; });
   const sql = <T>(fn: (db: Database) => T): T => fn(ownedDb);
   const open = async () => {
-    app = need(await createApplication({ paths, invoiceSourceRoot: join(root, 'source'), logger: { write() {}, async close() {} }, agentFactory: tools => {
+    const original = bootstrap.bootstrapDatabase;
+    const opening = spyOn(bootstrap, 'bootstrapDatabase').mockImplementation(input => {
+      const value = original(input);
+      if (value.ok && input.databaseFile === paths.databaseFile) { ownedStore = testDatabase(value.data); ownedDb = value.data.db; }
+      return value;
+    });
+    try { app = need(await createApplication({ paths, invoiceSourceRoot: join(root, 'source'), logger: { write() {}, async close() {} }, agentFactory: tools => {
       adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-t07',
         fetch: (input, init) => { calls.base++; return globalThis.fetch(input, init); }, sessionSetup(session) {
@@ -520,7 +521,8 @@ async function t09Fixture(ownedRoot?: string) {
         failSave?.(value)
           ? fail(appError('storage_write_failed', 'storage', 'Controlled T09 native commit failure.')) : write(value));
       return adapter;
-    } }));
+    } })); } finally { opening.mockRestore(); }
+    if (!ownedStore || !ownedDb) throw Error('The formal T09 application connection was not captured.');
     await app.queryRuntimeState();
     const opened = app; deferCleanup(() => opened.close()); return app;
   };
@@ -714,9 +716,9 @@ it('P9 T09 first cold opener preserves the exact acknowledged native prefix afte
       expect(repaired.tools).toEqual(before.facts.tools); expect(repaired.candidates).toEqual(before.facts.candidates); expect(repaired.fk).toEqual([]);
       expect(repaired.jobs).toEqual(before.facts.jobs); expect(repaired.snapshots).toEqual(before.facts.snapshots);
       console.log('T09 first cold repair', JSON.stringify(repaired));
-    } finally { first.close(); }
+    } finally { await first.close(); }
     const second = need(openDatabase(acknowledged.paths));
-    try { expect(capture(second)).toEqual(repaired!); } finally { second.close(); }
+    try { expect(capture(second)).toEqual(repaired!); } finally { await second.close(); }
     // Actual Application ownership is a 15s stale lease; do not delete its lock.
     await waitFor(async () => {
       try { return Date.now() - statSync(acknowledged.paths.databaseFile + '.lock').mtimeMs > 15_000; }

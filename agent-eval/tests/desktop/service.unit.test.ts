@@ -92,6 +92,25 @@ test('a necessary Judge missing from the selected plan rejects before preparing 
   } finally { writeFileSync(manifestFile, stripped); }
 });
 
+test('a required native Judge starts without an HTTP key and reaches the runner as native configuration', async () => {
+  const before = readFileSync(manifestFile, 'utf8'), end = finished(); let judges = 0, trials = 0;
+  const native: EvaluationConfigurationSnapshot = { ...settings, judge: { provider: 'codex-cli', executable: 'codex',
+    model: 'gpt-6.1-terra', reasoningEffort: 'medium', timeoutMs: 180000 }, credentials: { agent: 'configured', judge: 'configured' } };
+  try {
+    writeFileSync(manifestFile, originalManifest);
+    const s = service({ onEvent: end.onEvent, prepareJudge: async config => {
+      judges++; expect(config).toMatchObject(native.judge!); expect(config).not.toHaveProperty('apiKey'); return config;
+    }, runLocal: async (_repo, _options, deps) => {
+      trials++; expect(deps?.preparedJudge).toMatchObject(native.judge!); return localResult();
+    } });
+    const preview = s.preview(selection, native); if (!preview.ok) throw Error('Native preview failed');
+    expect(preview.data.ready).toBe(true);
+    expect(s.start({ previewId: preview.data.previewId, requestId: 'native-start' }, { batchId: 'native-batch', settings: native, credentials }))
+      .toMatchObject({ ok: true });
+    await end.wait; expect(judges).toBe(1); expect(trials).toBe(1); await s.shutdown();
+  } finally { writeFileSync(manifestFile, before); }
+});
+
 test('a same-version requirement changed during asynchronous preparation starts no Trial', async () => {
   const file = join(fixtureDirectory, 'cases/test-lines.json'), before = readFileSync(file, 'utf8');
   const preparation = deferred<typeof prepared>(), entered = deferred<void>(), end = finished(); let trials = 0;

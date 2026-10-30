@@ -46,6 +46,11 @@ Thumbs.db
 /agent-eval/runs/
 /agent-eval/calibration-runs/
 /agent-eval/records/
+/agent-eval/traces/
+/agent-eval/experiments/
+/agent-eval/baselines/
+/agent-eval/baselines.json
+/agent-eval/feedback.json
 /agent-eval/configs/*.json
 /agent-eval/configs/*.jsonc
 !/agent-eval/configs/*.example.jsonc

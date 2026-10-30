@@ -1,7 +1,7 @@
 import { markUnusableInTransaction } from '../memory/persistence.ts';
 import { evidenceReadFailure, readTransaction } from '../storage/reads.ts';
 import { isDeepStrictEqual } from 'node:util';
-import type { Database } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import type { RuntimeEventStore } from '../events/store.ts';
 import { readInputContext, readContextSnapshotOwner, readRunContextOwner } from '../context/repository.ts';
 import type { ContextOwnerCache } from '../context/repository.ts';
@@ -196,8 +196,11 @@ export function createSessionInputLedger(db: Database, events?: RuntimeEventStor
       try { return readTransaction(db, () => { const row = byId(inputId); return ok(row ? snapshot(db, row) : null); }); }
       catch (error) { return readFailure(error); }
     },
-    forRun(runId: DbId): Result<SessionInputSnapshot[]> {
-      try { return readTransaction(db, () => ok(snapshots(db, db.query('SELECT * FROM session_inputs WHERE run_id=? ORDER BY id').all(runId) as InputRow[]))); }
+    forRun(runId: DbId, inputIds?: readonly DbId[]): Result<SessionInputSnapshot[]> {
+      try { return readTransaction(db, () => {
+        const rows = db.query('SELECT * FROM session_inputs WHERE run_id=? ORDER BY id').all(runId) as InputRow[];
+        return ok(snapshots(db, inputIds === undefined ? rows : rows.filter(row => inputIds.includes(row.id))));
+      }); }
       catch (error) { return readFailure(error); }
     },
     admit(raw: SessionInputRequest, admitInput: () => Result<SessionInputAdmission>, at: string, desktopRequestIdentity?: string): Result<{ input: SessionInputSnapshot; created: boolean }> {
@@ -400,11 +403,22 @@ export function finishSessionInputs(db: Database, runId: DbId, status: 'complete
     if (changed === 1) appendInputState(db, row.id, events, origin);
   }
 }
+export function legacyRecoverySessionIds(db: Database): DbId[] {
+  const columns = db.query<{ name: string }, []>('PRAGMA table_info(sessions)').all();
+  if (!columns.length) return [];
+  if (!columns.some(column => column.name === 'runtime_kind'))
+    return db.query<{ id: number }, []>('SELECT id FROM sessions').all().map(row => row.id);
+  const rows = db.query<{ id: number; runtime_kind: unknown }, []>('SELECT id,runtime_kind FROM sessions').all();
+  if (rows.some(row => row.runtime_kind !== 'agent_session' && row.runtime_kind !== 'durable')) throw Error('invalid_session_runtime');
+  return rows.filter(row => row.runtime_kind === 'agent_session').map(row => row.id);
+}
+
 /** Boot repair neither invents a result nor dispatches another input. */
 export function recoverSessionInputs(db: Database, at: string,
   qualify: (runId: DbId, inputIds: readonly DbId[], resultEntryId: string, completed?: boolean) => boolean = () => false,
   events?: RuntimeEventStore): void {
-  const completed = db.query("SELECT * FROM session_inputs WHERE processing_status='completed' AND json_extract(content_json,'$.version')=2").all() as InputRow[];
+  const legacySessions = JSON.stringify(legacyRecoverySessionIds(db));
+  const completed = db.query("SELECT * FROM session_inputs WHERE processing_status='completed' AND json_extract(content_json,'$.version')=2 AND session_id IN (SELECT value FROM json_each(?))").all(legacySessions) as InputRow[];
   const verified = new Set<string>();
   for (const input of completed) {
     const key = `${input.run_id}:${input.result_entry_id}`;
@@ -419,7 +433,8 @@ export function recoverSessionInputs(db: Database, at: string,
     } catch { markUnusableInTransaction(db, input.session_id); }
   }
   const rows = db.query(`SELECT DISTINCT run.id,run.session_id,run.status,run.error_json FROM session_inputs input JOIN runs run ON run.id=input.run_id
-    WHERE input.processing_status='pending' AND run.status IN ('completed','failed','cancelled')`).all() as {
+    WHERE input.processing_status='pending' AND run.status IN ('completed','failed','cancelled')
+      AND run.session_id IN (SELECT value FROM json_each(?))`).all(legacySessions) as {
       id: number; session_id: number; status: 'completed' | 'failed' | 'cancelled'; error_json: string | null }[];
   for (const row of rows) {
     if (row.status === 'completed') {

@@ -3,7 +3,7 @@ import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'bun:test';
 import { appError, fail, ok } from '@flowmate/contracts';
-import { createDocumentService } from '../../packages/data/src/documents.ts';
+import { createTestDocumentService } from '../support/documents.ts';
 import { readInvoiceEvidence } from '../../packages/employee-invoice/src/tools/read_invoice_evidence.ts';
 import { checkInvoiceSourcesResult } from '../../packages/employee-invoice/src/tools/check_invoice_sources.ts';
 import { listInvoicePages } from '../../packages/employee-invoice/src/tools/list_invoice_pages.ts';
@@ -11,7 +11,8 @@ import { readInvoiceDocument, projectInvoiceDocumentPage } from '../../packages/
 import { searchInvoiceDocument } from '../../packages/employee-invoice/src/tools/search_invoice_document.ts';
 import { listInvoiceTables } from '../../packages/employee-invoice/src/tools/list_invoice_tables.ts';
 import { parseVoxel51Sample } from '../../packages/data/src/parsed-document.ts';
-import { createFileStore, openDatabase } from '@flowmate/core';
+import { createFileStore } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
 import { deferCleanup, mkdtempSync } from '../support/resources.ts';
 
 function paths(root: string) {
@@ -55,9 +56,9 @@ function serviceFor(root: string, allowedSourceRoot = join(root, 'source')) {
   const opened = openDatabase(productPaths);
   if (!opened.ok) throw new Error('test_database_open_failed');
   deferCleanup(() => opened.data.close());
-  const files = createFileStore(productPaths, opened.data.documents);
-  const service = createDocumentService({ paths: productPaths, repository: opened.data.documents, files,
-    allowedSourceRoot, now: () => '2026-09-28T00:00:00.000Z' });
+  const files = createFileStore(productPaths, opened.data);
+  const service = createTestDocumentService({ paths: productPaths, files,
+    allowedSourceRoot, now: () => '2026-09-28T00:00:00.000Z' }, opened.data);
   return { opened: opened.data, files, service, productPaths };
 }
 
@@ -115,8 +116,8 @@ it('prepared text and three-page PDF register immutable public Documents with re
   if (!first.ok) throw new Error('Synthetic registration failed');
   expect(service.inspectForWorkspace(first.data.documentRef)).toMatchObject({ ok: true, data: { kind: 'valid', document: { pageCount: 3 } } });
   expect(service.readParsedForWorkspace(first.data.documentRef.id)).toMatchObject({ ok: true, data: { parsed: { pages: input.pages } } });
-  expect(service.readOriginalForWorkspace(first.data.documentRef.id, 1)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
-  expect(service.restoreDocument(first.data.documentRef.id)).toMatchObject({ ok: true, data: { status: 'available' } });
+  expect(await service.readOriginalForWorkspace(first.data.documentRef.id, 1)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+  expect(await service.restoreDocument(first.data.documentRef.id)).toMatchObject({ ok: true, data: { status: 'available' } });
   const changed = await register.call(service, { ...input, sourceText: sourceText.replace('3.00', '4.00'),
     pages: input.pages.map(page => ({ ...page, blocks: page.blocks.map(block => ({ ...block, text: block.text.replace('3.00', '4.00') })) })) });
   expect(changed).toMatchObject({ ok: true, data: { documentRef: { id: expect.any(Number) } } });
@@ -211,18 +212,19 @@ describe('P8 readonly Context parsed inspection', () => {
     const f = await fixture(), before = facts(f);
     for (const code of ['EACCES', 'EPERM', 'EBUSY', 'EIO']) {
       const error = appError('input_unavailable', 'input', code, true);
-      const service = createDocumentService({ paths: f.productPaths, allowedSourceRoot: f.root, repository: f.opened.documents,
-        files: { publish: input => f.files.publish(input), read: () => fail(error) }, now: () => '2026-10-03T00:00:00.000Z' });
+      const service = createTestDocumentService({ paths: f.productPaths, allowedSourceRoot: f.root,
+        files: { publish: f.files.publish.bind(f.files), read: () => fail(error) }, now: () => '2026-10-03T00:00:00.000Z' }, f.opened);
       expect(service.inspectParsedForContext(f.request)).toEqual({ ok: false, error });
     }
     expect(facts(f)).toEqual(before);
   });
   it('can inspect through read-only capabilities with all writer methods forbidden', async () => {
     const f = await fixture(), before = facts(f);
-    const service = createDocumentService({ paths: f.productPaths, allowedSourceRoot: f.root,
-      repository: { ...f.opened.documents, setAvailability: () => { throw new Error('inspection must not write'); } },
-      files: { read: (artifact, file) => f.files.read(artifact, file), publish: async () => { throw new Error('inspection must not publish'); } },
-      now: () => { throw new Error('inspection must not request a write time'); } });
+    const service = createTestDocumentService({ paths: f.productPaths, allowedSourceRoot: f.root,
+      inspection: { repository: { ...f.opened.documents, setAvailability: () => { throw new Error('inspection must not write'); } },
+        files: { read: (artifact, file) => f.files.read(artifact, file, f.opened.contents) } },
+      files: { read: f.files.read.bind(f.files), publish: async () => { throw new Error('inspection must not publish'); } },
+      now: () => { throw new Error('inspection must not request a write time'); } }, f.opened);
     expect(service.inspectParsedForContext(f.request).ok).toBe(true);
     expect(facts(f)).toEqual(before);
   });
@@ -248,7 +250,7 @@ describe('P3 controlled document input', () => {
     expect(artifact.ok).toBe(true);
     if (!artifact.ok) return;
     for (const name of ['parsed.json', 'source.json']) {
-      const bytes = files.read(artifact.data, name);
+      const bytes = files.read(artifact.data, name, opened.contents);
       expect(bytes.ok).toBe(true);
       if (bytes.ok) expect(JSON.parse(Buffer.from(bytes.data).toString('utf8'))).not.toHaveProperty('parserKey');
     }
@@ -319,26 +321,26 @@ describe('P3 controlled document input', () => {
         expect(opened.documents.setAvailability({ documentId, status: 'unavailable', reason: 'fixture',
           at: '2026-09-28T00:01:00.000Z' }).ok).toBe(true);
       }
-      const result = access === 'run' ? service.readParsedForRun(documentId, context)
+      const result = await (access === 'run' ? service.readParsedForRun(documentId, context)
         : access === 'workspace' ? service.readParsedForWorkspace(documentId)
         : access === 'restore' ? service.restoreDocument(documentId)
-        : checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents);
+        : checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents));
       expect(result).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
       expect(opened.documents.get(documentId)).toMatchObject({ ok: true,
         data: { documentRef: document.documentRef, status: 'unavailable', unavailableReason: 'parsed_artifact_missing_or_corrupt' } });
-      expect(checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents))
+      expect(await checkInvoiceSourcesResult({ documentId, sources: [changedSource] }, context, service, opened.documents))
         .toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
-      expect(service.restoreDocument(documentId)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+      expect(await service.restoreDocument(documentId)).toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
 
       writeFileSync(managedPath, saved);
       for (const name of ['original.png', 'content.json', 'pages.json', 'metadata.json']) unlinkSync(join(sourceDirectory, name));
-      expect(service.restoreDocument(documentId)).toMatchObject({ ok: true,
+      expect(await service.restoreDocument(documentId)).toMatchObject({ ok: true,
         data: { documentRef: document.documentRef, status: 'available' } });
       const restoredRead = service.readParsedForWorkspace(documentId);
       expect(restoredRead.ok).toBe(true);
       if (restoredRead.ok) expect(restoredRead.data.parsed.pages[0]?.blocks[0])
         .toMatchObject({ id: 'b1', text: 'Header text' });
-      expect(checkInvoiceSourcesResult({ documentId, sources: [{ ...changedSource, quote: 'Header text' }] }, context, service, opened.documents))
+      expect(await checkInvoiceSourcesResult({ documentId, sources: [{ ...changedSource, quote: 'Header text' }] }, context, service, opened.documents))
         .toMatchObject({ ok: true, data: { results: [{ status: 'valid', code: 'parsed_quote_matched' }] } });
     });
   }
@@ -355,15 +357,15 @@ describe('P3 controlled document input', () => {
       const read = files.read.bind(files);
       let matchedReads = 0;
       const temporaryFailure = fail(appError('input_unavailable', 'input', 'Temporarily unreadable.', true));
-      files.read = (artifact, name) => name === fileName && ++matchedReads === attempt
-        ? temporaryFailure : read(artifact, name);
-      const restored = service.restoreDocument(imported.data.documentRef.id);
+      files.read = (artifact, name, contents) => name === fileName && ++matchedReads === attempt
+        ? temporaryFailure : read(artifact, name, contents);
+      const restored = await service.restoreDocument(imported.data.documentRef.id);
       expect(matchedReads).toBe(attempt);
       expect(restored).toEqual(temporaryFailure);
       expect(opened.documents.get(imported.data.documentRef.id)).toMatchObject({ ok: true,
         data: { status: 'available', unavailableReason: null } });
       files.read = read;
-      expect(service.restoreDocument(imported.data.documentRef.id)).toMatchObject({ ok: true,
+      expect(await service.restoreDocument(imported.data.documentRef.id)).toMatchObject({ ok: true,
         data: { status: 'available', unavailableReason: null } });
     });
   }
@@ -402,7 +404,7 @@ describe('P3 controlled document input', () => {
     if (workspaceRead.ok) expect(workspaceRead.data.parsed).not.toHaveProperty('parser');
     expect(opened.documents.setAvailability({ documentId: document.documentRef.id, status: 'unavailable',
       reason: 'fixture', at }).ok).toBe(true);
-    expect(service.restoreDocument(document.documentRef.id)).toMatchObject({ ok: true,
+    expect(await service.restoreDocument(document.documentRef.id)).toMatchObject({ ok: true,
       data: { documentRef: document.documentRef, status: 'available' } });
   });
 
@@ -531,9 +533,9 @@ describe('P3 controlled document input', () => {
     if (!workspaceParsed.ok) return;
     expect(projectInvoiceDocumentPage({ documentId: imported.data.documentRef.id, page: 1, afterBlockId: null, limit: 1 }, workspaceParsed.data))
       .toMatchObject({ ok: true, data: { documentRef: imported.data.documentRef, blocks: [{ id: 'b1' }] } });
-    const workspaceOriginal = service.readOriginalForWorkspace(imported.data.documentRef.id, 1);
+    const workspaceOriginal = await service.readOriginalForWorkspace(imported.data.documentRef.id, 1);
     expect(workspaceOriginal).toMatchObject({ ok: true, data: { mimeType: 'image/png', bytes: onePixelPng } });
-    expect(service.readOriginalForWorkspace(imported.data.documentRef.id, 2)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(await service.readOriginalForWorkspace(imported.data.documentRef.id, 2)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
     expect(await readPage.execute({ documentId: imported.data.documentRef.id, page: 1, afterBlockId: 'b1', limit: 1 }, call, context))
       .toMatchObject({ blocks: [{ id: 'b2', kind: 'table' }], nextAfterBlockId: 'b2' });
     expect(await readPage.execute({ documentId: imported.data.documentRef.id, page: 1, afterBlockId: 'b2', limit: 10 }, call, context))
@@ -556,7 +558,7 @@ describe('P3 controlled document input', () => {
     expect(parsedEvidence).toMatchObject({ kind: 'parsed', text: expect.stringContaining('20.00') });
     const validSource = { ...parsedEvidence.source, quote: '20.00' };
     const falseSource = { ...validSource, quote: 'not on this page' };
-    expect(checkInvoiceSourcesResult({ documentId: imported.data.documentRef.id, sources: [validSource, falseSource] }, execution, service, opened.documents))
+    expect(await checkInvoiceSourcesResult({ documentId: imported.data.documentRef.id, sources: [validSource, falseSource] }, execution, service, opened.documents))
       .toMatchObject({ ok: true, data: { results: [
         { index: 0, status: 'valid', code: 'parsed_quote_matched' },
         { index: 1, status: 'invalid', code: 'quote_mismatch' },
@@ -566,13 +568,13 @@ describe('P3 controlled document input', () => {
     await expect(evidence.execute({ documentId: imported.data.documentRef.id, page: 1, kind: 'original', blockId: null } as never,
       { nativeToolCallId: execution.nativeToolCallId, signal: execution.signal }, execution))
       .rejects.toMatchObject({ code: 'tool_invalid_input' });
-    expect(checkInvoiceSourcesResult({ documentId: imported.data.documentRef.id, sources: [originalSource] }, execution, service, opened.documents))
+    expect(await checkInvoiceSourcesResult({ documentId: imported.data.documentRef.id, sources: [originalSource] }, execution, service, opened.documents))
       .toMatchObject({ ok: false, error: { code: 'tool_access_denied' } });
     const parsedArtifact = opened.documents.getArtifact(imported.data.parsedArtifactId);
     expect(parsedArtifact.ok).toBe(true);
     if (!parsedArtifact.ok) return;
-    expect(files.read(parsedArtifact.data, 'source.json').ok).toBe(true);
-    expect(files.read(parsedArtifact.data, 'raw-content.json').ok).toBe(true);
+    expect(files.read(parsedArtifact.data, 'source.json', opened.contents).ok).toBe(true);
+    expect(files.read(parsedArtifact.data, 'raw-content.json', opened.contents).ok).toBe(true);
     expect(opened.db.query('SELECT COUNT(*) AS count FROM artifacts').get()).toEqual({ count: 2 });
     expect(opened.db.query('SELECT COUNT(*) AS count FROM business_events WHERE type=\'document_imported\'').get()).toEqual({ count: 1 });
     expect(await service.importVoxel51({ sourceDirectory })).toMatchObject({ ok: true, data: { documentRef: { id: imported.data.documentRef.id } } });
@@ -636,7 +638,7 @@ describe('P3 controlled document input', () => {
     await expect(tool.execute({ documentId: imported.data.documentRef.id }, call, context)).rejects.toMatchObject({ code: 'input_unavailable' });
     expect(opened.documents.get(imported.data.documentRef.id)).toMatchObject({ ok: true, data: { status: 'unavailable' } });
     copyFileSync(backupPath, parsedPath);
-    expect(service.restoreDocument(imported.data.documentRef.id)).toMatchObject({ ok: true, data: { status: 'available' } });
+    expect(await service.restoreDocument(imported.data.documentRef.id)).toMatchObject({ ok: true, data: { status: 'available' } });
     expect(await tool.execute({ documentId: imported.data.documentRef.id }, call, context)).toMatchObject({ pageCount: 1 });
   });
 
@@ -657,7 +659,7 @@ describe('P3 controlled document input', () => {
     renameSync(productPaths.artifactsDir, backup);
     symlinkSync(foreign, productPaths.artifactsDir, 'junction');
     try {
-      expect(files.read(original.data, 'original.png'))
+      expect(files.read(original.data, 'original.png', opened.contents))
         .toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
     } finally {
       unlinkSync(productPaths.artifactsDir);
@@ -694,7 +696,7 @@ describe('P3 controlled document input', () => {
       .rejects.toMatchObject({ code: 'tool_invalid_input' });
     const artifact = opened.documents.getArtifact(imported.data.originalArtifactId);
     expect(artifact.ok).toBe(true);
-    if (artifact.ok) expect(files.read(artifact.data, 'original.png')).toMatchObject({ ok: true });
+    if (artifact.ok) expect(files.read(artifact.data, 'original.png', opened.contents)).toMatchObject({ ok: true });
   });
 });
 
@@ -712,14 +714,14 @@ describe('P7 Workspace material inspection', () => {
     if (!artifact.ok) return;
     const inaccessibleRoot = join(root, 'not-mounted');
     const absentRoot = createFileStore({ ...productPaths, root: inaccessibleRoot,
-      artifactsDir: join(inaccessibleRoot, 'artifacts') }, opened.documents);
-    expect(absentRoot.read(artifact.data)).toMatchObject({ ok: false,
+      artifactsDir: join(inaccessibleRoot, 'artifacts') }, opened);
+    expect(absentRoot.read(artifact.data, undefined, opened.contents)).toMatchObject({ ok: false,
       error: { code: 'input_unavailable', retryable: true } });
-    const absentArtifactRoot = createFileStore({ ...productPaths, artifactsDir: join(productPaths.root, 'not-mounted') }, opened.documents);
-    expect(absentArtifactRoot.read(artifact.data)).toMatchObject({ ok: false,
+    const absentArtifactRoot = createFileStore({ ...productPaths, artifactsDir: join(productPaths.root, 'not-mounted') }, opened);
+    expect(absentArtifactRoot.read(artifact.data, undefined, opened.contents)).toMatchObject({ ok: false,
       error: { code: 'input_unavailable', retryable: true } });
     unlinkSync(join(productPaths.artifactsDir, String(artifact.data.artifactId), 'parsed.json'));
-    expect(files.read(artifact.data)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+    expect(files.read(artifact.data, undefined, opened.contents)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
   });
 
   it('returns real page and block identities without changing unavailable material or workspace facts', async () => {
@@ -796,9 +798,9 @@ describe('P7 Workspace material inspection', () => {
     const before = opened.db.query('SELECT * FROM documents').all();
     for (const code of ['EACCES', 'EPERM', 'EBUSY', 'EIO']) {
       const error = appError('input_unavailable', 'input', code, true);
-      const unavailable = createDocumentService({ paths: productPaths, repository: opened.documents,
-        files: { publish: input => files.publish(input), read: () => fail(error) },
-        allowedSourceRoot: join(root, 'source'), now: () => '2026-10-03T00:00:00.000Z' });
+      const unavailable = createTestDocumentService({ paths: productPaths,
+        files: { publish: files.publish.bind(files), read: () => fail(error) },
+        allowedSourceRoot: join(root, 'source'), now: () => '2026-10-03T00:00:00.000Z' }, opened);
       expect(typeof unavailable.inspectForWorkspace).toBe('function');
       expect(unavailable.inspectForWorkspace(imported.data.documentRef)).toEqual({ ok: false, error });
     }

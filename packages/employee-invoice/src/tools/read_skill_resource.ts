@@ -2,7 +2,7 @@ import { appError, ReadSkillResourceInputSchema, ReadSkillResourceOutputSchema }
 import type { ReadSkillResourceInput, ReadSkillResourceOutput, ProductToolContext, Result, ToolDefinition } from '@flowmate/contracts';
 import { unwrap } from './definition.ts';
 
-export const readSkillResource = (read: (input: ReadSkillResourceInput, context: ProductToolContext) => Result<ReadSkillResourceOutput>) => ({
+export const readSkillResource = (read: (input: ReadSkillResourceInput, context: ProductToolContext) => Result<ReadSkillResourceOutput> | Promise<Result<ReadSkillResourceOutput>>) => ({
   name: 'read_skill_resource', version: '1', label: 'Read Skill resource',
   description: 'Read SKILL.md or a listed relative file from this Run\'s fixed Skill. Uses UTF-8 byte offset/limit; continue at nextOffset when present. Reading scripts never executes them.',
   inputSchema: ReadSkillResourceInputSchema, outputSchema: ReadSkillResourceOutputSchema,
@@ -10,6 +10,6 @@ export const readSkillResource = (read: (input: ReadSkillResourceInput, context:
   execute: async (input, call, context) => {
     if (call.signal.aborted) throw appError('tool_cancelled', 'runtime', 'Skill reading was cancelled.', true,
       context.runId, context.sessionId, call.nativeToolCallId);
-    return unwrap(read(input, context));
+    return unwrap(await read(input, context));
   },
 } satisfies ToolDefinition<ReadSkillResourceInput, ReadSkillResourceOutput>);

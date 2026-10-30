@@ -79,7 +79,7 @@ describe('Pi SDK contract probe', () => {
     expect(probe.error).toBeUndefined();
     expect(probe.model).toMatchObject({
       provider: 'deepseek',
-      id: 'deepseek-v4-flash',
+      id: 'deepseek-flash',
     });
     expect(probe.missingModel).toBeUndefined();
     expect(probe.networkEnabled).toBe(false);

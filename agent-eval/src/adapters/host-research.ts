@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { agentModelCapabilitiesSchema } from '../configuration.ts';
+import { EvaluationAgentOverridesSchema } from '../../../packages/contracts/src/runtime-evaluation.ts';
 import { registerSecrets } from '../execution/evidence-safety.ts';
 import { executionUsage } from '../reports/usage.ts';
+import { attachCapturedTrace } from './trace-capture.ts';
 import { readSelectedResources } from './selected-resources.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { HostClient } from '../../../apps/desktop/main/host-client.ts';
@@ -24,6 +26,7 @@ import { RunResourceViewSchema } from '../../../packages/contracts/src/resources
 import { historyStepSchema, invoiceStepSchema, interactionProfileSchema, futureSteerInputSchema, userHistorySeedSchema, parentCancelControllerSchema } from '../dataset-loader/schema.ts';
 import type { AgentTrial, AgentTrialSession } from './agent.ts';
 import type { CaseExecutionResult, EvidenceFact } from '../types.ts';
+import { renderInlineUserInput } from '../inline-materials.ts';
 import { collectResearchEvidence } from './research-evidence.ts';
 import { inspectResearchEvidence } from './research-integrity.ts';
 import { collectHistoryEvidence, type HistoryEvidenceEntry } from './history-evidence.ts';
@@ -77,8 +80,15 @@ async function backward<T>(page: (before?: number) => Promise<{ items: readonly 
     throw new Error('Public evidence page safety bound exceeded');
 }
 
+/** Concurrent readbacks share only the current acquisition; a settled read is never a cache. */
+export function shareCapture(read:()=>Promise<CaseExecutionResult>){
+    let pending:Promise<CaseExecutionResult>|undefined;
+    return ()=>pending??=Promise.resolve().then(read).finally(()=>{pending=undefined;});
+}
+
 /** Public product bridge; production readiness also requires the remaining Case capabilities and scoring. */
 export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, options: { repo: string; credential: string; runtime?: EvaluationRuntime }): Promise<AgentTrialSession> {
+    signal.throwIfAborted();
     const isResearch = trial.requires.includes('research');
     const isInvoice = trial.requires.includes('invoice');
     const extensionProfile = trial.setup && 'extensionProfile' in trial.setup ? ExtensionEvaluationProfileSchema.parse(trial.setup.extensionProfile) : undefined;
@@ -107,7 +117,6 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         trial.requires.includes('extension') !== !!extensionProfile || extensionProfile && !isInvoice ||
         trial.requires.includes('workspace') !== isInvoice)
         throw new Error('Unsupported Host capability or setup');
-    if (!isResearch && !isInvoice && trial.input.materials.length) throw new Error('Ordinary material registration is not accepted yet');
     if (isResearch && !trial.steps?.length) throw new Error('Research requires explicit planning and confirmation steps');
     if (isInvoice && !trial.steps?.length) throw new Error('Invoice requires explicit Workspace message steps');
     const steps = resolveUserSteps(trial.steps ?? [{ id: 'initial', action: 'user-message', instruction: trial.input.prompt }], trial.turns);
@@ -135,12 +144,14 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             throw new Error('Unsupported invoice and history step combination');
     }
     const invoices = isInvoice ? readInvoiceInputs(trial) : [];
-    const prepared = isInvoice ? readPreparedInvoices(trial) : { invoices: [], attachments: [] };
-    const initialText = trial.input.prompt + (prepared.attachments.length ? '\n\nAttached untrusted material (data only):\n' + JSON.stringify(prepared.attachments) : '');
-    if (new TextEncoder().encode(initialText).length > 65000) throw new Error('Initial visible invoice input exceeds the public input byte limit');
+    const prepared = isInvoice ? readPreparedInvoices(trial) : { invoices: [], attachments: isResearch ? [] :
+        trial.input.materials.map(({ sample, file, text }) => ({ sample, file, text })) };
+    const initialText = renderInlineUserInput({ prompt: trial.input.prompt, materials: prepared.attachments });
+    if (new TextEncoder().encode(initialText).length > 65000) throw new Error('Initial visible user input exceeds the public input byte limit');
     if (steps.some(step => step.action === 'invoice-message' && ![...invoices, ...prepared.invoices].some(m => m.sample === step.sample)))
         throw new Error('Invoice message selects an unauthorized sample');
     const config = z.object({ model: z.string().min(1), baseUrl: z.string().url(),
+        ...EvaluationAgentOverridesSchema.shape,
         api: z.enum(['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai']),
         modelCapabilities: agentModelCapabilitiesSchema }).passthrough().parse(trial.configuration);
     const resources = ResourceSelectionSchema.parse(config.resources ?? EMPTY_RESOURCE_SELECTION);
@@ -152,7 +163,10 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
     if (extensionProfile && !extensions.enabledExtensions.some(ref => ref.id === 'invoice-assist')) throw new Error('Evaluation Hook profile requires the selected trusted invoice extension');
     signal.throwIfAborted();
     registerSecrets([options.credential]);
-    const local = prepareLocalHost(options.repo, trial.directory, invoices, extensionProfile, caseFaultProfile, selectedResources, options.runtime);
+    const local = prepareLocalHost(options.repo, trial.directory, invoices, extensionProfile, caseFaultProfile, selectedResources, options.runtime,
+        { ...(config.systemPrompt === undefined ? {} : { systemPrompt: config.systemPrompt }),
+          ...(config.controlledReplay ? { controlledReplay: true } : {}),
+          ...(config.reasoning === undefined ? {} : { reasoning: config.reasoning }), ...(config.strategy === undefined ? {} : { strategy: config.strategy }) });
     const { productRoot, invoiceSourceRoot, launch } = local;
     const client = new HostClient(), modelId = 'eval-agent', credentialRef = randomUUID().replaceAll('-','');
     let settingsRevision=0;
@@ -307,7 +321,8 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         settingsRevision=(await query({ type: 'save_settings', settings: { version: 6, revision: 0, profile: { displayName: 'Evaluation', theme: 'system' },
             models: [{ id: modelId, credentialRef, name: 'Evaluation Agent', kind: 'custom', providerId: null,
                 baseUrl: config.baseUrl, model: config.model, api: config.api, contextWindow: config.modelCapabilities.contextWindow,
-                maxTokens: config.modelCapabilities.maxTokens, reasoning: config.modelCapabilities.reasoning }],
+                maxTokens: Math.min(config.modelCapabilities.maxTokens, config.modelCapabilities.transport?.maxTokens ?? config.modelCapabilities.maxTokens),
+                reasoning: config.modelCapabilities.reasoning }],
             defaultModelId: modelId, resources, extensions, runtime: RuntimeRequestOverridesSchema.parse({...(config.budget?{budget:config.budget}:{}),...(config.timeoutMs?{timeoutMs:config.timeoutMs}:{}),
                 ...(config.stopGraceMs?{stopGraceMs:config.stopGraceMs}:{})}), updatedAt: '2026-10-11T00:00:00.000Z' } }, z.object({revision:z.number().int().nonnegative()}).passthrough())).revision;
         sessionId = (await query({ type: 'create_session', input: { title: isResearch ? 'Evaluation research' : 'Evaluation chat' } }, z.object({ sessionId: id }).passthrough())).sessionId;
@@ -361,6 +376,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         input: structuredClone(trial.input), answer: null, artifacts: [], observations: [], evidence: {}, configuration: structuredClone(trial.configuration),
         usage: {}, startedAt: null, endedAt: null };
     const observedRuns = new Map<number, z.infer<typeof runSchema>>();
+    let businessEnded=false,businessSignal:AbortSignal|undefined;
     const stopGaps: unknown[] = [], captureGaps: string[] = [];
     let controllerFailure: CaseExecutionResult['error'];
     function rememberStop(run: z.infer<typeof runSchema>) {
@@ -393,8 +409,12 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             if(calls.some(call=>call.toolName==='save_invoice_candidate'&&call.startedAt!==null))return;
             const original=calls.find(call=>call.toolName==='read_invoice_document'&&call.status==='succeeded'&&call.stoppedAt!==null);
             if(run.status==='running'&&original){
-                const fact=await collectToolEvidence(client,[original]),checked=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().safeParse(fact.actual);
-                if(!fact.present||!checked.success)return;
+                const fact=await collectToolEvidence(client,[original]);
+                if(!fact.present){const gap=fact.actual&&typeof fact.actual==='object'?Reflect.get(fact.actual,'gap'):undefined;
+                    if(gap==='query_run_tool_evidence: state_conflict'){await delay(50,undefined,{signal:running});continue;}
+                    return;}
+                const checked=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().safeParse(fact.actual);
+                if(!checked.success)return;
                 const read=checked.data.calls[0]!,body=invoiceToolSchemas.read_invoice_document.output.safeParse(read.tool.result?.data);
                 const workspace=await query({type:'read_workspace'},WorkspaceSnapshotSchema),root=await readRun(runId);
                 if(root.status!=='running'||workspace.sessionId!==sessionId||workspace.jobId!==root.jobId||!body.success||!isDeepStrictEqual(body.data.documentRef,workspace.documentRef)||
@@ -466,8 +486,10 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             const first=calls.filter(call=>call.toolName==='save_invoice_candidate'&&call.status==='succeeded').sort((a,b)=>a.toolCallId-b.toolCallId)[0];
             if(first){
                 const fact=await collectToolEvidence(client,[first]);
+                if(!fact.present){const gap=fact.actual&&typeof fact.actual==='object'?Reflect.get(fact.actual,'gap'):undefined;
+                    if(gap==='query_run_tool_evidence: state_conflict'){await delay(50,undefined,{signal:running});continue;}
+                    throw new Error('Original save evidence is incomplete: '+(typeof gap==='string'?gap:'unavailable'));}
                 const original=z.object({calls:z.array(z.object({tool:ToolCallSnapshotSchema}).passthrough()).length(1)}).passthrough().parse(fact.actual).calls[0]!;
-                if(!fact.present)throw new Error('Original save evidence is incomplete');
                 const call=original.tool,receipt=invoiceToolSchemas.save_invoice_candidate.output.parse(call.result?.data);
                 if(call.result?.status!=='succeeded'||call.result.committedCandidateId!==receipt.candidateId||call.runId!==runId||call.sessionId!==sessionId)throw new Error('Original save commit is unverified');
                 const detail=()=>query({type:'query_job_candidate',input:{jobId:receipt.jobId,candidateId:receipt.candidateId}},z.object({documentRef:DocumentRefSchema,candidate:candidateSchema}).strict());
@@ -546,7 +568,62 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         }
         return false;
     }
-    async function capture(): Promise<CaseExecutionResult> {
+    async function stopSnapshot():Promise<CaseExecutionResult>{
+        const result=structuredClone(execution),owned=[...runIds];
+        const deadline=performance.now()+z.number().int().positive().parse(trial.configuration.stopGraceMs??5000);
+        const port={request:(command:Parameters<HostClient['request']>[0])=>client.request(command,Math.max(1,deadline-performance.now()))};
+        const stopQuery=async<T>(command:Command,schema:z.ZodType<T,z.ZodTypeDef,unknown>):Promise<T>=>{
+            if(performance.now()>=deadline)throw Error('Stop observation deadline');
+            const response=z.discriminatedUnion('ok',[z.object({ok:z.literal(true),data:z.unknown()}).strict(),z.object({ok:z.literal(false),error:AppErrorSchema}).strict()]).parse(await port.request(command));
+            if(!response.ok)throw Error(command.type+': '+response.error.code);
+            return schema.parse(response.data);
+        };
+        const reads=await Promise.allSettled(owned.map(async runId=>{
+            const run=await stopQuery({type:'query_run',runId},runSchema);
+            if(run.runId!==runId||run.sessionId!==runSessions.get(runId)||run.kind!=='agent')throw Error('Foreign stop observation');
+            observedRuns.set(runId,run);rememberStop(run);return run;
+        }));
+        const roots=owned.flatMap(runId=>observedRuns.has(runId)?[observedRuns.get(runId)!]:[]),all=[...roots];
+        result.started=roots.some(run=>run.startedAt!==null)||result.started;
+        result.startedAt=roots.find(run=>run.startedAt!==null)?.startedAt??result.startedAt;
+        result.endedAt=roots.length&&roots.every(run=>!['created','running'].includes(run.status))?roots.at(-1)!.endedAt:null;
+        const failed=[...roots].reverse().find(run=>run.status==='failed'||run.status==='cancelled');
+        result.status=failed?.status==='failed'?'failed':failed?'cancelled':roots.length&&roots.every(run=>run.status==='completed')?'completed':result.started?'error':'not-started';
+        result.error=failed?.error?{code:failed.error.code,message:failed.error.message,infrastructure:failed.error.category==='provider'}:controllerFailure;
+        result.answer=typeof roots.at(-1)?.output?.text==='string'?roots.at(-1)!.output!.text as string:null;
+        result.endpointReached=false;
+        const children=await collectSubagentEvidence(port,roots.map(run=>({runId:run.runId,sessionId:run.sessionId})));
+        result.evidence.subagents=children;
+        const parsed=z.object({children:z.array(SubagentDetailSchema)}).passthrough().safeParse(children.actual);
+        let childrenRead=children.present&&parsed.success;
+        if(parsed.success)for(const child of parsed.data.children){
+            try{const run=await stopQuery({type:'query_run',runId:child.childRunId},runSchema);
+                if(run.kind!=='subagent'||run.runId!==child.childRunId||run.sessionId!==child.childSessionId||run.parentRunId!==child.parentRunId||run.originToolCallId!==child.originToolCallId)throw Error('Foreign child stop observation');
+                rememberStop(run);all.push(run);
+            }catch{childrenRead=false;}
+        }
+        const pendingInput=receipts.some(receipt=>z.object({pending:z.literal(true)}).passthrough().safeParse(receipt.result).success);
+        result.evidence.runs={present:reads.every(read=>read.status==='fulfilled')&&childrenRead&&isDeepStrictEqual(owned,runIds)&&!pendingInput&&(businessEnded||businessSignal?.aborted===true),
+            actual:all,source:'Original owned Run/child stop queries; pending input admissions and future controller steps remain unconfirmed'};
+        const operations=structuredClone(historyOperations),maintenance:Array<z.infer<typeof SessionCompactionSnapshotSchema>>=[];let operationsRead=true;
+        for(const owner of compactions)try{
+            const snapshot=await stopQuery({type:'query_session_compaction',input:owner},SessionCompactionSnapshotSchema);
+            if(snapshot.sessionId!==owner.sessionId||snapshot.operation?.operationId!==owner.operationId)throw Error('Foreign maintenance stop observation');
+            maintenance.push(snapshot);
+            const record=operations.find(record=>record.operationId===owner.operationId);if(!record)throw Error('Missing original maintenance owner');record.after=snapshot;
+            operationsRead&&=snapshot.operation.phase==='ended'&&snapshot.operation.stopped;
+        }catch{operationsRead=false;}
+        result.evidence['history-operations']={present:operationsRead&&operations.every(operation=>operation.action!=='restart-host'||operation.verified===true),actual:operations,
+            source:'Original owned maintenance/restart stop receipts; no full history acquisition'};
+        Object.assign(result.usage,executionUsage(all,maintenance,childrenRead&&operationsRead));
+        if(controllerFailure){result.status='failed';result.error=controllerFailure;}
+        if(cancelRaceEvidence)result.evidence['case-controller']=structuredClone(cancelRaceEvidence);
+        if(stopGaps.length){result.evidence['original-stop-gaps']={present:false,actual:structuredClone(stopGaps),source:'Original observed stop gaps remain unresolved'};
+            result.error={code:'stop_unconfirmed',message:'Original actor stopping could not be confirmed.',infrastructure:true};result.status='error';}
+        return result;
+    }
+    const capture=shareCapture(collectCapture);
+    async function collectCapture(): Promise<CaseExecutionResult> {
         for (const fact of Object.values(execution.evidence)) fact.present = false;
         const reads = await Promise.allSettled(runIds.map(readRun));
         for (const [index, read] of reads.entries()) if (read.status === 'rejected')
@@ -567,8 +644,10 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         execution.evidence.environment = { present: true, actual: { ...trial.identity, fresh: true, isolation: local.manifest,
             ...(trial.privateEffects ? { privateEffectsRequired: true } : {}) },
             source: 'Exclusive new local product directory and independent Host process; no OS filesystem sandbox claim' };
-        execution.evidence['material-registration'] = { present: true, actual: isInvoice ? invoiceRegistration : registration,
-            source: isInvoice ? 'Declared selected invoice bytes and original Host import/query_document receipts' : 'Host import_research_material receipts' };
+        execution.evidence['material-registration'] = { present: true, actual: isInvoice ? invoiceRegistration : isResearch ? registration :
+            prepared.attachments.map(material => ({ ...material, source: 'inline-user-input' })),
+            source: isInvoice ? 'Declared selected invoice bytes and original Host import/query_document receipts' : isResearch ? 'Host import_research_material receipts' :
+                'Authorized local-text attachments rendered as data in the original user Input' };
         execution.evidence['step-results'] = { present: true, actual: structuredClone(receipts), source: 'Host submit_session_input receipts; no model replay on read' };
         execution.evidence.answer = { present: execution.answer !== null, actual: execution.answer, source: 'Original Host Run output' };
         execution.observations = runs.map(run => ({ id: trial.identity.trialId + ':run:' + run.runId, kind: 'span', name: (isResearch ? 'research' : 'agent') + ' Run ' + run.runId,
@@ -585,6 +664,8 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             execution.evidence['capture-gaps'] = { present: false, actual: [...captureGaps], source: 'Optional Host evidence collection errors; original root and saved business facts retained' };
         }
         if (trial.privateEffects) execution.evidence['safety-effects'] = observeSafetyProbes(trial.privateEffects, execution);
+        try { attachCapturedTrace(execution, trial.directory); }
+        catch { execution.evidence['trace-capture'] = { present: false, actual: { gaps: ['raw-capture-read-failed'] }, source: 'Original Trace capture could not be verified' }; }
         if (controllerFailure) { execution.status = 'failed'; execution.error = controllerFailure; execution.endpointReached = false; }
         if (stopGaps.length) {
             execution.evidence['original-stop-gaps'] = { present: false, actual: structuredClone(stopGaps), source: 'Original Run or descendant stopping gaps; later readback and Host close cannot erase them' };
@@ -719,6 +800,18 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
             }
         }
         execution.evidence['context-requests'] = { present: subagents.present && context.every(c => c.collected), actual: context, source: 'Host actual SDK/wire inclusion; no inference from UI display' };
+        if (!isInvoice && !isResearch && prepared.attachments.length) {
+            const request = first?.status === 'consumed' && first.nativeEntryId !== null && first.content.text === initialText && execution.evidence['context-requests'].present
+                ? context.find(frame => frame.runId === first.runId)?.requests.find(request => request.sdkPayload?.inclusion === 'confirmed' &&
+                    request.binding.includedBindings.some(binding => binding.inputId === first.inputId && binding.nativeEntryId === first.nativeEntryId &&
+                        binding.snapshotId === first.contextSnapshotId && binding.originRunId === first.runId) &&
+                    request.attempts.some(attempt => attempt.wireInclusion === 'confirmed' && attempt.enteredAt !== null && attempt.responseStatus !== null)) : undefined;
+            execution.evidence['inline-materials'] = { present: !!first && execution.evidence['context-requests'].present,
+                actual: { materials: prepared.attachments, renderedText: initialText, delivery: request && first ? { inputId: first.inputId,
+                    sessionId: first.sessionId, runId: first.runId, nativeEntryId: first.nativeEntryId, snapshotId: first.contextSnapshotId,
+                    requestSequence: request.binding.requestSequence } : null },
+                source: 'Original inline user-material content and consumed Input bound to the confirmed native SDK/wire request' };
+        }
         for (const snapshot of manualSnapshots) {
             const operation = snapshot.operation;
             if (operation?.nativeOutcome !== 'succeeded' || !operation.generated || !operation.saved) continue;
@@ -989,11 +1082,13 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
         Object.assign(execution.usage, executionUsage(allRuns, manualSnapshots, subagents.present));
     }
     return {
-        input: structuredClone(trial.input), snapshot: capture,
-        async execute(external) {
+        input: structuredClone(trial.input), snapshot: options=>options?.stopOnly?stopSnapshot():capture(),
+        async execute(external,onQuiescent) {
             if (executed) throw new Error('Trial execute cannot replay; use snapshot for readback');
             executed = true;
             const running = AbortSignal.any([signal, external, AbortSignal.timeout(z.number().int().positive().parse(trial.configuration.timeoutMs ?? 120000))]);
+            businessSignal=running;
+            const finish=async()=>{businessEnded=true;if(onQuiescent){running.throwIfAborted();const facts=await stopSnapshot();running.throwIfAborted();onQuiescent(facts);}return capture();};
             for (const step of steps) {
                 running.throwIfAborted();
                 if(historySeed&&step.id==='auto-final-save'&&!autoSnapshots.length)continue;
@@ -1186,7 +1281,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                                 const error = after.operation.error;
                                 record.outcome = error?.code === 'compaction_not_needed' ? 'no-work' : 'failed';
                                 controllerFailure = { code: error?.code ?? 'compaction_failed', message: error?.message ?? 'Manual compaction did not produce a usable original summary.', infrastructure: false };
-                                return capture();
+                                return finish();
                             }
                             break;
                         }
@@ -1243,7 +1338,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 const run = await waitRun(result.data.runId, running);
                 if(run.status==='failed'&&await recoverDeliveredSave(run.runId,running))continue;
                 if (run.status !== 'completed' || run.stoppedAt === null || run.cleanup.stopped !== true || run.cleanup.lateObservationRequired === true)
-                    return capture();
+                    return finish();
                 if(autoProfile){
                     const snapshot=await query({type:'query_session_compaction',input:{sessionId,runId:run.runId}},SessionCompactionSnapshotSchema);
                     if(snapshot.sessionId!==sessionId||!isDeepStrictEqual(snapshot.policy,autoInitial!.policy)||snapshot.capacity.contextWindow!==config.modelCapabilities.contextWindow||snapshot.capacity.thresholdTokens!==config.modelCapabilities.contextWindow-autoProfile.reserveTokens)
@@ -1263,7 +1358,7 @@ export async function prepareHostTrial(trial: AgentTrial, signal: AbortSignal, o
                 }
             }
             stepsComplete = true;
-            return capture();
+            return finish();
         },
         async cancel() {
             if (controls) await controls.request({ action: 'cancel' });

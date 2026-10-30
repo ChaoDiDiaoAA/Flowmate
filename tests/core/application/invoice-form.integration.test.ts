@@ -9,7 +9,7 @@ import type { AgentRunEvent, AgentRunRequest, Application, InvoiceFormApplicatio
   ProviderConfig, Result, FillInputRequest, WorkspaceSnapshot } from '@flowmate/contracts';
 import { createApplication } from '../../../apps/composition.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 
 function need<T>(result: Result<T>): T {
@@ -80,7 +80,7 @@ describe('Fill backend through the public Application', () => {
     const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
       invoiceFormBridge: async request => { bridgeCalls.push(structuredClone(request)); const base = unknownReceipt(request);
         return { ...base, outcome: 'applied', appliedRevision: request.target.expectedRevision + 1, appliedAt: base.observedAt }; },
-      agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-large-fill-key' }) }));
     deferCleanup(() => app.close());
     const doc = need(await app.importInvoiceMaterial(source)); documentId = doc.documentRef.id;
@@ -161,7 +161,7 @@ describe('Fill backend through the public Application', () => {
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
     const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
-      agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-unavailable-key' }) }));
     deferCleanup(async () => { await app.close(); });
     deferCleanup(() => release());
@@ -218,7 +218,7 @@ describe('Fill backend through the public Application', () => {
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
     const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
-      agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-feedback-key' }) }));
     deferCleanup(async () => { await app.close(); });
     const doc = need(await app.importInvoiceMaterial(sourcePath));
@@ -269,6 +269,7 @@ describe('Fill backend through the public Application', () => {
     } finally { db.close(); }
   });
 
+  // Observe the existing 30s Run budget and cleanup rather than the default 15s test limit.
   it('finishes the saved candidate and input when saving uses the twelfth model call and the receipt needs the thirteenth', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-late-save-budget-'));
     const paths = productPaths(join(root, 'product'));
@@ -294,7 +295,7 @@ describe('Fill backend through the public Application', () => {
       connection: { baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions', contextWindow: 64_000, maxTokens: 16_384 },
       parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
     const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
-      agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-budget-key' }) }));
     deferCleanup(async () => { await app.close(); });
     const doc = need(await app.importInvoiceMaterial(source)); documentId = doc.documentRef.id;
@@ -322,7 +323,7 @@ describe('Fill backend through the public Application', () => {
       expect(JSON.parse(savedTool.result_json)).toMatchObject({ status: 'succeeded', committedCandidateId: expect.any(Number) });
       expect(JSON.parse(savedTool.delivery_json)).toMatchObject({ state: 'request_observed', includedInCallSequence: 13 });
     } finally { proof.close(); }
-  });
+  }, 45000);
 
   it.each(['normal', 'failure-save', 'workspace-change', 'revoke'] as const)('keeps an unmet initial save goal failed when a later FollowUp saves a candidate, and freezes each compatible Workspace: %s', async scenario => {
     const rejectFailureSave = scenario === 'failure-save';
@@ -353,10 +354,10 @@ describe('Fill backend through the public Application', () => {
     if (rejectFailureSave) {
       const fault = need(openDatabase(paths));
       try { fault.db.exec("CREATE TRIGGER reject_goal_failure BEFORE UPDATE OF processing_status ON session_inputs WHEN NEW.processing_status='failed' AND json_extract(NEW.error_json,'$.code')='agent_goal_not_met' BEGIN SELECT RAISE(ABORT,'goal failure save rejected'); END;"); }
-      finally { fault.close(); }
+      finally { await fault.close(); }
     }
     const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
-      agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-late-candidate-key' }) }));
     deferCleanup(async () => { await app.close(); });
     deferCleanup(() => release());
@@ -447,7 +448,7 @@ describe('Fill backend through the public Application', () => {
     let names: readonly string[] = [];
     const app = need(await createApplication({ paths: productPaths(root), logger: { write() {}, async close() {} },
       ...(bridgePresent ? { invoiceFormBridge: async (request: InvoiceFormBridgeRequest) => unknownReceipt(request) } : {}),
-      agentFactory: (tools, resourceContents) => {
+      agentFactory: tools => {
         names = tools.map(tool => tool.name);
         return { createSession: () => { throw new Error('No Session is needed.'); }, inspect: () => ({ availability: 'ready' }),
           async prepare() { throw new Error('No model call is allowed.'); },
@@ -530,8 +531,8 @@ describe('Fill backend through the public Application', () => {
           appliedRevision: request.target.expectedRevision + 1, appliedAt: base.observedAt };
         return outcome === 'not_applied' ? { ...base, outcome: 'not_applied', reason: 'fixture-target-unavailable' } : base;
       },
-      agentFactory: (tools, resourceContents) => {
-        const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+      agentFactory: tools => {
+        const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
           credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-form-key' });
         if (outcome === 'toolResult-save-failure') {
           const watch = adapter.watchSession.bind(adapter);

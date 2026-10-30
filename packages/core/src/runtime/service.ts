@@ -1,4 +1,3 @@
-import type { ResearchRepository } from '../research/repository.ts';
 import type { ResearchContext, ResearchPlan, ResearchSourcePolicy } from '@flowmate/contracts';
 import { RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES, RESEARCH_PLANNING_SYSTEM_PROMPT, RESEARCH_INVESTIGATION_SYSTEM_PROMPT } from '@flowmate/contracts';
 import { FrozenInputDefinitionsSchema } from '@flowmate/contracts';
@@ -52,25 +51,27 @@ import type {
   NormalizedActiveInputRequest,
   SessionInputContentV2,
   SessionInputAccepted,
+  SessionInputSnapshot,
   RuntimeAgentConfigFacts,
   RuntimeRequestOverrides,
   ResolvedRuntimeBudget,
   RuntimeStrategySnapshot,
   RuntimeStrategyPolicy,
   ContextHooks,
-  MemoryStore,
   CompactionObservation, CompactionAccepted, SessionCompactionRequest, SessionCompactionQuery,
   SessionCompactionCancel, SessionCompactionSnapshot, NativeCompactionOutcome,
 } from '@flowmate/contracts';
-import type { AgentOutputRecord, RunRepository, SessionRepository, SessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
-import { ensureNativeSession } from '../sessions/service.ts';
+import type { AgentOutputRecord, SessionRepository, AgentSessionRow, TerminalWrite, WorkspaceRunAdmission } from '../storage/repositories.ts';
+import { ensureNativeSession, installNativeSession } from '../sessions/service.ts';
+import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { ToolExecutor } from '../tools/executor.ts';
-import type { SessionInputAdmission, SessionInputLedger } from '../sessions/input-ledger.ts';
+import type { SessionInputAdmission } from '../sessions/input-ledger.ts';
 import type { WorkspaceVerifier } from '../workspace/verification.ts';
 import type { ContextService } from '../context/service.ts';
 import type { ContextRepository } from '../context/repository.ts';
 import { SUBAGENT_ROLE, SUBAGENT_SYSTEM_PROMPT, SUBAGENT_TOOL_NAMES, DelegateArgsSchema } from '@flowmate/contracts';
 import { visibleFrozenSkills } from '../skill-hub/capability-map.ts';
+import { captureFrozenResourceContents } from '../skill-hub/bundle.ts';
 import type { SubagentOrigin, PreparedSubagent, SubagentConfig, DelegateArgs, AgentObservation, AgentToolBinding } from '@flowmate/contracts';
 
 export interface RuntimeLogger {
@@ -79,18 +80,12 @@ export interface RuntimeLogger {
 }
 
 export type RuntimeDependencies = {
-  research?: ResearchRepository;
-  memory: Pick<MemoryStore, 'load' | 'commit'>;
-  runs: RunRepository;
+  database: Pick<DbHandle, 'read' | 'transaction'>;
   recoveryError?: AppError | null;
   provider: ProviderPort;
   agent?: AgentPort;
-  sessions?: SessionRepository;
-  sessionInputs?: SessionInputLedger;
   workspaceVerifier?: WorkspaceVerifier;
   contextService?: Pick<ContextService, 'build'>;
-  contextRepository?: Pick<ContextRepository, 'bindRequest' | 'recordRequest' | 'resolveToolResult'>
-    & Partial<Pick<ContextRepository, 'recordCompactionEvidence' | 'readCompactionEvidence' | 'recordResourceRead' | 'recordResourceRequest'>>;
   isSessionManaging?: (sessionId: number) => boolean;
   tools?: ToolExecutor;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
@@ -99,8 +94,11 @@ export type RuntimeDependencies = {
   inputDefinitions?: InputDefinitions;
   resourceDefaults?: () => Result<AssemblySelectionSnapshot | ResourceSelectionResult>;
   runtimePolicy?: RuntimeStrategyPolicy;
+  systemPromptOverride?: string;
+  thinkingLevelOverride?: string;
   sampleSource?: 'production' | 'test' | 'evaluation';
   observeCompaction?: (value: CompactionObservation) => void;
+  onAdmissionChanged?: () => void;
   nativeTools?: {
     runtimeDir: string;
     availability: readonly NativeToolAvailability[];
@@ -124,6 +122,7 @@ type ActiveCall = {
   stop: (reason: StopReason, sharedIntent?: StopIntent) => boolean;
   stopIntent?: StopIntent;
   storageError?: AppError;
+  cancellation?: Promise<boolean>;
   stopFailure?: AppError;
   inputFailure?: AppError;
   providerFailureBeforeStop?: boolean;
@@ -153,7 +152,7 @@ type AgentEventPayload =
 type AgentExecutionContext = {
   active: ActiveCall;
   request: FrozenAgentRunRequest;
-  session: SessionRow;
+  session: AgentSessionRow;
   input: InputRecord;
   admission: WorkspaceRunAdmission | null;
   scope: RunScope | null;
@@ -215,7 +214,7 @@ function initialAgentSnapshot(request: FrozenAgentRunRequest, nativeSessionId: s
     resolvedModel: null,
     api: request.config.connection?.api ?? null,
     endpoint: request.config.connection?.baseUrl ?? null,
-    sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
+    sdk: { codingAgent: '1.4.0', ai: '1.4.0' },
     parameters: request.config.parameters,
     limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
     native: { authSource: 'unknown', modelsSelection: request.config.native.modelsPath },
@@ -233,7 +232,7 @@ function initialP3AgentSnapshot(request: FrozenAgentRunRequest, nativeSessionId:
     resolvedModel: null,
     api: request.config.connection?.api ?? null,
     endpoint: request.config.connection?.baseUrl ?? null,
-    sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
+    sdk: { codingAgent: '1.4.0', ai: '1.4.0' },
     parameters: request.config.parameters,
     limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
     native: { authSource: 'unknown', modelsSelection: request.config.native.modelsPath },
@@ -252,7 +251,7 @@ function initialSnapshot(request: ProviderRequest): SafeConfigSnapshot {
     resolvedModel: null,
     api: null,
     endpoint: null,
-    sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
+    sdk: { codingAgent: '1.4.0', ai: '1.4.0' },
     parameters: request.config.parameters,
     limits: { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
     native: {
@@ -313,7 +312,12 @@ function withinGrace<T>(promise: Promise<T>, graceMs: number): Promise<{ kind: '
 
 export class RuntimeService {
   private readonly dependencies: RuntimeDependencies;
-  private active: ActiveCall | ActiveCompaction | null = null;
+  private currentActive: ActiveCall | ActiveCompaction | null = null;
+  private get active(): ActiveCall | ActiveCompaction | null { return this.currentActive; }
+  private set active(value: ActiveCall | ActiveCompaction | null) {
+    this.currentActive = value;
+    try { this.dependencies.onAdmissionChanged?.(); } catch { /* Saved queues can be reconstructed after observer failure. */ }
+  }
   private agentContext: AgentExecutionContext | null = null;
   private readonly childSlots = new Map<number, { context: AgentExecutionContext; origin: SubagentOrigin; unsubscribe?: () => void }>();
   private readonly compactions = new Map<string, ActiveCompaction>();
@@ -324,6 +328,7 @@ export class RuntimeService {
   private closeInFlight: Promise<CloseReport> | null = null;
   private finalCloseReport: CloseReport | null = null;
   private readonly closeErrors = new Map<string, ReturnType<typeof appError>>();
+  private readonly pendingNativeFinalizations = new Set<Promise<void>>();
 
   public constructor(dependencies: RuntimeDependencies) {
     this.dependencies = dependencies;
@@ -347,18 +352,16 @@ export class RuntimeService {
     catch { /* Transient notifications are repaired by readonly queries. */ }
   }
 
-  private compactionHistory(sessionId: number) {
-    const sessions = this.dependencies.sessions;
-    if (!sessions) return fail<import('../storage/repositories.ts').SessionHistorySnapshot>(
-      appError('compaction_unavailable', 'runtime', 'Session history is unavailable.'));
+  private compactionHistory(sessionId: number, sessions: Pick<SessionRepository, 'readHistorySnapshot'>) {
     return sessions.readHistorySnapshot(sessionId, value => value.bundle.history && value.bundle.commit
       ? ok(value) : fail(appError('session_history_unavailable', 'session', 'Committed history is unavailable.')));
   }
 
-  private compactionEligibility(value: import('../storage/repositories.ts').SessionHistorySnapshot): Result<void> {
-    const child = this.dependencies.sessions?.isSubagentSession(value.row.sessionId);
-    if (child && !child.ok) return child;
-    if (child?.ok && child.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot be compacted.'));
+  private compactionEligibility(value: import('../storage/repositories.ts').SessionHistorySnapshot,
+    sessions: Pick<SessionRepository, 'isSubagentSession'>): Result<void> {
+    const child = sessions.isSubagentSession(value.row.sessionId);
+    if (!child.ok) return child;
+    if (child.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot be compacted.'));
     if (this.poisoned || this.closing || this.closed)
       return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot compact this Session.'));
     if (value.row.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Complete Session deletion first.', true));
@@ -373,143 +376,164 @@ export class RuntimeService {
     return ok(undefined);
   }
 
-  public async compactSession(request: SessionCompactionRequest): Promise<Result<CompactionAccepted>> {
-    const prior = this.compactions.get(request.operationId);
-    if (prior) {
-      if (!isDeepStrictEqual(prior.request, request))
-        return fail(appError('state_conflict', 'session', 'Operation identity has different content.', true));
-      return this.active === prior
-        ? ok({ sessionId: request.sessionId, operationId: request.operationId })
-        : fail(appError('operation_result_unknown', 'runtime', 'The operation is no longer available.'));
-    }
-    const { agent } = this.dependencies;
-    if (!agent?.compactSession || !agent.inspectSessionCompaction)
-      return fail(appError('compaction_unavailable', 'runtime', 'Native compaction is unavailable.'));
-    if (this.active) return fail(appError('runtime_busy', 'runtime', 'A native operation is active.'));
-    const current = this.compactionHistory(request.sessionId);
-    if (!current.ok) return current;
-    const eligible = this.compactionEligibility(current.data);
-    if (!eligible.ok) return eligible;
-    if (!isDeepStrictEqual(current.data.bundle.commit, request.expected))
-      return fail(appError('state_conflict', 'session', 'Conversation history has changed.', true));
-    try {
-      const availability = agent.inspect(current.data.row.nativeSessionId).availability;
-      if (availability === 'busy') return fail(appError('session_busy', 'session', 'Native Session is active.', true));
-      if (availability === 'unusable') return fail(appError('agent_session_unusable', 'session', 'Native Session is unusable.'));
-    } catch { return fail(appError('agent_session_unavailable', 'session', 'Native Session state cannot be confirmed.')); }
-    const inspected = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed, commit: current.data.bundle.commit! });
-    if (!inspected.ok) return inspected;
-    const frozen = structuredClone(request);
-    const controller = new AbortController();
-    let resolveCompletion!: (value: Result<NativeCompactionOutcome>) => void;
-    const completion = new Promise<Result<NativeCompactionOutcome>>(resolve => { resolveCompletion = resolve; });
-    const active: ActiveCompaction = {
-      kind: 'compaction', runId: null, sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId,
-      request: frozen, controller, startedAt: this.dependencies.monotonicNow(), completion,
-      observation: { sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId, operationId: request.operationId,
-        runId: null, reason: 'manual', observationSequence: 1, phase: 'preparing', generated: false, nativeOutcome: 'pending',
-        entryId: null, saved: null, error: null, stopRequested: false, stopped: false, continuation: 'next-run', mayContinue: false,
-        capacity: inspected.data.capacity, usage: { version: 1, source: 'not-requested', reason: 'not-started', sdkValues: null,
-          attempts: 0, attemptsComplete: true, costSource: null, updatedAt: this.dependencies.now() },
-        tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } },
-      stop: reason => {
-        if (active.stopIntent || active.observation.stopped) return false;
-        active.stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
-        active.observation = { ...active.observation, observationSequence: active.observation.observationSequence + 1,
-          phase: 'stopping', stopRequested: true, mayContinue: false };
-        controller.abort();
-        this.notifyCompaction(active.observation);
-        active.stopTimer = setTimeout(() => {
-          if (this.active !== active || active.observation.stopped) return;
-          this.poisoned = true;
+  public async compactSession(request: SessionCompactionRequest, control: Pick<AgentControl, 'signal'> = {}): Promise<Result<CompactionAccepted>> {
+    request = structuredClone(request);
+    control = { ...control };
+    let launch: (() => void) | undefined;
+    const admitted = await this.readRuntimeStorage<CompactionAccepted>(scope => {
+      const prior = this.compactions.get(request.operationId);
+      if (prior) {
+        if (!isDeepStrictEqual(prior.request, request))
+          return fail(appError('state_conflict', 'session', 'Operation identity has different content.', true));
+        return this.active === prior
+          ? ok({ sessionId: request.sessionId, operationId: request.operationId })
+          : fail(appError('operation_result_unknown', 'runtime', 'The operation is no longer available.'));
+      }
+      const { agent } = this.dependencies;
+      if (control.signal?.aborted) return fail(appError('runtime_shutdown', 'runtime', 'The foreground client is no longer available.'));
+      if (!agent?.compactSession || !agent.inspectSessionCompaction)
+        return fail(appError('compaction_unavailable', 'runtime', 'Native compaction is unavailable.'));
+      if (this.active) return fail(appError('runtime_busy', 'runtime', 'A native operation is active.'));
+      const current = this.compactionHistory(request.sessionId, scope.sessions);
+      if (!current.ok) return current;
+      const eligible = this.compactionEligibility(current.data, scope.sessions);
+      if (!eligible.ok) return eligible;
+      if (!isDeepStrictEqual(current.data.bundle.commit, request.expected))
+        return fail(appError('state_conflict', 'session', 'Conversation history has changed.', true));
+      try {
+        const availability = agent.inspect(current.data.row.nativeSessionId).availability;
+        if (availability === 'busy') return fail(appError('session_busy', 'session', 'Native Session is active.', true));
+        if (availability === 'unusable') return fail(appError('agent_session_unusable', 'session', 'Native Session is unusable.'));
+      } catch { return fail(appError('agent_session_unavailable', 'session', 'Native Session state cannot be confirmed.')); }
+      const inspected = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed, commit: current.data.bundle.commit! });
+      if (!inspected.ok) return inspected;
+      const controller = new AbortController();
+      let resolveCompletion!: (value: Result<NativeCompactionOutcome>) => void;
+      const completion = new Promise<Result<NativeCompactionOutcome>>(resolve => { resolveCompletion = resolve; });
+      const active: ActiveCompaction = {
+        kind: 'compaction', runId: null, sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId,
+        request, controller, startedAt: this.dependencies.monotonicNow(), completion,
+        observation: { sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId, operationId: request.operationId,
+          runId: null, reason: 'manual', observationSequence: 1, phase: 'preparing', generated: false, nativeOutcome: 'pending',
+          entryId: null, saved: null, error: null, stopRequested: false, stopped: false, continuation: 'next-run', mayContinue: false,
+          capacity: inspected.data.capacity, usage: { version: 1, source: 'not-requested', reason: 'not-started', sdkValues: null,
+            attempts: 0, attemptsComplete: true, costSource: null, updatedAt: this.dependencies.now() },
+          tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } },
+        stop: reason => {
+          if (active.stopIntent || active.observation.stopped) return false;
+          active.stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
           active.observation = { ...active.observation, observationSequence: active.observation.observationSequence + 1,
-            phase: 'stopping', stopped: false, mayContinue: false,
-            error: appError('stop_unconfirmed', 'runtime', 'Native compaction stop was not confirmed within grace.', true) };
+            phase: 'stopping', stopRequested: true, mayContinue: false };
+          controller.abort();
           this.notifyCompaction(active.observation);
-        }, RUNTIME_CONFIG.request.stopGraceMs);
-        return true;
-      },
-    };
-    // The shared Runtime slot is claimed before ensure/prepare can yield.
-    this.active = active;
-    this.compactions.set(request.operationId, active);
-    this.lastManualCompaction.set(request.sessionId, request.operationId);
-    this.notifyCompaction(active.observation);
-    void this.executeManualCompaction(active).then(resolveCompletion, () => {
-      this.poisoned = true;
-      active.observation = { ...active.observation, phase: 'stopping', mayContinue: false,
-        error: appError('stop_unconfirmed', 'runtime', 'Native operation stop cannot be confirmed.', true) };
-      resolveCompletion(ok({ observation: active.observation, stopped: false, cleanupErrors: [] }));
+          active.stopTimer = setTimeout(() => {
+            if (this.active !== active || active.observation.stopped) return;
+            this.poisoned = true;
+            active.observation = { ...active.observation, observationSequence: active.observation.observationSequence + 1,
+              phase: 'stopping', stopped: false, mayContinue: false,
+              error: appError('stop_unconfirmed', 'runtime', 'Native compaction stop was not confirmed within grace.', true) };
+            this.notifyCompaction(active.observation);
+          }, RUNTIME_CONFIG.request.stopGraceMs);
+          return true;
+        },
+      };
+      // Every root admission checks and claims this slot in the same database owner queue.
+      this.active = active;
+      this.compactions.set(request.operationId, active);
+      this.lastManualCompaction.set(request.sessionId, request.operationId);
+      const externalAbort = () => active.stop(control.signal?.reason === 'shutdown' ? 'shutdown' : 'user');
+      control.signal?.addEventListener('abort', externalAbort, { once: true });
+      if (control.signal?.aborted) externalAbort();
+      void completion.then(() => control.signal?.removeEventListener('abort', externalAbort));
+      launch = () => {
+        this.notifyCompaction(active.observation);
+        void this.executeManualCompaction(active).then(resolveCompletion, () => {
+          this.poisoned = true;
+          active.observation = { ...active.observation, phase: 'stopping', mayContinue: false,
+            error: appError('stop_unconfirmed', 'runtime', 'Native operation stop cannot be confirmed.', true) };
+          resolveCompletion(ok({ observation: active.observation, stopped: false, cleanupErrors: [] }));
+        });
+      };
+      return ok({ sessionId: request.sessionId, operationId: request.operationId });
     });
-    return ok({ sessionId: request.sessionId, operationId: request.operationId });
+    launch?.();
+    return launch ? ok({ sessionId: request.sessionId, operationId: request.operationId }) : admitted;
   }
 
-  private verifyCompactionUse(active: ActiveCompaction): Result<void> {
-    if (this.active !== active) return fail(appError('compaction_unavailable', 'runtime', 'Operation ownership was lost.'));
-    if (active.stopIntent || active.controller.signal.aborted) return fail(appError(
-      active.stopIntent?.reason === 'timeout' ? 'compaction_timeout' : active.stopIntent?.reason === 'shutdown' ? 'runtime_shutdown' : 'compaction_cancelled',
-      'runtime', 'Compaction was stopped.'));
-    if (this.dependencies.monotonicNow() - active.startedAt >= RUNTIME_CONFIG.request.timeoutMs) {
-      active.stop('timeout'); return fail(appError('compaction_timeout', 'runtime', 'Compaction deadline expired.'));
-    }
-    const current = this.compactionHistory(active.sessionId);
-    if (!current.ok) return current;
-    const eligible = this.compactionEligibility(current.data);
-    if (!eligible.ok) return eligible;
-    if (current.data.row.nativeSessionId !== active.nativeSessionId)
-      return fail(appError('session_history_invalid', 'session', 'Native Session identity changed.'));
-    const native = this.dependencies.agent?.exportSession?.(active.nativeSessionId);
-    if (!native?.ok || !isDeepStrictEqual(JSON.parse(JSON.stringify(native.data)), current.data.bundle.history))
-      return fail(appError('session_history_invalid', 'session', 'Native history is not the committed prefix.'));
-    return ok(undefined);
+  private async verifyCompactionUse(active: ActiveCompaction): Promise<Result<import('../storage/repositories.ts').SessionHistorySnapshot>> {
+    return this.readRuntimeStorage(scope => {
+      if (this.active !== active) return fail(appError('compaction_unavailable', 'runtime', 'Operation ownership was lost.'));
+      if (active.stopIntent || active.controller.signal.aborted) return fail(appError(
+        active.stopIntent?.reason === 'timeout' ? 'compaction_timeout' : active.stopIntent?.reason === 'shutdown' ? 'runtime_shutdown' : 'compaction_cancelled',
+        'runtime', 'Compaction was stopped.'));
+      if (this.dependencies.monotonicNow() - active.startedAt >= RUNTIME_CONFIG.request.timeoutMs) {
+        active.stop('timeout'); return fail(appError('compaction_timeout', 'runtime', 'Compaction deadline expired.'));
+      }
+      const current = this.compactionHistory(active.sessionId, scope.sessions);
+      if (!current.ok) return current;
+      const eligible = this.compactionEligibility(current.data, scope.sessions);
+      if (!eligible.ok) return eligible;
+      if (current.data.row.nativeSessionId !== active.nativeSessionId)
+        return fail(appError('session_history_invalid', 'session', 'Native Session identity changed.'));
+      const native = this.dependencies.agent?.exportSession?.(active.nativeSessionId);
+      if (!native?.ok || !isDeepStrictEqual(JSON.parse(JSON.stringify(native.data)), current.data.bundle.history))
+        return fail(appError('session_history_invalid', 'session', 'Native history is not the committed prefix.'));
+      return current;
+    });
   }
 
   private async executeManualCompaction(active: ActiveCompaction): Promise<Result<NativeCompactionOutcome>> {
-    const agent = this.dependencies.agent!, sessions = this.dependencies.sessions!;
+    const agent = this.dependencies.agent!;
     const timer = setTimeout(() => active.stop('timeout'), RUNTIME_CONFIG.request.timeoutMs);
     let stopped = true;
     let cleanupErrors: readonly AppError[] = [];
     let baseline: import('@flowmate/contracts').HistoryCommitState | null = null;
     try {
-      const current = this.compactionHistory(active.sessionId);
+      const current = await this.readRuntimeStorage(scope => {
+        const history = this.compactionHistory(active.sessionId, scope.sessions);
+        if (!history.ok) return history;
+        // Summary inherits the committed history's trusted scope, including fork origins.
+        // It receives no tool permission and does not depend on the current desktop workspace.
+        let workspaceHistory = false;
+        for (const runId of new Set(history.data.bundle.seed.origins.flatMap(origin => origin.originRunId === null ? [] : [origin.originRunId]))) {
+          const run = scope.runs.get(runId);
+          if (!run.ok) return run;
+          if (run.data.kind !== 'agent' || 'runtimeKind' in run.data) return fail(appError('session_history_invalid', 'session', 'Native history has an invalid Run origin.'));
+          if (run.data.scope.version === 2) workspaceHistory = true;
+        }
+        const resourceContents = captureFrozenResourceContents(null, scope.contents);
+        return resourceContents.ok ? ok({ history: history.data, workspaceHistory, resourceContents: resourceContents.data }) : resourceContents;
+      });
       if (!current.ok) throw current.error;
-      const installed = ensureNativeSession(sessions, agent, current.data.row, this.dependencies.memory);
+      const installed = await ensureNativeSession(this.dependencies.database, agent, current.data.history.row);
       if (!installed.ok) throw installed.error;
-      const verified = this.verifyCompactionUse(active);
+      const verified = await this.verifyCompactionUse(active);
       if (!verified.ok) throw verified.error;
-      // Summary inherits the committed history's trusted scope, including fork origins.
-      // It receives no tool permission and does not depend on the current desktop workspace.
-      let workspaceHistory = false;
-      for (const runId of new Set(current.data.bundle.seed.origins.flatMap(origin => origin.originRunId === null ? [] : [origin.originRunId]))) {
-        const run = this.dependencies.runs.get(runId);
-        if (!run.ok) throw run.error;
-        if (run.data.kind !== 'agent') throw appError('session_history_invalid', 'session', 'Native history has an invalid Run origin.');
-        if (run.data.scope.version === 2) workspaceHistory = true;
-      }
       stopped = false;
       const prepared = await agent.prepare(active.nativeSessionId, active.request.config,
         { timeoutMs: RUNTIME_CONFIG.request.timeoutMs, stopGraceMs: RUNTIME_CONFIG.request.stopGraceMs },
-        active.controller.signal, { compactionPolicy: RUNTIME_CONFIG.compaction,
-          ...(workspaceHistory ? { activeToolNames: [] } : {}),
+        active.controller.signal, { compactionPolicy: RUNTIME_CONFIG.compaction, resourceContents: current.data.resourceContents,
+          ...(current.data.workspaceHistory ? { activeToolNames: [] } : {}),
           runtimeBudget: { maxModelCalls: 2, maxToolCalls: 0, toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs } });
       if (!prepared.ok) {
         stopped = prepared.error.code !== 'stop_unconfirmed';
         throw prepared.error;
       }
       stopped = true;
-      const valid = this.verifyCompactionUse(active);
+      const valid = await this.verifyCompactionUse(active);
       if (!valid.ok) throw valid.error;
       if (!isDeepStrictEqual(prepared.data.snapshot.compactionPolicy, RUNTIME_CONFIG.compaction))
         throw appError('compaction_unavailable', 'runtime', 'Prepared compaction policy differs from frozen policy.');
-      const afterPrepare = this.compactionHistory(active.sessionId);
-      if (!afterPrepare.ok) throw afterPrepare.error;
-      baseline = afterPrepare.data.bundle.commit!;
+      baseline = valid.data.bundle.commit!;
       active.baseline = baseline;
       stopped = false;
       const outcome = await agent.compactSession!(active.nativeSessionId, {
         sessionId: active.sessionId, operationId: active.request.operationId, signal: active.controller.signal, maxModelCalls: 2,
         remainingMs: () => Math.max(0, RUNTIME_CONFIG.request.timeoutMs - (this.dependencies.monotonicNow() - active.startedAt)),
-        verifyUse: () => this.verifyCompactionUse(active),
+        verifyUse: async () => {
+          const valid = await this.verifyCompactionUse(active);
+          return valid.ok ? ok(undefined) : valid;
+        },
         observe: value => {
           if (this.active !== active || value.observationSequence <= (active.nativeObservationSequence ?? 0)) return;
           const parsed = CompactionObservationSchema.safeParse(value);
@@ -537,13 +561,12 @@ export class RuntimeService {
         phase: stopped ? 'ended' : 'stopping', nativeOutcome: active.stopIntent ? 'cancelled' : 'failed',
         stopped, stopRequested: active.stopIntent !== undefined, mayContinue: false, error: known };
     } finally { clearTimeout(timer); clearTimeout(active.stopTimer); }
-    const current = this.compactionHistory(active.sessionId);
-    const valid = this.verifyCompactionUse(active);
+    const valid = await this.verifyCompactionUse(active);
     const observed = active.observation;
-    const committed = current.ok && (observed.generated ? observed.saved !== null
-      && isDeepStrictEqual(current.data.bundle.commit, observed.saved)
-      && current.data.bundle.history!.entries.some(entry => entry.id === observed.entryId && entry.type === 'compaction')
-      : baseline !== null && isDeepStrictEqual(current.data.bundle.commit, baseline));
+    const committed = valid.ok && (observed.generated ? observed.saved !== null
+      && isDeepStrictEqual(valid.data.bundle.commit, observed.saved)
+      && valid.data.bundle.history!.entries.some(entry => entry.id === observed.entryId && entry.type === 'compaction')
+      : baseline !== null && isDeepStrictEqual(valid.data.bundle.commit, baseline));
     const mayContinue = stopped && !active.stopIntent && observed.nativeOutcome !== 'cancelled'
       && observed.capacity.fitsEstimate === true && committed && valid.ok;
     active.observation = { ...observed, observationSequence: observed.observationSequence + 1,
@@ -556,60 +579,62 @@ export class RuntimeService {
   }
 
   public async querySessionCompaction(request: SessionCompactionQuery): Promise<Result<SessionCompactionSnapshot>> {
-    const current = this.compactionHistory(request.sessionId);
-    if (!current.ok) return current;
-    const agent = this.dependencies.agent;
-    if (!agent?.inspectSessionCompaction) return fail(appError('compaction_unavailable', 'runtime', 'Native compaction inspection is unavailable.'));
-    const inspected = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed, commit: current.data.bundle.commit! });
-    if (!inspected.ok) return inspected;
-    const operationId = request.operationId ?? (request.runId === undefined && !inspected.data.operation
-      ? this.lastManualCompaction.get(request.sessionId) : undefined);
-    const manual = operationId === undefined ? undefined : this.compactions.get(operationId);
-    if (manual && (manual.sessionId !== request.sessionId || request.runId !== undefined))
-      return fail(appError('state_conflict', 'runtime', 'Compaction identity does not belong to this query.'));
-    if (request.runId !== undefined) {
-      const run = this.dependencies.runs.get(request.runId);
-      if (!run.ok) return run;
-      if (run.data.kind !== 'agent' || run.data.sessionId !== request.sessionId)
-        return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.'));
-    }
-    const eligible = this.compactionEligibility(current.data);
-    let blockCode = eligible.ok ? null : eligible.error.code;
-    if (blockCode === null && this.active) blockCode = 'runtime_busy';
-    if (blockCode === null) {
-      try {
-        const availability = agent.inspect(current.data.row.nativeSessionId).availability;
-        if (availability === 'busy') blockCode = 'session_busy';
-        else if (availability === 'unusable') blockCode = 'agent_session_unusable';
+    return this.readRuntimeStorage(scope => {
+      const current = this.compactionHistory(request.sessionId, scope.sessions);
+      if (!current.ok) return current;
+      const agent = this.dependencies.agent;
+      if (!agent?.inspectSessionCompaction) return fail(appError('compaction_unavailable', 'runtime', 'Native compaction inspection is unavailable.'));
+      const inspected = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed, commit: current.data.bundle.commit! });
+      if (!inspected.ok) return inspected;
+      const operationId = request.operationId ?? (request.runId === undefined && !inspected.data.operation
+        ? this.lastManualCompaction.get(request.sessionId) : undefined);
+      const manual = operationId === undefined ? undefined : this.compactions.get(operationId);
+      if (manual && (manual.sessionId !== request.sessionId || request.runId !== undefined))
+        return fail(appError('state_conflict', 'runtime', 'Compaction identity does not belong to this query.'));
+      if (request.runId !== undefined) {
+        const run = scope.runs.get(request.runId);
+        if (!run.ok) return run;
+        if (run.data.kind !== 'agent' || run.data.sessionId !== request.sessionId)
+          return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.'));
       }
-      catch { blockCode = 'agent_session_unavailable'; }
-    }
-    let recorded: CompactionObservation | null = null;
-    const native = inspected.data.operation;
-    const liveMatches = native && (request.operationId === undefined || native.operationId === request.operationId)
-      && (request.runId === undefined || native.runId === request.runId);
-    if (!manual && !liveMatches && request.runId !== undefined && this.dependencies.contextRepository?.readCompactionEvidence) {
-      const evidence = this.dependencies.contextRepository.readCompactionEvidence({ ...request, runId: request.runId });
-      if (!evidence.ok) return evidence;
-      recorded = evidence.data.at(-1)?.observation ?? null;
-    }
-    const candidate = manual?.observation ?? (liveMatches ? native : recorded);
-    const currentOwner = candidate?.runId === null ? this.active === null
-      : this.active?.kind === 'agent' && this.active.runId === candidate?.runId && !this.active.stopIntent && !this.active.terminalCommitted;
-    const samePosition = candidate?.saved !== null && candidate?.saved !== undefined
-      ? isDeepStrictEqual(candidate.saved, current.data.bundle.commit)
-      : manual !== undefined && isDeepStrictEqual(manual.baseline ?? manual.request.expected, current.data.bundle.commit);
-    const operation = candidate && (request.operationId === undefined || request.operationId === candidate.operationId)
-      && (request.runId === undefined || request.runId === candidate.runId)
-      ? { ...candidate, mayContinue: candidate.mayContinue && eligible.ok && currentOwner && samePosition
-        && inspected.data.capacity.fitsEstimate === true } : null;
-    const snapshot = SessionCompactionSnapshotSchema.safeParse({
-      sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId, commit: current.data.bundle.commit,
-      policy: RUNTIME_CONFIG.compaction, capacity: inspected.data.capacity, lastSaved: inspected.data.lastSaved,
-      operation, operationAvailability: operation ? recorded ? 'recorded' : 'live' : request.operationId || request.runId ? 'unknown' : 'none',
-      manualAllowed: blockCode === null, blockCode,
+      const eligible = this.compactionEligibility(current.data, scope.sessions);
+      let blockCode = eligible.ok ? null : eligible.error.code;
+      if (blockCode === null && this.active) blockCode = 'runtime_busy';
+      if (blockCode === null) {
+        try {
+          const availability = agent.inspect(current.data.row.nativeSessionId).availability;
+          if (availability === 'busy') blockCode = 'session_busy';
+          else if (availability === 'unusable') blockCode = 'agent_session_unusable';
+        }
+        catch { blockCode = 'agent_session_unavailable'; }
+      }
+      let recorded: CompactionObservation | null = null;
+      const native = inspected.data.operation;
+      const liveMatches = native && (request.operationId === undefined || native.operationId === request.operationId)
+        && (request.runId === undefined || native.runId === request.runId);
+      if (!manual && !liveMatches && request.runId !== undefined) {
+        const evidence = scope.context.readCompactionEvidence({ ...request, runId: request.runId });
+        if (!evidence.ok) return evidence;
+        recorded = evidence.data.at(-1)?.observation ?? null;
+      }
+      const candidate = manual?.observation ?? (liveMatches ? native : recorded);
+      const currentOwner = candidate?.runId === null ? this.active === null
+        : this.active?.kind === 'agent' && this.active.runId === candidate?.runId && !this.active.stopIntent && !this.active.terminalCommitted;
+      const samePosition = candidate?.saved !== null && candidate?.saved !== undefined
+        ? isDeepStrictEqual(candidate.saved, current.data.bundle.commit)
+        : manual !== undefined && isDeepStrictEqual(manual.baseline ?? manual.request.expected, current.data.bundle.commit);
+      const operation = candidate && (request.operationId === undefined || request.operationId === candidate.operationId)
+        && (request.runId === undefined || request.runId === candidate.runId)
+        ? { ...candidate, mayContinue: candidate.mayContinue && eligible.ok && currentOwner && samePosition
+          && inspected.data.capacity.fitsEstimate === true } : null;
+      const snapshot = SessionCompactionSnapshotSchema.safeParse({
+        sessionId: request.sessionId, nativeSessionId: current.data.row.nativeSessionId, commit: current.data.bundle.commit,
+        policy: RUNTIME_CONFIG.compaction, capacity: inspected.data.capacity, lastSaved: inspected.data.lastSaved,
+        operation, operationAvailability: operation ? recorded ? 'recorded' : 'live' : request.operationId || request.runId ? 'unknown' : 'none',
+        manualAllowed: blockCode === null, blockCode,
+      });
+      return snapshot.success ? ok(snapshot.data) : fail(appError('session_history_invalid', 'session', 'Compaction projection is invalid.'));
     });
-    return snapshot.success ? ok(snapshot.data) : fail(appError('session_history_invalid', 'session', 'Compaction projection is invalid.'));
   }
 
   public async cancelSessionCompaction(request: SessionCompactionCancel): Promise<Result<{ sessionId: number; operationId: string; accepted: boolean }>> {
@@ -628,34 +653,42 @@ export class RuntimeService {
     }));
   }
 
-  public cancel(runId: number): Result<{ runId: number; accepted: boolean }> {
+  public async cancel(runId: number): Promise<Result<{ runId: number; accepted: boolean }>> {
     if (this.active && this.active.kind !== 'compaction' && this.active.runId === runId) {
       const active = this.active;
       const accepted = active.stop('user');
+      await active.cancellation;
       return active.storageError ? fail(active.storageError, runId) : ok({ runId, accepted });
     }
-    const existing = this.dependencies.runs.get(runId);
-    return existing.ok ? ok({ runId, accepted: false }) : existing;
+    return this.readRuntimeStorage(scope => {
+      const existing = scope.runs.get(runId);
+      return existing.ok ? ok({ runId, accepted: false }) : existing;
+    });
   }
 
-  public cancelSubagent(input: { parentRunId: number; childRunId: number }): Result<import('@flowmate/contracts').SubagentCancelReceipt> {
-    const saved = this.dependencies.runs.get(input.childRunId);
-    if (!saved.ok) return saved;
-    if (saved.data.kind !== 'subagent' || saved.data.parentRunId !== input.parentRunId)
-      return fail(appError('subagent_identity_conflict', 'runtime', 'The child does not belong to this root.'));
+  public async cancelSubagent(input: { parentRunId: number; childRunId: number }): Promise<Result<import('@flowmate/contracts').SubagentCancelReceipt>> {
+    input = { ...input };
     const owner = this.childSlots.get(input.childRunId), child = owner?.context;
     const accepted = child?.active.runId === input.childRunId && owner?.origin.parentRunId === input.parentRunId
       ? child.active.stop('user') : false;
+    if (accepted || child?.active.stopIntent?.reason === 'user') await child?.active.cancellation;
+    const current = await this.readRuntimeStorage(scope => {
+      const saved = scope.runs.get(input.childRunId);
+      if (!saved.ok) return saved;
+      if (saved.data.kind !== 'subagent' || saved.data.parentRunId !== input.parentRunId)
+        return fail(appError('subagent_identity_conflict', 'runtime', 'The child does not belong to this root.'));
+      return ok({ accepted, cancelRequestedAt: saved.data.cancelRequestedAt });
+    });
+    if (!current.ok) return current;
     if (child?.active.runId === input.childRunId && (child.active.storageError || child.active.stopFailure))
       return fail(child.active.storageError ?? child.active.stopFailure!);
-    const current = this.dependencies.runs.get(input.childRunId);
-    return current.ok ? ok({ accepted, cancelRequestedAt: current.data.cancelRequestedAt }) : current;
+    return current;
   }
 
-  public verifySessionMutation(sessionId: number, intent?: 'cleanup'): Result<void> {
-    const child = this.dependencies.sessions?.isSubagentSession(sessionId);
-    if (child && !child.ok) return child;
-    if (child?.ok && child.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
+  public verifySessionMutation(sessionId: number, intent: 'cleanup' | undefined, repository: Pick<SessionRepository, 'isSubagentSession'>): Result<void> {
+    const child = repository.isSubagentSession(sessionId);
+    if (!child.ok) return child;
+    if (child.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions do not accept public mutations.'));
     if (this.poisoned && intent !== 'cleanup' || this.closing || this.closed) return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot manage Sessions.', true));
     if (this.active && this.active.kind !== 'provider' && this.active.sessionId === sessionId)
       return fail(appError('session_busy', 'session', 'This Session has an active Run.', true));
@@ -663,71 +696,118 @@ export class RuntimeService {
   }
 
   public async appendInput(request: NormalizedActiveInputRequest): Promise<Result<SessionInputAccepted>> {
-    const { sessionInputs: ledger, agent, runs } = this.dependencies;
-    if (!ledger) return fail(appError('session_input_unavailable', 'session', 'Session input storage is unavailable.'));
-    const prior = ledger.lookup(request);
-    if (!prior.ok) return prior;
-    if (prior.data) return prior.data.runId === null ? fail(appError('operation_result_unknown', 'session', 'Original Run is unknown.'))
-      : ok({ inputId: prior.data.inputId, runId: prior.data.runId, sessionId: prior.data.sessionId });
-    if (request.text.trimStart().startsWith('/') && !request.text.trimStart().startsWith('/skill:'))
-      return fail(appError('input_admission_closed', 'session', 'Start delegation commands and templates after the active Run stops.'));
-    const active = this.active;
-    if (this.poisoned || this.closing || this.closed || !active || active.kind !== 'agent' || active.runId !== request.runId
-      || active.sessionId !== request.sessionId || !active.inputStreamingStarted || active.terminalCommitted || active.stopIntent || active.inputAdmissionClosed)
-      return fail(appError('input_admission_closed', 'session', 'The Run is no longer accepting input.', true));
-    if (this.dependencies.isSessionManaging?.(request.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
-    if (!agent?.enqueueInput || !active.nativeSessionId) return fail(appError('agent_input_unavailable', 'runtime', 'Active input dispatch is unavailable.'));
-    try {
-      if (agent.inspect(active.nativeSessionId).availability !== 'busy') return fail(appError('input_admission_closed', 'session', 'The native Run is not streaming.', true));
-      if (agent.inspectSessionCompaction) {
-        const current = this.compactionHistory(request.sessionId);
-        if (!current.ok) return current;
-        const view = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed,
-          commit: current.data.bundle.commit! });
-        if (!view.ok) return view;
-        if (view.data.operation && !view.data.operation.stopped && view.data.operation.runId === active.runId)
-          return fail(appError('session_busy', 'session', 'Compaction is not accepting new input.', true));
+    request = structuredClone(request);
+    const { agent } = this.dependencies;
+    let committedReceipt: SessionInputAccepted | undefined;
+    let newInput: { active: ActiveCall; input: SessionInputSnapshot } | undefined;
+    const admitted = await this.writeRuntimeStorage<SessionInputAccepted>(store => {
+      const prior = store.sessionInputs.lookup(request);
+      if (!prior.ok) return prior;
+      if (prior.data) {
+        if (prior.data.runId === null) return fail(appError('operation_result_unknown', 'session', 'Original Run is unknown.'));
+        const receipt = { inputId: prior.data.inputId, runId: prior.data.runId, sessionId: prior.data.sessionId };
+        store.db.afterCommit!(() => { committedReceipt = receipt; });
+        return ok(receipt);
       }
-    } catch { return fail(appError('agent_session_unavailable', 'session', 'Native state cannot be confirmed.', true)); }
-    const savedRun = runs.get(request.runId);
-    if (!savedRun.ok) return savedRun;
-    const resources = savedRun.data.config.resources === undefined ? null : FrozenResourcesSchema.safeParse(savedRun.data.config.resources);
-    if (resources && !resources.success) return fail(appError('storage_corrupt', 'storage', 'Saved resource binding is invalid.'));
-    const fixed = resources?.success ? resources.data : null;
-    const required = resolveRequiredSkill(request.text, request.requiredSkill, fixed?.discoveredSkills ?? []);
-    if (!required.ok) return required;
-    if (fixed) {
-      const verified = this.dependencies.resources?.verifyFrozen(fixed);
-      if (!verified || !verified.ok) return verified ?? fail(appError('resource_bundle_unavailable', 'storage', 'Frozen resource verification is unavailable.', true));
-    }
-    const resourceBinding: ResourceBinding | undefined = fixed ? { bundleId: fixed.bundleId, requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
-    const at = this.dependencies.now();
-    const admitted = ledger.admit(request, () => {
-      const frozen = runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
-        text: request.text, expected: request.workspace, at }, this.dependencies.workspaceVerifier);
-      return frozen.ok ? this.buildInput(frozen.data.runId, request.sessionId, { ...frozen.data.content,
-        ...(resourceBinding ? { resourceBinding } : {}) }, at) : frozen;
-    }, at);
-    if (!admitted.ok) return admitted;
-    const input = admitted.data.input;
-    if (!admitted.data.created) return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
+      if (request.text.trimStart().startsWith('/') && !request.text.trimStart().startsWith('/skill:'))
+        return fail(appError('input_admission_closed', 'session', 'Start delegation commands and templates after the active Run stops.'));
+      const active = this.active;
+      if (this.poisoned || this.closing || this.closed || !active || active.kind !== 'agent' || active.runId !== request.runId
+        || active.sessionId !== request.sessionId || !active.inputStreamingStarted || active.terminalCommitted || active.stopIntent || active.inputAdmissionClosed)
+        return fail(appError('input_admission_closed', 'session', 'The Run is no longer accepting input.', true));
+      if (this.dependencies.isSessionManaging?.(request.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+      if (!agent?.enqueueInput || !active.nativeSessionId) return fail(appError('agent_input_unavailable', 'runtime', 'Active input dispatch is unavailable.'));
+      try {
+        if (agent.inspect(active.nativeSessionId).availability !== 'busy') return fail(appError('input_admission_closed', 'session', 'The native Run is not streaming.', true));
+        if (agent.inspectSessionCompaction) {
+          const current = this.compactionHistory(request.sessionId, store.sessions);
+          if (!current.ok) return current;
+          const view = agent.inspectSessionCompaction({ history: current.data.bundle.history!, seed: current.data.bundle.seed,
+            commit: current.data.bundle.commit! });
+          if (!view.ok) return view;
+          if (view.data.operation && !view.data.operation.stopped && view.data.operation.runId === active.runId)
+            return fail(appError('session_busy', 'session', 'Compaction is not accepting new input.', true));
+        }
+      } catch { return fail(appError('agent_session_unavailable', 'session', 'Native state cannot be confirmed.', true)); }
+      const savedRun = store.runs.get(request.runId);
+      if (!savedRun.ok) return savedRun;
+      const resources = savedRun.data.config.resources === undefined ? null : FrozenResourcesSchema.safeParse(savedRun.data.config.resources);
+      if (resources && !resources.success) return fail(appError('storage_corrupt', 'storage', 'Saved resource binding is invalid.'));
+      const fixed = resources?.success ? resources.data : null;
+      const required = resolveRequiredSkill(request.text, request.requiredSkill, fixed?.discoveredSkills ?? []);
+      if (!required.ok) return required;
+      if (fixed) {
+        const verified = this.dependencies.resources?.verifyFrozen(fixed, store.contents);
+        if (!verified || !verified.ok) return verified ?? fail(appError('resource_bundle_unavailable', 'storage', 'Frozen resource verification is unavailable.', true));
+      }
+      const resourceBinding: ResourceBinding | undefined = fixed ? { bundleId: fixed.bundleId, requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
+      const at = this.dependencies.now();
+      const admitted = store.sessionInputs.admit(request, () => {
+        const frozen = store.runs.freezeInput({ runId: request.runId, sessionId: request.sessionId,
+          text: request.text, expected: request.workspace, at }, this.dependencies.workspaceVerifier
+            ? input => this.dependencies.workspaceVerifier!(input, store) : undefined);
+        return frozen.ok ? this.buildInput(frozen.data.runId, request.sessionId, { ...frozen.data.content,
+          ...(resourceBinding ? { resourceBinding } : {}) }, at, store) : frozen;
+      }, at);
+      if (!admitted.ok) return admitted;
+      const input = admitted.data.input;
+      const receipt = { inputId: input.inputId, runId: request.runId, sessionId: request.sessionId };
+      store.db.afterCommit!(() => {
+        committedReceipt = receipt;
+        if (admitted.data.created) newInput = { active, input };
+      });
+      return ok(receipt);
+    });
+    if (!committedReceipt) return admitted;
+    if (!newInput) return ok(committedReceipt);
+    const { active, input } = newInput;
     if (input.content.version !== 2) return fail(appError('input_processing_unconfirmed', 'runtime', 'Frozen input is invalid.'));
-    const dispatched = ledger.dispatch(input.inputId, this.dependencies.now());
-    if (!dispatched.ok) { active.inputFailure = dispatched.error; active.stop('input-failure'); return dispatched; }
+    let dispatchCommitted = false;
+    const dispatched = await this.writeRuntimeStorage(store => {
+      if (this.poisoned || this.closing || this.closed || this.active !== active || active.terminalCommitted
+        || active.stopIntent || active.inputAdmissionClosed)
+        return fail(appError('input_admission_closed', 'session', 'The Run is no longer accepting input.', true));
+      const result = store.sessionInputs.dispatch(input.inputId, this.dependencies.now());
+      if (result.ok) store.db.afterCommit!(() => { dispatchCommitted = true; });
+      return result;
+    });
+    if (!dispatchCommitted) {
+      const error = dispatched.ok ? appError('input_delivery_unknown', 'session', 'Input dispatch could not be confirmed.', true, request.runId) : dispatched.error;
+      active.inputFailure = error; active.stop('input-failure'); return fail(error);
+    }
+    if (this.poisoned || this.closing || this.closed || this.active !== active || active.terminalCommitted || active.stopIntent || active.inputAdmissionClosed)
+      return fail(appError('input_admission_closed', 'session', 'The Run is no longer accepting input.', true));
     let enqueued: Result<void>;
-    try { enqueued = await agent.enqueueInput(active.nativeSessionId, { inputId: input.inputId, runId: request.runId,
+    try { enqueued = await agent!.enqueueInput!(active.nativeSessionId!, { inputId: input.inputId, runId: request.runId,
       sessionId: request.sessionId, mode: request.mode, text: input.content.text, promptText: input.content.promptText,
       ...(input.content.resourceBinding ? { resourceBinding: input.content.resourceBinding } : {}),
       ...(input.contextSnapshotId === null ? {} : { contextSnapshotId: input.contextSnapshotId }) }); }
     catch { enqueued = fail(appError('input_delivery_unknown', 'session', 'Native input delivery could not be confirmed.', true, request.runId)); }
     if (!enqueued.ok) { active.inputFailure = enqueued.error; active.stop('input-failure'); return enqueued; }
-    return ok({ inputId: input.inputId, runId: request.runId, sessionId: request.sessionId });
+    return ok(committedReceipt);
   }
 
-  private buildInput(runId: number, sessionId: number, content: SessionInputContentV2, at: string): Result<SessionInputAdmission> {
+  private async readRuntimeStorage<T>(read: (store: SqlDatabaseStore) => Result<T>): Promise<Result<T>> {
+    try { return await this.dependencies.database.read(read); }
+    catch { return fail(appError('storage_read_failed', 'storage', 'Runtime state could not be read.', true)); }
+  }
+
+  private async writeRuntimeStorage<T>(write: (store: SqlDatabaseStore) => Result<T>): Promise<Result<T>> {
+    let rejected: Result<never> | undefined;
+    try {
+      return await this.dependencies.database.transaction(store => {
+        const result = write(store);
+        if (!result.ok) { rejected = result; throw new Error('runtime_storage_rejected'); }
+        return result;
+      });
+    } catch { return rejected ?? fail(appError('storage_write_failed', 'storage', 'Runtime state could not be saved.', true)); }
+  }
+
+  private buildInput(runId: number, sessionId: number, content: SessionInputContentV2, at: string,
+    store: SqlDatabaseStore): Result<SessionInputAdmission> {
     const contextService = this.dependencies.contextService;
     if (!contextService) return ok({ runId, content }); // Explicit legacy Runtime construction.
-    const run = this.dependencies.runs.get(runId);
+    const run = store.runs.get(runId);
     if (!run.ok) return run;
     if (run.data.kind !== 'agent') return fail(appError('run_state_invalid', 'runtime', 'Context requires an Agent Run.'));
     const goalMode = run.data.config.goalMode ?? 'answer';
@@ -739,93 +819,105 @@ export class RuntimeService {
       ...(content.resourceBinding ? { resourceBinding: content.resourceBinding } : {}),
       ...(content.inputCommand ? { inputCommand: content.inputCommand } : {}),
       allowedDocumentIds: content.allowedDocumentIds, allowedArtifactIds: content.allowedArtifactIds,
-      workingDirectory: typeof run.data.config.workingDirectory === 'string' ? run.data.config.workingDirectory : null, createdAt: at });
+      workingDirectory: typeof run.data.config.workingDirectory === 'string' ? run.data.config.workingDirectory : null, createdAt: at }, store);
     return built.ok ? ok({ runId, content: { ...content, promptText: built.data.promptText },
       contextPolicyVersion: 'p8-context-v1', contextSnapshotId: built.data.snapshot.id }) : built;
   }
 
-  private verifyInputUse(context: AgentExecutionContext, inputId: number): Result<void> {
+  private verifyInputUse(context: AgentExecutionContext, inputId: number, store: SqlDatabaseStore): Result<void> {
+    return this.verifyInputUses(context, [inputId], store);
+  }
+  private verifyInputUses(context: AgentExecutionContext, inputIds: readonly number[], store: SqlDatabaseStore): Result<void> {
     const { active, session } = context;
-    const stored = this.dependencies.sessionInputs?.get(inputId);
-    if (!stored || !stored.ok || !stored.data || stored.data.runId !== active.runId || stored.data.sessionId !== session.sessionId
-      || stored.data.content.version !== 2 || !['queued', 'consumed'].includes(stored.data.status))
-      return fail(appError('input_delivery_unknown', 'session', 'Input identity cannot be confirmed.', true, active.runId));
-    const row = this.dependencies.sessions?.get(session.sessionId);
-    const run = this.dependencies.runs.get(active.runId);
+    const stored = store.sessionInputs?.forRun(active.runId, inputIds);
+    const unknown = () => fail(appError('input_delivery_unknown', 'session', 'Input identity cannot be confirmed.', true, active.runId));
+    if (!inputIds.length || !stored?.ok || stored.data.length !== inputIds.length) return unknown();
+    const inputs: Array<{ inputId: number; contextSnapshotId: number | null; content: SessionInputContentV2 }> = [];
+    for (const input of stored.data) {
+      if (!inputIds.includes(input.inputId) || input.runId !== active.runId || input.sessionId !== session.sessionId
+        || input.content.version !== 2 || !['queued', 'consumed'].includes(input.status)) return unknown();
+      inputs.push({ inputId: input.inputId, contextSnapshotId: input.contextSnapshotId, content: input.content });
+    }
+    const row = store.sessions?.get(session.sessionId);
+    const run = store.runs.get(active.runId);
     if (!row || !row.ok || !run.ok) return fail(appError('storage_read_failed', 'storage', 'Input use cannot be confirmed.', true, active.runId));
     if (this.poisoned || active.poisoned || active.terminalCommitted || active.stopIntent || run.data.cancelRequestedAt !== null
       || !['created', 'running'].includes(run.data.status)) return fail(appError('input_admission_closed', 'session', 'Input use is closed.', true, active.runId));
     if (row.data.deletePending || row.data.status !== 'active' || row.data.nativeSessionId !== session.nativeSessionId)
       return fail(appError('session_history_invalid', 'session', 'Input Session is unavailable.', false, active.runId));
-    const permission = this.dependencies.sessions?.isModelUseBlocked(session.sessionId);
+    const permission = store.sessions?.isModelUseBlocked(session.sessionId);
     if (!permission) return fail(appError('storage_read_failed', 'storage', 'Input material access cannot be verified.', true, active.runId));
     if (!permission.ok) return permission;
     if (permission.data) return fail(appError('session_scope_revoked', 'session', 'Input material access was revoked.', false, active.runId));
     if (row.data.nativeUnusable) return fail(appError('agent_session_unusable', 'session', 'Saved history is unusable.', false, active.runId));
-    const content = stored.data.content;
     const corrupt = () => fail(appError('storage_corrupt', 'storage', 'Saved input does not match its fixed Run scope.', false, active.runId));
-    if (run.data.kind === 'provider') return corrupt();
+    if (run.data.kind === 'provider' || 'runtimeKind' in run.data) return corrupt();
     const frozenResources = run.data.config.resources === undefined ? null : FrozenResourcesSchema.safeParse(run.data.config.resources);
-    if (frozenResources && !frozenResources.success || Boolean(frozenResources) !== Boolean(content.resourceBinding)) return corrupt();
+    if (frozenResources && !frozenResources.success) return corrupt();
+    for (const input of inputs) {
+      const content = input.content;
+      if (Boolean(frozenResources) !== Boolean(content.resourceBinding)) return corrupt();
+      if (frozenResources?.success) {
+        const binding = content.resourceBinding!;
+        if (binding.bundleId !== frozenResources.data.bundleId || binding.requiredSkill && !frozenResources.data.discoveredSkills.some(ref =>
+          resourceRefKey(ref) === resourceRefKey(binding.requiredSkill!))) return corrupt();
+      }
+      if (run.data.kind === 'subagent') {
+        const provenance = run.data.config.subagent as import('@flowmate/contracts').SubagentConfig['subagent'];
+        if (input.inputId !== provenance.childInputId) return corrupt();
+        continue;
+      }
+      if (content.research) {
+        const binding = store.research?.bindingForRun(active.runId);
+        if (!binding?.ok || !isDeepStrictEqual(binding.data, content.research.binding) || run.data.scope.version !== 2) return corrupt();
+        continue;
+      }
+      if (run.data.scope.version === 1) {
+        if (content.workspaceContext !== null || content.workspaceInput !== null
+          || content.allowedDocumentIds.length !== 0 || content.allowedArtifactIds.length !== 0) return corrupt();
+      } else if (run.data.scope.version === 2) {
+        if (run.data.config.inputDefinitions && run.data.scope.allowedTools.includes('Agent')
+          && run.data.input.version === 1 && content.workspaceContext === null && content.workspaceInput === null
+          && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
+          && !run.data.scope.allowedDocumentIds.length && !run.data.scope.allowedArtifactIds.length
+          && run.data.scope.allowedTools.every(name => name === 'Agent')) continue;
+        const frozen = content.workspaceContext;
+        const initial = WorkspaceContextSchema.safeParse(run.data.config.workspaceContext);
+        const sameIds = (left: readonly number[], right: readonly number[]) => left.length === right.length
+          && left.every(id => right.includes(id));
+        if (!frozen || !content.workspaceInput || !initial.success || run.data.input.version !== 2
+          || frozen.sessionId !== run.data.sessionId || frozen.sessionId !== initial.data.sessionId
+          || frozen.jobId !== run.data.jobId || frozen.jobId !== initial.data.jobId
+          || JSON.stringify(frozen.documentRef) !== JSON.stringify(initial.data.documentRef)
+          || JSON.stringify(frozen.candidateRef) !== JSON.stringify(initial.data.candidateRef)
+          || JSON.stringify(content.workspaceInput) !== JSON.stringify(run.data.input.workspaceInput)
+          || JSON.stringify(frozen.documentRef) !== JSON.stringify(content.workspaceInput.documentRef)
+          || frozen.jobId !== (content.workspaceInput.job?.id ?? null)
+          || frozen.candidateRef?.id !== content.workspaceInput.candidate?.id
+          || frozen.candidateRef?.sequence !== content.workspaceInput.candidate?.sequence
+          || !sameIds(content.allowedDocumentIds, run.data.scope.allowedDocumentIds)
+          || !sameIds(content.allowedArtifactIds, run.data.scope.allowedArtifactIds)) return corrupt();
+      } else return corrupt();
+    }
     if (frozenResources?.success) {
-      const binding = content.resourceBinding!;
-      if (binding.bundleId !== frozenResources.data.bundleId || binding.requiredSkill && !frozenResources.data.discoveredSkills.some(ref =>
-        resourceRefKey(ref) === resourceRefKey(binding.requiredSkill!))) return corrupt();
-      const verified = this.dependencies.resources?.verifyFrozen(frozenResources.data);
+      const verified = this.dependencies.resources?.verifyFrozen(frozenResources.data, store.contents);
       if (!verified || !verified.ok) return verified ?? fail(appError('resource_bundle_unavailable', 'storage', 'Frozen resource verification is unavailable.', true));
     }
-    if (run.data.kind === 'subagent') {
-      const provenance = run.data.config.subagent as import('@flowmate/contracts').SubagentConfig['subagent'];
-      if (inputId !== provenance.childInputId) return corrupt();
-      return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier,
-        { runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
-    }
-    if (content.research) {
-      const binding = this.dependencies.research?.bindingForRun(active.runId);
-      if (!binding?.ok || !isDeepStrictEqual(binding.data, content.research.binding) || run.data.scope.version !== 2) return corrupt();
-      return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier,
-        { runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
-    }
-    if (run.data.scope.version === 1) {
-      if (content.workspaceContext !== null || content.workspaceInput !== null
-        || content.allowedDocumentIds.length !== 0 || content.allowedArtifactIds.length !== 0) return corrupt();
-    } else if (run.data.scope.version === 2) {
-      if (run.data.config.inputDefinitions && run.data.scope.allowedTools.includes('Agent')
-        && run.data.input.version === 1 && content.workspaceContext === null && content.workspaceInput === null
-        && !content.allowedDocumentIds.length && !content.allowedArtifactIds.length
-        && !run.data.scope.allowedDocumentIds.length && !run.data.scope.allowedArtifactIds.length
-        && run.data.scope.allowedTools.every(name => name === 'Agent')) return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier,
-          { runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
-      const frozen = content.workspaceContext;
-      const initial = WorkspaceContextSchema.safeParse(run.data.config.workspaceContext);
-      const sameIds = (left: readonly number[], right: readonly number[]) => left.length === right.length
-        && left.every(id => right.includes(id));
-      if (!frozen || !content.workspaceInput || !initial.success || run.data.input.version !== 2
-        || frozen.sessionId !== run.data.sessionId || frozen.sessionId !== initial.data.sessionId
-        || frozen.jobId !== run.data.jobId || frozen.jobId !== initial.data.jobId
-        || JSON.stringify(frozen.documentRef) !== JSON.stringify(initial.data.documentRef)
-        || JSON.stringify(frozen.candidateRef) !== JSON.stringify(initial.data.candidateRef)
-        || JSON.stringify(content.workspaceInput) !== JSON.stringify(run.data.input.workspaceInput)
-        || JSON.stringify(frozen.documentRef) !== JSON.stringify(content.workspaceInput.documentRef)
-        || frozen.jobId !== (content.workspaceInput.job?.id ?? null)
-        || frozen.candidateRef?.id !== content.workspaceInput.candidate?.id
-        || frozen.candidateRef?.sequence !== content.workspaceInput.candidate?.sequence
-        || !sameIds(content.allowedDocumentIds, run.data.scope.allowedDocumentIds)
-        || !sameIds(content.allowedArtifactIds, run.data.scope.allowedArtifactIds)) return corrupt();
-    } else return corrupt();
-    return this.dependencies.runs.verifyInputUse(content, this.dependencies.workspaceVerifier, {
-      runId: active.runId, sessionId: session.sessionId, contextSnapshotId: stored.data.contextSnapshotId });
+    return store.runs.verifyInputUse(inputs.map(input => ({ content: input.content,
+      binding: { runId: active.runId, sessionId: session.sessionId, contextSnapshotId: input.contextSnapshotId } })), this.dependencies.workspaceVerifier
+        ? input => this.dependencies.workspaceVerifier!(input, store) : undefined);
   }
 
-  private qualifyInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Result<boolean> {
-    const evidence = this.dependencies.sessionInputs!.resultEvidence(context.active.runId, inputIds, resultEntryId);
+  private qualifyInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string,
+    store: SqlDatabaseStore): Result<boolean> {
+    const evidence = store.sessionInputs.resultEvidence(context.active.runId, inputIds, resultEntryId);
     if (!evidence.ok) return evidence;
     for (const input of evidence.data.inputs) {
-      const allowed = this.verifyInputUse(context, input.inputId);
+      const allowed = this.verifyInputUse(context, input.inputId, store);
       if (!allowed.ok) return allowed;
     }
     if (context.scope && this.dependencies.tools) {
-      const facts = this.dependencies.tools.candidateFacts(context.active.runId, evidence.data.toolCallIds);
+      const facts = this.dependencies.tools.candidateFacts(context.active.runId, evidence.data.toolCallIds, store.toolCalls);
       if (!facts.ok) return facts;
       if (facts.data.cleanupErrors.length) return fail(facts.data.cleanupErrors[0]!);
       if (!facts.data.stopped) return ok(false);
@@ -834,7 +926,7 @@ export class RuntimeService {
       if (context.request.goalMode === 'fill-form') return ok(false);
     }
     if (context.scope?.allowedTools.includes('Agent') && context.inputDefinitions?.command?.requiredRoles.length) {
-      const children = this.dependencies.runs.listSubagents({ parentRunId: context.active.runId, limit: 100 });
+      const children = store.runs.listSubagents({ parentRunId: context.active.runId, limit: 100 });
       if (!children.ok) return children;
       const delivered = children.data.items.filter(child => evidence.data.toolCallIds.includes(child.parentNativeToolCallId)
         && child.status === 'completed' && child.stoppedAt !== null);
@@ -847,17 +939,20 @@ export class RuntimeService {
     return ok(true);
   }
 
-  private completeInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Result<void> {
-    const qualified = this.qualifyInputResult(context, inputIds, resultEntryId);
-    let completed: Result<void>;
-    if (!qualified.ok) {
-      if (qualified.error.code !== 'agent_goal_not_met') return qualified;
-      completed = this.dependencies.sessionInputs!.failResult(context.active.runId, inputIds, resultEntryId, qualified.error, this.dependencies.now());
-    } else {
+  private async completeInputResult(context: AgentExecutionContext, inputIds: readonly number[], resultEntryId: string): Promise<Result<void>> {
+    let writeAttempted = false;
+    const completed = await this.writeRuntimeStorage(store => {
+      const qualified = this.qualifyInputResult(context, inputIds, resultEntryId, store);
+      if (!qualified.ok) {
+        if (qualified.error.code !== 'agent_goal_not_met') return qualified;
+        writeAttempted = true;
+        return store.sessionInputs.failResult(context.active.runId, inputIds, resultEntryId, qualified.error, this.dependencies.now());
+      }
       if (!qualified.data) return ok(undefined);
-      completed = this.dependencies.sessionInputs!.completeResult(context.active.runId, inputIds, resultEntryId, this.dependencies.now());
-    }
-    if (!completed.ok) {
+      writeAttempted = true;
+      return store.sessionInputs.completeResult(context.active.runId, inputIds, resultEntryId, this.dependencies.now());
+    });
+    if (!completed.ok && (writeAttempted || completed.error.code === 'storage_write_failed')) {
       context.active.storageError = completed.error;
       context.active.stop('shutdown');
       context.active.poisoned = this.poisoned = true;
@@ -865,44 +960,64 @@ export class RuntimeService {
     return completed;
   }
 
-  private persistCancellation(active: ActiveCall, at: string): boolean {
-    try {
-      const recorded = this.dependencies.runs.recordCancel(active.runId, at);
-      if (recorded.ok) return recorded.data;
-    } catch { /* an unexpected storage exception must not prevent abort */ }
-    active.storageError = appError('storage_write_failed', 'storage', '取消意图保存失败。', true, active.runId);
-    active.poisoned = this.poisoned = true;
-    try { this.dependencies.log.write({ at, level: 'error', component: 'runtime', runId: active.runId,
-      event: 'cancel_record_failed', code: active.storageError.code }); } catch { /* diagnostics are best effort */ }
-    return false;
+  private persistCancellation(active: ActiveCall, at: string): Promise<boolean> {
+    if (active.cancellation) return active.cancellation;
+    let committed = false;
+    active.cancellation = this.writeRuntimeStorage(scope => {
+      const recorded = scope.runs.recordCancel(active.runId, at);
+      if (!recorded.ok) return recorded;
+      if (!recorded.data) {
+        const terminal = scope.runs.get(active.runId);
+        if (!terminal.ok) return terminal;
+        if (terminal.data.cancelRequestedAt !== at) return ok(false);
+      }
+      scope.db.afterCommit!(() => { committed = true; });
+      return ok(true);
+    }).then(() => {
+      if (committed) return true;
+      active.storageError = appError('storage_write_failed', 'storage', '取消意图保存失败。', true, active.runId);
+      active.poisoned = this.poisoned = true;
+      try { this.dependencies.log.write({ at, level: 'error', component: 'runtime', runId: active.runId,
+        event: 'cancel_record_failed', code: active.storageError.code }); } catch { /* diagnostics are best effort */ }
+      return false;
+    });
+    return active.cancellation;
   }
 
   public async revokeDocumentUse(documentId: number): Promise<Result<{ affectedSessionIds: number[]; stopRequested: boolean }>> {
-    if (!Number.isSafeInteger(documentId) || documentId < 1 || !this.dependencies.sessions) {
+    if (!Number.isSafeInteger(documentId) || documentId < 1) {
       return fail(appError('input_invalid', 'input', '撤回材料使用权限的参数无效。'));
     }
-    const persisted = this.dependencies.sessions.revokeDocumentUse({ documentId, at: this.dependencies.now() });
-    if (!persisted.ok) {
-      if (persisted.error.code === 'document_not_found') return persisted;
+    let committed: { affectedSessionIds: number[] } | undefined;
+    const persisted = await this.writeRuntimeStorage(store => {
+      const result = store.sessions.revokeDocumentUse({ documentId, at: this.dependencies.now() });
+      if (result.ok) store.db.afterCommit!(() => { committed = result.data; });
+      return result;
+    });
+    if (!committed) {
+      if (!persisted.ok && persisted.error.code === 'document_not_found') return persisted;
       this.poisoned = true;
       if (this.active && this.active.kind !== 'provider') this.active.stop('user');
       return fail(appError('model_access_revocation_failed', 'storage', '模型使用权限未能持久撤回；当前 Runtime 已停止接纳新请求。', true));
     }
     const active = this.active;
     const affected = active && active.kind !== 'provider' && active.sessionId !== null
-      && persisted.data.affectedSessionIds.includes(active.sessionId);
+      && committed.affectedSessionIds.includes(active.sessionId);
     const stopRequested = affected ? active!.stop('user') : false;
-    return ok({ ...persisted.data, stopRequested });
+    return ok({ ...committed, stopRequested });
   }
 
   public async start(rawRequest: NormalizedAgentRunRequest, control: AgentControl = {}, inputSubmission?: NormalizedSessionInputRequest): Promise<Result<RunAccepted>> {
-    if (!this.dependencies.sessionInputs) return fail(appError('session_input_unavailable', 'session', 'Session input storage is unavailable.'));
+    rawRequest = structuredClone(rawRequest);
+    inputSubmission = inputSubmission === undefined ? undefined : structuredClone(inputSubmission);
+    control = { ...control };
     if (inputSubmission) {
       const normalized = normalizeSessionInputRequest({ ...inputSubmission, ...rawRequest });
       if (inputSubmission.mode !== 'prompt' || !normalized.ok || JSON.stringify(normalized.data) !== JSON.stringify(inputSubmission)) {
         return fail(appError('input_invalid', 'input', 'Input and Run request do not match.'));
       }
-      const previous = this.dependencies.sessionInputs.lookup(inputSubmission, control.desktopRequestIdentity);
+      const submission = inputSubmission;
+      const previous = await this.readRuntimeStorage(store => store.sessionInputs.lookup(submission, control.desktopRequestIdentity));
       if (!previous.ok) return previous;
       if (previous.data) return previous.data.runId === null
         ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
@@ -912,36 +1027,62 @@ export class RuntimeService {
     }
     if (rawRequest.workspace && !this.dependencies.workspaceVerifier)
       return fail(appError('workspace_unavailable', 'storage', 'Workspace verification is unavailable.', true));
-    const taskForSession = this.dependencies.research?.forSession(rawRequest.sessionId);
-    if (taskForSession && !taskForSession.ok) return taskForSession;
-    if (taskForSession?.ok && taskForSession.data && !rawRequest.research)
-      return fail(appError('research_intent_required', 'input', 'Choose a research action for this dedicated Session.'));
-    let researchPolicy: ResearchSourcePolicy | undefined;
-    let researchGoal: string | undefined;
-    let confirmedPlan: ResearchPlan | undefined;
-    if (rawRequest.research) {
-      const repository = this.dependencies.research;
-      if (!repository || !this.dependencies.contextService || !inputSubmission) return fail(appError('research_unavailable', 'runtime', 'Research requires durable input admission.'));
-      const task = repository.get(rawRequest.research.researchId); if (!task.ok) return task;
-      if (task.data.sessionId !== rawRequest.sessionId) return fail(appError('research_identity_conflict', 'runtime', 'Research task belongs to another Session.'));
-      researchPolicy = task.data.sourcePolicy;
-      researchGoal = task.data.title;
-      if (rawRequest.research.phase === 'researching') {
-        const reference = rawRequest.research.plan;
-        if (!reference || task.data.currentPlanId !== reference.planId) return fail(appError('research_plan_stale', 'runtime', 'Confirm the latest plan version.'));
-        const plan = repository.getPlan({ researchId: task.data.researchId, planId: reference.planId }); if (!plan.ok) return plan;
-        if (plan.data.revision !== reference.revision) return fail(appError('research_plan_stale', 'runtime', 'Confirm the latest plan version.'));
-        if (rawRequest.research.continuation && !task.data.planConfirmed)
-          return fail(appError('research_plan_not_confirmed', 'runtime', 'Confirm this plan before continuing its investigation.'));
-        if (task.data.planConfirmed && !rawRequest.research.continuation)
-          return fail(appError('research_already_started', 'runtime', 'This plan has already been confirmed. Continue explicitly.'));
-        confirmedPlan = plan.data; researchPolicy = confirmedPlan.body.sourcePolicy;
-        const supplied = originalOverrides(rawRequest), fixed = confirmedPlan.body.execution;
-        if (supplied.timeoutMs !== undefined && supplied.timeoutMs !== fixed.timeoutMs || supplied.stopGraceMs !== undefined && supplied.stopGraceMs !== fixed.stopGraceMs
-          || Object.entries(supplied.budget ?? {}).some(([key, value]) => fixed.budget[key as keyof typeof fixed.budget] !== value))
-          return fail(appError('research_budget_conflict', 'input', 'Execution must use the confirmed plan budget.'));
+    const { agent } = this.dependencies;
+    if (!agent) return fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'));
+    const sessionResult = await this.readRuntimeStorage(store => {
+      if (control.signal?.aborted) return fail(appError('runtime_shutdown', 'runtime', 'The foreground client is no longer available.'));
+      if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Agent 停止或 Run 保存未确认，运行实例不可复用。'));
+      if (this.closing || this.closed || this.active !== null && !rawRequest.research)
+        return fail(appError('runtime_busy', 'runtime', '已有 Run 正在执行。'));
+      if (this.dependencies.isSessionManaging?.(rawRequest.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+      const current = store.sessions.get(rawRequest.sessionId); if (!current.ok) return current;
+      const child = store.sessions.isSubagentSession(rawRequest.sessionId); if (!child.ok) return child;
+      if (child.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot start public Runs.'));
+      if (current.data.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
+      if (current.data.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
+      const blocked = store.sessions.isModelUseBlocked(rawRequest.sessionId); if (!blocked.ok) return blocked;
+      return blocked.data ? fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限，请新建 Session。')) : current;
+    });
+    if (!sessionResult.ok) return sessionResult;
+    if (sessionResult.data.runtimeKind !== 'agent_session') return fail(appError('session_runtime_mismatch', 'session', 'This Session belongs to the Durable business runtime.'));
+    let session: AgentSessionRow = sessionResult.data;
+    const research = await this.readRuntimeStorage(store => {
+      let researchPolicy: ResearchSourcePolicy | undefined;
+      let researchGoal: string | undefined;
+      let confirmedPlan: ResearchPlan | undefined;
+      const repository = store.research;
+      const taskForSession = repository.forSession(rawRequest.sessionId);
+      if (!taskForSession.ok) return taskForSession;
+      if (taskForSession.data && !rawRequest.research)
+        return fail(appError('research_intent_required', 'input', 'Choose a research action for this dedicated Session.'));
+      if (rawRequest.research) {
+        if (!this.dependencies.contextService || !inputSubmission) return fail(appError('research_unavailable', 'runtime', 'Research requires durable input admission.'));
+        const task = repository.get(rawRequest.research.researchId); if (!task.ok) return task;
+        if (task.data.sessionId !== rawRequest.sessionId) return fail(appError('research_identity_conflict', 'runtime', 'Research task belongs to another Session.'));
+        researchPolicy = task.data.sourcePolicy;
+        researchGoal = task.data.title;
+        if (rawRequest.research.phase === 'researching') {
+          const reference = rawRequest.research.plan;
+          if (!reference || task.data.currentPlanId !== reference.planId) return fail(appError('research_plan_stale', 'runtime', 'Confirm the latest plan version.'));
+          const plan = repository.getPlan({ researchId: task.data.researchId, planId: reference.planId }); if (!plan.ok) return plan;
+          if (plan.data.revision !== reference.revision) return fail(appError('research_plan_stale', 'runtime', 'Confirm the latest plan version.'));
+          if (rawRequest.research.continuation && !task.data.planConfirmed)
+            return fail(appError('research_plan_not_confirmed', 'runtime', 'Confirm this plan before continuing its investigation.'));
+          if (task.data.planConfirmed && !rawRequest.research.continuation)
+            return fail(appError('research_already_started', 'runtime', 'This plan has already been confirmed. Continue explicitly.'));
+          confirmedPlan = plan.data; researchPolicy = confirmedPlan.body.sourcePolicy;
+          const supplied = originalOverrides(rawRequest), fixed = confirmedPlan.body.execution;
+          if (supplied.timeoutMs !== undefined && supplied.timeoutMs !== fixed.timeoutMs || supplied.stopGraceMs !== undefined && supplied.stopGraceMs !== fixed.stopGraceMs
+            || Object.entries(supplied.budget ?? {}).some(([key, value]) => fixed.budget[key as keyof typeof fixed.budget] !== value))
+            return fail(appError('research_budget_conflict', 'input', 'Execution must use the confirmed plan budget.'));
+        }
       }
-    }
+      return ok({ researchPolicy, researchGoal, confirmedPlan });
+    });
+    if (!research.ok) return research;
+    // An already-confirmed research intent is resolved before rejecting a new occupied-slot admission.
+    if (this.active !== null) return fail(appError('runtime_busy', 'runtime', '已有 Run 正在执行。'));
+    const { researchPolicy, researchGoal, confirmedPlan } = research.data;
     const effectiveRequest = { ...rawRequest, ...(confirmedPlan ? confirmedPlan.body.execution : {}) };
     const settings = this.dependencies.runtimeDefaults?.() ?? ok({});
     if (!settings.ok) return settings;
@@ -962,8 +1103,6 @@ export class RuntimeService {
           ? RUNTIME_CONFIG.runBudget.maxModelCalls.workspace : RUNTIME_CONFIG.runBudget.maxModelCalls.chat,
         toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs,
         ...defaults.data.budget, ...effectiveRequest.budget, ...(!rawRequest.workspace && !rawRequest.research && !delegationConfigured ? { maxToolCalls: 0 } : {}) }) };
-    const { agent, sessions } = this.dependencies;
-    if (!agent || !sessions) return fail(appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'));
     if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Agent 停止或 Run 保存未确认，运行实例不可复用。'));
     if (this.closing || this.closed || this.active !== null) return fail(appError('runtime_busy', 'runtime', '已有 Run 正在执行。'));
     if (this.dependencies.isSessionManaging?.(request.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
@@ -971,12 +1110,6 @@ export class RuntimeService {
       return fail(appError('tool_runtime_unavailable', 'runtime', 'The trusted invoice form tool is unavailable.'));
     }
 
-    const sessionResult = sessions.get(request.sessionId);
-    if (!sessionResult.ok) return sessionResult;
-    const childSession = sessions.isSubagentSession(request.sessionId);
-    if (!childSession.ok) return childSession;
-    if (childSession.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot start public Runs.'));
-    const session = sessionResult.data;
     let workingDirectory: string | undefined;
     const availability = this.queryNativeTools();
     const nativeNames = availability.ok ? availability.data.filter((tool) => tool.available).map((tool) => tool.name) : [];
@@ -989,11 +1122,15 @@ export class RuntimeService {
     }
     if (session.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
     if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
-    const modelUseBlocked = sessions.isModelUseBlocked(request.sessionId);
-    if (!modelUseBlocked.ok) return modelUseBlocked;
-    if (modelUseBlocked.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限，请新建 Session。'));
-    const restored = ensureNativeSession(sessions, agent, session, this.dependencies.memory);
+    const restored = await installNativeSession(this.dependencies.database, agent, session);
     if (!restored.ok) return restored;
+    // Restoring now waits for the database owner; another admission or close may have won meanwhile.
+    if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot admit another Run.'));
+    if (this.closing || this.closed || this.active !== null) return fail(appError('runtime_busy', 'runtime', '已有 Run 正在执行。'));
+    if (this.dependencies.isSessionManaging?.(request.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+    session = restored.data.row;
+    if (session.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
+    if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
     let inspected: ReturnType<AgentPort['inspect']>;
     try {
       inspected = agent.inspect(session.nativeSessionId);
@@ -1009,313 +1146,372 @@ export class RuntimeService {
     }
     const hub = this.dependencies.resources;
     if (hub && !this.dependencies.contextService) return fail(appError('resource_evidence_write_failed', 'storage', 'Resource admission requires Context persistence.', true));
-    let selected: AssemblySelectionSnapshot = assembly.data;
-    if (request.research && hub) {
-      const catalog = hub.catalog({ revision: selected.revision, selection: EMPTY_RESOURCE_SELECTION });
-      if (!catalog.ok) return catalog;
-      const prompt = catalog.data.items.find(item => item.available && item.ref.kind === 'prompt' && item.ref.id === 'research')?.ref;
-      const skill = catalog.data.items.find(item => item.available && item.ref.kind === 'skill' && item.ref.id === 'deep-research')?.ref;
-      if (!prompt || !skill) return fail(appError('resource_required_unavailable', 'input', 'The research Prompt and Skill are unavailable.'));
-      selected = { ...selected, selection: { prompt, enabledSkills: [skill] },
-        extensions: { enabledExtensions: selected.extensions.enabledExtensions.filter(ref => ref.id === 'subagents') } };
-    }
-    const required = resolveRequiredSkill(request.text, request.requiredSkill, selected.selection.enabledSkills);
-    if (!required.ok) return required;
-    const skillNames = (request.workspace || request.research) && request.goalMode !== 'fill-form'
-      ? SKILL_RESOURCE_TOOL_NAMES.filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : [];
-    const activeToolNames = request.research ? [...(request.research.phase === 'planning' ? RESEARCH_PLANNING_TOOL_NAMES : RESEARCH_INVESTIGATION_TOOL_NAMES), ...skillNames]
-      .filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
-      request.workspace.documentRef !== null, request.workspace.jobId !== null), ...skillNames, ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
-    if (delegationConfigured && (!request.research || request.research.phase === 'researching') && request.goalMode !== 'fill-form'
-      && request.budget.maxToolCalls > 0 && request.budget.maxModelCalls >= 3
-      && this.dependencies.tools?.listTools().some(tool => tool.name === 'Agent')) activeToolNames.push('Agent');
-    const extensionHub = this.dependencies.extensions;
-    const fixedExtensions = extensionHub?.freeze({ selection: selected.extensions, settingsRevision: selected.revision, activeToolNames,
-      policy: request.goalMode === 'fill-form' ? 'fill' : request.workspace || request.research ? 'p3' : 'p2' }) ?? ok(null);
-    if (!fixedExtensions.ok) return fixedExtensions;
-    if (!extensionHub && selected.extensions.enabledExtensions.length) return fail(appError('extension_config_invalid', 'input', 'Extension directory is unavailable.'));
-    const extensions = fixedExtensions.data;
-    if (!extensions?.included.some(item => item.ref.id === 'subagents')) {
-      const index = activeToolNames.indexOf('Agent'); if (index >= 0) activeToolNames.splice(index, 1);
-    }
-    const fixed = hub?.freeze({ selection: selected.selection, settingsRevision: selected.revision, activeToolNames, requiredSkill: required.data,
-      availableExtensions: extensions?.included.map(item => item.ref) ?? [] }) ?? ok(null);
-    if (!fixed.ok) return fixed;
-    if (!hub && (selected.selection.prompt || selected.selection.enabledSkills.length || required.data))
-      return fail(appError('resource_required_unavailable', 'input', 'Managed resources are unavailable.'));
-    const resources = fixed.data;
-    const definitions = this.dependencies.inputDefinitions?.freeze(request.text) ?? ok(null);
-    if (!definitions.ok) return definitions;
-    const inputDefinitions = definitions.data;
-    if (inputDefinitions?.command && !extensions?.included.some(item => item.ref.id === 'subagents'))
-      return fail(appError('extension_not_loaded', 'extension', 'Delegation input requires the compatible subagents plugin.'));
-    if (inputDefinitions?.command?.requiredRoles.some(id => !activeToolNames.includes('Agent')
-      || !inputDefinitions.roles.find(role => role.id === id)?.tools.every(name => activeToolNames.includes(name))))
-      return fail(appError('subagent_tool_denied', 'tool', 'The requested role requires tools unavailable in this Run.'));
-    const resourceBinding: ResourceBinding | undefined = resources ? { bundleId: resources.bundleId,
-      requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
+    const preparedResources = await this.readRuntimeStorage(store => {
+      let selected: AssemblySelectionSnapshot = assembly.data;
+      if (request.research && hub) {
+        const catalog = hub.catalog({ revision: selected.revision, selection: EMPTY_RESOURCE_SELECTION }, store.contents);
+        if (!catalog.ok) return catalog;
+        const prompt = catalog.data.items.find(item => item.available && item.ref.kind === 'prompt' && item.ref.id === 'research')?.ref;
+        const skill = catalog.data.items.find(item => item.available && item.ref.kind === 'skill' && item.ref.id === 'deep-research')?.ref;
+        if (!prompt || !skill) return fail(appError('resource_required_unavailable', 'input', 'The research Prompt and Skill are unavailable.'));
+        selected = { ...selected, selection: { prompt, enabledSkills: [skill] },
+          extensions: { enabledExtensions: selected.extensions.enabledExtensions.filter(ref => ref.id === 'subagents') } };
+      }
+      const required = resolveRequiredSkill(request.text, request.requiredSkill, selected.selection.enabledSkills);
+      if (!required.ok) return required;
+      const skillNames = (request.workspace || request.research) && request.goalMode !== 'fill-form'
+        ? SKILL_RESOURCE_TOOL_NAMES.filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : [];
+      const activeToolNames = request.research ? [...(request.research.phase === 'planning' ? RESEARCH_PLANNING_TOOL_NAMES : RESEARCH_INVESTIGATION_TOOL_NAMES), ...skillNames]
+        .filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
+        request.workspace.documentRef !== null, request.workspace.jobId !== null), ...skillNames, ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
+      if (delegationConfigured && (!request.research || request.research.phase === 'researching') && request.goalMode !== 'fill-form'
+        && request.budget.maxToolCalls > 0 && request.budget.maxModelCalls >= 3
+        && this.dependencies.tools?.listTools().some(tool => tool.name === 'Agent')) activeToolNames.push('Agent');
+      const extensionHub = this.dependencies.extensions;
+      const fixedExtensions = extensionHub?.freeze({ selection: selected.extensions, settingsRevision: selected.revision, activeToolNames,
+        policy: request.goalMode === 'fill-form' ? 'fill' : request.workspace || request.research ? 'p3' : 'p2' }) ?? ok(null);
+      if (!fixedExtensions.ok) return fixedExtensions;
+      if (!extensionHub && selected.extensions.enabledExtensions.length) return fail(appError('extension_config_invalid', 'input', 'Extension directory is unavailable.'));
+      const extensions = fixedExtensions.data;
+      if (!extensions?.included.some(item => item.ref.id === 'subagents')) {
+        const index = activeToolNames.indexOf('Agent'); if (index >= 0) activeToolNames.splice(index, 1);
+      }
+      const fixed = hub?.freeze({ selection: selected.selection, settingsRevision: selected.revision, activeToolNames, requiredSkill: required.data,
+        availableExtensions: extensions?.included.map(item => item.ref) ?? [] }, store.contents) ?? ok(null);
+      if (!fixed.ok) return fixed;
+      if (!hub && (selected.selection.prompt || selected.selection.enabledSkills.length || required.data))
+        return fail(appError('resource_required_unavailable', 'input', 'Managed resources are unavailable.'));
+      const resources = fixed.data;
+      const definitions = this.dependencies.inputDefinitions?.freeze(request.text) ?? ok(null);
+      if (!definitions.ok) return definitions;
+      const inputDefinitions = definitions.data;
+      if (inputDefinitions?.command && !extensions?.included.some(item => item.ref.id === 'subagents'))
+        return fail(appError('extension_not_loaded', 'extension', 'Delegation input requires the compatible subagents plugin.'));
+      if (inputDefinitions?.command?.requiredRoles.some(id => !activeToolNames.includes('Agent')
+        || !inputDefinitions.roles.find(role => role.id === id)?.tools.every(name => activeToolNames.includes(name))))
+        return fail(appError('subagent_tool_denied', 'tool', 'The requested role requires tools unavailable in this Run.'));
+      const resourceBinding: ResourceBinding | undefined = resources ? { bundleId: resources.bundleId,
+        requiredSkill: required.data as ResourceBinding['requiredSkill'] } : undefined;
+      return ok({ resources, extensions, inputDefinitions, resourceBinding, skillNames, activeToolNames });
+    });
+    if (!preparedResources.ok) return preparedResources;
+    const { resources, extensions, inputDefinitions, resourceBinding, skillNames, activeToolNames } = preparedResources.data;
     const freezeConfig = (config: ReturnType<typeof initialAgentSnapshot>) => ({ ...config,
       ...(resources ? { resources } : {}), ...(extensions ? { extensions } : {}), ...(inputDefinitions ? { inputDefinitions } : {}),
       agent: { ...config.agent, ...(resources ? { resourcePolicy: 'p11-resources-v1' as const } : {}),
+        ...(this.dependencies.systemPromptOverride === undefined ? {} : { systemPrompt: this.dependencies.systemPromptOverride }),
+        ...(this.dependencies.thinkingLevelOverride === undefined ? {} : { thinkingLevel: this.dependencies.thinkingLevelOverride }),
         ...(extensions ? { extensionPolicy: extensions.included.length ? extensions.policyVersion : 'none' as const } : {}) } });
     const createdAt = this.dependencies.now();
     const input: InputRecord = { version: 1, goal: researchGoal ?? INVOICE_CHAT_GOAL,
       text: request.text, messageTimestamp: Date.now() };
-    let admission: WorkspaceRunAdmission | null = null;
-    const materials = researchPolicy ? this.dependencies.research!.materialScope(researchPolicy) : null;
-    if (materials && !materials.ok) return materials;
-    let researchContext: ResearchContext | undefined;
-    let scope: RunScope | null = request.research && materials?.ok
-      ? { version: 2, allowedTools: activeToolNames, ...materials.data, allowedResourcePaths: [] } : !request.workspace && activeToolNames.includes('Agent')
-      ? { version: 2, allowedTools: ['Agent'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] } : null;
-    let inputId: number | undefined;
-    let frozenContent: SessionInputContentV2 | undefined;
-    const createInput = (submission: NormalizedSessionInputRequest) => this.dependencies.sessionInputs!.admit(submission, () => {
-      if (submission.mode !== 'prompt') return fail(appError('input_invalid', 'input', 'Initial input must be a prompt.'));
-      let runId: number;
-      if (request.workspace) {
-        const verify = this.dependencies.workspaceVerifier;
-        if (!verify) return fail(appError('workspace_unavailable', 'storage', 'Workspace verification is unavailable.', true));
-        const created = this.dependencies.runs.createWorkspaceAgent({ sessionId: request.sessionId,
-          expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
-          messageTimestamp: input.messageTimestamp, goal: INVOICE_CHAT_GOAL,
-          config: { ...freezeConfig(initialP3AgentSnapshot(request, session.nativeSessionId)),
-            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
-            ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
-              ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
-          cleanup: initialCleanup(), createdAt, skillToolNames: skillNames,
-          ...(hub ? { collectResourceEvidence: true as const } : {}),
-          ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
-          ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
-            runtimeDir: this.dependencies.nativeTools.runtimeDir, allowedTools: nativeNames,
-            ...(workingDirectory ? { workingDirectory } : {}) } } : {}) }, verify);
-        if (!created.ok) return created;
-        admission = created.data;
-        scope = created.data.scope;
-        runId = created.data.runId;
-        if (this.dependencies.nativeTools && submission.goalMode !== 'fill-form')
-          workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(runId), 'work');
-      } else {
-        const created = this.dependencies.runs.createAgent({ goal: input.goal, input,
-          config: { ...freezeConfig(scope ? { ...initialP3AgentSnapshot(request, session.nativeSessionId),
-            agent: { ...initialP3AgentSnapshot(request, session.nativeSessionId).agent, systemPrompt: request.research ? request.research.phase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT } }
-            : initialAgentSnapshot(request, session.nativeSessionId)),
-            ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
-            ...(this.dependencies.agent?.compactSession && this.dependencies.contextRepository?.recordCompactionEvidence
-              ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
-          cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: scope ?? chatScope,
-          ...(hub ? { collectResourceEvidence: true as const } : {}) });
-        if (!created.ok) return created;
-        runId = created.data;
+    let committed: RunAccepted | undefined;
+    const result = await this.writeRuntimeStorage(store => {
+      if (inputSubmission) {
+        const previous = store.sessionInputs.lookup(inputSubmission, control.desktopRequestIdentity);
+        if (!previous.ok) return previous;
+        if (previous.data) return previous.data.runId === null
+          ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
+          : ok({ runId: previous.data.runId, sessionId: previous.data.sessionId, inputId: previous.data.inputId });
       }
-      if (request.research) {
-        const bound = this.dependencies.research!.bindRun({ ...request.research, sessionId: request.sessionId, runId, at: createdAt });
-        if (!bound.ok) return bound;
-        researchContext = { binding: bound.data, plan: confirmedPlan?.body ?? null };
-      }
-      const content: SessionInputContentV2 = { ...(researchContext ? { research: researchContext } : {}), version: 2, text: request.text,
-        ...(inputDefinitions?.command ? { inputCommand: inputDefinitions.command } : {}),
-        ...(resourceBinding ? { resourceBinding } : {}),
-        requestIdentityVersion: 1, originalBudgetOverrides: originalOverrides(rawRequest),
-        workspaceContext: admission?.workspaceContext ?? null, workspaceInput: admission?.workspaceInput ?? null,
-        allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : researchContext && scope?.version === 2 ? [...scope.allowedDocumentIds] : [],
-        allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : researchContext && scope?.version === 2 ? [...scope.allowedArtifactIds] : [],
-        ...(control.desktopRequestIdentity === undefined ? {} : { desktopRequestIdentity: control.desktopRequestIdentity }),
-        promptText: formatExecutionPrompt({ text: inputDefinitions?.command?.expandedText ?? request.text, business: admission !== null,
-          ...(admission ? { workspaceInput: admission.workspaceInput, workspaceContext: admission.workspaceContext,
-            goalMode: request.goalMode ?? 'answer' } : {}),
-          ...(workingDirectory ? { workingDirectory } : {}) }) };
-      return this.buildInput(runId, request.sessionId, content, createdAt);
-    }, createdAt, control.desktopRequestIdentity);
-    const accepted = inputSubmission ? createInput(inputSubmission)
-      : this.dependencies.sessionInputs.allocateSequence(request.sessionId, sequence => {
-        const normalized = normalizeSessionInputRequest({ ...rawRequest, mode: 'prompt', clientSequence: sequence });
-        return normalized.ok ? createInput(normalized.data) : normalized;
+      if (control.signal?.aborted) return fail(appError('runtime_shutdown', 'runtime', 'The foreground client is no longer available.'));
+      if (this.poisoned) return fail(appError('runtime_unusable', 'runtime', 'Runtime cannot admit another Run.'));
+      if (this.closing || this.closed || this.active !== null) return fail(appError('runtime_busy', 'runtime', '已有 Run 正在执行。'));
+      if (this.dependencies.isSessionManaging?.(request.sessionId)) return fail(appError('session_busy', 'session', 'Session management is in progress.', true));
+      if (!store.db.afterCommit) return fail(appError('storage_write_failed', 'storage', 'Runtime admission requires a confirmed commit.', true));
+      const currentSession = store.sessions.get(request.sessionId); if (!currentSession.ok) return currentSession;
+      if (currentSession.data.runtimeKind !== 'agent_session') return fail(appError('session_runtime_mismatch', 'session', 'This Session belongs to the Durable business runtime.'));
+      const childSession = store.sessions.isSubagentSession(request.sessionId); if (!childSession.ok) return childSession;
+      if (childSession.data) return fail(appError('subagent_origin_invalid', 'runtime', 'Child Sessions cannot start public Runs.'));
+      session = currentSession.data;
+      if (session.deletePending) return fail(appError('session_delete_incomplete', 'session', 'Retry Delete to finish removing this Session.', true));
+      if (session.status !== 'active') return fail(appError('session_archived', 'session', '归档 Session 不能继续执行。'));
+      const modelUseBlocked = store.sessions.isModelUseBlocked(request.sessionId); if (!modelUseBlocked.ok) return modelUseBlocked;
+      if (modelUseBlocked.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限，请新建 Session。'));
+      const taskForSession = store.research.forSession(request.sessionId);
+      if (!taskForSession.ok) return taskForSession;
+      if (taskForSession.data && !request.research)
+        return fail(appError('research_intent_required', 'input', 'Choose a research action for this dedicated Session.'));
+      let admission: WorkspaceRunAdmission | null = null;
+      const materials = researchPolicy ? store.research.materialScope(researchPolicy) : null;
+      if (materials && !materials.ok) return materials;
+      let researchContext: ResearchContext | undefined;
+      let scope: RunScope | null = request.research && materials?.ok
+        ? { version: 2, allowedTools: activeToolNames, ...materials.data, allowedResourcePaths: [] } : !request.workspace && activeToolNames.includes('Agent')
+        ? { version: 2, allowedTools: ['Agent'], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] } : null;
+      let inputId: number | undefined;
+      let frozenContent: SessionInputContentV2 | undefined;
+      const createInput = (submission: NormalizedSessionInputRequest) => store.sessionInputs.admit(submission, () => {
+        if (submission.mode !== 'prompt') return fail(appError('input_invalid', 'input', 'Initial input must be a prompt.'));
+        let runId: number;
+        if (request.workspace) {
+          const verify = this.dependencies.workspaceVerifier;
+          if (!verify) return fail(appError('workspace_unavailable', 'storage', 'Workspace verification is unavailable.', true));
+          const created = store.runs.createWorkspaceAgent({ sessionId: request.sessionId,
+            expected: request.workspace, goalMode: request.goalMode ?? 'answer', text: request.text,
+            messageTimestamp: input.messageTimestamp, goal: INVOICE_CHAT_GOAL,
+            config: { ...freezeConfig(initialP3AgentSnapshot(request, session.nativeSessionId)),
+              ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
+              ...(this.dependencies.agent?.compactSession && this.dependencies.contextService
+                ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
+            cleanup: initialCleanup(), createdAt, skillToolNames: skillNames,
+            ...(hub ? { collectResourceEvidence: true as const } : {}),
+            ...(submission.goalMode === 'fill-form' ? { formTarget: submission.formTarget } : {}),
+            ...(this.dependencies.nativeTools && submission.goalMode !== 'fill-form' ? { nativeTools: {
+              runtimeDir: this.dependencies.nativeTools.runtimeDir, allowedTools: nativeNames,
+              ...(workingDirectory ? { workingDirectory } : {}) } } : {}) }, input => verify(input, store));
+          if (!created.ok) return created;
+          admission = created.data;
+          scope = created.data.scope;
+          runId = created.data.runId;
+          if (this.dependencies.nativeTools && submission.goalMode !== 'fill-form')
+            workingDirectory ??= join(this.dependencies.nativeTools.runtimeDir, String(runId), 'work');
+        } else {
+          const created = store.runs.createAgent({ goal: input.goal, input,
+            config: { ...freezeConfig(scope ? { ...initialP3AgentSnapshot(request, session.nativeSessionId),
+              agent: { ...initialP3AgentSnapshot(request, session.nativeSessionId).agent, systemPrompt: request.research ? request.research.phase === 'planning' ? RESEARCH_PLANNING_SYSTEM_PROMPT : RESEARCH_INVESTIGATION_SYSTEM_PROMPT : INVOICE_CHAT_SYSTEM_PROMPT } }
+              : initialAgentSnapshot(request, session.nativeSessionId)),
+              ...(this.dependencies.contextService ? { contextPolicyVersion: 'p8-context-v1' as const } : {}),
+              ...(this.dependencies.agent?.compactSession && this.dependencies.contextService
+                ? { compactionPolicy: RUNTIME_CONFIG.compaction } : {}) }, usage: initialUsage(createdAt),
+            cleanup: initialCleanup(), createdAt, sessionId: request.sessionId, scope: scope ?? chatScope,
+            ...(hub ? { collectResourceEvidence: true as const } : {}) });
+          if (!created.ok) return created;
+          runId = created.data;
+        }
+        if (request.research) {
+          const bound = store.research.bindRun({ ...request.research, sessionId: request.sessionId, runId, at: createdAt });
+          if (!bound.ok) return bound;
+          researchContext = { binding: bound.data, plan: confirmedPlan?.body ?? null };
+        }
+        const content: SessionInputContentV2 = { ...(researchContext ? { research: researchContext } : {}), version: 2, text: request.text,
+          ...(inputDefinitions?.command ? { inputCommand: inputDefinitions.command } : {}),
+          ...(resourceBinding ? { resourceBinding } : {}),
+          requestIdentityVersion: 1, originalBudgetOverrides: originalOverrides(rawRequest),
+          workspaceContext: admission?.workspaceContext ?? null, workspaceInput: admission?.workspaceInput ?? null,
+          allowedDocumentIds: admission ? [...admission.scope.allowedDocumentIds] : researchContext && scope?.version === 2 ? [...scope.allowedDocumentIds] : [],
+          allowedArtifactIds: admission ? [...admission.scope.allowedArtifactIds] : researchContext && scope?.version === 2 ? [...scope.allowedArtifactIds] : [],
+          ...(control.desktopRequestIdentity === undefined ? {} : { desktopRequestIdentity: control.desktopRequestIdentity }),
+          promptText: formatExecutionPrompt({ text: inputDefinitions?.command?.expandedText ?? request.text, business: admission !== null,
+            ...(admission ? { workspaceInput: admission.workspaceInput, workspaceContext: admission.workspaceContext,
+              goalMode: request.goalMode ?? 'answer' } : {}),
+            ...(workingDirectory ? { workingDirectory } : {}) }) };
+        return this.buildInput(runId, request.sessionId, content, createdAt, store);
+      }, createdAt, control.desktopRequestIdentity);
+      const accepted = inputSubmission ? createInput(inputSubmission)
+        : store.sessionInputs.allocateSequence(request.sessionId, sequence => {
+          const normalized = normalizeSessionInputRequest({ ...rawRequest, mode: 'prompt', clientSequence: sequence });
+          return normalized.ok ? createInput(normalized.data) : normalized;
+        });
+      if (!accepted.ok) return accepted;
+      inputId = accepted.data.input.inputId;
+      if (!accepted.data.created) return accepted.data.input.runId === null
+        ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
+        : ok({ runId: accepted.data.input.runId, sessionId: request.sessionId, inputId });
+      if (accepted.data.input.content.version !== 2 || accepted.data.input.runId === null)
+        return fail(appError('input_processing_unconfirmed', 'runtime', 'New input evidence is invalid.'));
+      frozenContent = accepted.data.input.content;
+      const runId = accepted.data.input.runId;
+      const content = frozenContent;
+      store.db.afterCommit(() => {
+        const controller = new AbortController();
+        let sequence = 0;
+        let stopIntent: StopIntent | undefined;
+        let resolveStop: ((intent: StopIntent) => void) | undefined;
+        const stopPromise = new Promise<StopIntent>((resolve) => { resolveStop = resolve; });
+        const emit = (payload: AgentEventPayload) => {
+          sequence += 1;
+          const event: AgentRunEvent = {
+            ...payload,
+            runId,
+            sessionId: request.sessionId,
+            nativeSessionId: session.nativeSessionId,
+            sequence,
+            at: this.dependencies.now(),
+          } as AgentRunEvent;
+          try { control.onEvent?.(event); }
+          catch {
+            try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'warn', component: 'runtime', runId, event: 'agent_event_callback_failed' }); } catch { /* diagnostics are best effort */ }
+          }
+        };
+        const active: ActiveCall = {
+          runId,
+          kind: 'agent',
+          sessionId: request.sessionId,
+          nativeSessionId: session.nativeSessionId,
+          controller,
+          startedAt: this.dependencies.monotonicNow(),
+          terminalCommitted: false,
+          stop: () => false,
+          completion: Promise.resolve(fail(appError('runtime_not_started', 'runtime', 'Run 尚未开始。', false, runId))),
+          poisoned: false,
+          observe: () => undefined,
+        };
+        active.stop = (reason, sharedIntent) => {
+          if (stopIntent || active.poisoned || active.terminalCommitted) return false;
+          stopIntent = sharedIntent ?? { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
+          active.stopIntent = stopIntent;
+          active.inputAdmissionClosed = true;
+          try {
+            if (reason === 'user') this.persistCancellation(active, stopIntent.at);
+          } finally {
+            resolveStop?.(stopIntent);
+            controller.abort(reason);
+          }
+          emit({ type: 'run_progress', phase: 'stopping', reason });
+          return true;
+        };
+        let resolveCompletion!: (result: Result<ProviderOutcome>) => void;
+        active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
+        this.active = active;
+        const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: content.promptText,
+          resources, extensions, ...(inputDefinitions ? { inputDefinitions } : {}), ...(resourceBinding ? { resourceBinding } : {}),
+          ...(extensions?.included.some(item => item.ref.id === 'subagents')
+            ? { modelBudget: { used: 0, limit: request.budget.maxModelCalls } } : {}),
+          ...(inputId === undefined ? {} : { inputId }),
+          ...(accepted.data.input.contextSnapshotId === null ? {} : { contextSnapshotId: accepted.data.input.contextSnapshotId }),
+          control, stopPromise, readStop: () => stopIntent, emit };
+        this.agentContext = context;
+        committed = { runId, sessionId: request.sessionId, ...(inputId === undefined ? {} : { inputId }) };
+        const timer = setTimeout(() => active.stop('timeout'), request.timeoutMs);
+        const externalAbort = () => active.stop(control.signal?.reason === 'shutdown' ? 'shutdown' : 'user');
+        control.signal?.addEventListener('abort', externalAbort, { once: true });
+        if (control.signal?.aborted) externalAbort();
+        emit({ type: 'run_progress', phase: 'created' });
+        if (this.closing || this.closed) active.stop('shutdown');
+        const execution = this.executeAgent(context).catch(() => this.finishAgent(context, null,
+          appError('agent_runtime_error', 'runtime', 'Agent 执行失败。', true, runId), false, true));
+        void execution.then((result) => {
+          clearTimeout(timer);
+          control.signal?.removeEventListener('abort', externalAbort);
+          if (this.active === active) this.active = null;
+          if (this.agentContext === context) this.agentContext = null;
+          resolveCompletion(result);
+          emit({ type: 'run_finished', result });
+        }, () => {
+          clearTimeout(timer);
+          control.signal?.removeEventListener('abort', externalAbort);
+          active.poisoned = true;
+          this.poisoned = true;
+          if (this.active === active) this.active = null;
+          const failed = fail<AgentOutcome>(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, runId), runId);
+          resolveCompletion(failed);
+          emit({ type: 'run_finished', result: failed });
+        });
       });
-    if (!accepted.ok) return accepted;
-    inputId = accepted.data.input.inputId;
-    if (!accepted.data.created) return accepted.data.input.runId === null
-      ? fail(appError('operation_result_unknown', 'session', 'The original input has no confirmed Run.'))
-      : ok({ runId: accepted.data.input.runId, sessionId: request.sessionId, inputId });
-    if (accepted.data.input.content.version !== 2 || accepted.data.input.runId === null)
-      return fail(appError('input_processing_unconfirmed', 'runtime', 'New input evidence is invalid.'));
-    frozenContent = accepted.data.input.content;
-    const runId = accepted.data.input.runId;
-    const controller = new AbortController();
-    let sequence = 0;
-    let stopIntent: StopIntent | undefined;
-    let resolveStop: ((intent: StopIntent) => void) | undefined;
-    const stopPromise = new Promise<StopIntent>((resolve) => { resolveStop = resolve; });
-    const emit = (payload: AgentEventPayload) => {
-      sequence += 1;
-      const event: AgentRunEvent = {
-        ...payload,
-        runId,
-        sessionId: request.sessionId,
-        nativeSessionId: session.nativeSessionId,
-        sequence,
-        at: this.dependencies.now(),
-      } as AgentRunEvent;
-      try { control.onEvent?.(event); }
-      catch {
-        try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'warn', component: 'runtime', runId, event: 'agent_event_callback_failed' }); } catch { /* diagnostics are best effort */ }
-      }
-    };
-    const active: ActiveCall = {
-      runId,
-      kind: 'agent',
-      sessionId: request.sessionId,
-      nativeSessionId: session.nativeSessionId,
-      controller,
-      startedAt: this.dependencies.monotonicNow(),
-      terminalCommitted: false,
-      stop: () => false,
-      completion: Promise.resolve(fail(appError('runtime_not_started', 'runtime', 'Run 尚未开始。', false, runId))),
-      poisoned: false,
-      observe: () => undefined,
-    };
-    active.stop = (reason, sharedIntent) => {
-      if (stopIntent || active.poisoned || active.terminalCommitted) return false;
-      stopIntent = sharedIntent ?? { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
-      active.stopIntent = stopIntent;
-      active.inputAdmissionClosed = true;
-      try {
-        if (reason === 'user') this.persistCancellation(active, stopIntent.at);
-      } finally {
-        resolveStop?.(stopIntent);
-        controller.abort(reason);
-      }
-      emit({ type: 'run_progress', phase: 'stopping', reason });
-      return true;
-    };
-    let resolveCompletion!: (result: Result<ProviderOutcome>) => void;
-    active.completion = new Promise((resolve) => { resolveCompletion = resolve; });
-    this.active = active;
-    const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: frozenContent.promptText,
-      resources, extensions, ...(inputDefinitions ? { inputDefinitions } : {}), ...(resourceBinding ? { resourceBinding } : {}),
-      ...(extensions?.included.some(item => item.ref.id === 'subagents')
-        ? { modelBudget: { used: 0, limit: request.budget.maxModelCalls } } : {}),
-      ...(inputId === undefined ? {} : { inputId }),
-      ...(accepted.data.input.contextSnapshotId === null ? {} : { contextSnapshotId: accepted.data.input.contextSnapshotId }),
-      control, stopPromise, readStop: () => stopIntent, emit };
-    this.agentContext = context;
-    const timer = setTimeout(() => active.stop('timeout'), request.timeoutMs);
-    emit({ type: 'run_progress', phase: 'created' });
-    const execution = this.executeAgent(context).catch(() => this.finishAgent(context, null,
-      appError('agent_runtime_error', 'runtime', 'Agent 执行失败。', true, runId), false, true));
-    void execution.then((result) => {
-      clearTimeout(timer);
-      if (this.active === active) this.active = null;
-      if (this.agentContext === context) this.agentContext = null;
-      resolveCompletion(result);
-      emit({ type: 'run_finished', result });
-    }, () => {
-      clearTimeout(timer);
-      active.poisoned = true;
-      this.poisoned = true;
-      if (this.active === active) this.active = null;
-      const failed = fail<AgentOutcome>(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, runId), runId);
-      resolveCompletion(failed);
-      emit({ type: 'run_finished', result: failed });
+      return ok({ runId, sessionId: request.sessionId, ...(inputId === undefined ? {} : { inputId }) });
     });
-    return ok({ runId, sessionId: request.sessionId, ...(inputId === undefined ? {} : { inputId }) });
+    return committed === undefined ? result : ok(committed);
   }
 
   public async callProvider(request: ProviderRequest, control: ProviderControl = {}): Promise<Result<ProviderOutcome>> {
-    if (this.poisoned) {
-      return fail(appError('runtime_unusable', 'runtime', 'Provider 停止未确认，运行实例不可复用。'));
-    }
-    if (this.closing || this.closed || this.active !== null) {
-      return fail(appError('runtime_busy', 'runtime', '已有 Provider Run 正在执行。'));
-    }
+    request = structuredClone(request);
+    control = { ...control };
+    let completion: Promise<Result<ProviderOutcome>> | undefined;
+    const admitted = await this.writeRuntimeStorage<void>(scope => {
+      if (control.signal?.aborted && control.signal.reason === 'shutdown')
+        return fail(appError('runtime_shutdown', 'runtime', 'The foreground client is no longer available.'));
+      if (this.poisoned) {
+        return fail(appError('runtime_unusable', 'runtime', 'Provider 停止未确认，运行实例不可复用。'));
+      }
+      if (this.closing || this.closed || this.active !== null) {
+        return fail(appError('runtime_busy', 'runtime', '已有 Provider Run 正在执行。'));
+      }
 
-    const startedAt = this.dependencies.monotonicNow();
-    const createdAt = this.dependencies.now();
-    const input: InputRecord = { version: 1, goal: request.goal, text: request.text, messageTimestamp: Date.now() };
-    const created = this.dependencies.runs.create({
-      goal: request.goal,
-      input,
-      config: initialSnapshot(request),
-      usage: initialUsage(createdAt),
-      cleanup: initialCleanup(),
-      createdAt,
-    });
-    if (!created.ok) return created;
+      const startedAt = this.dependencies.monotonicNow();
+      const createdAt = this.dependencies.now();
+      const input: InputRecord = { version: 1, goal: request.goal, text: request.text, messageTimestamp: Date.now() };
+      const created = scope.runs.create({
+        goal: request.goal,
+        input,
+        config: initialSnapshot(request),
+        usage: initialUsage(createdAt),
+        cleanup: initialCleanup(),
+        createdAt,
+      });
+      if (!created.ok) return created;
 
-    const runId = created.data;
-    const controller = new AbortController();
-    let sequence = 0;
-    let stopIntent: StopIntent | undefined;
-    let stopResolver: ((intent: StopIntent) => void) | undefined;
-    const stopPromise = new Promise<StopIntent>((resolve) => { stopResolver = resolve; });
-    const observe = (type: ProviderObservation['type'], data: Readonly<Record<string, unknown>> = {}) => {
-      sequence += 1;
-      try {
-        control.onObservation?.({
+      const runId = created.data;
+      scope.db.afterCommit!(() => {
+        const controller = new AbortController();
+        let sequence = 0;
+        let stopIntent: StopIntent | undefined;
+        let stopResolver: ((intent: StopIntent) => void) | undefined;
+        const stopPromise = new Promise<StopIntent>((resolve) => { stopResolver = resolve; });
+        const observe = (type: ProviderObservation['type'], data: Readonly<Record<string, unknown>> = {}) => {
+          sequence += 1;
+          try {
+            control.onObservation?.({
+              runId,
+              sequence,
+              at: this.dependencies.now(),
+              monotonicMs: this.dependencies.monotonicNow(),
+              type,
+              data,
+            });
+          } catch {
+            try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'warn', component: 'runtime', runId, event: 'observation_callback_failed' }); } catch { /* diagnostics are best effort */ }
+          }
+        };
+        const active: ActiveCall = {
           runId,
-          sequence,
-          at: this.dependencies.now(),
-          monotonicMs: this.dependencies.monotonicNow(),
-          type,
-          data,
-        });
-      } catch {
-        try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'warn', component: 'runtime', runId, event: 'observation_callback_failed' }); } catch { /* diagnostics are best effort */ }
-      }
-    };
-    const active: ActiveCall = {
-      runId,
-      kind: 'provider',
-      sessionId: null,
-      nativeSessionId: null,
-      controller,
-      startedAt,
-      terminalCommitted: false,
-      stop: () => false,
-      completion: Promise.resolve(fail(appError('runtime_not_started', 'runtime', 'Run 尚未开始。', false, runId))),
-      poisoned: false,
-      observe,
-    };
-    let resolveLifecycle!: (result: Result<ProviderOutcome>) => void;
-    active.completion = new Promise((resolve) => { resolveLifecycle = resolve; });
-    const requestStop = (reason: StopReason) => {
-      if (stopIntent || active.poisoned || active.terminalCommitted) return false;
-      stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
-      active.stopIntent = stopIntent;
-      active.inputAdmissionClosed = true;
-      const elapsedMs = Math.max(0, Math.round(stopIntent.monotonicMs - active.startedAt));
-      let cancelPersisted: boolean | undefined;
-      try {
-        if (reason === 'user') cancelPersisted = this.persistCancellation(active, stopIntent.at);
-      } finally {
-        stopResolver?.(stopIntent);
-        controller.abort(reason);
-      }
-      observe('stop_requested', { reason, elapsedMs, deadlineElapsedMs: request.timeoutMs, stopGraceMs: request.stopGraceMs });
-      if (reason === 'user') observe('cancel_requested', { persisted: cancelPersisted });
-      return true;
-    };
-    active.stop = requestStop;
-    this.active = active;
-    const timer = setTimeout(() => requestStop('timeout'), Math.max(0, request.timeoutMs - (this.dependencies.monotonicNow() - startedAt)));
-    observe('run_created', { status: 'created' });
-    const externalAbort = () => requestStop('user');
-    control.signal?.addEventListener('abort', externalAbort, { once: true });
-    if (control.signal?.aborted) requestStop('user');
+          kind: 'provider',
+          sessionId: null,
+          nativeSessionId: null,
+          controller,
+          startedAt,
+          terminalCommitted: false,
+          stop: () => false,
+          completion: Promise.resolve(fail(appError('runtime_not_started', 'runtime', 'Run 尚未开始。', false, runId))),
+          poisoned: false,
+          observe,
+        };
+        let resolveLifecycle!: (result: Result<ProviderOutcome>) => void;
+        active.completion = new Promise((resolve) => { resolveLifecycle = resolve; });
+        completion = active.completion;
+        const requestStop = (reason: StopReason) => {
+          if (stopIntent || active.poisoned || active.terminalCommitted) return false;
+          stopIntent = { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
+          active.stopIntent = stopIntent;
+          active.inputAdmissionClosed = true;
+          const elapsedMs = Math.max(0, Math.round(stopIntent.monotonicMs - active.startedAt));
+          let cancellation: Promise<boolean> | undefined;
+          try {
+            if (reason === 'user') cancellation = this.persistCancellation(active, stopIntent.at);
+          } finally {
+            stopResolver?.(stopIntent);
+            controller.abort(reason);
+          }
+          observe('stop_requested', { reason, elapsedMs, deadlineElapsedMs: request.timeoutMs, stopGraceMs: request.stopGraceMs });
+          if (cancellation) void cancellation.then(persisted => { observe('cancel_requested', { persisted }); });
+          return true;
+        };
+        active.stop = requestStop;
+        this.active = active;
+        const timer = setTimeout(() => requestStop('timeout'), Math.max(0, request.timeoutMs - (this.dependencies.monotonicNow() - startedAt)));
+        observe('run_created', { status: 'created' });
+        const externalAbort = () => requestStop(control.signal?.reason === 'shutdown' ? 'shutdown' : 'user');
+        control.signal?.addEventListener('abort', externalAbort, { once: true });
+        if (control.signal?.aborted) externalAbort();
+        if (this.closing || this.closed) requestStop('shutdown');
 
-    const readStop = () => {
-      if (!stopIntent && this.dependencies.monotonicNow() - startedAt >= request.timeoutMs) requestStop('timeout');
-      return stopIntent;
-    };
-    const completion = this.execute(active, request, input, observe, stopPromise, readStop);
-    active.completion = completion;
-    const result = completion.finally(() => {
-      clearTimeout(timer);
-      control.signal?.removeEventListener('abort', externalAbort);
-      if (this.active === active) this.active = null;
+        const readStop = () => {
+          if (!stopIntent && this.dependencies.monotonicNow() - startedAt >= request.timeoutMs) requestStop('timeout');
+          return stopIntent;
+        };
+        const execution = this.execute(active, request, input, observe, stopPromise, readStop);
+        active.completion = execution;
+        const result = execution.finally(() => {
+          clearTimeout(timer);
+          control.signal?.removeEventListener('abort', externalAbort);
+          if (this.active === active) this.active = null;
+        });
+        void result.then(resolveLifecycle, () => resolveLifecycle(fail(appError('provider_runtime_error', 'runtime', 'Provider 执行失败。', true, runId), runId)));
+      });
+      return ok(undefined);
     });
-    void result.then(resolveLifecycle, () => resolveLifecycle(fail(appError('provider_runtime_error', 'runtime', 'Provider 执行失败。', true, runId), runId)));
-    return result;
+    if (completion) return completion;
+    return admitted.ok ? fail(appError('runtime_not_started', 'runtime', 'Run 尚未开始。')) : admitted;
   }
 
   private remainingGrace(context: AgentExecutionContext, intent: StopIntent): number {
@@ -1331,106 +1527,133 @@ export class RuntimeService {
   }
 
   public async prepareSubagent(origin: SubagentOrigin, pluginAgentId: string, rawArgs: DelegateArgs): Promise<Result<PreparedSubagent>> {
-    const parent = this.agentContext, agent = this.dependencies.agent, sessions = this.dependencies.sessions;
+    origin = { ...origin, requestBinding: structuredClone(origin.requestBinding) };
+    const parent = this.agentContext, agent = this.dependencies.agent;
     const args = DelegateArgsSchema.safeParse(rawArgs);
-    const denied = () => fail<PreparedSubagent>(appError('subagent_origin_invalid', 'runtime', 'Delegation has no open root execution.'));
+    const denied = () => fail(appError('subagent_origin_invalid', 'runtime', 'Delegation has no open root execution.'));
     const role = args.success ? parent?.inputDefinitions?.roles.find(role => role.id === args.data.subagent_type) : null;
-    if (!role || role.tools.some(name => !parent?.scope?.allowedTools.includes(name)) || !args.success || !parent || !agent || !sessions || !this.dependencies.sessionInputs || !this.dependencies.tools
-      || this.active !== parent.active || this.poisoned || this.closing || parent.active.controller.signal.aborted
-      || parent.active.terminalCommitted || parent.active.runId !== origin.parentRunId
-      || parent.session.sessionId !== origin.parentSessionId || parent.session.nativeSessionId !== origin.parentNativeSessionId
-      || !parent.scope || !parent.extensions?.included.some(item => item.ref.id === 'subagents')) return denied();
-    let held = 0;
-    for (const owner of this.childSlots.values()) {
-      const prior = this.dependencies.runs.get(owner.context.active.runId); if (!prior.ok) return prior;
-      if (!owner.context.active.terminalCommitted || owner.context.active.poisoned || prior.data.stoppedAt === null) held++;
-    }
-    if (held >= 4) return fail(appError('subagent_busy', 'runtime', 'Four child executions are already owned.', true));
-    const savedParent = this.dependencies.runs.get(origin.parentRunId);
-    if (!savedParent.ok) return savedParent;
-    if (savedParent.data.kind !== 'agent' || savedParent.data.status !== 'running') return denied();
-    const instances = agent.inspectExtensions?.(origin.parentNativeSessionId);
-    if (!instances?.ok || !instances.data.instances.some(item => item.ref.id === 'subagents'
-      && item.instanceId === origin.extensionInstanceId && item.state === 'active' && item.admission === 'open')) return denied();
-    const prior = this.dependencies.runs.getByOriginToolCall(origin.originToolCallId);
-    if (!prior.ok) return prior;
-    if (prior.data) return fail(appError('subagent_identity_conflict', 'runtime', 'The original delegation already owns a child; it cannot replay.'));
-    if (!Number.isFinite(origin.delegateDeadlineAt) || !origin.delegateSignal || origin.delegateSignal.aborted) return denied();
-    const deadlineAt = Math.min(parent.active.startedAt + parent.request.timeoutMs, origin.delegateDeadlineAt!);
-    const remaining = Math.floor(deadlineAt - this.dependencies.monotonicNow());
-    const available = (parent.modelBudget?.limit ?? 0) - (parent.modelBudget?.used ?? 0) - 1;
-    if (remaining <= 0 || available < 1) return denied();
+    if (!role || role.tools.some(name => !parent?.scope?.allowedTools.includes(name)) || !args.success || !parent || !agent
+      || !this.dependencies.tools || !parent.scope
+      || parent.active.runId !== origin.parentRunId || parent.session.sessionId !== origin.parentSessionId
+      || parent.session.nativeSessionId !== origin.parentNativeSessionId
+      || !parent.extensions?.included.some(item => item.ref.id === 'subagents')) return denied();
+    const validate = (store: SqlDatabaseStore) => {
+      if (this.agentContext !== parent || this.active !== parent.active || this.poisoned || this.closing
+        || parent.active.controller.signal.aborted || parent.active.terminalCommitted) return denied();
+      let held = 0;
+      for (const owner of this.childSlots.values()) {
+        const prior = store.runs.get(owner.context.active.runId); if (!prior.ok) return prior;
+        if (!owner.context.active.terminalCommitted || owner.context.active.poisoned || prior.data.stoppedAt === null) held++;
+      }
+      if (held >= 4) return fail(appError('subagent_busy', 'runtime', 'Four child executions are already owned.', true));
+      const savedParent = store.runs.get(origin.parentRunId);
+      if (!savedParent.ok) return savedParent;
+      if (savedParent.data.kind !== 'agent' || savedParent.data.status !== 'running' || savedParent.data.cancelRequestedAt !== null) return denied();
+      const session = store.sessions.get(origin.parentSessionId);
+      if (!session.ok) return session;
+      if (session.data.nativeSessionId !== origin.parentNativeSessionId || session.data.status !== 'active'
+        || session.data.deletePending || session.data.modelUseBlocked || session.data.nativeUnusable) return denied();
+      const instances = agent.inspectExtensions?.(origin.parentNativeSessionId);
+      if (!instances?.ok || !instances.data.instances.some(item => item.ref.id === 'subagents'
+        && item.instanceId === origin.extensionInstanceId && item.state === 'active' && item.admission === 'open')) return denied();
+      const prior = store.runs.getByOriginToolCall(origin.originToolCallId);
+      if (!prior.ok) return prior;
+      if (prior.data) return fail(appError('subagent_identity_conflict', 'runtime', 'The original delegation already owns a child; it cannot replay.'));
+      if (!Number.isFinite(origin.delegateDeadlineAt) || !origin.delegateSignal || origin.delegateSignal.aborted) return denied();
+      const deadlineAt = Math.min(parent.active.startedAt + parent.request.timeoutMs, origin.delegateDeadlineAt!);
+      const remaining = Math.floor(deadlineAt - this.dependencies.monotonicNow());
+      const available = (parent.modelBudget?.limit ?? 0) - (parent.modelBudget?.used ?? 0) - 1;
+      return remaining <= 0 || available < 1 ? denied() : ok({ savedParent: savedParent.data, deadlineAt, remaining, available });
+    };
+    const initial = await this.readRuntimeStorage(validate);
+    if (!initial.ok) return initial;
     const native = agent.createSession(); if (!native.ok) return native;
     const nativeId = native.data.nativeSessionId, history = agent.exportSession?.(nativeId);
     if (!history?.ok) { await agent.releaseSession(nativeId); return history ?? denied(); }
-    const parentFacts = savedParent.data.config as SafeConfigSnapshot & Record<string, unknown> & { agent: RuntimeAgentConfigFacts };
-    const { extensions: _extensions, extensionAssembly: _assembly, inputCommandReceipt: _commandReceipt, compactionPolicy: _compaction, runtimeStrategy: _strategy,
-      workspaceContext: _workspace, formTarget: _form, ...base } = parentFacts;
-    const budget = { ...parent.request.budget, maxModelCalls: available };
-    const { extensionPolicy: _extensionPolicy, ...parentAgent } = parentFacts.agent;
-    const childDefinitions = parent.inputDefinitions ? { ...parent.inputDefinitions, command: null } : undefined;
-    const config = { ...base, ...(childDefinitions ? { inputDefinitions: childDefinitions } : {}), goalMode: 'answer' as const, contextPolicyVersion: 'p8-context-v1' as const, historyPolicyVersion: 'p9-native-history-v1' as const,
-      runtimeBudget: budget, limits: { timeoutMs: remaining, stopGraceMs: parent.request.stopGraceMs },
-      agent: { ...parentAgent, ...budget, nativeSessionId: nativeId, systemPrompt: role.systemPrompt },
-      subagent: { version: 1 as const, role: role.id, definition: role, pluginVersion: '0.19.0' as const, patchVersion: 'flowmate-p13.2' as const,
-        extensionInstanceId: origin.extensionInstanceId, parentNativeSessionId: origin.parentNativeSessionId,
-        parentContextSnapshotId: origin.requestBinding.snapshotId, parentInputId: origin.requestBinding.inputId,
-        parentRequestSequence: origin.requestBinding.requestSequence } };
-    const scope: RunScope = Object.freeze({ ...parent.scope,
-      allowedTools: Object.freeze([...role.tools]) });
-    const created = this.dependencies.runs.createSubagent({ origin, pluginAgentId, nativeSessionId: nativeId,
-      args: args.data, scope, config, history: history.data, at: this.dependencies.now() });
-    if (!created.ok) { await agent.releaseSession(nativeId); return created; }
-    const saved = this.dependencies.runs.get(created.data.runId), row = sessions.get(created.data.sessionId);
-    if (!saved.ok || !row.ok) { this.poisoned = true; return !saved.ok ? saved : row as Result<PreparedSubagent>; }
-    const storedInput = this.dependencies.sessionInputs.get(created.data.inputId);
-    if (!storedInput.ok || !storedInput.data || storedInput.data.content.version !== 2) { this.poisoned = true; return denied(); }
-    const active: ActiveCall = { runId: created.data.runId, kind: 'agent', sessionId: row.data.sessionId, nativeSessionId: nativeId,
-      controller: new AbortController(), startedAt: this.dependencies.monotonicNow(), terminalCommitted: false,
-      poisoned: false, completion: Promise.resolve(fail(appError('runtime_not_started', 'runtime', 'Child is not started.'))),
-      observe: () => undefined, stop: () => false };
-    let resolveCompletion!: (result: Result<ProviderOutcome>) => void;
-    active.completion = new Promise(resolve => resolveCompletion = resolve);
-    let resolveStop!: (intent: StopIntent) => void;
-    const stopPromise = new Promise<StopIntent>(resolve => resolveStop = resolve);
-    active.stop = reason => {
-      if (active.stopIntent || active.terminalCommitted) return false;
-      const intent = parent.active.stopIntent ?? { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
-      active.stopIntent = intent; active.inputAdmissionClosed = true;
-      try {
-        if (intent.reason === 'user') this.persistCancellation(active, intent.at);
-      } finally { resolveStop(intent); active.controller.abort(intent.reason); }
-      if (active.inputStreamingStarted) {
-        const requested = agent.requestSubagentStop?.({ childRunId: active.runId, childNativeSessionId: nativeId, pluginAgentId });
-        if (!requested?.ok) {
-          active.stopFailure = requested?.error ?? appError('subagent_stop_unconfirmed', 'runtime', 'The child stop owner is unavailable.', true, active.runId);
-          active.poisoned = this.poisoned = true;
+    const owned = await this.writeRuntimeStorage(store => {
+      const admission = validate(store);
+      if (!admission.ok) return admission;
+      const { savedParent, deadlineAt, remaining, available } = admission.data;
+      const parentFacts = savedParent.config as SafeConfigSnapshot & Record<string, unknown> & { agent: RuntimeAgentConfigFacts };
+      const { extensions: _extensions, extensionAssembly: _assembly, inputCommandReceipt: _commandReceipt, compactionPolicy: _compaction, runtimeStrategy: _strategy,
+        workspaceContext: _workspace, formTarget: _form, ...base } = parentFacts;
+      const budget = { ...parent.request.budget, maxModelCalls: available };
+      const { extensionPolicy: _extensionPolicy, ...parentAgent } = parentFacts.agent;
+      const childDefinitions = parent.inputDefinitions ? { ...parent.inputDefinitions, command: null } : undefined;
+      const config = { ...base, ...(childDefinitions ? { inputDefinitions: childDefinitions } : {}), goalMode: 'answer' as const, contextPolicyVersion: 'p8-context-v1' as const, historyPolicyVersion: 'p9-native-history-v1' as const,
+        runtimeBudget: budget, limits: { timeoutMs: remaining, stopGraceMs: parent.request.stopGraceMs },
+        agent: { ...parentAgent, ...budget, nativeSessionId: nativeId, systemPrompt: role.systemPrompt },
+        subagent: { version: 1 as const, role: role.id, definition: role, pluginVersion: '0.19.0' as const, patchVersion: 'flowmate-p13.2' as const,
+          extensionInstanceId: origin.extensionInstanceId, parentNativeSessionId: origin.parentNativeSessionId,
+          parentContextSnapshotId: origin.requestBinding.snapshotId, parentInputId: origin.requestBinding.inputId,
+          parentRequestSequence: origin.requestBinding.requestSequence } };
+      const scope: RunScope = Object.freeze({ ...parent.scope!, allowedTools: Object.freeze([...role.tools]) });
+      const created = store.runs.createSubagent({ origin, pluginAgentId, nativeSessionId: nativeId,
+        args: args.data, scope, config, history: history.data, at: this.dependencies.now() });
+      if (!created.ok) return created;
+      const saved = store.runs.get(created.data.runId), row = store.sessions.get(created.data.sessionId);
+      if (!saved.ok) return saved;
+      if (!row.ok) return row;
+      if (row.data.runtimeKind !== 'agent_session') return denied();
+      const storedInput = store.sessionInputs.get(created.data.inputId);
+      if (!storedInput.ok) return storedInput;
+      if (!storedInput.data || storedInput.data.content.version !== 2) return denied();
+      const active: ActiveCall = { runId: created.data.runId, kind: 'agent', sessionId: row.data.sessionId, nativeSessionId: nativeId,
+        controller: new AbortController(), startedAt: this.dependencies.monotonicNow(), terminalCommitted: false,
+        poisoned: false, completion: Promise.resolve(fail(appError('runtime_not_started', 'runtime', 'Child is not started.'))),
+        observe: () => undefined, stop: () => false };
+      let resolveCompletion!: (result: Result<ProviderOutcome>) => void;
+      active.completion = new Promise(resolve => resolveCompletion = resolve);
+      let resolveStop!: (intent: StopIntent) => void;
+      const stopPromise = new Promise<StopIntent>(resolve => resolveStop = resolve);
+      active.stop = reason => {
+        if (active.stopIntent || active.terminalCommitted) return false;
+        const intent = parent.active.stopIntent ?? { reason, at: this.dependencies.now(), monotonicMs: this.dependencies.monotonicNow() };
+        active.stopIntent = intent; active.inputAdmissionClosed = true;
+        try {
+          if (intent.reason === 'user') this.persistCancellation(active, intent.at);
+        } finally { resolveStop(intent); active.controller.abort(intent.reason); }
+        if (active.inputStreamingStarted) {
+          const requested = agent.requestSubagentStop?.({ childRunId: active.runId, childNativeSessionId: nativeId, pluginAgentId });
+          if (!requested?.ok) {
+            active.stopFailure = requested?.error ?? appError('subagent_stop_unconfirmed', 'runtime', 'The child stop owner is unavailable.', true, active.runId);
+            active.poisoned = this.poisoned = true;
+          }
         }
-      }
-      return true;
-    };
-    const stopFromParent = () => active.stop(parent.active.stopIntent?.reason ?? 'shutdown');
-    const stopFromDelegate = () => active.stop(origin.delegateSignal!.reason === 'tool_timeout' ? 'timeout' : 'shutdown');
-    parent.active.controller.signal.addEventListener('abort', stopFromParent, { once: true });
-    origin.delegateSignal.addEventListener('abort', stopFromDelegate, { once: true });
-    const unsubscribe = () => {
-      parent.active.controller.signal.removeEventListener('abort', stopFromParent);
-      origin.delegateSignal!.removeEventListener('abort', stopFromDelegate);
-    };
-    const context: AgentExecutionContext = { ...parent, active, session: row.data, inputDefinitions: childDefinitions,
-      request: { ...parent.request, sessionId: row.data.sessionId, text: args.data.prompt, goalMode: 'answer',
-        budget, timeoutMs: remaining }, admission: null, scope, input: saved.data.input,
-      promptText: storedInput.data.content.promptText, inputId: created.data.inputId, contextSnapshotId: created.data.contextSnapshotId,
-      extensions: null, resources: parent.resources, resourceBinding: storedInput.data.content.resourceBinding,
-      maxModelCalls: budget.maxModelCalls, runtimeStrategy: undefined, control: {},
-      emit: () => undefined, stopPromise, readStop: () => active.stopIntent, resolveCompletion };
-    this.childSlots.set(active.runId, { context, origin, unsubscribe });
+        return true;
+      };
+      const stopFromParent = () => active.stop(parent.active.stopIntent?.reason ?? 'shutdown');
+      const stopFromDelegate = () => active.stop(origin.delegateSignal!.reason === 'tool_timeout' ? 'timeout' : 'shutdown');
+      const unsubscribe = () => {
+        parent.active.controller.signal.removeEventListener('abort', stopFromParent);
+        origin.delegateSignal!.removeEventListener('abort', stopFromDelegate);
+      };
+      const context: AgentExecutionContext = { ...parent, active, session: row.data, inputDefinitions: childDefinitions,
+        request: { ...parent.request, sessionId: row.data.sessionId, text: args.data.prompt, goalMode: 'answer',
+          budget, timeoutMs: remaining }, admission: null, scope, input: saved.data.input,
+        promptText: storedInput.data.content.promptText, inputId: created.data.inputId, contextSnapshotId: created.data.contextSnapshotId,
+        extensions: null, resources: parent.resources, resourceBinding: storedInput.data.content.resourceBinding,
+        maxModelCalls: budget.maxModelCalls, runtimeStrategy: undefined, control: {},
+        emit: () => undefined, stopPromise, readStop: () => active.stopIntent, resolveCompletion };
+      store.db.afterCommit!(() => {
+        this.childSlots.set(active.runId, { context, origin, unsubscribe });
+        parent.active.controller.signal.addEventListener('abort', stopFromParent, { once: true });
+        origin.delegateSignal!.addEventListener('abort', stopFromDelegate, { once: true });
+        if (parent.active.controller.signal.aborted) stopFromParent();
+        else if (origin.delegateSignal!.aborted) stopFromDelegate();
+      });
+      return ok({ active, context, row: row.data, stopPromise, unsubscribe,
+        frozenConfig: saved.data.config as SubagentConfig, budget, deadlineAt, inputId: created.data.inputId });
+    });
+    if (!owned.ok) { await agent.releaseSession(nativeId); return owned; }
+    const { active, context, row, stopPromise, unsubscribe, frozenConfig, budget, deadlineAt, inputId } = owned.data;
     void stopPromise.then(async intent => {
       const settled = await withinGrace(active.completion, this.remainingGrace(context, intent));
       if (settled.kind !== 'grace' || active.terminalCommitted) return;
       active.stopFailure = appError('subagent_stop_unconfirmed', 'runtime', 'The child did not settle within the root stop grace.', true, active.runId);
-      const ended = this.finishAgent(context, null, active.stopFailure, false, true);
-      const tool = this.dependencies.tools!.failUnconfirmedDelegation({ runId: origin.parentRunId, sessionId: origin.parentSessionId }, origin.parentNativeToolCallId);
+      const ended = await this.finishAgent(context, null, active.stopFailure, false, true);
+      const tool = await this.writeRuntimeStorage(store => this.dependencies.tools!.failUnconfirmedDelegation(
+        { runId: origin.parentRunId, sessionId: origin.parentSessionId }, origin.parentNativeToolCallId, store.toolCalls));
       parent.active.stopFailure = !ended.ok ? ended.error : !tool.ok ? tool.error
         : { ...active.stopFailure, runId: origin.parentRunId };
       parent.active.stop('shutdown', { ...intent, reason: 'shutdown' });
@@ -1438,68 +1661,82 @@ export class RuntimeService {
       active.poisoned = this.poisoned = true;
       parent.active.stop('shutdown', active.stopIntent && { ...active.stopIntent, reason: 'shutdown' });
     });
-    const frozenConfig = saved.data.config as SubagentConfig;
-    const installed = ensureNativeSession(sessions, agent, row.data, this.dependencies.memory);
+    const installed = await ensureNativeSession(this.dependencies.database, agent, row);
     if (!installed.ok) {
-      this.finishAgent(context, null, installed.error, true); await agent.releaseSession(nativeId);
+      await this.finishAgent(context, null, installed.error, true); await agent.releaseSession(nativeId);
       unsubscribe(); return installed;
     }
     let started = false;
-    return ok({ childRunId: active.runId, childSessionId: row.data.sessionId, childNativeSessionId: nativeId,
-      pluginAgentId, parentRunId: origin.parentRunId, inputId: created.data.inputId, scope,
+    return ok({ childRunId: active.runId, childSessionId: row.sessionId, childNativeSessionId: nativeId,
+      pluginAgentId, parentRunId: origin.parentRunId, inputId, scope: context.scope!,
       config: frozenConfig, input: this.executionInput(context), signal: active.controller.signal,
       observe: event => { if (event.type === 'agent_event' && event.data.eventName === 'agent_start') active.inputStreamingStarted = true; },
-      start: systemPrompt => {
-        if (started || active.controller.signal.aborted || this.poisoned || this.childSlots.get(active.runId)?.context !== context)
+      start: systemPrompt => this.writeRuntimeStorage(store => {
+        if (started || active.controller.signal.aborted || this.poisoned || this.closing
+          || this.childSlots.get(active.runId)?.context !== context || this.agentContext !== parent
+          || parent.active.terminalCommitted || parent.active.controller.signal.aborted)
           return fail(appError('subagent_origin_invalid', 'runtime', 'Child admission is closed.'));
         if (systemPrompt !== role.systemPrompt && !systemPrompt.startsWith(`${role.systemPrompt}\n`))
           return fail(appError('subagent_tool_denied', 'tool', 'Child system prompt differs from the trusted role.'));
-        const strategy = this.dependencies.tools!.freezeStrategy({ allowedTools: scope.allowedTools,
+        const valid = this.verifyInputUse(context, inputId, store);
+        if (!valid.ok) return valid;
+        const parentRun = store.runs.get(origin.parentRunId);
+        if (!parentRun.ok) return parentRun;
+        if (parentRun.data.status !== 'running' || parentRun.data.cancelRequestedAt !== null
+          || this.dependencies.monotonicNow() >= deadlineAt) return denied();
+        const strategy = this.dependencies.tools!.freezeStrategy({ allowedTools: context.scope!.allowedTools,
           configuredToolTimeoutMs: budget.toolTimeoutMs, sdk: frozenConfig.sdk, environment: `${process.platform}-${process.arch}-${process.versions.bun ? 'bun' : 'node'}`,
           sampleSource: this.dependencies.sampleSource ?? 'production', taskType: 'answer',
-          modelKey: JSON.stringify(frozenConfig.resolvedModel ?? frozenConfig.requestedModel), promptVersion: 'runtime-v1' });
+          modelKey: JSON.stringify(frozenConfig.resolvedModel ?? frozenConfig.requestedModel), promptVersion: 'runtime-v1' }, store.toolCalls);
         if (!strategy.ok) return strategy;
-        context.runtimeStrategy = strategy.data;
-        this.dependencies.tools!.configureRun(active.runId, { budget, strategy: strategy.data,
-          deadlineAt });
-        this.dependencies.tools!.attachChildBudget(active.runId, origin.parentRunId);
         const startedConfig: SubagentConfig = { ...frozenConfig,
           agent: { ...frozenConfig.agent, systemPrompt }, runtimeStrategy: strategy.data };
-        const saved = this.dependencies.runs.start(active.runId, startedConfig, this.dependencies.now());
+        const saved = store.runs.start(active.runId, startedConfig, this.dependencies.now());
         if (!saved.ok) return saved;
-        started = true;
-        return this.dependencies.sessionInputs!.dispatch(created.data.inputId, this.dependencies.now());
-      } });
+        const dispatched = store.sessionInputs.dispatch(inputId, this.dependencies.now());
+        if (!dispatched.ok) return dispatched;
+        store.db.afterCommit!(() => {
+          context.runtimeStrategy = strategy.data;
+          this.dependencies.tools!.configureRun(active.runId, { budget, strategy: strategy.data, deadlineAt });
+          this.dependencies.tools!.attachChildBudget(active.runId, origin.parentRunId);
+          started = true;
+        });
+        return dispatched;
+      }) });
   }
 
   public async finishSubagent(childRunId: number, outcome: AgentNativeOutcome): Promise<Result<void>> {
-    const owner = this.childSlots.get(childRunId), child = owner?.context;
     let completionFacts: string;
-    try { completionFacts = serializeSubagentCompletion(outcome); }
+    try { completionFacts = serializeSubagentCompletion(outcome); outcome = structuredClone(outcome); }
     catch { return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion facts cannot be verified.')); }
+    const state = await this.readRuntimeStorage(store => {
+      const saved = store.runs.get(childRunId);
+      return saved.ok ? ok({ saved: saved.data, owner: this.childSlots.get(childRunId) }) : saved;
+    });
+    if (!state.ok) return state;
+    const { owner } = state.data, child = owner?.context;
     if (!owner) {
-      const saved = this.dependencies.runs.get(childRunId);
-      if (!saved.ok) return saved;
-      if (saved.data.kind !== 'subagent' || saved.data.stoppedAt === null || saved.data.status === 'created' || saved.data.status === 'running'
-        || saved.data.output?.nativeOutcomeFacts !== completionFacts)
+      const saved = state.data.saved;
+      if (saved.kind !== 'subagent' || saved.stoppedAt === null || saved.status === 'created' || saved.status === 'running'
+        || saved.output?.nativeOutcomeFacts !== completionFacts)
         return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion differs from its saved original facts.'));
-      return saved.data.error ? fail(saved.data.error) : ok(undefined);
+      return saved.error ? fail(saved.error) : ok(undefined);
     }
     if (!child || child.active.runId !== childRunId || child.session.nativeSessionId !== outcome.agent.nativeSessionId)
       return fail(appError('subagent_identity_conflict', 'runtime', 'Child completion has no matching execution owner.'));
     if (child.subagentOutcome && !isDeepStrictEqual(child.subagentOutcome, outcome))
       return fail(appError('subagent_identity_conflict', 'runtime', 'The original child completion has different facts.'));
     if (child.active.terminalCommitted) {
-      const saved = this.dependencies.runs.get(childRunId);
+      const saved = await this.readRuntimeStorage(store => store.runs.get(childRunId));
       if (!saved.ok) return saved;
       if (saved.data.status === 'created' || saved.data.status === 'running')
         return fail(appError('subagent_persist_failed', 'storage', 'The original child terminal was not committed.', true, childRunId));
-      if (child.active.poisoned) this.supplementLateAgentUsage(childRunId, outcome);
+      if (child.active.poisoned) await this.supplementLateAgentUsage(childRunId, outcome);
       child.resolveCompletion?.(ok({ runId: childRunId, status: saved.data.status, text: '', error: saved.data.error,
         stopped: outcome.stopped, cleanupErrors: outcome.cleanupErrors }));
       return saved.data.error ? fail(saved.data.error) : ok(undefined);
     }
-    let result = this.finishAgent(child, outcome, outcome.error, outcome.stopped, !outcome.stopped);
+    let result = await this.finishAgent(child, outcome, outcome.error, outcome.stopped, !outcome.stopped);
     if (result.ok) child.subagentOutcome = structuredClone(outcome);
     if (result.ok && outcome.stopped && !child.active.poisoned && !child.active.storageError) {
       const released = await this.dependencies.agent!.releaseSession(child.session.nativeSessionId);
@@ -1517,28 +1754,27 @@ export class RuntimeService {
 
   private executionContextHooks(context: AgentExecutionContext): ContextHooks | undefined {
     const { active, request, session } = context;
-    const repository = this.dependencies.contextRepository;
     const p8 = context.contextSnapshotId !== undefined;
-    return p8 && repository ? {
-      ...(this.dependencies.resources && repository.recordResourceRead ? { recordResourceRead: value => repository.recordResourceRead!(value,
-        { runId: active.runId, sessionId: request.sessionId }) } : {}),
-      ...(this.dependencies.resources && repository.recordResourceRequest ? { recordResourceRequest: value => repository.recordResourceRequest!(value,
-        { runId: active.runId, sessionId: request.sessionId }) } : {}),
-      ...(repository.recordCompactionEvidence ? { compaction: (value: Parameters<ContextRepository['recordCompactionEvidence']>[0]) => {
+    return p8 ? {
+      ...(this.dependencies.resources ? { recordResourceRead: value => this.writeRuntimeStorage(store => store.context.recordResourceRead(value,
+        { runId: active.runId, sessionId: request.sessionId })) } : {}),
+      ...(this.dependencies.resources ? { recordResourceRequest: value => this.writeRuntimeStorage(store => store.context.recordResourceRequest(value,
+        { runId: active.runId, sessionId: request.sessionId })) } : {}),
+      compaction: async (value: Parameters<ContextRepository['recordCompactionEvidence']>[0]) => {
         if (value.runId !== active.runId || value.sessionId !== request.sessionId || value.nativeSessionId !== session.nativeSessionId)
           return fail(appError('context_binding_unknown', 'runtime', 'Compaction does not belong to this Run.'));
-        const saved = repository.recordCompactionEvidence!(value);
+        const saved = await this.writeRuntimeStorage(store => store.context.recordCompactionEvidence(value));
         if (saved.ok) this.notifyCompaction(value.observation);
         return saved;
-      } } : {}),
+      },
       resolveToolResult: source => source.sessionId === request.sessionId
-        ? repository.resolveToolResult(source)
+        ? this.readRuntimeStorage(store => store.context.resolveToolResult(source))
         : fail(appError('context_binding_unknown', 'runtime', 'Tool result does not belong to this Session.')),
       bind: value => value.binding.runId === active.runId && value.binding.sessionId === request.sessionId
-        && value.binding.nativeSessionId === session.nativeSessionId ? repository.bindRequest(value)
+        && value.binding.nativeSessionId === session.nativeSessionId ? this.writeRuntimeStorage(store => store.context.bindRequest(value))
         : fail(appError('context_binding_unknown', 'runtime', 'Request does not belong to this Run.')),
       record: (binding, update) => binding.runId === active.runId && binding.sessionId === request.sessionId
-        && binding.nativeSessionId === session.nativeSessionId ? repository.recordRequest(binding, update)
+        && binding.nativeSessionId === session.nativeSessionId ? this.writeRuntimeStorage(store => store.context.recordRequest(binding, update))
         : fail(appError('context_binding_unknown', 'runtime', 'Request does not belong to this Run.')),
     } : undefined;
   }
@@ -1567,7 +1803,7 @@ export class RuntimeService {
       runtimeBudget: request.budget, runtimeStrategy: context.runtimeStrategy,
       budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
       remainingRunMs: () => Math.max(0, active.startedAt + request.timeoutMs - this.dependencies.monotonicNow()),
-      verifyInputUse: inputId => this.verifyInputUse(context, inputId),
+      verifyInputUse: inputIds => this.readRuntimeStorage(store => this.verifyInputUses(context, inputIds, store)),
       ...(context.modelBudget ? { reserveModelRequest: () => {
         const root = this.agentContext, shared = context.modelBudget!;
         if (!root || root.modelBudget !== shared || root.active.controller.signal.aborted || active.controller.signal.aborted
@@ -1580,13 +1816,13 @@ export class RuntimeService {
       } } : {}),
       completeInputResult: (inputIds, resultEntryId) => this.completeInputResult(context, inputIds, resultEntryId),
       onInputAdmissionClosed: () => { active.inputAdmissionClosed = true; },
-      verifyModelUse: () => {
-        const row = this.dependencies.sessions?.get(request.sessionId);
+      verifyModelUse: () => this.readRuntimeStorage(store => {
+        const row = store.sessions.get(request.sessionId);
         if (!row || !row.ok) return fail(appError('storage_read_failed', 'storage', 'Session 使用资格无法确认。', true, active.runId, request.sessionId));
-        if (row.data.nativeSessionId !== session.nativeSessionId || row.data.status !== 'active' || row.data.deletePending) {
+        if (row.data.runtimeKind !== 'agent_session' || row.data.nativeSessionId !== session.nativeSessionId || row.data.status !== 'active' || row.data.deletePending) {
           return fail(appError('session_history_invalid', 'session', 'Run 与 Session 身份不一致。', false, active.runId, request.sessionId));
         }
-        const permission = this.dependencies.sessions?.isModelUseBlocked(request.sessionId);
+        const permission = store.sessions.isModelUseBlocked(request.sessionId);
         if (!permission) return fail(appError('storage_read_failed', 'storage', 'Material access cannot be verified.', true, active.runId, request.sessionId));
         if (!permission.ok) return permission;
         if (permission.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
@@ -1598,26 +1834,43 @@ export class RuntimeService {
             !instance.data.instances.some(live => live.instanceId === item.instanceId && live.state === 'active' && live.admission === 'open')))
             return fail(appError('extension_hook_failed', 'extension', 'Run Extension instance is no longer active.'));
         }
-        if (context.resources) return this.dependencies.resources!.verifyFrozen(context.resources);
+        if (context.resources) return this.dependencies.resources!.verifyFrozen(context.resources, store.contents);
         return ok(undefined);
-      },
+      }),
       ...(context.admission ? { workspaceInput: context.admission.workspaceInput, workspaceContext: context.admission.workspaceContext,
         goalMode: request.goalMode ?? 'answer' as const } : {}),
       ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}),
       ...(productContext && this.dependencies.tools ? { toolBinding: {
         context: productContext,
-        observeRequest: (name, raw, call) => {
+        observeRequest: (name, raw, call) => this.writeRuntimeStorage(store => {
           const result = this.dependencies.tools!.observeRequest(name, raw, { ...productContext,
-            nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) });
+            nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) }, store);
           return result.ok ? ok(undefined) : result;
+        }),
+        rejectRequest: async (name, raw, call, error, stage) => {
+          const committed = await this.writeRuntimeStorage<Result<void>>(store => {
+            const result = this.dependencies.tools!.rejectRequest(name, raw, { ...productContext,
+              nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) }, error, stage, store);
+            if (result.ok) return ok(result);
+            const saved = this.dependencies.tools!.queryCall(productContext, call.nativeToolCallId, store.toolCalls);
+            if (!saved.ok) return saved;
+            // A saved refusal can still require the SDK to stop; that error must not undo its terminal facts.
+            return saved.data.result && saved.data.result.status !== 'succeeded'
+              && isDeepStrictEqual(saved.data.result.error, result.error) ? ok(result) : result;
+          });
+          return committed.ok ? committed.data : committed;
         },
-        rejectRequest: (name, raw, call, error, stage) => {
-          const result = this.dependencies.tools!.rejectRequest(name, raw, { ...productContext,
-            nativeToolCallId: call.nativeToolCallId, signal: call.signal, ...(call.requestBinding ? { requestBinding: call.requestBinding } : {}) }, error, stage);
-          return result.ok ? ok(undefined) : result;
+        recordDelivery: async (nativeToolCallId, delivery) => {
+          const committed = await this.writeRuntimeStorage<Result<void>>(store => {
+            const result = this.dependencies.tools!.recordDelivery(productContext, nativeToolCallId, delivery, store.toolCalls);
+            if (result.ok) return ok(result);
+            const saved = this.dependencies.tools!.queryCall(productContext, nativeToolCallId, store.toolCalls);
+            return saved.ok && saved.data.delivery.state === 'failed' && isDeepStrictEqual(saved.data.delivery.error, result.error)
+              ? ok(result) : result;
+          });
+          return committed.ok ? committed.data : committed;
         },
-        recordDelivery: (nativeToolCallId, delivery) => this.dependencies.tools!.recordDelivery(productContext, nativeToolCallId, delivery),
-        queryCall: nativeToolCallId => this.dependencies.tools!.queryCall(productContext, nativeToolCallId),
+        queryCall: nativeToolCallId => this.readRuntimeStorage(store => this.dependencies.tools!.queryCall(productContext, nativeToolCallId, store.toolCalls)),
         execute: async (name, input, call, rawArguments = input) => {
           const label = this.dependencies.tools!.listTools().find((tool) => tool.name === name)?.label ?? 'Working';
           context.emit({ type: 'tool_progress', toolName: name, label, phase: 'running' });
@@ -1638,18 +1891,21 @@ export class RuntimeService {
     const agent = this.dependencies.agent;
     if (context.scope) this.dependencies.tools?.setRunDeadline(active.runId, active.startedAt + request.timeoutMs);
     if (!agent) return this.finishAgent(context, null, appError('agent_unavailable', 'runtime', 'Agent Runtime 尚未组装。'), true);
-    const savedRun = this.dependencies.runs.get(active.runId);
+    const savedRun = await this.readRuntimeStorage(store => {
+      const run = store.runs.get(active.runId); if (!run.ok) return run;
+      const contents = captureFrozenResourceContents(context.resources, store.contents);
+      return contents.ok ? ok({ run: run.data, resourceContents: contents.data }) : contents;
+    });
     if (!savedRun.ok) return this.finishAgent(context, null, savedRun.error, true);
-    const p8 = savedRun.data.config.contextPolicyVersion === 'p8-context-v1';
-    const compactionPolicy = savedRun.data.config.compactionPolicy === undefined ? undefined
-      : CompactionPolicySchema.safeParse(savedRun.data.config.compactionPolicy);
+    const p8 = savedRun.data.run.config.contextPolicyVersion === 'p8-context-v1';
+    const compactionPolicy = savedRun.data.run.config.compactionPolicy === undefined ? undefined
+      : CompactionPolicySchema.safeParse(savedRun.data.run.config.compactionPolicy);
     if (compactionPolicy && !compactionPolicy.success)
       return this.finishAgent(context, null, appError('agent_config_invalid', 'runtime', 'Frozen compaction policy is invalid.', false, active.runId), true);
     const frozenCompactionPolicy = compactionPolicy?.success ? compactionPolicy.data : undefined;
-    const repository = this.dependencies.contextRepository;
-    if (p8 && (!repository || context.contextSnapshotId === undefined))
+    if (p8 && context.contextSnapshotId === undefined)
       return this.finishAgent(context, null, appError('context_binding_unknown', 'runtime', 'Context persistence is unavailable.', false, active.runId), true);
-    if (this.dependencies.resources && (!p8 || !repository?.recordResourceRead || !repository.recordResourceRequest))
+    if (this.dependencies.resources && !p8)
       return this.finishAgent(context, null, appError('resource_evidence_write_failed', 'storage', 'Resource evidence persistence is unavailable.', true, active.runId), true);
     const contextHooks = this.executionContextHooks(context);
     if (context.admission && context.workingDirectory) {
@@ -1673,7 +1929,7 @@ export class RuntimeService {
       request.config,
       { timeoutMs: request.timeoutMs, stopGraceMs: request.stopGraceMs },
       active.controller.signal,
-      context.scope ? { ...(request.research ? { researchPhase: request.research.phase } : {}), ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}),
+      context.scope ? { resourceContents: savedRun.data.resourceContents, ...(request.research ? { researchPhase: request.research.phase } : {}), ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}),
         ...(context.inputId && context.inputDefinitions?.command?.kind === 'subagent'
           ? { inputCommandOwner: { runId: active.runId, sessionId: request.sessionId, inputId: context.inputId } } : {}),
         ...(!context.admission && context.scope.allowedTools.every(name => name === 'Agent') ? { chatDelegation: true } : {}), activeToolNames: context.scope.allowedTools, goalMode: request.goalMode ?? 'answer', runtimeBudget: request.budget,
@@ -1681,7 +1937,7 @@ export class RuntimeService {
         ...extensionPreparation,
         ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}),
         sessionInputs: true, ...(context.workingDirectory ? { workingDirectory: context.workingDirectory } : {}) }
-        : { ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}), sessionInputs: true, runtimeBudget: request.budget,
+        : { resourceContents: savedRun.data.resourceContents, ...(context.inputDefinitions ? { inputDefinitions: context.inputDefinitions } : {}), sessionInputs: true, runtimeBudget: request.budget,
           ...(context.resources ? { resources: context.resources } : {}),
         ...extensionPreparation,
           ...(frozenCompactionPolicy ? { compactionPolicy: frozenCompactionPolicy } : {}) },
@@ -1737,7 +1993,7 @@ export class RuntimeService {
     if (stopBeforeStart) {
       return this.finishAgent(context, null, errorForStop(stopBeforeStart.reason, active.runId, 'agent'), true);
     }
-    const modelUseBlocked = this.dependencies.sessions?.isModelUseBlocked(request.sessionId);
+    const modelUseBlocked = await this.readRuntimeStorage(store => store.sessions.isModelUseBlocked(request.sessionId));
     if (modelUseBlocked && (!modelUseBlocked.ok || modelUseBlocked.data)) {
       return this.finishAgent(context, null, modelUseBlocked.ok
         ? appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId)
@@ -1746,7 +2002,7 @@ export class RuntimeService {
 
     let startedConfig: SafeConfigSnapshot = prepared.snapshot;
     if (context.inputId !== undefined) {
-      const initial = this.dependencies.runs.get(active.runId);
+      const initial = await this.readRuntimeStorage(store => store.runs.get(active.runId));
       if (!initial.ok) return this.finishAgent(context, null, { ...initial.error, runId: active.runId }, false, true);
       const saved = initial.data.config as Record<string, unknown>;
       const preparedFacts = prepared.snapshot as SafeConfigSnapshot & Record<string, unknown>;
@@ -1775,11 +2031,12 @@ export class RuntimeService {
           ...request.budget } } as SafeConfigSnapshot;
     }
     if (context.scope && this.dependencies.tools) {
-      const strategy = this.dependencies.tools.freezeStrategy({ allowedTools: context.scope.allowedTools,
+      const tools = this.dependencies.tools, scope = context.scope;
+      const strategy = await this.readRuntimeStorage(store => tools.freezeStrategy({ allowedTools: scope.allowedTools,
         configuredToolTimeoutMs: request.budget.toolTimeoutMs, sdk: prepared.snapshot.sdk,
         environment: `${process.platform}-${process.arch}-${process.versions.bun ? 'bun' : 'node'}`,
         sampleSource: this.dependencies.sampleSource ?? 'production', taskType: request.goalMode,
-        modelKey: JSON.stringify(prepared.snapshot.resolvedModel ?? prepared.snapshot.requestedModel), promptVersion: 'runtime-v1' });
+        modelKey: JSON.stringify(prepared.snapshot.resolvedModel ?? prepared.snapshot.requestedModel), promptVersion: 'runtime-v1' }, store.toolCalls));
       if (!strategy.ok) return this.finishAgent(context, null, strategy.error, true);
       context.runtimeStrategy = strategy.data;
       startedConfig = { ...startedConfig, runtimeStrategy: strategy.data };
@@ -1787,11 +2044,22 @@ export class RuntimeService {
         deadlineAt: active.startedAt + request.timeoutMs });
     }
     context.maxModelCalls = request.budget.maxModelCalls;
-    const started = this.dependencies.runs.start(active.runId, startedConfig, this.dependencies.now());
+    let startAttempted = false;
+    const started = await this.writeRuntimeStorage(store => {
+      if (this.closing || this.closed) active.stop('shutdown');
+      const stop = this.agentStop(context);
+      if (stop) return fail(errorForStop(stop.reason, active.runId, 'agent'));
+      const permission = store.sessions.isModelUseBlocked(request.sessionId);
+      if (!permission.ok) return permission;
+      if (permission.data) return fail(appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。', false, active.runId, request.sessionId));
+      startAttempted = true;
+      return store.runs.start(active.runId, startedConfig, this.dependencies.now());
+    });
     if (!started.ok) {
+      if (!startAttempted) return this.finishAgent(context, null, started.error, true);
       active.poisoned = true;
       this.poisoned = true;
-      const terminal = this.finishAgent(context, null, { ...started.error, runId: active.runId }, true);
+      const terminal = await this.finishAgent(context, null, { ...started.error, runId: active.runId }, true);
       return terminal.ok ? fail({ ...started.error, runId: active.runId }, active.runId) : terminal;
     }
     context.emit({ type: 'run_progress', phase: 'running' });
@@ -1804,9 +2072,16 @@ export class RuntimeService {
     const agentInput = this.executionInput(context, prepared.snapshot.extensionAssembly);
     let nativeWork: Promise<AgentNativeOutcome>;
     if (context.inputId !== undefined) {
-      const dispatched = this.dependencies.sessionInputs!.dispatch(context.inputId, this.dependencies.now());
+      const inputId = context.inputId;
+      const dispatched = await this.writeRuntimeStorage(store => {
+        if (this.closing || this.closed) active.stop('shutdown');
+        const allowed = this.verifyInputUse(context, inputId, store);
+        return allowed.ok ? store.sessionInputs.dispatch(inputId, this.dependencies.now()) : allowed;
+      });
       if (!dispatched.ok) return this.finishAgent(context, null, dispatched.error, true);
     }
+    const stopBeforeExecute = this.agentStop(context);
+    if (stopBeforeExecute) return this.finishAgent(context, null, errorForStop(stopBeforeExecute.reason, active.runId, 'agent'), true);
     try {
       nativeWork = Promise.resolve(prepared.execute(agentInput, active.controller.signal, (event) => {
         if (event.type === 'agent_event' && event.data.eventName === 'agent_start') active.inputStreamingStarted = true;
@@ -1820,9 +2095,13 @@ export class RuntimeService {
     } catch {
       return this.finishAgent(context, null, appError('agent_runtime_error', 'runtime', 'Agent 执行失败。', true, active.runId), false, true);
     }
+    let lateUsageObserved = false;
     const work = nativeWork.then(
-      (outcome) => {
-        if (active.terminalCommitted && active.poisoned) this.supplementLateAgentUsage(active.runId, outcome);
+      async (outcome) => {
+        if (active.terminalCommitted && active.poisoned) {
+          lateUsageObserved = true;
+          await this.supplementLateAgentUsage(active.runId, outcome);
+        }
         return { kind: 'outcome' as const, outcome };
       },
       () => ({ kind: 'error' as const }),
@@ -1836,7 +2115,15 @@ export class RuntimeService {
       if (settled.kind === 'grace') {
         active.poisoned = true;
         this.poisoned = true;
-        return this.finishAgent(context, null, errorForStop(result.intent.reason, active.runId, 'agent'), false, true);
+        const terminal = this.finishAgent(context, null, errorForStop(result.intent.reason, active.runId, 'agent'), false, true);
+        let finalization!: Promise<void>;
+        finalization = Promise.all([work, terminal]).then(async ([late]) => {
+          if (late.kind === 'outcome' && !lateUsageObserved && active.terminalCommitted)
+            await this.supplementLateAgentUsage(active.runId, late.outcome);
+        }).catch(() => { this.logAgentCleanup(active.runId, 'late_usage_not_applied'); })
+          .finally(() => { this.pendingNativeFinalizations.delete(finalization); });
+        this.pendingNativeFinalizations.add(finalization);
+        return terminal;
       }
       return settled.value.kind === 'outcome'
         ? this.finishAgent(context, settled.value.outcome, errorForStop(result.intent.reason, active.runId, 'agent'), settled.value.outcome.stopped, !settled.value.outcome.stopped)
@@ -1847,13 +2134,13 @@ export class RuntimeService {
       : this.finishAgent(context, null, appError('agent_runtime_error', 'runtime', 'Agent 执行失败。', true, active.runId), false, true);
   }
 
-  private finishAgent(
+  private async finishAgent(
     context: AgentExecutionContext,
     outcome: AgentNativeOutcome | null,
     error: AppError | null,
     stopped: boolean,
     unconfirmed = false,
-  ): Result<AgentOutcome> {
+  ): Promise<Result<AgentOutcome>> {
     const { active, request, session } = context;
     if (active.terminalCommitted) return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已开始提交。', false, active.runId), active.runId);
     const settledChildren: number[] = [];
@@ -1862,13 +2149,15 @@ export class RuntimeService {
       if (child === context || owner.origin.parentRunId !== active.runId) continue;
       if (!child.active.terminalCommitted) {
         child.active.stopFailure = appError('subagent_stop_unconfirmed', 'runtime', 'The child did not settle within the root stop grace.', true, child.active.runId);
-        const ended = this.finishAgent(child, null, child.active.stopFailure, false, true);
+        const ended = await this.finishAgent(child, null, child.active.stopFailure, false, true);
         if (!ended.ok) { active.poisoned = this.poisoned = true; return ended; }
-        const tool = this.dependencies.tools?.failUnconfirmedDelegation({ runId: active.runId, sessionId: session.sessionId },
-          owner.origin.parentNativeToolCallId);
+        const tool = this.dependencies.tools
+          ? await this.writeRuntimeStorage(store => this.dependencies.tools!.failUnconfirmedDelegation(
+            { runId: active.runId, sessionId: session.sessionId }, owner.origin.parentNativeToolCallId, store.toolCalls))
+          : undefined;
         if (!tool?.ok) { active.poisoned = this.poisoned = true; return tool ?? fail(appError('subagent_persist_failed', 'storage', 'The original delegation could not be closed.', true, active.runId)); }
       }
-      const savedChild = this.dependencies.runs.get(child.active.runId);
+      const savedChild = await this.readRuntimeStorage(store => store.runs.get(child.active.runId));
       if (!savedChild.ok) { active.poisoned = this.poisoned = true; return savedChild; }
       if (savedChild.data.status === 'created' || savedChild.data.status === 'running') {
         active.poisoned = this.poisoned = true;
@@ -1882,193 +2171,196 @@ export class RuntimeService {
     active.inputAdmissionClosed = true;
     const toolExecutor = context.scope ? this.dependencies.tools : undefined;
     toolExecutor?.closeRun(active.runId);
-    const intent = this.agentStop(context);
-    let cleanupFailure = active.stopFailure ?? outcome?.cleanupErrors[0];
-    let finalError: AppError | null = cleanupFailure ? { ...cleanupFailure, runId: active.runId }
-      : intent?.reason === 'input-failure' ? { ...(active.inputFailure ?? errorForStop(intent.reason, active.runId, 'agent')), runId: active.runId }
-        : intent ? errorForStop(intent.reason, active.runId, 'agent')
-        : error ? { ...error, runId: active.runId } : null;
-    let inputUnconfirmed = false;
-    let unresolvedDispatched: number[] = [];
-    if (context.inputId !== undefined) {
-      const inputs = this.dependencies.sessionInputs!.forRun(active.runId);
-      if (!inputs.ok) {
-        finalError ??= { ...inputs.error, runId: active.runId };
-        inputUnconfirmed = true;
-      }
-      else {
-        if (inputs.data.some(input => input.processingStatus === 'failed')) finalError ??= inputs.data.find(input => input.processingStatus === 'failed')!.error
-          ?? appError('input_processing_unconfirmed', 'runtime', 'An input failed processing.', true, active.runId);
-        unresolvedDispatched = inputs.data.filter(input => input.status !== 'consumed' && input.dispatchedAt !== null).map(input => input.inputId);
-      }
-    }
-    if (!finalError && (!outcome || !stopped)) finalError = appError('agent_stop_unconfirmed', 'runtime', 'Agent 执行结束，但停止状态未确认。', true, active.runId);
-    if (!finalError && outcome && (outcome.partial || outcome.stopReason !== 'stop' || !outcome.text.trim())) {
-      finalError = appError('agent_incomplete_response', 'runtime', 'Agent 未产生完整的文本回复。', false, active.runId);
-    }
-    let candidateIds: number[] = [];
-    let deliveredCandidateIds: number[] = [];
-    let formAppliedAndDelivered = false;
-    const toolCleanupErrors: AppError[] = [];
-    if (context.scope && toolExecutor) {
-      const facts = toolExecutor.candidateFacts(active.runId);
-      if (!facts.ok) finalError ??= appError('storage_read_failed', 'storage', 'Run 候选事实无法核验。', true, active.runId);
-      else {
-        if (context.admission) {
-          candidateIds = facts.data.candidateIds;
-          deliveredCandidateIds = facts.data.deliveredCandidateIds;
-          const target = context.admission.formTarget;
-          const candidate = context.admission.workspaceContext.candidateRef;
-          formAppliedAndDelivered = !!target && !!candidate && facts.data.deliveredFormApplications.some(receipt =>
-            receipt.formInstanceId === target.formInstanceId && receipt.appliedRevision === target.expectedRevision + 1
-            && receipt.candidateId === candidate.id && receipt.candidateSequence === candidate.sequence);
-        }
-        toolCleanupErrors.push(...facts.data.cleanupErrors);
-        if (!facts.data.stopped) {
-          stopped = false;
-          unconfirmed = true;
-          cleanupFailure ??= appError('stop_not_confirmed', 'runtime', 'A native tool process has not confirmed termination.', true, active.runId);
-          finalError ??= cleanupFailure;
-        }
-        if (facts.data.cleanupErrors.length) {
-          cleanupFailure ??= facts.data.cleanupErrors[0];
-          finalError ??= cleanupFailure!;
-        }
-      }
-    }
-    if (!finalError && outcome) {
-      const modelCallLimit = context.maxModelCalls ?? 0;
-      const validCounts = outcome.agent.turnCount >= 1 && outcome.agent.turnCount <= modelCallLimit
-        && outcome.agent.modelCallCount >= 1 && outcome.agent.modelCallCount <= modelCallLimit;
-      if (outcome.agent.nativeSessionId !== session.nativeSessionId || !validCounts) {
-        finalError = appError('agent_mechanical_check_failed', 'runtime', 'Agent execution exceeded its model call budget.', false, active.runId);
-      }
-    }
-    if (!finalError && context.admission && request.goalMode === 'save-candidate' && deliveredCandidateIds.length === 0) {
-      finalError = appError('agent_goal_not_met', 'runtime', '候选未在模型后续请求中成功回送，保存目标未完成。', false, active.runId);
-    }
-    if (!finalError && request.goalMode === 'fill-form' && !formAppliedAndDelivered) {
-      finalError = appError('agent_goal_not_met', 'runtime', '表单应用及结果进入后续模型请求未确认，录入目标未完成。', false, active.runId);
-    }
-    const confirmedUnconsumedInputIds = stopped && !unconfirmed ? outcome?.agent.confirmedUnconsumedInputIds : undefined;
-    inputUnconfirmed ||= unresolvedDispatched.some(id => !confirmedUnconsumedInputIds?.includes(id));
-    if (inputUnconfirmed && !intent) finalError ??= appError('input_delivery_unknown', 'session', 'Input consumption could not be confirmed.', false, active.runId);
-    const inputResults: import('../sessions/input-ledger.ts').InputResultBatch[] = [];
-    if (!finalError && context.inputId !== undefined) {
-      const inputs = this.dependencies.sessionInputs!.forRun(active.runId);
-      if (!inputs.ok) {
-        finalError = { ...inputs.error, runId: active.runId };
-        inputUnconfirmed = true;
-      }
-      else {
-        const pending = inputs.data.filter(input => input.processingStatus === 'pending' && input.status === 'consumed');
-        for (const input of pending) if (input.resultEntryId === null) {
-          finalError = appError('input_processing_unconfirmed', 'runtime', 'Input has no saved final result.', true, active.runId);
+    let terminal: TerminalWrite | undefined;
+    let cleanupFailure: AppError | undefined;
+    const result = await this.writeRuntimeStorage(store => {
+      if (active.terminalCommitted) return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已开始提交。', false, active.runId), active.runId);
+      if (this.closing || this.closed) active.stop('shutdown');
+      const intent = this.agentStop(context);
+      cleanupFailure = active.stopFailure ?? outcome?.cleanupErrors[0];
+      let finalError: AppError | null = cleanupFailure ? { ...cleanupFailure, runId: active.runId }
+        : intent?.reason === 'input-failure' ? { ...(active.inputFailure ?? errorForStop(intent.reason, active.runId, 'agent')), runId: active.runId }
+          : intent ? errorForStop(intent.reason, active.runId, 'agent')
+          : error ? { ...error, runId: active.runId } : null;
+      let inputUnconfirmed = false;
+      let unresolvedDispatched: number[] = [];
+      if (context.inputId !== undefined) {
+        const inputs = store.sessionInputs.forRun(active.runId);
+        if (!inputs.ok) {
+          finalError ??= { ...inputs.error, runId: active.runId };
           inputUnconfirmed = true;
         }
-        for (const resultEntryId of new Set(pending.flatMap(input => input.resultEntryId ? [input.resultEntryId] : []))) {
-          const members = inputs.data.filter(input => input.resultEntryId === resultEntryId).map(input => input.inputId);
-          const qualified = this.qualifyInputResult(context, members, resultEntryId);
-          if (!qualified.ok) finalError ??= qualified.error;
-          else if (qualified.data || request.goalMode === 'fill-form' && formAppliedAndDelivered && stopped)
-            inputResults.push({ inputIds: members, resultEntryId });
-          else finalError ??= appError('input_processing_unconfirmed', 'runtime', 'Input result is not qualified.', true, active.runId);
+        else {
+          if (inputs.data.some(input => input.processingStatus === 'failed')) finalError ??= inputs.data.find(input => input.processingStatus === 'failed')!.error
+            ?? appError('input_processing_unconfirmed', 'runtime', 'An input failed processing.', true, active.runId);
+          unresolvedDispatched = inputs.data.filter(input => input.status !== 'consumed' && input.dispatchedAt !== null).map(input => input.inputId);
         }
       }
-    }
-    const ownedChild = this.childSlots.get(active.runId);
-    if (finalError?.category === 'storage' && (ownedChild || [...this.childSlots.values()].some(owner => owner.origin.parentRunId === active.runId))) {
-      // Necessary P13 persistence cannot be treated as an ordinary child task failure.
-      cleanupFailure ??= finalError; active.stopFailure ??= finalError; active.poisoned = this.poisoned = true;
-      if (ownedChild && this.agentContext && ownedChild.origin.parentRunId === this.agentContext.active.runId) {
-        this.agentContext.active.stopFailure ??= finalError;
-        this.agentContext.active.inputAdmissionClosed = true;
-        this.dependencies.tools?.closeRun(this.agentContext.active.runId);
+      if (!finalError && (!outcome || !stopped)) finalError = appError('agent_stop_unconfirmed', 'runtime', 'Agent 执行结束，但停止状态未确认。', true, active.runId);
+      if (!finalError && outcome && (outcome.partial || outcome.stopReason !== 'stop' || !outcome.text.trim())) {
+        finalError = appError('agent_incomplete_response', 'runtime', 'Agent 未产生完整的文本回复。', false, active.runId);
       }
-    }
-    const status: AgentOutcome['status'] = cleanupFailure ? 'failed'
-      : intent ? intent.reason === 'user' && stopped ? 'cancelled' : 'failed'
-        : finalError ? 'failed' : 'completed';
-    const cleanupErrors = new Map<string, AppError>();
-    for (const cleanupError of outcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
-    for (const cleanupError of toolCleanupErrors) cleanupErrors.set(cleanupError.code, cleanupError);
-    if (active.storageError) cleanupErrors.set(active.storageError.code, active.storageError);
-    if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true, active.runId));
-    const cleanup: CleanupRecord = {
-      version: 1,
-      stopped,
-      stopReason: intent?.reason ?? outcome?.stopReason ?? null,
-      errors: [...cleanupErrors.values()],
-      lateObservationRequired: unconfirmed || !stopped,
-    };
-    const { confirmedUnconsumedInputIds: _proof, ...productAgent } = outcome?.agent ?? { nativeSessionId: session.nativeSessionId, turnCount: 0, modelCallCount: 0 };
-    const output: AgentOutputRecord | null = outcome ? {
-      ...outputRecord(outcome),
-      version: 2,
-      agent: { ...productAgent, ...(context.admission ? { candidateIds } : {}) },
-      ...(ownedChild ? { nativeOutcomeFacts: serializeSubagentCompletion(outcome) } : {}),
-    } : null;
-    const usage = outcome?.usage ?? initialUsage(this.dependencies.now());
-    const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
-    const terminal: TerminalWrite = {
-      status,
-      inputResults: status === 'completed' ? inputResults : [],
-      confirmedUnconsumedInputIds,
-      nativeHistoryUnusable: inputUnconfirmed || unconfirmed || !stopped || this.dependencies.agent?.inspect(session.nativeSessionId).availability === 'unusable',
-      output,
-      error: finalError,
-      usage,
-      tokens,
-      cleanup,
-      endedAt: this.dependencies.now(),
-      stoppedAt: stopped ? this.dependencies.now() : null,
-      durationMs: Math.max(0, Math.round(this.dependencies.monotonicNow() - active.startedAt)),
-      cancelRequestedAt: intent?.reason === 'user' ? intent.at : undefined,
-    };
-    active.terminalCommitted = true;
-    let committed: ReturnType<RunRepository['finish']>;
-    try { committed = this.dependencies.runs.finish(active.runId, terminal); }
-    catch { committed = fail(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, active.runId), active.runId); }
-    if (!committed.ok) {
-      active.poisoned = true;
-      this.poisoned = true;
-      // The terminal transaction rolled back. This independent conservative block
-      // preserves that failure while preventing reuse of SQL's last committed prefix.
-      if (terminal.nativeHistoryUnusable && this.dependencies.sessions) {
-        const blocked = this.dependencies.sessions.markHistoryUnusable(session.sessionId);
+      let candidateIds: number[] = [];
+      let deliveredCandidateIds: number[] = [];
+      let formAppliedAndDelivered = false;
+      const toolCleanupErrors: AppError[] = [];
+      if (context.scope && toolExecutor) {
+        const facts = toolExecutor.candidateFacts(active.runId, undefined, store.toolCalls);
+        if (!facts.ok) finalError ??= appError('storage_read_failed', 'storage', 'Run 候选事实无法核验。', true, active.runId);
+        else {
+          if (context.admission) {
+            candidateIds = facts.data.candidateIds;
+            deliveredCandidateIds = facts.data.deliveredCandidateIds;
+            const target = context.admission.formTarget;
+            const candidate = context.admission.workspaceContext.candidateRef;
+            formAppliedAndDelivered = !!target && !!candidate && facts.data.deliveredFormApplications.some(receipt =>
+              receipt.formInstanceId === target.formInstanceId && receipt.appliedRevision === target.expectedRevision + 1
+              && receipt.candidateId === candidate.id && receipt.candidateSequence === candidate.sequence);
+          }
+          toolCleanupErrors.push(...facts.data.cleanupErrors);
+          if (!facts.data.stopped) {
+            stopped = false;
+            unconfirmed = true;
+            cleanupFailure ??= appError('stop_not_confirmed', 'runtime', 'A native tool process has not confirmed termination.', true, active.runId);
+            finalError ??= cleanupFailure;
+          }
+          if (facts.data.cleanupErrors.length) {
+            cleanupFailure ??= facts.data.cleanupErrors[0];
+            finalError ??= cleanupFailure!;
+          }
+        }
+      }
+      if (!finalError && outcome) {
+        const modelCallLimit = context.maxModelCalls ?? 0;
+        const validCounts = outcome.agent.turnCount >= 1 && outcome.agent.turnCount <= modelCallLimit
+          && outcome.agent.modelCallCount >= 1 && outcome.agent.modelCallCount <= modelCallLimit;
+        if (outcome.agent.nativeSessionId !== session.nativeSessionId || !validCounts) {
+          finalError = appError('agent_mechanical_check_failed', 'runtime', 'Agent execution exceeded its model call budget.', false, active.runId);
+        }
+      }
+      if (!finalError && context.admission && request.goalMode === 'save-candidate' && deliveredCandidateIds.length === 0) {
+        finalError = appError('agent_goal_not_met', 'runtime', '候选未在模型后续请求中成功回送，保存目标未完成。', false, active.runId);
+      }
+      if (!finalError && request.goalMode === 'fill-form' && !formAppliedAndDelivered) {
+        finalError = appError('agent_goal_not_met', 'runtime', '表单应用及结果进入后续模型请求未确认，录入目标未完成。', false, active.runId);
+      }
+      const confirmedUnconsumedInputIds = stopped && !unconfirmed ? outcome?.agent.confirmedUnconsumedInputIds : undefined;
+      inputUnconfirmed ||= unresolvedDispatched.some(id => !confirmedUnconsumedInputIds?.includes(id));
+      if (inputUnconfirmed && !intent) finalError ??= appError('input_delivery_unknown', 'session', 'Input consumption could not be confirmed.', false, active.runId);
+      const inputResults: import('../sessions/input-ledger.ts').InputResultBatch[] = [];
+      if (!finalError && context.inputId !== undefined) {
+        const inputs = store.sessionInputs.forRun(active.runId);
+        if (!inputs.ok) {
+          finalError = { ...inputs.error, runId: active.runId };
+          inputUnconfirmed = true;
+        }
+        else {
+          const pending = inputs.data.filter(input => input.processingStatus === 'pending' && input.status === 'consumed');
+          for (const input of pending) if (input.resultEntryId === null) {
+            finalError = appError('input_processing_unconfirmed', 'runtime', 'Input has no saved final result.', true, active.runId);
+            inputUnconfirmed = true;
+          }
+          for (const resultEntryId of new Set(pending.flatMap(input => input.resultEntryId ? [input.resultEntryId] : []))) {
+            const members = inputs.data.filter(input => input.resultEntryId === resultEntryId).map(input => input.inputId);
+            const qualified = this.qualifyInputResult(context, members, resultEntryId, store);
+            if (!qualified.ok) finalError ??= qualified.error;
+            else if (qualified.data || request.goalMode === 'fill-form' && formAppliedAndDelivered && stopped)
+              inputResults.push({ inputIds: members, resultEntryId });
+            else finalError ??= appError('input_processing_unconfirmed', 'runtime', 'Input result is not qualified.', true, active.runId);
+          }
+        }
+      }
+      const ownedChild = this.childSlots.get(active.runId);
+      if (finalError?.category === 'storage' && (ownedChild || [...this.childSlots.values()].some(owner => owner.origin.parentRunId === active.runId))) {
+        // Necessary P13 persistence cannot be treated as an ordinary child task failure.
+        cleanupFailure ??= finalError; active.stopFailure ??= finalError; active.poisoned = this.poisoned = true;
+        if (ownedChild && this.agentContext && ownedChild.origin.parentRunId === this.agentContext.active.runId) {
+          this.agentContext.active.stopFailure ??= finalError;
+          this.agentContext.active.inputAdmissionClosed = true;
+          this.dependencies.tools?.closeRun(this.agentContext.active.runId);
+        }
+      }
+      const status: AgentOutcome['status'] = cleanupFailure ? 'failed'
+        : intent ? intent.reason === 'user' && stopped ? 'cancelled' : 'failed'
+          : finalError ? 'failed' : 'completed';
+      const cleanupErrors = new Map<string, AppError>();
+      for (const cleanupError of outcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
+      for (const cleanupError of toolCleanupErrors) cleanupErrors.set(cleanupError.code, cleanupError);
+      if (active.storageError) cleanupErrors.set(active.storageError.code, active.storageError);
+      if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Agent 停止未确认。', true, active.runId));
+      const cleanup: CleanupRecord = {
+        version: 1,
+        stopped,
+        stopReason: intent?.reason ?? outcome?.stopReason ?? null,
+        errors: [...cleanupErrors.values()],
+        lateObservationRequired: unconfirmed || !stopped,
+      };
+      const { confirmedUnconsumedInputIds: _proof, ...productAgent } = outcome?.agent ?? { nativeSessionId: session.nativeSessionId, turnCount: 0, modelCallCount: 0 };
+      const output: AgentOutputRecord | null = outcome ? {
+        ...outputRecord(outcome),
+        version: 2,
+        agent: { ...productAgent, ...(context.admission ? { candidateIds } : {}) },
+        ...(ownedChild ? { nativeOutcomeFacts: serializeSubagentCompletion(outcome) } : {}),
+      } : null;
+      const usage = outcome?.usage ?? initialUsage(this.dependencies.now());
+      const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
+      terminal = {
+        status,
+        inputResults: status === 'completed' ? inputResults : [],
+        confirmedUnconsumedInputIds,
+        nativeHistoryUnusable: inputUnconfirmed || unconfirmed || !stopped || this.dependencies.agent?.inspect(session.nativeSessionId).availability === 'unusable',
+        output,
+        error: finalError,
+        usage,
+        tokens,
+        cleanup,
+        endedAt: this.dependencies.now(),
+        stoppedAt: stopped ? this.dependencies.now() : null,
+        durationMs: Math.max(0, Math.round(this.dependencies.monotonicNow() - active.startedAt)),
+        cancelRequestedAt: intent?.reason === 'user' ? intent.at : undefined,
+      };
+      active.terminalCommitted = true;
+      const committed = store.runs.finish(active.runId, terminal);
+      if (!committed.ok) return committed;
+      if (!committed.data) return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已由其他路径提交。', false, active.runId), active.runId);
+      return ok({
+        runId: active.runId,
+        sessionId: request.sessionId,
+        nativeSessionId: session.nativeSessionId,
+        status,
+        text: outcome?.text ?? '',
+        error: finalError,
+        stopped,
+        cleanupErrors: cleanup.errors,
+      });
+    });
+    if (!result.ok) {
+      active.poisoned = this.poisoned = true;
+      // Preserve the rolled-back terminal failure while blocking unsafe reuse of its committed prefix.
+      if (terminal?.nativeHistoryUnusable) {
+        const blocked = await this.writeRuntimeStorage(store => store.sessions.markHistoryUnusable(session.sessionId));
         if (!blocked.ok) return fail(blocked.error, active.runId);
       }
-      return fail(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, active.runId), active.runId);
-    }
-    if (!committed.data) {
-      active.poisoned = true;
-      this.poisoned = true;
-      return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已由其他路径提交。', false, active.runId), active.runId);
+      return fail({ ...result.error, runId: active.runId }, active.runId);
     }
     for (const childRunId of settledChildren) this.childSlots.delete(childRunId);
     if (stopped && !unconfirmed && !cleanupFailure && !active.poisoned && !active.storageError) toolExecutor?.releaseRun(active.runId);
     active.poisoned ||= unconfirmed || !!cleanupFailure;
     if (unconfirmed || cleanupFailure) this.poisoned = true;
     if (active.storageError) return fail(active.storageError, active.runId);
-    return ok({
-      runId: active.runId,
-      sessionId: request.sessionId,
-      nativeSessionId: session.nativeSessionId,
-      status,
-      text: outcome?.text ?? '',
-      error: finalError,
-      stopped,
-      cleanupErrors: cleanup.errors,
-    });
+    return result;
   }
 
-  private supplementLateAgentUsage(runId: number, outcome: AgentNativeOutcome): void {
-    try {
-      const supplemented = this.dependencies.runs.supplementUsage(runId, outcome.usage, outcome.tokens);
-      if (!supplemented.ok || !supplemented.data) this.logAgentCleanup(runId, 'late_usage_not_applied');
-    } catch { this.logAgentCleanup(runId, 'late_usage_not_applied'); }
+  private async supplementLateUsage(runId: number, outcome: Pick<NativeOutcome, 'usage' | 'tokens'>): Promise<void> {
+    const supplemented = await this.writeRuntimeStorage(store => store.runs.supplementUsage(runId, outcome.usage, outcome.tokens));
+    if (!supplemented.ok || !supplemented.data) this.logAgentCleanup(runId, 'late_usage_not_applied');
+  }
+
+  private async supplementLateAgentUsage(runId: number, outcome: AgentNativeOutcome): Promise<void> {
+    try { await this.supplementLateUsage(runId, outcome); }
     finally {
-      const facts = this.dependencies.tools?.candidateFacts(runId);
+      const tools = this.dependencies.tools;
+      const facts = tools ? await this.readRuntimeStorage(store => tools.candidateFacts(runId, undefined, store.toolCalls)) : undefined;
       if (outcome.stopped && (!facts || facts.ok && facts.data.stopped)) this.dependencies.tools?.releaseRun(runId);
     }
   }
@@ -2119,7 +2411,12 @@ export class RuntimeService {
     if (preparedStop) {
       return this.finish(active, request, input, errorForStop(preparedStop.reason, active.runId), null, true, undefined, preparedStop);
     }
-    const started = this.dependencies.runs.start(active.runId, prepared.data.snapshot, this.dependencies.now());
+    const snapshot = prepared.data.snapshot;
+    const started = await this.writeRuntimeStorage(scope => {
+      if (this.closing || this.closed) active.stop('shutdown');
+      if (readStop()) return ok(undefined);
+      return scope.runs.start(active.runId, snapshot, this.dependencies.now());
+    });
     if (!started.ok) {
       active.poisoned = true;
       this.poisoned = true;
@@ -2142,13 +2439,9 @@ export class RuntimeService {
     } catch {
       work = Promise.reject();
     }
-    const workResult = work.then((outcome) => {
-      if (active.terminalCommitted && active.poisoned) {
-        const supplemented = this.dependencies.runs.supplementUsage(active.runId, outcome.usage, outcome.tokens);
-        if (!supplemented.ok || !supplemented.data) {
-          try { this.dependencies.log.write({ at: this.dependencies.now(), level: 'warn', component: 'runtime', runId: active.runId, event: 'late_usage_not_applied' }); } catch { /* diagnostics are best effort */ }
-        }
-      }
+    let lateUsage: Promise<void> | undefined;
+    const workResult = work.then(outcome => {
+      if (active.terminalCommitted && active.poisoned) lateUsage = this.supplementLateUsage(active.runId, outcome);
       return { kind: 'work' as const, outcome };
     }, () => ({ kind: 'error' as const }));
     const stopResult = stopPromise.then((intent) => ({ kind: 'stop' as const, intent }));
@@ -2159,8 +2452,16 @@ export class RuntimeService {
       const settled = await withinGrace(workResult, remaining);
       if (settled.kind === 'grace') {
         active.poisoned = true;
-        void work.catch(() => undefined);
-        return this.finish(active, request, input, errorForStop(first.intent.reason, active.runId), null, false, undefined, first.intent, true);
+        const terminal = this.finish(active, request, input, errorForStop(first.intent.reason, active.runId), null, false, undefined, first.intent, true);
+        let finalization!: Promise<void>;
+        finalization = Promise.all([workResult, terminal]).then(async ([late]) => {
+          if (late.kind !== 'work') return;
+          if (lateUsage) await lateUsage;
+          else if (active.terminalCommitted) await this.supplementLateUsage(active.runId, late.outcome);
+        }).catch(() => { this.logAgentCleanup(active.runId, 'late_usage_not_applied'); })
+          .finally(() => { this.pendingNativeFinalizations.delete(finalization); });
+        this.pendingNativeFinalizations.add(finalization);
+        return terminal;
       }
       finished = settled.value;
     } else {
@@ -2182,14 +2483,9 @@ export class RuntimeService {
     outcome: NativeOutcome,
     stopIntent: StopIntent | undefined,
   ): Promise<Result<ProviderOutcome>> {
-    if (stopIntent && !(active.providerFailureBeforeStop && outcome.error)) {
-      const error = errorForStop(stopIntent.reason, active.runId);
-      const confirmedCancellation = stopIntent.reason === 'user' && outcome.stopped;
-      return this.finish(active, request, input, error, outcome, outcome.stopped, outcome, stopIntent, !outcome.stopped && !confirmedCancellation);
-    }
-    if (outcome.error) return this.finish(active, request, input, { ...outcome.error, runId: active.runId }, outcome, outcome.stopped, outcome, stopIntent, !outcome.stopped);
-    if (!outcome.stopped) return this.finish(active, request, input, appError('provider_stop_unconfirmed', 'provider', 'Provider 停止未确认。', true, active.runId), outcome, false, outcome, undefined, true);
-    return this.finish(active, request, input, null, outcome, true, outcome, undefined);
+    const error = outcome.error ? { ...outcome.error, runId: active.runId } : outcome.stopped ? null
+      : appError('provider_stop_unconfirmed', 'provider', 'Provider 停止未确认。', true, active.runId);
+    return this.finish(active, request, input, error, outcome, outcome.stopped, outcome, stopIntent, !outcome.stopped);
   }
 
   private async finish(
@@ -2203,64 +2499,69 @@ export class RuntimeService {
     stopIntent: StopIntent | undefined,
     unconfirmed = false,
   ): Promise<Result<ProviderOutcome>> {
-    const status: ProviderOutcome['status'] = stopIntent && !(active.providerFailureBeforeStop && rawOutcome?.error)
-      ? (stopIntent.reason === 'user' && stopped ? stopStatus(stopIntent.reason) : 'failed')
-      : error ? 'failed' : 'completed';
-    const finalError = error === null && status === 'completed' && rawOutcome ? null : error ?? appError('provider_incomplete_response', 'provider', 'Provider 响应不完整。', false, active.runId);
-    const output = rawOutcome ? outputRecord(rawOutcome) : null;
-    const cleanupErrors = new Map<string, AppError>();
-    for (const cleanupError of rawOutcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
-    if (active.storageError) cleanupErrors.set(active.storageError.code, active.storageError);
-    if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId));
-    const cleanup: CleanupRecord = {
-      version: 1,
-      stopped,
-      stopReason: stopIntent?.reason ?? (rawOutcome?.stopReason ?? null),
-      errors: [...cleanupErrors.values()],
-      lateObservationRequired: unconfirmed || !stopped,
-    };
-    const usage = outcomeForUsage?.usage ?? initialUsage(this.dependencies.now());
-    const tokens = outcomeForUsage?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
-    const terminal: TerminalWrite = {
-      status,
-      output,
-      error: finalError,
-      usage,
-      tokens,
-      cleanup,
-      endedAt: this.dependencies.now(),
-      stoppedAt: stopped ? this.dependencies.now() : null,
-      durationMs: Math.max(0, Math.round(this.dependencies.monotonicNow() - active.startedAt)),
-      cancelRequestedAt: stopIntent?.reason === 'user' ? stopIntent.at : undefined,
-    };
-    const committed = this.dependencies.runs.finish(active.runId, terminal);
-    if (!committed.ok) {
-      // The provider has stopped (or the stop grace was exhausted), but the
-      // durable terminal fact is unknown. Do not let a later call reuse the
-      // instance and create a second request against an ambiguous Run.
-      active.poisoned = true;
-      this.poisoned = true;
-      return fail(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, active.runId), active.runId);
+    let committedTerminal: { outcome: ProviderOutcome; cleanup: CleanupRecord } | undefined;
+    const committed = await this.writeRuntimeStorage<void>(scope => {
+      if (!active.stopIntent && (this.closing || this.closed)) active.stop('shutdown');
+      if (!active.stopIntent && this.dependencies.monotonicNow() - active.startedAt >= request.timeoutMs) active.stop('timeout');
+      stopIntent = active.stopIntent ?? stopIntent;
+      if (stopIntent && !(active.providerFailureBeforeStop && rawOutcome?.error)) error = errorForStop(stopIntent.reason, active.runId);
+      const status: ProviderOutcome['status'] = stopIntent && !(active.providerFailureBeforeStop && rawOutcome?.error)
+        ? (stopIntent.reason === 'user' && stopped ? stopStatus(stopIntent.reason) : 'failed')
+        : error ? 'failed' : 'completed';
+      const finalError = error === null && status === 'completed' && rawOutcome ? null : error ?? appError('provider_incomplete_response', 'provider', 'Provider 响应不完整。', false, active.runId);
+      const output = rawOutcome ? outputRecord(rawOutcome) : null;
+      const cleanupErrors = new Map<string, AppError>();
+      for (const cleanupError of rawOutcome?.cleanupErrors ?? []) cleanupErrors.set(cleanupError.code, cleanupError);
+      if (active.storageError) cleanupErrors.set(active.storageError.code, active.storageError);
+      if (unconfirmed) cleanupErrors.set('stop_unconfirmed', appError('stop_unconfirmed', 'runtime', 'Provider 停止未确认。', true, active.runId));
+      const cleanup: CleanupRecord = {
+        version: 1,
+        stopped,
+        stopReason: stopIntent?.reason ?? (rawOutcome?.stopReason ?? null),
+        errors: [...cleanupErrors.values()],
+        lateObservationRequired: unconfirmed || !stopped,
+      };
+      const usage = outcomeForUsage?.usage ?? initialUsage(this.dependencies.now());
+      const tokens = outcomeForUsage?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
+      const terminal: TerminalWrite = {
+        status,
+        output,
+        error: finalError,
+        usage,
+        tokens,
+        cleanup,
+        endedAt: this.dependencies.now(),
+        stoppedAt: stopped ? this.dependencies.now() : null,
+        durationMs: Math.max(0, Math.round(this.dependencies.monotonicNow() - active.startedAt)),
+        cancelRequestedAt: stopIntent?.reason === 'user' ? stopIntent.at : undefined,
+      };
+      const saved = scope.runs.finish(active.runId, terminal);
+      if (!saved.ok) return fail(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, active.runId), active.runId);
+      if (!saved.data) return fail(appError('run_state_invalid', 'runtime', 'Run 终态已由其他路径提交。', false, active.runId), active.runId);
+      const productOutcome: ProviderOutcome = {
+        runId: active.runId,
+        status,
+        text: rawOutcome?.text ?? '',
+        error: finalError,
+        stopped,
+        cleanupErrors: cleanup.errors,
+      };
+      scope.db.afterCommit!(() => {
+        active.terminalCommitted = true;
+        active.poisoned ||= unconfirmed;
+        if (unconfirmed) this.poisoned = true;
+        committedTerminal = { outcome: productOutcome, cleanup };
+      });
+      return ok(undefined);
+    });
+    if (!committedTerminal) {
+      active.poisoned = this.poisoned = true;
+      return committed.ok ? fail(appError('storage_write_failed', 'storage', 'Run 终态保存失败。', true, active.runId), active.runId)
+        : fail(committed.error, active.runId);
     }
-    if (!committed.data) {
-      active.poisoned = true;
-      this.poisoned = true;
-      return fail(appError('run_state_invalid', 'runtime', 'Run 终态已由其他路径提交。', false, active.runId), active.runId);
-    }
-    active.terminalCommitted = true;
-    active.poisoned ||= unconfirmed;
-    if (unconfirmed) this.poisoned = true;
-    active.observe('stopped', { stopped, reason: cleanup.stopReason, cleanupErrors: cleanup.errors.map((entry) => entry.code) });
-    if (active.storageError) return fail(active.storageError, active.runId);
-    const productOutcome: ProviderOutcome = {
-      runId: active.runId,
-      status,
-      text: rawOutcome?.text ?? '',
-      error: finalError,
-      stopped,
-      cleanupErrors: cleanup.errors,
-    };
-    return ok(productOutcome);
+    const { outcome, cleanup } = committedTerminal;
+    active.observe('stopped', { stopped: outcome.stopped, reason: cleanup.stopReason, cleanupErrors: cleanup.errors.map(entry => entry.code) });
+    return active.storageError ? fail(active.storageError, active.runId) : ok(outcome);
   }
 
   public close(): Promise<CloseReport> {
@@ -2278,7 +2579,14 @@ export class RuntimeService {
   private async closeOnce(): Promise<CloseReport> {
     if (this.closed) return { stopped: true, closed: true, errors: [...this.closeErrors.values()] };
     this.closing = true;
-    const active = this.active;
+    const initialActive = this.active;
+    initialActive?.stop('shutdown');
+    const barrier = await this.readRuntimeStorage(() => ok(undefined));
+    if (!barrier.ok) {
+      this.closeErrors.set(barrier.error.code, barrier.error);
+      return { stopped: false, closed: false, errors: [...this.closeErrors.values()] };
+    }
+    const active = this.active ?? initialActive;
     let activeStopped = true;
     if (active) {
       active.stop('shutdown');
@@ -2303,9 +2611,18 @@ export class RuntimeService {
     }
     try {
       const providerReport = await this.dependencies.provider.close();
+      let finalized = this.pendingNativeFinalizations.size === 0;
+      if (!finalized && providerReport.closed && providerReport.stopped && agentReport.closed && agentReport.stopped) {
+        const awaited = await withinGrace(Promise.all([...this.pendingNativeFinalizations]), RUNTIME_CONFIG.request.stopGraceMs);
+        finalized = awaited.kind === 'settled';
+        if (!finalized) {
+          const error = appError('runtime_finalization_pending', 'runtime', 'Native usage finalization is still pending.', true);
+          this.closeErrors.set(error.code, error);
+        }
+      }
       const toolsReport=this.dependencies.tools?.close()??{stopped:true,closed:true,errors:[]};
       for(const error of toolsReport.errors)this.closeErrors.set(error.code,error);
-      this.closed = activeStopped && agentReport.closed && providerReport.closed && toolsReport.closed;
+      this.closed = activeStopped && agentReport.closed && providerReport.closed && toolsReport.closed && finalized;
       const stopped = activeStopped && agentReport.stopped && providerReport.stopped && toolsReport.stopped;
       this.poisoned ||= !stopped;
       for (const error of providerReport.errors) this.closeErrors.set(error.code, error);

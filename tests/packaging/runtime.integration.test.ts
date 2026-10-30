@@ -12,7 +12,7 @@ import { resolveRuntimeLayout } from '@flowmate/shared';
 import { codeIdentity, runtimeSourceConditions, type EvaluationRuntime } from '../../agent-eval/src/execution/source.ts';
 import { prepareLocalHost } from '../../agent-eval/src/adapters/local-host.ts';
 import { manifest } from '../../agent-eval/tests/fixtures/minimal-dataset.ts';
-import { readReport } from '../../agent-eval/src/reports/store.ts';
+import { readReport, reportPath } from '../../agent-eval/src/reports/store.ts';
 import { ok } from '@flowmate/contracts';
 
 it('refuses to create a runtime or installer when a required executable entry is missing', async () => {
@@ -45,9 +45,9 @@ it('starts the real bundled Host with fixed assets and records its installed ope
   finally { if (previous === undefined) delete process.env.FLOWMATE_EVAL_AGENT_API_KEY; else process.env.FLOWMATE_EVAL_AGENT_API_KEY = previous; }
   expect(release.files).toContain('bin/rg.exe'); expect(release.files).toContain('bin/fd.exe');
   expect(release.files).toContain('licenses/ripgrep@15.2.0/LICENSE-MIT'); expect(release.files).toContain('licenses/fd@10.4.2/LICENSE-MIT');
-  expect(readFileSync(join(runtime, 'licenses/bun@1.4.0/LICENSE.md')).equals(readFileSync(join(repository, 'licenses/bun-1.4.0.LICENSE.md')))).toBe(true);
+  expect(readFileSync(join(runtime, 'licenses/bun@1.4.4/LICENSE.md')).equals(readFileSync(join(repository, 'licenses/bun-1.4.4.LICENSE.md')))).toBe(true);
   for (const name of ['pi-ai', 'pi-agent-core', 'pi-coding-agent', 'pi-tui', 'pi-telemetry'])
-    expect(readFileSync(join(runtime, `licenses/@earendil-works+${name}@0.85.1/LICENSE`)).equals(readFileSync(join(repository, 'licenses/pi-0.85.1.LICENSE')))).toBe(true);
+    expect(readFileSync(join(runtime, `licenses/@earendil-works+${name}@1.4.0/LICENSE`)).equals(readFileSync(join(repository, 'licenses/pi-1.4.0.LICENSE')))).toBe(true);
   expect(release.files.some(file => /(^|\/)(gold|datasets?|fixtures|runs|\.env)(\/|$)/i.test(file))).toBe(false);
   for (const name of ['host.js', 'evaluation-worker.js', 'maintenance.js']) expect(readFileSync(join(runtime, 'apps', name), 'utf8')).not.toContain(secret);
   const imageWorker = Bun.spawn([join(runtime, 'bin/bun.exe'), '--no-env-file', '-e', `
@@ -86,7 +86,7 @@ it('starts the real bundled Host with fixed assets and records its installed ope
   } finally { expect(await client.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } }); }
   const db = new Database(join(data, 'data/app.sqlite'), { readonly: true });
   try {
-    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 0 });
   } finally { db.close(); }
   const checked = resolveRuntimeLayout({ isPackaged: true, appPath: join(parent, 'app.asar'), resourcesPath: parent, userDataRoot: data });
@@ -144,7 +144,7 @@ it('starts the real bundled Host with fixed assets and records its installed ope
       const state = await runner.control({ requestId });
       expect(state).toMatchObject({ ok: true, data: { state: 'finished', outcome: index === 1 ? 'completed' : 'failed', stop: 'confirmed' } });
       if (!state.ok || !state.data.executionIds[0]) throw Error('Installed Execution missing');
-      const file = join(checked.data.evaluationRoot, 'agent-eval/runs/business', state.data.executionIds[0], 'report.json');
+      const file = reportPath(checked.data.evaluationRoot, state.data.executionIds[0]);
       const report = readReport(file);
       expect(report.executionComplete).toBe(index === 1);
       expect(report.trials[0]!.status).toBe(index === 1 ? 'PASS' : 'ERROR');

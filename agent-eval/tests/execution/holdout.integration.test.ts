@@ -1,12 +1,13 @@
 import { expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { dataset, fixtureRepo, observed } from '../support/fixtures.ts';
 import { selectCases } from '../../src/dataset-loader/local.ts';
 import { main } from '../../src/cli.ts';
 import { runLocal } from '../../src/execution/runner.ts';
 import { readReport } from '../../src/reports/store.ts';
+import { readSnapshot, writeArchivePart } from '../../src/reports/archive.ts';
 import type { AgentKernel } from '../../src/adapters/agent.ts';
 import {publicVersions} from '../../src/reports/files.ts';
 
@@ -51,11 +52,11 @@ test('holdout repeat preserves successful, failed and infrastructure-error Trial
     expect(run.report.trials.map(trial => trial.repetition)).toEqual([1, 2, 3]);
     expect(run.report.trials.map(trial => trial.status)).toEqual(['PASS', 'FAIL', 'ERROR']);
     expect(publicVersions(readReport(run.file))).toEqual(publicVersions(JSON.parse(JSON.stringify((run.report)))));
-    const snapshot = JSON.parse(readFileSync(join(run.file, '..', 'snapshot.json'), 'utf8'));
+    const snapshot = readSnapshot(run.file);
     expect(snapshot.selection).toBe('holdout');
     expect(snapshot.cases.map((task: { id: string }) => task.id)).toEqual([held.id]);
     const tampered = structuredClone(run.report); tampered.trials[0]!.partition = 'smoke';
-    writeFileSync(run.file, JSON.stringify(tampered));
+    writeArchivePart(run.file, tampered);
     expect(() => { readReport(run.file); }).toThrow('holdout');
 });
 

@@ -1,0 +1,20 @@
+<service>
+  <id>{{SERVICE_NAME}}</id>
+  <name>{{SERVICE_NAME}}</name>
+  <description>Flowmate local runtime for its recorded Windows owner.</description>
+  <executable>{{BUN_EXECUTABLE}}</executable>
+  <arguments>--no-env-file &quot;{{SERVICE_ENTRY}}&quot; --installation-file &quot;{{INSTALLATION_FILE}}&quot;</arguments>
+  <workingdirectory>{{RUNTIME_ROOT}}</workingdirectory>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <!-- Windows service management must configure the owner account before installation can run. -->
+  <serviceaccount>
+    <domain>{{SERVICE_DOMAIN}}</domain>
+    <user>{{SERVICE_USER}}</user>
+    <allowservicelogon>false</allowservicelogon>
+  </serviceaccount>
+  <logpath>{{LOG_DIRECTORY}}</logpath>
+  <log mode="roll" />
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+  <stoptimeout>30sec</stoptimeout>
+</service>

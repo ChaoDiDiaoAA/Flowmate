@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { createRunRepository, createSessionRepository } from '../../../packages/core/src/storage/repositories.ts';
 import { normalizeListSessionsRequest, normalizeSessionRunsRequest } from '../../../packages/contracts/src/schemas.ts';
 import type { InputRecordV2, UsageRecordV2 } from '../../../packages/contracts/src/runtime.ts';
@@ -27,9 +27,9 @@ function makePaths(root: string): ProductPaths {
   };
 }
 
-function withDatabase(test: (paths: ProductPaths) => void) {
+async function withDatabase(test: (paths: ProductPaths) => void | Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-sessions-'));
-  test(makePaths(root));
+  await test(makePaths(root));
 }
 
 const runInput = {
@@ -91,7 +91,7 @@ function nativeFixture(paths: ProductPaths, historical = false) {
   expect(opened.ok).toBe(true);
   if (!opened.ok) throw new Error(opened.error.code);
   let closed = false;
-  const close = () => { if (!closed) { closed = true; opened.data.close(); } };
+  const close = async () => { if (!closed) { closed = true; await opened.data.close(); } };
   deferCleanup(close);
   // These corruption/repair fixtures represent history written before P6 event recording.
   const sessions = historical ? createSessionRepository(opened.data.db) : opened.data.sessions;
@@ -196,7 +196,7 @@ describe('P5 migration compatibility', () => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true); if (!opened.ok) return;
     deferCleanup(() => opened.data.close());
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(opened.data.db.query('SELECT * FROM session_inputs').get()).toEqual({ ...before, result_entry_id: null, context_snapshot_id: null, request_identity_json: null });
     const rows = opened.data.db.query('SELECT id,metadata_json,hidden_at,updated_at FROM sessions ORDER BY id').all() as Array<{ id: number; metadata_json: string; hidden_at: string | null; updated_at: string }>;
     expect(JSON.parse(rows[0]!.metadata_json)).toEqual({ version: 1, model_use_blocked: null, tool_profile: 'invoice', delete_pending: true });
@@ -349,14 +349,14 @@ describe('P2 Session and Agent Run storage', () => {
     expect(store.sessions.loadHistory(store.sessionId)).toMatchObject({ ok: true, data: { unusable: false } });
   }));
 
-  it.each(['created', 'running'] as const)('blocks an interrupted %s Agent history on startup without blocking a completed Session', (status) => withDatabase((paths) => {
+  it.each(['created', 'running'] as const)('blocks an interrupted %s Agent history on startup without blocking a completed Session', (status) => withDatabase(async (paths) => {
     const store = nativeFixture(paths);
     const completed = store.sessions.create({ nativeSessionId: 'native-completed', title: 'Complete', at: store.history.header.timestamp,
       nativeHistory: { ...store.history, header: { ...store.history.header, id: 'native-completed' } } });
     expect(completed.ok).toBe(true);
     if (!completed.ok) return;
     store.db.query('UPDATE runs SET status=? WHERE id=?').run(status, store.runId);
-    store.close();
+    await store.close();
     const reopened = openDatabase(paths);
     expect(reopened.ok).toBe(true);
     if (!reopened.ok) return;
@@ -366,16 +366,16 @@ describe('P2 Session and Agent Run storage', () => {
     expect(reopened.data.db.query("SELECT COUNT(*) AS count FROM runs WHERE status IN ('created','running')").get()).toEqual({ count: 0 });
   }));
 
-  it('migrates a real new database through the current schema before exposing repositories', () => withDatabase((paths) => {
+  it('migrates a real new database through the current schema before exposing repositories', () => withDatabase(async (paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
-    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual(Array.from({ length: 20 }, (_, index) => ({ version: index + 1 })));
+    expect(opened.data.db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual(Array.from({ length: 21 }, (_, index) => ({ version: index + 1 })));
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
-    opened.data.close();
+    await opened.data.close();
   }));
 
-  it('migrates version 7 without guessing old entry ownership and preserves native JSON', () => withDatabase((paths) => {
+  it('migrates version 7 without guessing old entry ownership and preserves native JSON', () => withDatabase(async (paths) => {
     const legacy = createLegacyV7(paths);
     const header = '{"type":"session","version":3,"id":"native-v7","timestamp":"2026-09-30T00:00:00.000Z","cwd":"fixture"}';
     const entry = '{"type":"message","id":"old-e1","parentId":null,"timestamp":"2026-09-30T00:00:00.000Z","message":{"role":"user","content":"old input","timestamp":1}}';
@@ -388,12 +388,12 @@ describe('P2 Session and Agent Run storage', () => {
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
     try {
-    expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(migrated.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
       expect(migrated.data.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: entry, run_id: null });
       expect(migrated.data.db.query('SELECT header_json,storage_version,leaf_id,entry_count FROM session_native_history').get())
         .toEqual({ header_json: header, storage_version: 1, leaf_id: 'old-e1', entry_count: 1 });
       expect(migrated.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
-    } finally { migrated.data.close(); }
+    } finally { await migrated.data.close(); }
   }));
 
   it('rolls back the new column when migration 008 cannot commit its version marker', () => withDatabase((paths) => {
@@ -425,13 +425,13 @@ describe('P2 Session and Agent Run storage', () => {
     expect(store.db.query('SELECT entry_json,run_id FROM session_native_entries').get()).toEqual({ entry_json: JSON.stringify(store.entry), run_id: store.runId });
   }));
 
-  it('rolls back startup history blocking when interrupted Run repair fails, then blocks on the next successful startup', () => withDatabase((paths) => {
+  it('rolls back startup history blocking when interrupted Run repair fails, then blocks on the next successful startup', () => withDatabase(async (paths) => {
     const store = nativeFixture(paths, true);
     expect(store.runs.finish(store.runId, { ...store.terminal, nativeHistoryUnusable: true }).ok).toBe(true);
     store.db.query('UPDATE session_native_history SET unusable=0').run();
     store.db.query("UPDATE runs SET status='running',ended_at=NULL,error_json=NULL WHERE id=?").run(store.runId);
     store.db.exec("CREATE TRIGGER reject_interruption BEFORE UPDATE ON runs WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'interrupted repair failed'); END;");
-    store.close();
+    await store.close();
     expect(openDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
     const unrecovered = new Database(paths.databaseFile);
     expect(unrecovered.query('SELECT status FROM runs WHERE id=?').get(store.runId)).toEqual({ status: 'running' });
@@ -447,7 +447,7 @@ describe('P2 Session and Agent Run storage', () => {
     expect(recovered.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   }));
 
-  it('keeps ordered native history and leaf across restart, and marks corrupt history invalid', () => withDatabase((paths) => {
+  it('keeps ordered native history and leaf across restart, and marks corrupt history invalid', () => withDatabase(async (paths) => {
     const first = openDatabase(paths);
     expect(first.ok).toBe(true);
     if (!first.ok) return;
@@ -461,7 +461,7 @@ describe('P2 Session and Agent Run storage', () => {
     const entry = { type: 'message', id: 'first', parentId: null, timestamp: header.timestamp,
       message: { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: 1 } };
     expect(saveTestHistory(first.data.db, first.data.runtimeEventStore, sessionId, { storageVersion: 1, header, entries: [entry], leafId: entry.id, unusable: false }).ok).toBe(true);
-    first.data.close();
+    await first.data.close();
     const second = openDatabase(paths);
     expect(second.ok).toBe(true);
     if (!second.ok) return;
@@ -471,10 +471,10 @@ describe('P2 Session and Agent Run storage', () => {
       .run(JSON.stringify({ ...entry, parentId: 'missing' }), sessionId);
     expect(second.data.sessions.get(sessionId)).toMatchObject({ ok: true, data: { historyState: 'invalid' } });
     expect(second.data.sessions.loadHistory(sessionId)).toMatchObject({ ok: false, error: { code: 'session_history_invalid' } });
-    second.data.close();
+    await second.data.close();
   }));
 
-  it('deletes a permitted session and its native history in one transaction', () => withDatabase((paths) => {
+  it('deletes a permitted session and its native history in one transaction', () => withDatabase(async (paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
@@ -489,10 +489,10 @@ describe('P2 Session and Agent Run storage', () => {
     expect(opened.data.sessions.delete(id, at)).toEqual({ ok: true, data: 'permanent' });
     expect(opened.data.db.query('SELECT * FROM session_native_history WHERE session_id=?').get(id)).toBeNull();
     expect(opened.data.sessions.get(id)).toMatchObject({ ok: false, error: { code: 'session_not_found' } });
-    opened.data.close();
+    await opened.data.close();
   }));
 
-  it('reads version-2 P3 Run facts beside unchanged version-1 P2 records', () => withDatabase((paths) => {
+  it('reads version-2 P3 Run facts beside unchanged version-1 P2 records', () => withDatabase(async (paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
@@ -529,7 +529,7 @@ describe('P2 Session and Agent Run storage', () => {
       data: { input: { version: 2, workspaceInput: { documentRef: null } }, usage: { version: 2, calls: [] },
         config: { agent: { policyVersion: 'p3-invoice-tools-v1', maxToolCalls: 24 } }, scope: p3Scope },
     });
-    opened.data.close();
+    await opened.data.close();
   }));
 
   it('preserves every legacy column before interrupted-run recovery, then recovers only active rows', () => withDatabase((paths) => {
@@ -568,7 +568,7 @@ describe('P2 Session and Agent Run storage', () => {
     reopened.close();
   }));
 
-  it('persists native Session identities, enforces Agent links, and updates a Session with its Run terminal', () => withDatabase((paths) => {
+  it('persists native Session identities, enforces Agent links, and updates a Session with its Run terminal', () => withDatabase(async (paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
@@ -637,10 +637,10 @@ describe('P2 Session and Agent Run storage', () => {
 
     expect(() => db.query('DELETE FROM sessions WHERE id=?').run(first.data.sessionId)).toThrow();
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
-    opened.data.close();
+    await opened.data.close();
   }));
 
-  it('renames a Session in place without changing its identity', () => withDatabase((paths) => {
+  it('renames a Session in place without changing its identity', () => withDatabase(async (paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
@@ -652,10 +652,10 @@ describe('P2 Session and Agent Run storage', () => {
     const renamed = sessions.rename({ sessionId, title: 'After', at: '2026-09-24T01:00:00.000Z' });
     expect(renamed).toMatchObject({ ok: true, data: { sessionId, nativeSessionId: 'native-rename-session', title: 'After', updatedAt: '2026-09-24T01:00:00.000Z' } });
     expect(sessions.get(sessionId)).toMatchObject({ ok: true, data: { nativeSessionId: 'native-rename-session', title: 'After' } });
-    opened.data.close();
+    await opened.data.close();
   }));
 
-  it('permanently deletes only the selected Session and its Agent Runs while retaining other Sessions and Provider Runs', () => withDatabase((paths) => {
+  it('permanently deletes only the selected Session and its Agent Runs while retaining other Sessions and Provider Runs', () => withDatabase(async (paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
@@ -719,10 +719,10 @@ describe('P2 Session and Agent Run storage', () => {
     expect(runs.get(activeOther.data)).toMatchObject({ ok: true, data: { kind: 'agent', status: 'created', sessionId: firstSession.data.sessionId } });
     expect(runs.get(providerRun.data)).toMatchObject({ ok: true, data: { kind: 'provider', sessionId: null } });
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
-    opened.data.close();
+    await opened.data.close();
   }));
 
-  it('enforces Run kind and Session reference combinations with SQLite constraints', () => withDatabase((paths) => {
+  it('enforces Run kind and Session reference combinations with SQLite constraints', () => withDatabase(async (paths) => {
     const opened = openDatabase(paths);
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
@@ -737,6 +737,6 @@ describe('P2 Session and Agent Run storage', () => {
     expect(() => insert.run('agent', null, JSON.stringify(scope))).toThrow();
     expect(() => insert.run('agent', 99_999, JSON.stringify(scope))).toThrow();
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
-    opened.data.close();
+    await opened.data.close();
   }));
 });

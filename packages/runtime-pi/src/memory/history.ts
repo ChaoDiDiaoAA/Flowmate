@@ -14,7 +14,7 @@ export function managerFor(history: NativeSessionHistory): SessionManager {
 }
 export function referenceIds(entry: NativeSessionHistory['entries'][number] | SessionEntry): string[] {
   const e = entry as NativeSessionEntry;
-  if (e.type === 'label') return [e.targetId];
+  if (e.type === 'label' || e.type === 'context_edit') return [e.targetId];
   if (e.type === 'compaction') return [e.firstKeptEntryId];
   const reference = e.type === 'branch_summary' ? e.fromId
     : e.type === 'message' && e.message.role === 'branchSummary' ? e.message.fromId : null;
@@ -60,7 +60,7 @@ export function validateAgentContext(messages: readonly AgentMessage[], complete
 export function validateLlmMessages(messages: readonly AgentMessage[]): Result<void> {
   const validated = validateAgentContext(messages);
   if (!validated.ok) return validated;
-  if (messages.some(m => !['user', 'assistant', 'toolResult'].includes(m.role))) return invalidHistory();
+  if (messages.some(m => !['system', 'user', 'assistant', 'toolResult'].includes(m.role))) return invalidHistory();
   return ok(undefined);
 }
 export function validateNativeHistory(history: NativeSessionHistory): Result<void> {
@@ -69,6 +69,13 @@ export function validateNativeHistory(history: NativeSessionHistory): Result<voi
     if (!parsed.success || history.header.version !== 3) return invalidHistory();
     const manager = managerFor(history), calls = new Set<string>();
     for (const entry of parsed.data.entries) {
+      if (entry.type === 'context_edit') {
+        const target = manager.getEntry(entry.targetId);
+        const editable = target?.type === 'custom_message'
+          || target?.type === 'message' && ['user', 'assistant', 'toolResult'].includes(target.message.role);
+        if (!editable || entry.parentId === null
+          || !manager.getBranch(entry.parentId).some(parent => parent.id === entry.targetId)) return invalidHistory();
+      }
       if (entry.type === 'message' && entry.message.role === 'assistant') for (const block of entry.message.content) if (block.type === 'toolCall') {
         if (calls.has(block.id)) return invalidHistory(); calls.add(block.id);
       }

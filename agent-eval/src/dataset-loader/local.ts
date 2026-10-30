@@ -15,6 +15,7 @@ import { caseSchema, caseV2Schema, manifestSchema, steerControllerSchema, future
 export { caseSchema, caseV2Schema, checkSchema, manifestSchema, metricIds } from './schema.ts';
 export type { LocalCase, Check } from './schema.ts';
 export type LocalDataset = {
+    published?: { benchmarkId: string; revision: number; regressionCaseIds: string[] };
     regressionOrigins?: Record<string, RegressionOrigin[]>;
     root: string;
     repo: string;
@@ -87,6 +88,8 @@ export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: Flat
         throw new Error('Duplicate Case membership');
     if (new Set(manifest.smoke).size !== manifest.smoke.length || manifest.smoke.some(id => !cases.some(c => c.id === id)))
         throw new Error('Invalid smoke references');
+    if (manifest.holdout && (new Set(manifest.holdout).size !== manifest.holdout.length || manifest.holdout.some(id =>
+        manifest.smoke.includes(id) || !cases.some(task => task.id === id)))) throw Error('Invalid holdout references');
     for (const judge of manifest.scoring.judges) {
         const required = judge.requiredFor ?? [];
         if (new Set(required).size !== required.length || required.some(id => !cases.some(c => c.id === id)))
@@ -98,7 +101,8 @@ export function loadDataset(directory: string, repo = REPO_ROOT, embedded?: Flat
         throw new Error('Common safeguards cannot be disabled');
     const groups = new Map<string, boolean>(),contents:Array<{bytes:Buffer;smoke:boolean}>=[];
     for (const task of cases)for (const m of task.input.materials) {
-        const smoke=manifest.smoke.includes(task.id),key=m.source+':'+m.sample;
+        // A quick Smoke subset does not turn other development Cases into independent holdout data.
+        const smoke=manifest.holdout ? !manifest.holdout.includes(task.id) : manifest.smoke.includes(task.id),key=m.source+':'+m.sample;
         if(groups.has(key)&&groups.get(key)!==smoke)throw Error('Source leakage between smoke and holdout');groups.set(key,smoke);
         const prefix=(m.source==='voxel51'?'':'materials/')+m.sample+'/';
         const source=(name:string)=>embedded?read((m.source==='voxel51'?'voxel51/':'')+prefix+name):readLocalMaterial(repo,m.source==='voxel51'?join(repo,'data/invoices/voxel51'):root,prefix+name);
@@ -140,7 +144,8 @@ export function judgeSelection(dataset:Pick<LocalDataset,'manifest'|'cases'>,req
 export function discoverDatasets(root: string, repo = REPO_ROOT, resourceRepository = repo): LocalDataset[] {
     if (!existsSync(root)) return [];
     if (existsSync(join(root,'cases.ts'))) return readDeclarationDatasets(root,repo,resourceRepository).map(group=>loadDataset(root,repo,group,resourceRepository));
-    return readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && !e.isSymbolicLink()).flatMap(e => {
+    return readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory() && !e.isSymbolicLink() &&
+        !['gold-candidates', 'bad-candidates', 'regression-candidates', 'published', 'badcase'].includes(e.name)).flatMap(e => {
         const dir = join(root, e.name);
         return readdirSync(dir).includes('dataset.json') ? [loadDataset(dir, repo, undefined, resourceRepository)] : [];
     });
@@ -247,11 +252,13 @@ export function selectCases(dataset: LocalDataset, selection: 'smoke' | 'holdout
         const task = dataset.cases.find(c => c.id === caseId);
         if (!task)
             throw new Error('Unknown Case');
-        if (selection !== 'full' && dataset.manifest.smoke.includes(task.id) !== (selection === 'smoke'))
+        if (selection !== 'full' && !(selection === 'smoke' ? dataset.manifest.smoke.includes(task.id)
+            : dataset.manifest.holdout?.includes(task.id) ?? !dataset.manifest.smoke.includes(task.id)))
             throw new Error('Case is outside selected partition');
         return [task];
     }
-    return dataset.cases.filter(c => selection === 'full' || dataset.manifest.smoke.includes(c.id) === (selection === 'smoke'));
+    return dataset.cases.filter(c => selection === 'full' || (selection === 'smoke' ? dataset.manifest.smoke.includes(c.id)
+        : dataset.manifest.holdout?.includes(c.id) ?? !dataset.manifest.smoke.includes(c.id)));
 }
 export function visitLocalCaseFiles(repo: string, datasetRoot: string, task: LocalCase,
     read: (root: string, path: string, publicPath: string) => Buffer | null,

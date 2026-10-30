@@ -1,4 +1,4 @@
-import type { Database } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import { ResearchContextSchema } from '@flowmate/contracts';
 import type { ResearchContext } from '@flowmate/contracts';
 import type { ResearchSourcePolicy } from '@flowmate/contracts';

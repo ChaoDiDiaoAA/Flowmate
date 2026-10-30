@@ -143,6 +143,17 @@ export const invoiceHeaderFields = ['invoiceNumber', 'issueDate', 'sellerName', 
   'buyerTaxId', 'currency', 'netAmount', 'taxAmount', 'totalAmount'] as const;
 export const invoiceLineFields = ['description', 'quantity', 'unit', 'unitPrice', 'netAmount', 'taxRate',
   'taxAmount', 'totalAmount'] as const;
+export const InvoiceCandidateFieldPathSchema = z.string().max(256).refine(path => {
+  const header = /^fields\.([A-Za-z]+)$/.exec(path);
+  if (header) return invoiceHeaderFields.some(name => name === header[1]);
+  const line = /^lines\.(0|[1-9]\d*)\.([A-Za-z]+)$/.exec(path);
+  return !!line && Number(line[1]) < MAX_INVOICE_LINES && invoiceLineFields.some(name => name === line[2]);
+}, 'Unregistered candidate field path.');
+export const InvoiceCandidateChildReportReferenceSchema = z.object({
+  childRunId: idSchema, fieldPath: InvoiceCandidateFieldPathSchema,
+  sourceRefs: z.array(SourceRefSchema).max(50), inputIds: z.array(idSchema).max(64),
+}).strict().refine(value => value.sourceRefs.length + value.inputIds.length > 0, 'An adopted report needs original evidence references.');
+export type InvoiceCandidateChildReportReference = z.infer<typeof InvoiceCandidateChildReportReferenceSchema>;
 const formHeaderShape = Object.fromEntries(invoiceHeaderFields.map(name => [name, z.string().max(MAX_INVOICE_FIELD_CHARS)])) as {
   [Name in typeof invoiceHeaderFields[number]]: z.ZodString;
 };
@@ -192,6 +203,9 @@ export type RejectInvoiceCandidateRequest = z.infer<typeof RejectInvoiceCandidat
 export const ExportInvoiceCandidateRequestSchema = z.object({ operationRef: z.string().min(1).max(256),
   candidateId: idSchema, format: z.enum(['json', 'csv', 'markdown']) }).strict();
 export type ExportInvoiceCandidateRequest = z.infer<typeof ExportInvoiceCandidateRequestSchema>;
+export function invoiceExportName(candidate: { jobId: number; sequence: number }, format: ExportInvoiceCandidateRequest['format']): string {
+  return `outputs/invoice-${candidate.jobId}-result-${candidate.sequence}.${format === 'markdown' ? 'md' : format}`;
+}
 export type SaveInvoiceCandidateResponse = { changed: boolean; candidate: import('./activity.ts').CandidateSnapshot;
   workspace: import('./workspace.ts').WorkspaceSnapshot };
 export type InvoiceCandidateDecisionResponse = { candidate: import('./activity.ts').CandidateSnapshot;
@@ -536,7 +550,8 @@ export const invoiceToolSchemas = {
     output: candidateDiffPageSchema,
   },
   save_invoice_candidate: {
-    input: z.object({ documentId: idSchema, candidate: CandidateDraftSchema }).strict(),
+    input: z.object({ documentId: idSchema, candidate: CandidateDraftSchema,
+      childReportRefs: z.array(InvoiceCandidateChildReportReferenceSchema).min(1).max(50).optional() }).strict(),
     output: CandidateReceiptSchema,
   },
   fill_invoice_form: { input: FillInvoiceFormInputSchema, output: FillInvoiceFormOutputSchema },

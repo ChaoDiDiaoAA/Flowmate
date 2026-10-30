@@ -4,7 +4,7 @@
 
 ## Prepare the development environment
 
-Use Windows x64, Bun **1.4.0**, Node.js **24**, and Git. Dependency versions are pinned in [package.json](../../package.json) and [bun.lock](../../bun.lock); preserve the two [dependency patches](development.md#dependency-patches). A model endpoint and its credentials are needed for model operations, not for reading the UI or running engineering fixtures.
+Use Windows x64, Bun **1.4.4**, Node.js **24**, and Git. The current engineering baseline uses Pi SDK **1.4.0** and data schema **21**. Dependency versions are pinned in [package.json](../../package.json) and [bun.lock](../../bun.lock); preserve the required [dependency patches](development.md#dependency-patches). A model endpoint and its credentials are needed for model operations, not for reading the UI or running engineering fixtures.
 
 From the repository root:
 
@@ -37,9 +37,18 @@ The application opens in the main conversation view. Opening it does not create 
 3. Click **Send** in the main conversation. Watch the Run and response; use **Stop** if needed, then wait for actual stopping facts.
 4. Open the conversation from recent chats in the left navigation or from **Chats** to return to the main canvas and inspect saved history. Viewing history does not start another model request.
 
-On business and settings pages, the conversation appears in the right-side Assistant. Switching presentations or collapsing and reopening that pane preserves the current Session draft in the window. Open **Invoices** or **Deep Research** for their business workflows; see [UI system](UI-SYSTEM.md) for layout behavior.
+On the existing invoice, research and settings pages, the conversation appears in the right-side Assistant. Switching presentations or collapsing and reopening that pane preserves the current Session draft in the window. **Chats**, **Invoices** and **Deep Research** retain their AgentSession workflows; see [UI system](UI-SYSTEM.md) for layout behavior. The independent **Personal Agent** entry uses Pi Durable for ongoing invoice work.
 
 For local-file work, select the intended working directory or authorized material before sending and state the scope in the request. Available native tools may include file writes and shell commands. Directory selection sets a working location; it is not a filesystem sandbox.
+
+## Start ongoing invoice work in Personal Agent
+
+1. Open **Personal Agent** from the left navigation and confirm/save its model, tool and resource configuration. Then select a fixed set of existing parsed invoices, enter the goal and explicitly submit to create the persistent invoice work. This creation flow is available only in Personal Agent; **Invoices** keeps single-invoice selection and editing.
+2. Inspect the work overview, per-invoice Todo items, candidates and source evidence. Supplement material for the relevant invoice or follow its review action back to **Invoices**.
+3. Read the operation receipt to distinguish saved material, authorization to execute, an existing or new attempt, queueing and a blocked condition. Valid material after a normally completed attempt can automatically continue eligible work; material saved after a user stop or failure needs an explicit continue action.
+4. Give each invoice an explicit final disposition: `accepted`, `rejected` or `excluded`. Ordinary **Reject** rejects a candidate; it does not end processing for that invoice. A candidate or a successful Run alone does not complete the work.
+
+Viewing pages/history and desktop reconnection are read-only and make no model or tool calls; they do not trigger backend recovery. Backend startup recovery separately loads the original persisted facts and native records, then checks saved authorization and current eligibility before resuming an eligible original attempt. An `open` work item alone creates no new intent, and stopped or failed attempts are not revived. This engineering delivery covers verified behavior while the application is running; execution after desktop closure, Windows service restart recovery and Windows startup recovery remain system-service goals, with real SCM acceptance deferred. See [Personal Agent workflow](workflows.md#personal-agent) for continuation and review details.
 
 ## Add capabilities deliberately
 
@@ -55,7 +64,7 @@ This command still requires the model to make a real `Agent` tool call. A comman
 
 ## Next workflows and common issues
 
-Use [Workflows](workflows.md) for research and invoices. Research starts from selected local text/Markdown or registered parsed material. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
+Use [Workflows](workflows.md) for research, single-invoice review and ongoing Personal Agent work. Research starts from selected local text/Markdown or registered parsed material. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
 
 | Symptom | First check |
 |---|---|
@@ -65,4 +74,4 @@ Use [Workflows](workflows.md) for research and invoices. Research starts from se
 | No child appears | Extension enabled, role available, actual `Agent` call and remaining budget |
 | Old conversation cannot continue | Saved history/material access may be unusable; read diagnostics before a new Run |
 
-The default Windows data root is `%APPDATA%\Flowmate`, with SQLite at `data\app.sqlite`. Model requests send relevant content to the chosen service and may cost money. Test connection, Optimize, Send, Fill with Agent, and research planning/execution can call a model. Opening pages and saving settings do not automatically do so.
+The default Windows data root is `%APPDATA%\Flowmate`, with SQLite at `data\app.sqlite`. Model requests send relevant content to the chosen service and may cost money. Test connection, Optimize, Send, Fill with Agent, research planning/execution and authorized Personal Agent execution can call a model. Opening pages and saving settings do not automatically do so.

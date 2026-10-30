@@ -196,7 +196,7 @@ describe('P13 SQLite ownership and migration', () => {
     expect(f.store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 
-  it('[F13-07/10/24] records child tools and consumed Input independently, then recovers tools before children before roots with zero replay', () => {
+  it('[F13-07/10/24] records child tools and consumed Input independently, then recovers tools before children before roots with zero replay', async () => {
     const f = admissionFixture(), created = need(f.store.runs.createSubagent(f.request));
     const config = { ...f.childConfig, subagent: { ...f.childConfig.subagent, childInputId: created.inputId } };
     need(f.store.runs.start(created.runId, config, at));
@@ -228,7 +228,7 @@ describe('P13 SQLite ownership and migration', () => {
       childSessionId: created.sessionId, originToolCallId: f.call.toolCallId }]);
     expect(need(f.store.runs.getByOriginToolCall(f.call.toolCallId))).toMatchObject({ runId: created.runId });
     const counts = f.store.db.query('SELECT (SELECT count(*) FROM sessions) AS sessions,(SELECT count(*) FROM runs) AS runs').get();
-    f.store.close();
+    await f.store.close();
     const reopened = need(openTestDatabase(f.p));
     expect(need(reopened.runs.get(created.runId))).toMatchObject({ kind: 'subagent', status: 'failed', stoppedAt: null,
       error: { code: 'runtime_interrupted' } });
@@ -271,14 +271,30 @@ describe('P13 SQLite ownership and migration', () => {
       VALUES(2,'Provider','{}','{}','{}','{}','failed',?,'{}',?)`).run(at, at);
     const before = old.query('SELECT * FROM runs ORDER BY id').all();
     const columns = (old.query('PRAGMA table_info(runs)').all() as { name: string }[]).map(row => row.name);
-    const objects = old.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND NOT(type='table' AND tbl_name IN ('tool_calls','session_inputs')) AND name!='context_snapshot_insert_guard' ORDER BY name").all();
+    const objects = old.query<{ type: string; name: string; tbl_name: string; sql: string }, []>("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND NOT(type='table' AND tbl_name IN ('tool_calls','session_inputs','sessions','invoice_candidates')) AND name!='context_snapshot_insert_guard' ORDER BY name").all();
+    const originalOwners = (['sessions', 'invoice_candidates'] as const).map(table => ({ table,
+      columns: old.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().map(row => row.name),
+      rows: old.query<Record<string, unknown>, []>(`SELECT * FROM ${table} ORDER BY id`).all() }));
+    type CandidateKey = { table: string; from: string; to: string; on_update: string; on_delete: string; match: string };
+    const keys = (db: Database) => db.query<CandidateKey, []>('PRAGMA foreign_key_list(invoice_candidates)').all()
+      .map(({ table, from, to, on_update, on_delete, match }) => ({ table, from, to, on_update, on_delete, match }))
+      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    const originalKeys = keys(old).filter(key => !(key.table === 'runs' && key.from === 'job_id'));
     old.close();
     const store = need(openTestDatabase(p));
-    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(store.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(store.db.query(`SELECT ${columns.join(',')} FROM runs ORDER BY id`).all()).toEqual(before);
     expect(store.db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs').all()).toEqual([
       { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);
-    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name!='runs' AND NOT(type='table' AND tbl_name IN ('tool_calls','session_inputs')) AND tbl_name NOT IN ('managed_file_contents','research_tasks','research_runs','research_plans','research_sources','research_claims','research_reports') AND name NOT IN ('context_snapshot_insert_guard','subagent_parallel_limit','tool_evidence_revision') ORDER BY name").all()).toEqual(objects);
+    expect(store.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name IN (SELECT value FROM json_each(?)) ORDER BY name")
+      .all(JSON.stringify(objects.map(object => object.name)))).toEqual(objects);
+    for (const original of originalOwners)
+      expect(store.db.query(`SELECT ${original.columns.join(',')} FROM ${original.table} ORDER BY id`).all()).toEqual(original.rows);
+    expect(store.db.query('SELECT id,runtime_kind,durable_conversation_id FROM sessions ORDER BY id').all())
+      .toEqual(originalOwners[0]!.rows.map(row => ({ id: row.id, runtime_kind: 'agent_session', durable_conversation_id: null })));
+    expect(keys(store.db)).toEqual(originalKeys);
+    expect(store.db.query("SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('invoice_candidate_insert_owner','invoice_candidate_update_owner','invoice_candidate_run_owner') ORDER BY name").all())
+      .toEqual([{ name: 'invoice_candidate_insert_owner' }, { name: 'invoice_candidate_run_owner' }, { name: 'invoice_candidate_update_owner' }]);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(store.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
     expect(store.db.query('PRAGMA legacy_alter_table').get()).toEqual({ legacy_alter_table: 0 });

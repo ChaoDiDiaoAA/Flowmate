@@ -6,15 +6,17 @@ import { writeInvoiceInputs, type SelectedInvoice } from './invoice-materials.ts
 import type { SelectedResource } from './selected-resources.ts';
 import { ExtensionEvaluationProfileSchema, type ExtensionEvaluationProfile } from '../../../packages/contracts/src/extensions.ts';
 import { CaseEvaluationFaultProfileSchema, type CaseEvaluationFaultProfile } from '../../../packages/contracts/src/runtime-evaluation.ts';
+import { EvaluationAgentOverridesSchema, type EvaluationAgentOverrides } from '../../../packages/contracts/src/runtime-evaluation.ts';
 import { PackagedReleaseSchema } from '@flowmate/shared';
 import type { EvaluationRuntime } from '../execution/source.ts';
 import { getToolPath } from '@earendil-works/pi-coding-agent';
 
 /** Each Trial owns its local process and data; this is not an OS filesystem sandbox. */
 export function prepareLocalHost(repo: string, directory: string, invoices: SelectedInvoice[] = [], extensionProfile?: ExtensionEvaluationProfile,
-    caseFaultProfile?: CaseEvaluationFaultProfile, resources: SelectedResource[] = [], runtime?: EvaluationRuntime) {
+    caseFaultProfile?: CaseEvaluationFaultProfile, resources: SelectedResource[] = [], runtime?: EvaluationRuntime, evaluationOverrides?: EvaluationAgentOverrides) {
     const profile = extensionProfile === undefined ? undefined : ExtensionEvaluationProfileSchema.parse(extensionProfile);
     const caseProfile = caseFaultProfile === undefined ? undefined : CaseEvaluationFaultProfileSchema.parse(caseFaultProfile);
+    const overrides = evaluationOverrides === undefined ? undefined : EvaluationAgentOverridesSchema.parse(evaluationOverrides);
     if (profile && caseProfile) throw Error('Only one evaluation fault profile may be configured');
     const root = realpathSync(runtime ? runtime.mode === 'installed' ? runtime.layout.runtimeRoot : runtime.repository
         : existsSync(join(repo, 'apps/host/main.ts')) ? repo : REPO_ROOT);
@@ -89,8 +91,10 @@ export function prepareLocalHost(repo: string, directory: string, invoices: Sele
     const launcher = installed ? join(codeRoot, 'apps/start-host.js') : join(runtimeRoot, 'apps/start.js');
     const launch = { executable: installed ? installed.layout.bunExecutable : process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun', args: ['--no-env-file', launcher,
         '--user-data-root', productRoot, '--invoice-source-root', invoiceSourceRoot,
+        '--evaluation-trial-root', realpathSync(directory),
         ...(profile ? ['--eval-extension-profile', JSON.stringify(profile)] : []),
-        ...(caseProfile ? ['--eval-case-fault-profile', JSON.stringify(caseProfile)] : [])] };
+        ...(caseProfile ? ['--eval-case-fault-profile', JSON.stringify(caseProfile)] : []),
+        ...(overrides && Object.keys(overrides).length ? ['--eval-agent-overrides', JSON.stringify(overrides)] : [])] };
     return { launch, runtimeRoot, productRoot, invoiceSourceRoot,
         manifest: { contract: 'flowmate-local-host/v1', kind: 'local-process', filesystemSandbox: false, runtimeRoot, productRoot, files: files.sort() } };
 }

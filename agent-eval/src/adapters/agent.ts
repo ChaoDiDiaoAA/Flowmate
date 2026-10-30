@@ -39,8 +39,9 @@ export type AgentTrial = {
 export interface AgentTrialSession {
     /** Actual initial visible input after controlled setup, before any model call. */
     input: CaseExecutionResult['input'];
-    execute(signal: AbortSignal): Promise<CaseExecutionResult>;
-    snapshot(): Promise<CaseExecutionResult>;
+    execute(signal: AbortSignal, onQuiescent?: (facts: CaseExecutionResult) => void): Promise<CaseExecutionResult>;
+    /** stopOnly reads existing owned actor state, without collecting full history/tool bodies. */
+    snapshot(options?: { stopOnly?: boolean }): Promise<CaseExecutionResult>;
     cancel(): Promise<void>;
     close(): Promise<EvidenceFact>;
 }

@@ -31,8 +31,8 @@ export function captureInstalledSource(runtime: Extract<EvaluationRuntime, { mod
 export function codeIdentity(repoRoot: string, snapshotFile?: string, runtime?: EvaluationRuntime) {
     if (runtime?.mode === 'installed') return captureInstalledSource(runtime, snapshotFile);
     if (runtime?.mode === 'development') repoRoot = runtime.repository;
-    const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim();
-    const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: repoRoot, encoding: 'utf8' }).split('\0');
+    const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8', windowsHide: true }).trim();
+    const files = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: repoRoot, encoding: 'utf8', windowsHide: true }).split('\0');
     const root = realpathSync(repoRoot);
     const source = [...new Set(files)].filter(p =>
         !/^agent-eval\/src\/(datasets|testing)\//.test(p) && /^(agent-eval\/src\/|packages\/|apps\/|scripts\/)/.test(p) && /\.(tsx?|[cm]?js|json|css|html|sql)$/.test(p) ||
@@ -62,7 +62,7 @@ export function codeIdentity(repoRoot: string, snapshotFile?: string, runtime?: 
         const contentBase64 = bytes.toString('base64');
         return { path,  contentBase64 };
     }).filter(file=>file.contentBase64!==null);
-    const identity = { release: process.env.FLOWMATE_EVAL_RELEASE || `git:${commit}`, dirty: !!execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8' }).trim(), commit };
+    const identity = { release: process.env.FLOWMATE_EVAL_RELEASE || `git:${commit}`, dirty: !!execFileSync('git', ['status', '--porcelain'], { cwd: repoRoot, encoding: 'utf8', windowsHide: true }).trim(), commit };
     manifests.set(identity,new Map(source.map(file=>[file.path,file.contentBase64!])));
     if (snapshotFile)
         writeFileSync(snapshotFile, artifactJson({ contract: 'flowmate-source-snapshot/v1', ...identity, runtime: { node: process.version, platform: process.platform, arch: process.arch }, files: source }), { flag: 'wx' });

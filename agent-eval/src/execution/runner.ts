@@ -3,7 +3,7 @@ import { atomicJson, publicVersions } from '../reports/files.ts';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { artifactJson } from '../artifacts.ts';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { discoverDatasets, REPO_ROOT, caseConditions, caseFiles, resolveCase, restoreCaseInputs, selectCases, assertSemanticSelection, judgeSelection, type LocalDataset, type Check } from '../dataset-loader/local.ts';
@@ -26,11 +26,14 @@ import {metricCatalog} from '../scoring/catalog.ts';
 import {compileEvaluatorPlan} from '../scoring/evaluator-plan.ts';
 import {createRegistry} from '../scoring/registry.ts';
 import { saveReport, safeId, type LocalReport } from '../reports/store.ts';
-import { createRunDirectory, datasetScope } from '../reports/paths.ts';
+import { createArchive, archiveReference, archiveFile, readArchive, snapshotReference, writeArchivePart, finishArchive } from '../reports/archive.ts';
+import { discoverSavedExecutions } from '../reports/paths.ts';
+import { writeRunReadme } from '../reports/readme.ts';
 import { deriveBadcases, saveBadcases } from '../reports/badcases.ts';
 import { recordRegressions } from '../reports/regressions.ts';
 import { deriveTrialStatistics, type TrialStatistics } from '../reports/trial-statistics.ts';
 import type { ExecutionStatus } from '../types.ts';
+import { reportTraces } from './trace.ts';
 type TrialProgress = { index: number; total: number; caseId: string; trialId: string; trialIndex?: number; trialsPerCase?: number };
 export type EvaluationProgress =
     | { type: 'preflight' }
@@ -53,7 +56,8 @@ function scoringProgressReason(trial: LocalReport['trials'][number]) {
     const call=trial.judgeCalls.find(call=>semantic.some(score=>score.judge?.callId===call.callId))??trial.judgeCalls[0];
     let summary='评分设施异常';
     if(semantic.length) {
-        if(call?.error) summary=call.transportStatus===402?'Judge 计费不可用':[401,403].includes(call.transportStatus??0)?'Judge 认证失败':
+        if(!call) summary=trial.execution?.error?.infrastructure?'执行设施异常，语义评分未运行':'必要语义评分未运行';
+        else if(call.error) summary=call.transportStatus===402?'Judge 计费不可用':[401,403].includes(call.transportStatus??0)?'Judge 认证失败':
             /timeout/i.test(call.error)?'Judge 调用超时':/cancel|abort/i.test(call.error)?'Judge 调用已取消':
             call.stopReason==='length'?'Judge 返回被截断':call.responseComplete?'Judge 返回格式或指标身份不合法':'Judge 调用失败或返回未完成';
         else {
@@ -78,6 +82,7 @@ export async function runLocal(repo: string, options: {
     judgeConfigFile?: string;
     config?: z.infer<typeof runConfigSchema>;
 }, deps: {
+    runFile?: string;
     runtime?: EvaluationRuntime;
     kernel?: AgentKernel;
     env?: NodeJS.ProcessEnv;
@@ -91,6 +96,8 @@ export async function runLocal(repo: string, options: {
     notify({ type: 'preflight' });
     const dataset = structuredClone(options.dataset), selected = selectCases(dataset, options.selection, options.caseId);
     if (!selected.length) throw new Error(dataset.manifest.suite === 'badcase' ? '暂无可运行成员' : 'No Cases in selected partition');
+    const executionId = safeId(options.executionId ?? ('agent-' + Date.now() + '-' + randomUUID().slice(0, 8)));
+    if (discoverSavedExecutions(repo).some(saved => saved.executionId === executionId)) throw Error('Conflicting duplicate execution ID: ' + executionId);
     const isProductAgent = !deps.kernel || deps.kernel === productAgent;
     let kernel = deps.kernel ?? productAgent;
     let config: z.infer<typeof runConfigSchema> & { modelCapabilities?: AgentModelCapabilities } = parseRunConfig(options.config ?? {});
@@ -99,7 +106,7 @@ export async function runLocal(repo: string, options: {
         throw new Error('Trials must be 1–20');
     if (isProductAgent) {
         const agent = deps.preparedAgent ?? await prepareAgentConfig(repo, deps.env ?? process.env, config, undefined, deps);
-        config = { ...config, ...agent.configuration };
+        config = { ...config, ...agent.configuration, ...(config.reasoning === undefined ? {} : { reasoning: config.reasoning }) };
         kernel = createProductAgent(repo, agent.apiKey, deps.runtime);
     }
     const ready = kernel.readiness();
@@ -114,14 +121,14 @@ export async function runLocal(repo: string, options: {
     let judge = options.judge === 'off' || !selection.needed ? null : deps.preparedJudge !== undefined ? deps.preparedJudge : judgeConfig(deps.env ?? process.env, repo, options.judgeConfigFile);
     const batch = dataset.manifest.scoring.judges.find(j => j.id === 'semantic-batch');
     const plans=selected.flatMap(task=>'contract'in task&&task.expected.semantic?[task.expected.semantic]:[]);
-    const rubrics = rubricsFor(plans);
+    const rubrics = rubricsFor(plans,judge?.provider==='codex-cli');
     const judgeRequired = selection.required;
     if (options.judge !== 'off' && judgeRequired && !judge)
         throw new Error('Required Judge is unavailable');
     if (judge && deps.preparedJudge === undefined) judge = await prepareJudge(judge, deps.fetcher, deps.signal);
     const selectedJudge = judge ? publicJudgeConfig(judge) : null;
-    const executionId = safeId(options.executionId ?? ('agent-' + Date.now() + '-' + randomUUID().slice(0, 8)));
-    const root = createRunDirectory(repo, executionId, datasetScope(dataset));
+    const runFile = deps.runFile ?? createArchive(repo, { selection: options.caseId ? 'case' : options.selection ?? 'full' }).file;
+    const root = dirname(archiveFile(runFile)), file = archiveReference(runFile, 'executions', executionId);
     const sourceRoot=deps.runtime ? deps.runtime.mode === 'installed' ? deps.runtime.layout.runtimeRoot : deps.runtime.repository
         : isProductAgent&&!existsSync(join(repo,'apps/host/main.ts'))?REPO_ROOT:repo;
     const code = codeIdentity(sourceRoot, undefined, deps.runtime);
@@ -140,18 +147,19 @@ export async function runLocal(repo: string, options: {
         gold:authored?Object.fromEntries(selected.map(c=>[c.id,authored.gold[c.id]])):undefined,
         materials:prepared.map(({task,resolved})=>({caseId:task.id,materials:resolved?.projected.materials??[],files:resolved?caseFiles(dataset,task):[]})),
         ...(dataset.regressionOrigins ? { regressionOrigins: dataset.regressionOrigins } : {}),
-        scoring:{catalog:metricCatalog,rules:formalRules,evaluators:createRegistry().list().map(({id,name,kind,version,outputs,rubric})=>({id,name,kind,version,outputs,rubric})),...(batch?{rubrics}:{rubric:legacyRubric}),
+        ...(dataset.published ? { published: dataset.published } : {}),
+        scoring:{scoringVersion:2,catalog:metricCatalog,rules:formalRules,evaluators:createRegistry().list().map(({id,name,kind,version,outputs,rubric})=>({id,name,kind,version,outputs,rubric})),...(batch?{rubrics}:{rubric:legacyRubric}),
             plans:selected.map(task=>({caseId:task.id,checks:task.expected.checks,...('contract'in task?{metrics:task.expected.metrics,semantic:task.expected.semantic}:{})}))},
         fixtures:authored?Object.fromEntries(selected.flatMap(c=>{const name=authored.cases.find(d=>d.id===c.id)?.input.fixture?.name;return name?[[name,authored.fixtures[name]]]:[];})):undefined});
     if((snapshot.fact.actual as {leaked:boolean}).leaked)throw Error('Secret in declared configuration; refusing execution');
-    atomicJson(join(root,'snapshot.json'),publicVersions({...snapshot.value,runtimeSource}));
+    writeArchivePart(snapshotReference(file), { ...snapshot.value, runtimeSource });
     const report: LocalReport = {
-        contract: 'flowmate-agent-run/v2', executionId, code,
-        ...(dataset.manifest.suite === 'badcase' ? { executionKind: isProductAgent && !deps.fetcher ? 'model' as const : 'controlled' as const } : {}),
+        contract: 'flowmate-agent-run/v2', executionId, runId: readArchive(runFile).id, code,
+        executionKind: isProductAgent && !deps.fetcher ? 'model' : 'controlled',
         dataset: { id: dataset.manifest.id, version: dataset.manifest.version,  subject: 'agent' },
         selection: options.caseId ? 'case' : options.selection ?? 'full', environment: config.environment ?? deps.env?.FLOWMATE_EVAL_ENVIRONMENT ?? process.env.FLOWMATE_EVAL_ENVIRONMENT ?? evaluationRunDefaults.environment, userId: deps.env?.FLOWMATE_EVAL_USER_ID ?? process.env.FLOWMATE_EVAL_USER_ID,
         startedAt: new Date().toISOString(), endedAt: null, repeat, executionComplete: false, scoring: 'pending', manualReview: 'none', formalAcceptance: 'not-assessed',
-        scoringConfiguration: { version: dataset.manifest.scoring.version, judgeMode: options.judge,
+        scoringConfiguration: { version: dataset.manifest.scoring.version, scoringVersion:2, judgeMode: options.judge,
             judge:selectedJudge,...(batch?{rubrics}:{}) },
         trials: [], export: { backend: options.backend, status: options.backend === 'local' ? 'disabled' : 'pending' }
     };
@@ -159,14 +167,14 @@ export async function runLocal(repo: string, options: {
         for (const { task,resolved } of prepared) {
             const trialId = executionId + '-' + task.id + '-trial-' + repetition;
             report.trials.push({ caseId: task.id, caseVersion: task.version, caseConditions: resolved?caseConditions(dataset, task):{task,unavailable:true}, caseName: task.name, category: task.category, purpose: dataset.embedded?.authored?.cases.find(c=>c.id===task.id)?.purpose??'regression',
-                partition: dataset.manifest.suite === 'badcase' ? 'badcase' : dataset.manifest.smoke.includes(task.id) ? 'smoke' : 'holdout', repetition, trialId, traceId: randomUUID().replaceAll('-',''),
+                partition: dataset.manifest.suite === 'badcase' ? 'badcase' : dataset.manifest.smoke.includes(task.id) ? 'smoke' :
+                    dataset.manifest.holdout && !dataset.manifest.holdout.includes(task.id) ? 'full' : 'holdout', repetition, trialId, traceId: randomUUID().replaceAll('-',''),
                 ...(dataset.regressionOrigins?.[task.id] ? { regressionOrigins: structuredClone(dataset.regressionOrigins[task.id]) } : {}),
-                status: 'NOT_RUN', reason: 'Planned', counts: {}, execution: null, scores: [], judgeCalls: [], feedback: 'none',
+                sessionId: 'Eval-' + trialId, status: 'NOT_RUN', reason: 'Planned', counts: {}, execution: null, scores: [], judgeCalls: [], feedback: 'none',
                 metricPlan: 'contract' in task ? structuredClone(task.expected.metrics) : [{ metricId: 'task-success', version: 1, unit: 'Trial', denominator: 1 }],
                 evaluatorPlan:compileEvaluatorPlan(task,[...dataset.manifest.scoring.required.map(metric=>({metric,required:true})),...task.expected.checks]),
                 ...('contract' in task && task.expected.semantic ? { semanticPlan: structuredClone(task.expected.semantic) } : {}) });
         }
-    const file = join(root, 'report.json');
     saveReport(file, report);
     notify({ type: 'dataset-start', datasetId: dataset.manifest.id, executionId, reportPath: file });
     let stopReason: string | null = null;
@@ -179,7 +187,7 @@ export async function runLocal(repo: string, options: {
             phase('saving');
             saveReport(file, report);
             notify({ type: 'trial-end', ...identityProgress, status: trial.status, reason: trial.reason,
-                elapsedMs: performance.now() - started, evidenceDirectory: `evidence/${trial.trialId}/` });
+                elapsedMs: performance.now() - started, evidenceDirectory: `run.json#/executions/${executionId}/trials/${index}` });
         };
         const item = prepared.find(p => p.task.id === trial.caseId)!;
         if (stopReason || deps.signal?.aborted || !item.resolved) {
@@ -267,6 +275,8 @@ export async function runLocal(repo: string, options: {
         const { exportReport } = await import('../langfuse/export.ts');
         await exportReport(report, file, undefined, repo);
     }
+    if (!deps.runFile) finishArchive(runFile, stopReason || deps.signal?.aborted ? 'stopped' : report.executionComplete ? 'complete' : 'blocked');
+    writeRunReadme(runFile);
     return { report, file, stopped: !!stopReason || !!deps.signal?.aborted };
 }
 
@@ -297,12 +307,13 @@ export async function runBatch(repo: string,
     const ready = (deps.kernel ?? createProductAgent(repo, preparedAgent!.apiKey, deps.runtime)).readiness();
     if (!ready.ready) throw Error(ready.reason);
     if (preparedJudge && deps.preparedJudge === undefined) preparedJudge = await prepareJudge(preparedJudge, deps.fetcher, deps.signal);
+    const runFile = deps.runFile ?? createArchive(repo, { selection: options.selection ?? 'full' }).file;
     const results: Awaited<ReturnType<typeof runLocal>>[] = [];
     const { datasets, ...runOptions } = options;
     let offset = 0;
     for (const [index, dataset] of datasets.entries()) {
         if (deps.signal?.aborted) break;
-        const result = await (deps.run ?? runLocal)(repo, { ...runOptions, dataset }, { ...deps, preparedAgent, preparedJudge,
+        const result = await (deps.run ?? runLocal)(repo, { ...runOptions, dataset }, { ...deps, runFile, preparedAgent, preparedJudge,
             onProgress(event) {
                 if (event.type === 'plan') return;
                 notify('index' in event ? { ...event, index: event.index + offset, total } : event);
@@ -310,6 +321,11 @@ export async function runBatch(repo: string,
         results.push(result);
         offset += plans[index]!.total;
         if (result.stopped) break;
+    }
+    if (!deps.runFile) {
+        finishArchive(runFile, deps.signal?.aborted || results.some(result => result.stopped) ? 'stopped' :
+            results.length === datasets.length && results.every(result => result.report.executionComplete) ? 'complete' : 'blocked');
+        writeRunReadme(runFile);
     }
     return results;
 }

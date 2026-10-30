@@ -1,5 +1,8 @@
 import { parseInputDefinitionCommand, isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../../packages/contracts/src/input-commands.ts';
+import { parsePersonalAgentCommand, isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure } from '../../../packages/contracts/src/personal-agent-commands.ts';
 import { contextBridge, ipcRenderer } from 'electron';
+import { z } from 'zod';
+import { EvaluationWorkflowRequestSchema, EvaluationWorkflowResultSchema } from '../../../packages/contracts/src/evaluation-workflow.ts';
 import { parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, isResearchHostCommand } from '../../../packages/contracts/src/research-commands.ts';
 import { appError, fail } from '../../../packages/contracts/src/errors.ts';
 import { parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../../packages/contracts/src/resources.ts';
@@ -10,6 +13,53 @@ import type { DesktopBridge, DesktopEvent, ProductSettings, ProviderTestRequest 
 import { DiagnosticsResultSchema, DiagnosticsExportResultSchema } from '../../../packages/contracts/src/diagnostics.ts';
 import { parseEvaluationCommand, parseEvaluationResponse, matchesEvaluationResponse, EvaluationEventSchema,
   type EvaluationOutput, type EvaluationInput, type EvaluationResponseType } from '../../../packages/contracts/src/evaluation.ts';
+import { BackgroundServiceStateSchema, BackgroundServiceConnectRequestSchema, BackgroundServiceDisconnectRequestSchema,
+  BackgroundServicePrepareRequestSchema, BackgroundServicePreparationSchema, BackgroundServiceEnableRequestSchema,
+  BackgroundServiceActivationQuerySchema, BackgroundServiceActivationViewSchema,
+  type BackgroundServiceState } from '../../../packages/contracts/src/background-service.ts';
+import { AppErrorSchema } from '../../../packages/contracts/src/runtime.ts';
+
+async function invokeBackgroundService(type: 'get-service-state' | 'connect-service' | 'disconnect-service', input?: unknown): Promise<Result<BackgroundServiceState>> {
+  const parsed = type === 'get-service-state' ? input === undefined : (type === 'connect-service'
+    ? BackgroundServiceConnectRequestSchema : BackgroundServiceDisconnectRequestSchema).safeParse(input).success;
+  if (!parsed) return fail(appError('input_invalid', 'input', 'The background service request is invalid.'));
+  try {
+    const raw: unknown = await ipcRenderer.invoke(`flowmate:${type}`, ...(input === undefined ? [] : [input]));
+    if (!raw || typeof raw !== 'object' || !('ok' in raw)) throw Error('invalid_service_response');
+    if (raw.ok === false && 'error' in raw) {
+      if (Object.keys(raw).some(key => !['ok', 'error'].includes(key))) throw Error('invalid_service_response');
+      const error = AppErrorSchema.safeParse(raw.error); if (error.success) return fail(error.data);
+    }
+    if (Object.keys(raw).some(key => !['ok', 'data'].includes(key))) throw Error('invalid_service_response');
+    const value = raw.ok === true && 'data' in raw ? BackgroundServiceStateSchema.safeParse(raw.data) : null;
+    if (value?.success && (type === 'get-service-state' || value.data.installationId === (input as { installationId: string }).installationId)) return { ok: true, data: value.data };
+  } catch { /* Only a bounded, verified service projection crosses the preload. */ }
+  return fail(appError('service_state_unavailable', 'runtime', 'The background service state could not be confirmed.', true));
+}
+
+async function invokeServiceActivation<T>(type: 'prepare-service' | 'enable-service' | 'query-service-activation', input: unknown,
+  response: z.ZodType<T>): Promise<Result<T>> {
+  const request = (type === 'prepare-service' ? BackgroundServicePrepareRequestSchema : type === 'enable-service'
+    ? BackgroundServiceEnableRequestSchema : BackgroundServiceActivationQuerySchema).safeParse(input);
+  if (!request.success) return fail(appError('input_invalid', 'input', 'The service activation request is invalid.'));
+  try {
+    const raw = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.unknown() }).strict(),
+      z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke(`flowmate:${type}`, request.data));
+    if (raw.success) {
+      if (!raw.data.ok) return fail(raw.data.error);
+      const checked = response.safeParse(raw.data.data);
+      if (checked.success) {
+        const value = checked.data;
+        if (type === 'prepare-service' || value && typeof value === 'object' && 'installationId' in value && 'operationId' in value
+          && 'installationId' in request.data && 'operationId' in request.data && value.installationId === request.data.installationId
+          && value.operationId === request.data.operationId && (type !== 'enable-service' || !('accepted' in value) || !value.accepted
+            || 'expectedSettingsRevision' in value && 'expectedSettingsRevision' in request.data && value.expectedSettingsRevision === request.data.expectedSettingsRevision))
+          return { ok: true, data: checked.data };
+      }
+    }
+  } catch { /* Keep the original caller ID; a lost reply does not authorize another operation. */ }
+  return fail(appError('service_activation_result_unknown', 'runtime', 'The original service activation response could not be confirmed. Query its saved operation ID.', true));
+}
 
 async function invokeEvaluation<K extends EvaluationResponseType>(type: K, input: EvaluationInput<K>): Promise<Result<EvaluationOutput<K>>> {
   const command = parseEvaluationCommand({ type, input });
@@ -22,7 +72,8 @@ async function invokeEvaluation<K extends EvaluationResponseType>(type: K, input
 
 async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<T>> {
   const extension = isExtensionHostCommand(type);
-  const [parse, result, matches, failure] = isResearchHostCommand(type)
+  const [parse, result, matches, failure] = isPersonalAgentHostCommand(type)
+    ? [parsePersonalAgentCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure] : isResearchHostCommand(type)
     ? [parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure] : isInputDefinitionHostCommand(type)
     ? [parseInputDefinitionCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure]
     : isSubagentHostCommand(type)
@@ -39,6 +90,33 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
 }
 
 const bridge: DesktopBridge = {
+  async runEvaluationWorkflow(input) {
+    const request = EvaluationWorkflowRequestSchema.safeParse(input);
+    if (!request.success) return fail(appError('input_invalid', 'input', '评测闭环请求无效。'));
+    try {
+      const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: EvaluationWorkflowResultSchema }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:evaluation-workflow', request.data));
+      if (!result.success || result.data.ok && result.data.data.action !== request.data.action)
+        return fail(appError('evaluation_protocol_invalid', 'runtime', '评测闭环回复不属于原请求。', true));
+      return result.data;
+    } catch { return fail(appError('evaluation_response_unknown', 'runtime', '评测闭环回复未知，请查询原记录。', true)); }
+  },
+  backgroundService: { getServiceState: (...args: unknown[]) => args.length ? Promise.resolve(fail(appError('input_invalid', 'input', 'Service state takes no arguments.')))
+      : invokeBackgroundService('get-service-state'),
+    connect: input => invokeBackgroundService('connect-service', input), disconnect: input => invokeBackgroundService('disconnect-service', input),
+    prepare: input => invokeServiceActivation('prepare-service', input, BackgroundServicePreparationSchema),
+    enable: input => invokeServiceActivation('enable-service', input, BackgroundServiceActivationViewSchema),
+    queryActivation: input => invokeServiceActivation('query-service-activation', input, BackgroundServiceActivationViewSchema) },
+  personalAgent: { get: () => invokeAssembly('personal_agent_get', {}), update: input => invokeAssembly('personal_agent_update', input),
+    openConversation: input => invokeAssembly('personal_agent_open_conversation', input) },
+  invoiceWorks: { create: input => invokeAssembly('invoice_work_create', input), list: input => invokeAssembly('invoice_work_list', input),
+    get: input => invokeAssembly('invoice_work_get', input), supplement: input => invokeAssembly('invoice_work_supplement', input),
+    disposeItem: input => invokeAssembly('invoice_work_dispose_item', input), continueWork: input => invokeAssembly('invoice_work_continue', input),
+    cancelWork: input => invokeAssembly('invoice_work_cancel', input), queryOperation: input => invokeAssembly('invoice_work_query_operation', input),
+    timeline: input => invokeAssembly('invoice_work_timeline', input) },
+  personalTasks: { list: input => invokeAssembly('personal_task_list', input), get: input => invokeAssembly('personal_task_get', input),
+    stop: input => invokeAssembly('personal_task_stop', input), history: input => invokeAssembly('personal_task_history', input),
+    historyEntry: input => invokeAssembly('personal_task_history_entry', input) },
   restartHost: (...args: unknown[]) => args.length ? Promise.resolve(fail(appError('input_invalid', 'input', 'Recheck takes no arguments.'))) : ipcRenderer.invoke('flowmate:restart-host'),
   async queryDiagnostics(...args: unknown[]) {
     if (args.length) return fail(appError('input_invalid', 'input', 'Diagnostics takes no arguments.'));

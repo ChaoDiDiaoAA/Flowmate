@@ -49,7 +49,8 @@ export function preparePayloadCodec(api: string, context: Pick<Context, 'message
           const result = context.messages[index]!;
           if (result.role !== 'toolResult') return mismatch();
           // shortcut: deferred tool references displace content; require a dedicated codec before confirming them.
-          if (result.addedToolNames?.length) return hasImages ? mismatch() : ok(undefined);
+          if ('addedToolNames' in result && Array.isArray(result.addedToolNames) && result.addedToolNames.length)
+            return hasImages ? mismatch() : ok(undefined);
           const content = result.content.some(block => block.type === 'image') ? result.content.map(anthropicContent)
             : sanitizeSurrogates(result.content.map(block => block.type === 'text' ? block.text : '').join('\n'));
           if (Array.isArray(content) && !content.some(block => block.type === 'text')) content.unshift({ type: 'text', text: '(see attached image)' });
@@ -193,6 +194,11 @@ export function checkResourcePayload(api: string, payload: unknown, expected: re
   const carriers = messages.flatMap<{ role: unknown; text: string | null; toolCallId: unknown }>(raw => {
     const message = record(raw); if (!message) return [];
     if (api === 'anthropic-messages') {
+      if (message.role === 'system') {
+        const content = Array.isArray(message.content) ? message.content.filter(raw =>
+          !['tool_addition', 'tool_removal'].includes(String(record(raw)?.type))) : message.content;
+        return [{ role: 'system', text: text(content), toolCallId: undefined }];
+      }
       if (message.role !== 'user') return [];
       const blocks = Array.isArray(message.content) ? message.content : [];
       return [{ role: 'user', text: text(message.content), toolCallId: undefined }, ...blocks.flatMap(raw => {

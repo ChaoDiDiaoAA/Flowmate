@@ -1,0 +1,187 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "parsePolicy": "metric-json-fence-strict-counts/v1",
+  "id": "combination-research-validation",
+  "instanceId": "combination-research-validation-instance",
+  "sourceGroup": "combination-research-validation",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic approved-contract fact and report/citation frame. Expected witnesses are authored from the original contract; no real Judge result or human approval is claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "DR01",
+        "version": "v1",
+        "unit": "事实Claim",
+        "denominator": 1,
+        "required": true,
+        "rule": "Compare the original claim and citation with the independently approved contract fee.",
+        "evidence": [
+          "researchFrame"
+        ],
+        "trigger": "started"
+      },
+      {
+        "metricId": "DR02",
+        "version": "v1",
+        "unit": "Gold Claim",
+        "denominator": 1,
+        "required": true,
+        "rule": "Compare the original claim and citation with the independently approved contract fee.",
+        "evidence": [
+          "researchFrame"
+        ],
+        "trigger": "started"
+      },
+      {
+        "metricId": "DR04",
+        "version": "v1",
+        "unit": "引用链接",
+        "denominator": 1,
+        "required": true,
+        "rule": "Compare the original claim and citation with the independently approved contract fee.",
+        "evidence": [
+          "researchFrame"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "researchFrame": {
+      "contract": "flowmate-research-frame/v1",
+      "complete": true,
+      "reportId": 1,
+      "blocks": [
+        {
+          "kind": "claim",
+          "key": "claim:1",
+          "claimId": 1,
+          "text": "The approved contract fee is 13.50 CNY."
+        }
+      ],
+      "links": [
+        {
+          "key": "claim:1:citation:0",
+          "claimId": 1,
+          "evidenceIndex": 0,
+          "relation": "supports",
+          "valid": true,
+          "display": "The approved contract fee is 13.50 CNY.",
+          "ref": {
+            "researchId": 1,
+            "planId": 1,
+            "revision": 1,
+            "runId": 1,
+            "toolCallId": 1,
+            "sourceSnapshotId": 1,
+            "locator": {
+              "start": 0,
+              "end": 39,
+              "quote": "The approved contract fee is 13.50 CNY."
+            }
+          }
+        }
+      ],
+      "integrity": {
+        "valid": true,
+        "issues": [],
+        "links": [
+          {
+            "claimId": 1,
+            "evidenceIndex": 0,
+            "valid": true
+          }
+        ],
+        "sourceBindings": [
+          {
+            "sourceSnapshotId": 1,
+            "sample": "combination-research-validation-source",
+            "file": "source.md"
+          }
+        ]
+      },
+      "gold": {
+        "status": "verified",
+        "claims": [
+          {
+            "id": "contract-fee",
+            "text": "The approved contract fee is 13.50 CNY.",
+            "required": true,
+            "acceptable": [
+              "The approved contract fee is 13.50 CNY."
+            ],
+            "conditions": [],
+            "entities": [
+              "approved-contract-fee"
+            ],
+            "evidence": [
+              {
+                "sample": "combination-research-validation-source",
+                "start": 0,
+                "end": 39,
+                "quote": "The approved contract fee is 13.50 CNY.",
+                "relation": "support"
+              }
+            ]
+          }
+        ],
+        "chains": [],
+        "forbidden": []
+      },
+      "sources": [
+        {
+          "sourceSnapshotId": 1,
+          "text": "The approved contract fee is 13.50 CNY.",
+          "modelRead": false,
+          "binding": {
+            "sourceSnapshotId": 1,
+            "sample": "combination-research-validation-source",
+            "file": "source.md"
+          }
+        }
+      ],
+      "rule": "Independent synthetic approved contract, original claim and citation; no real product run or human review is claimed."
+    }
+  },
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"DR01\",\"counts\":null,\"failures\":[]},{\"metricId\":\"DR02\",\"counts\":null,\"failures\":[]},{\"metricId\":\"DR04\",\"counts\":null,\"failures\":[]}],\"research\":{\"atoms\":[{\"block\":0,\"start\":0,\"length\":39,\"correct\":1,\"needsCitation\":true,\"covered\":1,\"gold\":1,\"matchUncertain\":false}],\"links\":[{\"atom\":0,\"state\":1}],\"chains\":[]}}",
+  "references": [
+    {
+      "metricId": "DR01",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The claim preserves the independently approved fee and the citation supports it."
+    },
+    {
+      "metricId": "DR02",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "The claim preserves the independently approved fee and the citation supports it."
+    },
+    {
+      "metricId": "DR04",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": true,
+      "reason": "The claim preserves the independently approved fee and the citation supports it."
+    }
+  ]
+}

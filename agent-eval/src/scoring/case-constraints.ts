@@ -5,9 +5,10 @@ import { PublicContextRequestEvidenceSchema, ContextSnapshotDetailSchema } from 
 import { RunResourceViewSchema } from '../../../packages/contracts/src/resources.ts';
 import type { CaseConstraints } from '../dataset-loader/authoring.ts';
 import type { EvaluationContext, EvaluationScore } from './types.ts';
+import { renderInlineUserInput } from '../inline-materials.ts';
 
 /** Case constraints grade original Trial evidence; they never set product execution budgets. */
-export function evaluateCaseConstraints({ task, result }: EvaluationContext): EvaluationScore[] {
+export function evaluateCaseConstraints({ task, result, projected: originalInput }: EvaluationContext): EvaluationScore[] {
     const expected = task.expected as typeof task.expected & Partial<CaseConstraints>;
     const scores: EvaluationScore[] = [];
     const fact = (key: string) => result.evidence[key];
@@ -46,10 +47,23 @@ export function evaluateCaseConstraints({ task, result }: EvaluationContext): Ev
     const contexts = z.array(z.object({ runId: z.number(), collected: z.boolean(), requests: z.array(PublicContextRequestEvidenceSchema), snapshots: z.array(ContextSnapshotDetailSchema) }).strict()).safeParse(fact('context-requests')?.actual);
     if (expected.mustHaveEvidence) {
         const projected = fact('input-projection');
+        const renderedInput = renderInlineUserInput(originalInput);
+        const inline = z.object({ materials: z.array(z.object({ sample: z.string(), file: z.string(), text: z.string() }).strict()).min(1), renderedText: z.string(),
+            delivery: z.object({ inputId: z.number().int().positive(), sessionId: z.number().int().positive(), runId: z.number().int().positive(),
+                nativeEntryId: z.string().min(1), snapshotId: z.number().int().positive(), requestSequence: z.number().int().positive() }).strict().nullable() }).strict()
+            .safeParse(fact('inline-materials')?.actual);
+        const inlineDelivery = inline.success && fact('inline-materials')?.present && inline.data.materials.some(material => material.text.trim().length > 0) &&
+            isDeepStrictEqual(inline.data.materials, originalInput.materials) && isDeepStrictEqual(result.input, originalInput) &&
+            inline.data.renderedText === renderedInput ? inline.data.delivery : null;
         const delivered = contexts.success && contexts.data.some(frame => frame.requests.some(request => {
             if (request.sdkPayload?.inclusion !== 'confirmed' || !request.attempts.some(a => a.wireInclusion === 'confirmed' && a.enteredAt !== null)) return false;
             const snapshot = frame.snapshots.find(s => s.snapshot.id === request.binding.snapshotId && s.snapshot.runId === frame.runId && s.snapshot.sessionId === request.binding.sessionId);
             const projection = snapshot?.snapshot.json.modelProjection;
+            if (inlineDelivery && inline.success && frame.runId === inlineDelivery.runId && request.binding.sessionId === inlineDelivery.sessionId &&
+                request.binding.requestSequence === inlineDelivery.requestSequence && snapshot?.snapshot.id === inlineDelivery.snapshotId &&
+                snapshot.snapshot.json.text === renderedInput && request.attempts.some(attempt => attempt.responseStatus !== null) &&
+                request.binding.includedBindings.some(binding => binding.inputId === inlineDelivery.inputId && binding.originRunId === inlineDelivery.runId &&
+                    binding.nativeEntryId === inlineDelivery.nativeEntryId && binding.snapshotId === inlineDelivery.snapshotId)) return true;
             return !!projection && (projection.fragments.some(f => f.windows.some(w => w.text.trim().length > 0)) || !!projection.candidate?.values.length) ||
                 calls.some(call => {
                     const data=call.result?.status==='succeeded'?call.result.data:undefined;

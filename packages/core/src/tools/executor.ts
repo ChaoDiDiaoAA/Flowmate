@@ -3,8 +3,12 @@ import { isDeepStrictEqual } from 'node:util';
 import type { AppError, DbId, Result, ToolCallDelivery, ToolDefinition, ToolExecutionContext, ToolResult, ToolCallSnapshot, ToolRuntimeObservation, RuntimeStrategySnapshot, ResolvedRuntimeBudget, RuntimeStrategyPolicy } from '@flowmate/contracts';
 import { RegisteredToolNameSchema, MAX_TOOL_VERSION_CHARS } from '@flowmate/contracts';
 import { createToolRecorder } from './recorder.ts';
+import type { ToolCallRepository } from '../storage/repositories.ts';
+import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import { createCaseEvaluationFault } from './evaluation-fault.ts';
 type Recorder = ReturnType<typeof createToolRecorder>;
+type ExecutorStorage = { database: Pick<DbHandle, 'read' | 'transaction'>; recorder?: never; isSessionModelUseBlocked?: never }
+  | { database?: never; recorder: Recorder; isSessionModelUseBlocked?: (sessionId: DbId) => Result<boolean> };
 export type ToolExecution = { call: ToolCallSnapshot; result: ToolResult<unknown>; fatal: boolean };
 export type ToolExecutor = ReturnType<typeof createToolExecutor>;
 type RunBudget = { ids: Set<string>; resultsBytes: number; closed: boolean; fatal: boolean; deadlineAt?: number;
@@ -93,10 +97,8 @@ export function freezeRuntimeStrategy(input: StrategyInput & { recorder: Pick<Re
     calibration: { sourceCutoffToolCallId: cutoff.ok ? cutoff.data : 0, groups }, experience });
 }
 
-export function createToolExecutor(input: {
+export function createToolExecutor(input: ExecutorStorage & {
   definitions: readonly ToolDefinition<any, any>[];
-  recorder: Recorder;
-  isSessionModelUseBlocked?: (sessionId: DbId) => Result<boolean>;
   now: () => string;
   maxToolCalls?: number;
   maxToolTimeoutMs?: number;
@@ -133,6 +135,23 @@ export function createToolExecutor(input: {
   const singleToolTimeoutMs = input.maxToolTimeoutMs ?? RUNTIME_CONFIG.runBudget.toolTimeoutMs;
   const maxResultBytes = input.maxResultBytes ?? RUNTIME_CONFIG.runBudget.maxToolFeedbackBytes;
   const monotonicNow = input.monotonicNow ?? (() => performance.now());
+  const recorderFor = (repository?: ToolCallRepository): Recorder => {
+    if (repository) return createToolRecorder(repository, input.now);
+    if (input.recorder) return input.recorder;
+    throw new Error('tool_storage_scope_required');
+  };
+  async function writeStorage<T>(database: Pick<DbHandle, 'transaction'>, operation: (store: SqlDatabaseStore) => Result<T>): Promise<Result<T>> {
+    let rejected: Result<never> | undefined;
+    let confirmed: Result<T> | undefined;
+    try {
+      return await database.transaction(store => {
+        const result = operation(store);
+        if (!result.ok) { rejected = result; throw new Error('tool_storage_rejected'); }
+        store.db.afterCommit?.(() => { confirmed = result; });
+        return result;
+      });
+    } catch { return confirmed ?? rejected ?? fail(appError('storage_write_failed', 'storage', 'Tool state could not be saved.', true)); }
+  }
   const budgetFor = (runId: DbId): RunBudget => {
     let budget = budgets.get(runId);
     if (!budget) { budget = { ids: new Set<string>(), resultsBytes: 0, closed: false, fatal: false }; budgets.set(runId, budget); }
@@ -161,9 +180,10 @@ export function createToolExecutor(input: {
     runDeadlineTruncated: false, commit: 'none_confirmed', commitError: null,
   });
   function reject(call: ToolCallSnapshot, budget: RunBudget, error: AppError,
-    stage: ToolRuntimeObservation['failureStage'] = 'before', fatal = false): ToolExecution {
+    stage: ToolRuntimeObservation['failureStage'] = 'before', fatal = false, repository?: ToolCallRepository): ToolExecution {
+    const recorder = recorderFor(repository);
     error = acceptFeedback(call, budget, undefined, error) ?? error;
-    const persisted = input.recorder.reject({ toolCallId: call.toolCallId, error,
+    const persisted = recorder.reject({ toolCallId: call.toolCallId, error,
       status: error.code === 'agent_cancelled' ? 'cancelled' : 'failed',
       runtimeObservation: { ...observationFor(call, budget, 'rejected'), failureStage: stage, diagnosticCode: error.code } });
     budget.fatal ||= fatal || !persisted.ok;
@@ -172,13 +192,14 @@ export function createToolExecutor(input: {
       result: persisted.ok ? persisted.data.result! : { status: 'failed', error: persisted.error }, fatal: budget.fatal };
   }
 
-  function observeRequest(name: string, raw: unknown, context: ToolExecutionContext): Result<ToolCallSnapshot> {
+  function observeRequest(name: string, raw: unknown, context: ToolExecutionContext, store?: SqlDatabaseStore): Result<ToolCallSnapshot> {
+    const recorder = recorderFor(store?.toolCalls);
     const parsed = ToolExecutionContextSchema.safeParse(context);
     if (!parsed.success) return fail(appError('tool_access_denied', 'runtime', '工具缺少可信 Run 上下文。'));
     const bound = Object.freeze({ ...parsed.data, scope: parsed.data.scope });
     const budget = budgetFor(bound.runId);
     const shared = budget.shared ?? budget;
-    const prior = input.recorder.query({ runId: bound.runId, sessionId: bound.sessionId, nativeToolCallId: bound.nativeToolCallId });
+    const prior = recorder.query({ runId: bound.runId, sessionId: bound.sessionId, nativeToolCallId: bound.nativeToolCallId });
     if (!prior.ok && prior.error.code !== 'tool_call_not_found') {
       budget.fatal = true;
       return prior;
@@ -190,7 +211,7 @@ export function createToolExecutor(input: {
         bound.signal.aborted ? 'Run 已取消，工具未执行。' : 'Run 已停止接纳新的工具调用。', false,
         bound.runId, bound.sessionId, bound.nativeToolCallId));
     }
-    const requested = input.recorder.request({ context: bound, call: { nativeToolCallId: bound.nativeToolCallId, signal: bound.signal,
+    const requested = recorder.request({ context: bound, call: { nativeToolCallId: bound.nativeToolCallId, signal: bound.signal,
       ...(bound.requestBinding ? { requestBinding: bound.requestBinding } : {}) },
       name, definition: byName.get(name), raw });
     if (!requested.ok) { budget.fatal = true; return requested; }
@@ -199,71 +220,93 @@ export function createToolExecutor(input: {
   }
 
   function rejectRequest(name: string, raw: unknown, context: ToolExecutionContext, error: AppError,
-    stage: ToolRuntimeObservation['failureStage'] = 'unknown'): Result<void> {
-    const requested = observeRequest(name, raw, context);
+    stage: ToolRuntimeObservation['failureStage'] = 'unknown', store?: SqlDatabaseStore): Result<void> {
+    const requested = observeRequest(name, raw, context, store);
     if (!requested.ok) return requested;
     if (requested.data.status !== 'requested') return ok(undefined);
-    const rejected = reject(requested.data, budgetFor(context.runId), error, stage);
+    const rejected = reject(requested.data, budgetFor(context.runId), error, stage, false, store?.toolCalls);
     if (rejected.fatal && rejected.result.status !== 'succeeded') return fail(rejected.result.error);
     return rejected.call.result ? ok(undefined) : fail(rejected.result.status === 'succeeded'
       ? appError('storage_write_failed', 'storage', 'ToolCall rejection could not be saved.') : rejected.result.error);
   }
 
-  function recordDelivery(context: Pick<ToolExecutionContext, 'runId' | 'sessionId'>, nativeToolCallId: string, delivery: ToolCallDelivery): Result<void> {
-    const call = input.recorder.query({ ...context, nativeToolCallId });
+  function recordDelivery(context: Pick<ToolExecutionContext, 'runId' | 'sessionId'>, nativeToolCallId: string, delivery: ToolCallDelivery, repository?: ToolCallRepository): Result<void> {
+    const recorder = recorderFor(repository);
+    const call = recorder.query({ ...context, nativeToolCallId });
     if (!call.ok) return call;
     if(caseFault?.profile.id==='case-save-delivery-loss'&&call.data.toolName==='save_invoice_candidate'&&delivery.state==='message_observed'&&call.data.status==='succeeded'){
-      const commit=input.recorder.queryCandidateCommit({toolCallId:call.data.toolCallId,...context});
+      const commit=recorder.queryCandidateCommit({toolCallId:call.data.toolCallId,...context});
       if(commit.ok&&commit.data!==null&&isDeepStrictEqual(call.data.result?.data,commit.data)&&caseFault.activate(call.data.toolName)){
         const error=appError('tool_execution_failed','tool','Committed candidate model delivery failed.',false,context.runId,context.sessionId,nativeToolCallId);
-        const saved=input.recorder.recordDelivery(call.data.toolCallId,{version:1,state:'failed',messageObservedAt:null,includedInCallSequence:null,requestDispatchedAt:null,error});
+        const saved=recorder.recordDelivery(call.data.toolCallId,{version:1,state:'failed',messageObservedAt:null,includedInCallSequence:null,requestDispatchedAt:null,error});
         return saved.ok?fail(error):saved;
       }
     }
-    const updated = input.recorder.recordDelivery(call.data.toolCallId, delivery);
+    const updated = recorder.recordDelivery(call.data.toolCallId, delivery);
     return updated.ok ? ok(undefined) : updated;
   }
 
-  async function execute(name: string, finalArguments: unknown, context: ToolExecutionContext, rawArguments: unknown = finalArguments): Promise<ToolExecution> {
+  async function execute(name: string, finalArguments: unknown, context: ToolExecutionContext, rawArguments: unknown = finalArguments,
+    resumeDelegation = false): Promise<ToolExecution> {
     const contextCheck = ToolExecutionContextSchema.safeParse(context);
     if (!contextCheck.success) {
       const failure = appError('tool_access_denied', 'runtime', '工具缺少可信 Run 上下文。');
       return { call: unavailableCall(context, name), result: { status: 'failed', error: failure }, fatal: true };
     }
-    const bound = Object.freeze({ ...contextCheck.data, scope: context.scope });
+    const bound = Object.freeze({ ...contextCheck.data, scope: contextCheck.data.scope });
+    try { finalArguments = structuredClone(finalArguments); rawArguments = structuredClone(rawArguments); }
+    catch { return { call: unavailableCall(bound, name), result: { status: 'failed',
+      error: appError('tool_invalid_input', 'tool', '工具参数无法固定。') }, fatal: true }; }
     const definition = byName.get(name);
     const identity = `${bound.runId}:${bound.nativeToolCallId}`;
     const budget = budgetFor(bound.runId);
-    const requested = observeRequest(name, rawArguments, bound);
-    if (!requested.ok) return { call: unavailableCall(bound, name), result: { status: 'failed', error: requested.error }, fatal: true };
-    const call = requested.data;
-    if (call.args.final !== null) {
+    const accept = (task: Promise<ToolExecution>, launch?: () => void) => ok({ task, launch });
+    const immediate = (value: ToolExecution) => accept(Promise.resolve(value));
+    const admit = (store?: SqlDatabaseStore) => {
+      const recorder = recorderFor(store?.toolCalls);
+      const requested = observeRequest(name, rawArguments, bound, store);
+      if (!requested.ok) return requested;
+      const call = requested.data;
       const parsed = definition?.inputSchema.safeParse(finalArguments);
-      if (!parsed?.success) return { call, result: { status: 'failed', error: appError('tool_invalid_input', 'tool', '工具参数不符合输入 Schema。') }, fatal: budget.fatal };
-      const fixed = input.recorder.fixArguments(call.toolCallId, parsed.data);
-      if (!fixed.ok) {
+      if (parsed?.success) {
+        // Fix arguments before another queued caller can reuse this execution.
+        const fixed = recorder.fixArguments(call.toolCallId, parsed.data);
+        if (!fixed.ok) { budget.fatal = true; return fixed; }
+      } else if (call.args.final !== null) return immediate({ call,
+        result: { status: 'failed', error: appError('tool_invalid_input', 'tool', '工具参数不符合输入 Schema。') }, fatal: budget.fatal });
+      const running = active.get(identity);
+      if (running) return accept(running);
+      if (call.result) return immediate({ call, result: call.result, fatal: budget.fatal });
+      const resume = resumeDelegation && name === 'Agent' && call.status === 'running' && bound.nativeDelegate !== undefined
+        && call.args.final !== null && isDeepStrictEqual(call.args.final, finalArguments);
+      if (call.status !== 'requested' && !resume) {
+        const failure = appError('tool_call_in_progress', 'runtime', 'ToolCall 已开始但当前 Runtime 无在途执行。', true, bound.runId, bound.sessionId, bound.nativeToolCallId);
         budget.fatal = true;
-        return { call, result: { status: 'failed', error: fixed.error }, fatal: true };
+        return immediate({ call, result: { status: 'failed', error: failure }, fatal: true });
       }
+      if (!resume && !(budget.shared ?? budget).ids.has(`${bound.sessionId}:${bound.nativeToolCallId}`)) return immediate({ call, result: { status: 'failed',
+        error: appError('tool_call_in_progress', 'runtime', 'ToolCall has no reusable execution in this Runtime.') }, fatal: true });
+      const completion = Promise.withResolvers<ToolExecution>();
+      const publish = () => { active.set(identity, completion.promise); };
+      if (store) store.db.afterCommit!(publish); else publish();
+      return accept(completion.promise, () => {
+        void runCall(definition, finalArguments, bound, call, budget, resume).then(completion.resolve, completion.reject).finally(() => {
+          if (active.get(identity) === completion.promise) active.delete(identity);
+        });
+      });
+    };
+    const admitted = input.database ? await writeStorage(input.database, admit) : admit();
+    if (!admitted.ok) {
+      budget.closed = budget.fatal = true;
+      return { call: unavailableCall(bound, name), result: { status: 'failed', error: admitted.error }, fatal: true };
     }
-    const running = active.get(identity);
-    if (running) return running;
-    if (call.result) return { call, result: call.result, fatal: budget.fatal };
-    if (call.status !== 'requested') {
-      const failure = appError('tool_call_in_progress', 'runtime', 'ToolCall 已开始但当前 Runtime 无在途执行。', true, bound.runId, bound.sessionId, bound.nativeToolCallId);
-      budget.fatal = true;
-      return { call, result: { status: 'failed', error: failure }, fatal: true };
-    }
-    if (!(budget.shared ?? budget).ids.has(`${bound.sessionId}:${bound.nativeToolCallId}`)) return { call, result: { status: 'failed',
-      error: appError('tool_call_in_progress', 'runtime', 'ToolCall has no reusable execution in this Runtime.') }, fatal: true };
-    const task = runCall(definition, finalArguments, bound, call, budget);
-    active.set(identity, task);
-    try { return await task; }
-    finally { if (active.get(identity) === task) active.delete(identity); }
+    admitted.data.launch?.();
+    return admitted.data.task;
   }
 
   function beforeToolUse(definition: ToolDefinition<any, any> | undefined, raw: unknown, context: ToolExecutionContext,
-    call: ToolCallSnapshot, budget: RunBudget): Result<PreparedToolUse> {
+    call: ToolCallSnapshot, budget: RunBudget, store?: SqlDatabaseStore, resumeDelegation = false): Result<PreparedToolUse> {
+    const recorder = recorderFor(store?.toolCalls);
     if (!definition) return fail(appError('tool_not_found', 'tool', '此 Run 未注册请求的工具。'));
     const native = NATIVE_TOOL_NAMES.includes(definition.name as (typeof NATIVE_TOOL_NAMES)[number]);
     let argumentsBytes: number;
@@ -271,12 +314,12 @@ export function createToolExecutor(input: {
     if (!native && argumentsBytes > TOOL_CONFIG.payload.maxRawArgumentsBytes) return fail(appError('tool_result_too_large', 'tool', '工具参数超过输入上限。'));
     const parsed = definition.inputSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('tool_invalid_input', 'tool', '工具参数不符合输入 Schema。'));
-    const fixed = input.recorder.fixArguments(call.toolCallId, parsed.data);
+    const fixed = recorder.fixArguments(call.toolCallId, parsed.data);
     if (!fixed.ok) return fixed;
-    const trusted = input.recorder.verifyUse(context);
+    const trusted = recorder.verifyUse(context);
     if (!trusted.ok) return trusted;
     if (!context.scope.allowedTools.includes(definition.name)) return fail(appError('tool_access_denied', 'runtime', '此 Run 未获准使用请求的工具。'));
-    const sessionAccess = input.isSessionModelUseBlocked?.(context.sessionId);
+    const sessionAccess = store ? store.sessions.isModelUseBlocked(context.sessionId) : input.isSessionModelUseBlocked?.(context.sessionId);
     if (sessionAccess && (!sessionAccess.ok || sessionAccess.data)) {
       return fail(sessionAccess.ok ? appError('session_scope_revoked', 'session', '此 Session 已撤回材料使用权限。') : sessionAccess.error);
     }
@@ -290,7 +333,9 @@ export function createToolExecutor(input: {
     // The SDK native bash timeout is already seconds; it can only shorten the Host ceiling.
     const nativeMs = ['bash', 'powershell'].includes(definition.name) && parsed.data && typeof parsed.data.timeout === 'number' && parsed.data.timeout > 0
       ? parsed.data.timeout * 1000 : Infinity;
-    const timeoutMs = Math.min(selectedMs, remainingRunMs, nativeMs);
+    const remainingToolMs = resumeDelegation && call.startedAt !== null
+      ? selectedMs - Math.max(0, Date.parse(input.now()) - Date.parse(call.startedAt)) : selectedMs;
+    const timeoutMs = Math.min(remainingToolMs, remainingRunMs, nativeMs);
     if (!(timeoutMs > 0)) return fail(appError('agent_timeout', 'runtime', 'Run deadline elapsed before tool execution.', false,
       context.runId, context.sessionId, context.nativeToolCallId));
     const observation = observationFor(call, budget, 'allowed');
@@ -298,18 +343,32 @@ export function createToolExecutor(input: {
     observation.timeoutSource = timeoutMs < selectedMs && timeoutMs === remainingRunMs ? 'run_remaining'
       : timeoutMs < selectedMs && timeoutMs === nativeMs ? 'native' : selected?.timeoutSource ?? 'configured';
     observation.runDeadlineTruncated = remainingRunMs < selectedMs && remainingRunMs <= nativeMs;
-    const started = input.recorder.start(call.toolCallId);
+    const started = resumeDelegation ? ok(call) : recorder.start(call.toolCallId);
     return started.ok ? ok({ call: started.data, definition, arguments: parsed.data, native, timeoutMs, observation }) : started;
   }
 
   async function runCall(definition: ToolDefinition<any, any> | undefined, raw: unknown, context: ToolExecutionContext,
-    requestedCall: ToolCallSnapshot, budget: RunBudget): Promise<ToolExecution> {
-    const prepared = beforeToolUse(definition, raw, context, requestedCall, budget);
+    requestedCall: ToolCallSnapshot, budget: RunBudget, resumeDelegation = false): Promise<ToolExecution> {
+    const prepare = (store?: SqlDatabaseStore): Result<{ use: PreparedToolUse | null; rejected: ToolExecution | null }> => {
+      const prepared = beforeToolUse(definition, raw, context, requestedCall, budget, store, resumeDelegation);
+      if (!prepared.ok) {
+        const fatal = prepared.error.category === 'storage' || ['session_scope_revoked', 'agent_timeout', 'state_conflict', 'run_state_invalid'].includes(prepared.error.code);
+        if (resumeDelegation) return ok({ use: null, rejected: { call: requestedCall,
+          result: { status: 'failed' as const, error: prepared.error }, fatal } });
+        const rejected = reject(requestedCall, budget, prepared.error,
+          prepared.error.category === 'storage' ? 'storage' : 'before', fatal, store?.toolCalls);
+        return rejected.call.result ? ok({ use: null, rejected })
+          : fail(rejected.result.status === 'succeeded' ? appError('storage_write_failed', 'storage', 'Tool refusal was not saved.') : rejected.result.error);
+      }
+      return ok({ use: prepared.data, rejected: null });
+    };
+    const prepared = input.database ? await writeStorage(input.database, prepare) : prepare();
     if (!prepared.ok) {
-      const fatal = prepared.error.category === 'storage' || ['session_scope_revoked', 'agent_timeout', 'state_conflict', 'run_state_invalid'].includes(prepared.error.code);
-      return reject(requestedCall, budget, prepared.error, prepared.error.category === 'storage' ? 'storage' : 'before', fatal);
+      budget.closed = budget.fatal = true;
+      return { call: requestedCall, result: { status: 'failed', error: prepared.error }, fatal: true };
     }
-    const use = prepared.data;
+    if (prepared.data.rejected) return prepared.data.rejected;
+    const use = prepared.data.use!;
     definition = use.definition;
     const native = use.native;
 
@@ -326,6 +385,7 @@ export function createToolExecutor(input: {
     try {
       const call = Object.freeze({ nativeToolCallId: context.nativeToolCallId, signal,
         deadlineAt: startedMs + use.timeoutMs,
+        ...(context.nativeDelegate ? { nativeDelegate: context.nativeDelegate } : {}),
         ...(context.requestBinding ? { requestBinding: context.requestBinding } : {}) });
       const product = Object.freeze({ runId: context.runId, sessionId: context.sessionId, scope: context.scope });
       if(caseFault)await caseFault.commitGate('before-commit',definition.name,signal);
@@ -350,6 +410,10 @@ export function createToolExecutor(input: {
           context.signal.aborted ? 'Run 已取消。' : '工具执行超过时间上限。', false, context.runId, context.sessionId, context.nativeToolCallId);
       }
     } catch (thrown) {
+      // Service shutdown leaves the owning native ToolTask recoverable; it is not a child result.
+      if (definition.name === 'Agent' && context.nativeDelegate && thrown instanceof ToolExecutionFailure
+        && thrown.error.code === 'durable_delegation_suspended')
+        return { call: use.call, result: { status: 'failed', error: thrown.error }, fatal: false };
       endedMs = monotonicNow();
       timedOut ||= endedMs - startedMs >= use.timeoutMs;
       if (thrown instanceof ToolExecutionFailure && thrown.data !== undefined) {
@@ -371,15 +435,25 @@ export function createToolExecutor(input: {
     } finally {
       clearTimeout(timer);
     }
-    return afterToolUse({ use, context, budget, data, status, error, startedMs, endedMs, timedOut, afterStructure });
+    const settlement = { use, context, budget, data, status, error, startedMs, endedMs, timedOut, afterStructure };
+    if (!input.database) return afterToolUse(settlement);
+    const ended = await writeStorage(input.database, store => {
+      const result = afterToolUse(settlement, store.toolCalls);
+      return result.call.result ? ok(result) : fail(result.result.status === 'succeeded'
+        ? appError('storage_write_failed', 'storage', 'Tool terminal was not saved.') : result.result.error);
+    });
+    if (ended.ok) return ended.data;
+    budget.closed = budget.fatal = true;
+    return { call: use.call, result: { status: 'failed', error: ended.error, ...(native && data !== undefined ? { data } : {}) }, fatal: true };
   }
 
   function afterToolUse(settlement: { use: PreparedToolUse; context: ToolExecutionContext; budget: RunBudget; data: unknown;
     status: 'succeeded' | 'failed' | 'cancelled'; error?: AppError; startedMs: number; endedMs: number; timedOut: boolean;
-    afterStructure: ToolRuntimeObservation['afterStructure'] }): ToolExecution {
+    afterStructure: ToolRuntimeObservation['afterStructure'] }, repository?: ToolCallRepository): ToolExecution {
+    const recorder = recorderFor(repository);
     const { use, context, budget, data, startedMs, endedMs, timedOut, afterStructure } = settlement;
     let { status, error } = settlement;
-    const observedCall = input.recorder.queryById(use.call.toolCallId);
+    const observedCall = recorder.queryById(use.call.toolCallId);
     if (observedCall.ok && observedCall.data.result?.status === 'failed'
       && observedCall.data.result.error.code === 'stop_not_confirmed' && !observedCall.data.cleanup.stopped
       && use.definition.name === 'Agent' && budget.closed && budget.fatal)
@@ -396,7 +470,7 @@ export function createToolExecutor(input: {
       observation.commit = 'unknown'; observation.commitError = observedCall.error;
       observation.afterDomain = 'unknown'; observation.failureStage = 'commit'; error = observedCall.error; status = 'failed'; budget.fatal = true;
     } else if (use.definition.name === 'save_invoice_candidate') {
-      const commit = input.recorder.queryCandidateCommit({ toolCallId: use.call.toolCallId, runId: context.runId, sessionId: context.sessionId });
+      const commit = recorder.queryCandidateCommit({ toolCallId: use.call.toolCallId, runId: context.runId, sessionId: context.sessionId });
       if (!commit.ok || !stopped && commit.data === null) {
         observation.commit = 'unknown'; observation.commitError = commit.ok
           ? error ?? appError('stop_not_confirmed', 'runtime', 'Execution stop has not been confirmed.') : commit.error;
@@ -431,7 +505,7 @@ export function createToolExecutor(input: {
     }
     if (status === 'succeeded' && use.definition.effect === 'READ'
       && INVOICE_REVIEW_TOOL_NAMES.includes(use.definition.name as (typeof INVOICE_REVIEW_TOOL_NAMES)[number])) {
-      const domain = input.recorder.validateOutput({ toolCallId: use.call.toolCallId, data });
+      const domain = recorder.validateOutput({ toolCallId: use.call.toolCallId, data });
       observation.afterDomain = domain.ok ? domain.data : domain.error.category === 'storage' ? 'unknown' : 'invalid';
       if (!domain.ok) {
         status = 'failed'; error = domain.error; observation.failureStage = 'validation';
@@ -449,7 +523,7 @@ export function createToolExecutor(input: {
       || timedOut && (!['PURE', 'READ'].includes(use.definition.effect) || observation.runDeadlineTruncated);
     if (budget.fatal) budget.closed = true;
     const endedAt = input.now();
-    const ended = input.recorder.finish({ toolCallId: use.call.toolCallId, status, ...(data === undefined ? {} : { data }),
+    const ended = recorder.finish({ toolCallId: use.call.toolCallId, status, ...(data === undefined ? {} : { data }),
       ...(error ? { error } : {}), committedCandidateId: commitId, cleanup: { version: 1,
         stopReason: timedOut ? 'tool-timeout' : context.signal.aborted ? 'run-abort' : 'tool-settled', stopped,
         errors: !stopped && error ? [error] : [] }, endedAt, stoppedAt: stopped ? endedAt : null, runtimeObservation: observation });
@@ -466,8 +540,9 @@ export function createToolExecutor(input: {
 
   return {
     close:():{stopped:boolean;closed:boolean;errors:AppError[]}=>({stopped:true,closed:true,errors:[]}),
-    failUnconfirmedDelegation(context: { runId: DbId; sessionId: DbId }, nativeToolCallId: string): Result<void> {
-      const call = input.recorder.query({ ...context, nativeToolCallId });
+    failUnconfirmedDelegation(context: { runId: DbId; sessionId: DbId }, nativeToolCallId: string, repository?: ToolCallRepository): Result<void> {
+      const recorder = recorderFor(repository);
+      const call = recorder.query({ ...context, nativeToolCallId });
       if (!call.ok) return call;
       if (call.data.toolName === 'Agent' && call.data.result?.status === 'failed'
         && call.data.result.error.code === 'stop_not_confirmed' && !call.data.cleanup.stopped) return ok(undefined);
@@ -475,19 +550,32 @@ export function createToolExecutor(input: {
         return fail(appError('subagent_identity_conflict', 'runtime', 'No active original delegation is available.'));
       const budget = budgetFor(context.runId); budget.closed = budget.fatal = true;
       const error = appError('stop_not_confirmed', 'runtime', 'The managed child has not confirmed termination.', true, context.runId);
-      const saved = input.recorder.finish({ toolCallId: call.data.toolCallId, status: 'failed', error,
+      const saved = recorder.finish({ toolCallId: call.data.toolCallId, status: 'failed', error,
         committedCandidateId: null, cleanup: { version: 1, stopReason: 'stop-grace-exhausted', stopped: false, errors: [error] }, stoppedAt: null });
       return saved.ok ? ok(undefined) : saved;
     },
     observeRequest,
     rejectRequest,
     recordDelivery,
-    execute,
-    freezeStrategy(config: StrategyInput) {
-      return freezeRuntimeStrategy({ ...config, recorder: input.recorder, definitions, policy: input.strategyPolicy });
+    execute: (name: string, finalArguments: unknown, context: ToolExecutionContext, rawArguments: unknown = finalArguments) =>
+      execute(name, finalArguments, context, rawArguments),
+    async resumeDelegation(context: ToolExecutionContext): Promise<ToolExecution> {
+      const original = input.database
+        ? await input.database.read(store => recorderFor(store.toolCalls).query(context)) : recorderFor().query(context);
+      if (!original.ok || original.data.toolName !== 'Agent' || original.data.args.final === null || !context.scope.invoiceWork
+        || !/^durable-task:[1-9]\d*$/.test(context.nativeToolCallId)
+        || !context.nativeDelegate || !['running', 'succeeded', 'failed', 'cancelled'].includes(original.data.status)) {
+        return { call: original.ok ? original.data : unavailableCall(context, 'Agent'), fatal: true,
+          result: { status: 'failed', error: appError('subagent_origin_invalid', 'runtime', 'Only the original fixed Agent delegation can resume.') } };
+      }
+      return execute('Agent', original.data.args.final, context, original.data.args.raw, true);
     },
-    queryCall(context: Pick<ToolExecutionContext, 'runId' | 'sessionId'>, nativeToolCallId: string) {
-      return input.recorder.query({ ...context, nativeToolCallId });
+    freezeStrategy(config: StrategyInput, repository?: ToolCallRepository) {
+      return freezeRuntimeStrategy({ ...config, recorder: recorderFor(repository),
+        definitions, policy: input.strategyPolicy });
+    },
+    queryCall(context: Pick<ToolExecutionContext, 'runId' | 'sessionId'>, nativeToolCallId: string, repository?: ToolCallRepository) {
+      return recorderFor(repository).query({ ...context, nativeToolCallId });
     },
     configureRun(runId: DbId, config: { budget: ResolvedRuntimeBudget; strategy: RuntimeStrategySnapshot; deadlineAt?: number }) {
       const budget = budgetFor(runId);
@@ -511,8 +599,8 @@ export function createToolExecutor(input: {
     },
     closeRun(runId: DbId) { const budget = budgets.get(runId); if (budget) budget.closed = true; },
     releaseRun(runId: DbId) { budgets.delete(runId); },
-    candidateFacts(runId: DbId, nativeToolCallIds?: readonly string[]) {
-      const listed = input.recorder.list(runId, 100);
+    candidateFacts(runId: DbId, nativeToolCallIds?: readonly string[], repository?: ToolCallRepository) {
+      const listed = recorderFor(repository).list(runId, 100);
       if (!listed.ok) return listed;
       const calls = listed.data.items.filter(call => nativeToolCallIds === undefined || nativeToolCallIds.includes(call.nativeToolCallId)).reverse();
       const candidateIds = [...new Set(calls.flatMap((call) => call.result?.committedCandidateId ? [call.result.committedCandidateId] : []))];

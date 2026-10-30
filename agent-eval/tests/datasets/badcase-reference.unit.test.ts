@@ -14,7 +14,7 @@ const rows = [
     { description: 'Nintendo 2DS Console Blue Japan model Combine Shipping available 2', quantity: '5', unit: 'each', unitPrice: '54.99', netAmount: '274.95', taxRate: '10', totalAmount: '302.45' }
 ];
 test('FM-045 independent correct lines pass while missing normalization, wrong tax units and missing rows fail', async () => {
-    const data = findDataset(REPO_ROOT, { dataset: 'flowmate-badcase-business-v1' }), task = data.cases[0]!;
+    const data = findDataset(REPO_ROOT, { dataset: 'flowmate-agent-v1' }), task = data.cases.find(c => c.id === 'FM-045')!;
     const result = observed(), projected = resolveCase(data, task, REPO_ROOT).projected;
     const field = (value: string | null) => ({ raw: value, normalized: value, state: value === null ? 'missing' : 'present', alternatives: [], sources: [] });
     const values = { fields: Object.fromEntries(invoiceHeaderFields.map(key => [key, field(null)])),
@@ -32,7 +32,7 @@ test('FM-045 independent correct lines pass while missing normalization, wrong t
 });
 
 test('FM-051 source-bound reference Report covers twelve required facts; no Report preserves twelve omissions', () => {
-    const data = findDataset(REPO_ROOT, { dataset: 'flowmate-badcase-research-v1' }), task = data.cases[0]!;
+    const data = findDataset(REPO_ROOT, { dataset: 'flowmate-research-v1' }), task = data.cases.find(c => c.id === 'FM-051')!;
     if (!('contract' in task) || !task.expected.research) throw Error('Research Gold missing');
     const facts = ['Landsat 9 quantitatively characterizes global land-surface change.', 'Landsat 9 carries OLI-2.', 'Landsat 9 carries TIRS-2.',
         'OLI-2 measures visible, near-infrared and shortwave infrared wavelengths.', 'OLI-2 panchromatic resolution is15m.', 'OLI-2 multispectral resolution is30m.',

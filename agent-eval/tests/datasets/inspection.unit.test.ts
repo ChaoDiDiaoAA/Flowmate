@@ -26,7 +26,7 @@ test('authored Case discovery reads registered declarations without requiring th
     expect(cases).toHaveLength(62);
     expect(cases.filter((item: { datasetId: string }) => item.datasetId === 'flowmate-agent-v1')).toHaveLength(50);
     expect(cases.filter((item: { datasetId: string }) => item.datasetId === 'flowmate-research-v1')).toHaveLength(12);
-    expect(cases.filter((item: { smoke: boolean }) => item.smoke)).toHaveLength(14);
+    expect(cases.filter((item: { smoke: boolean }) => item.smoke)).toHaveLength(7);
     expect(cases.find((item: { caseId: string }) => item.caseId === 'FM-028')).toMatchObject({ caseVersion: 1, task: { id: 'FM-028' } });
     expect(() => findDataset(p.root, { dataset: 'flowmate-agent-v1' })).toThrow();
 });

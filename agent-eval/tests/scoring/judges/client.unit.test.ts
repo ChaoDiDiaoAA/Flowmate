@@ -55,7 +55,7 @@ test('SDK completions uses catalog limits, the isolated key and one streamed gen
     expect(result).toMatchObject({ text, stopReason: 'stop', rawStopReason: 'stop', responseComplete: true, usageSource: 'sdk', usage: { input: 10, output: 8, totalTokens: 18 } });
     expect(config.modelCapabilities).toMatchObject({ contextWindow: 131072, maxTokens: 32768, source: 'pi-sdk-model-catalog' });
     expect(JSON.stringify(publicJudgeConfig(config))).not.toContain('judge-key');
-    expect(publicJudgeConfig(config)).toMatchObject({ api: 'openai-completions', sdk: { ai: '0.85.1', codingAgent: '0.85.1' } });
+    expect(publicJudgeConfig(config)).toMatchObject({ api: 'openai-completions', sdk: { ai: '1.4.0', codingAgent: '1.4.0' } });
     expect(structuredClone(config)).not.toHaveProperty('runtime');
 });
 

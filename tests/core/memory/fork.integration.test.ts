@@ -2,9 +2,10 @@ import { expect, it } from 'bun:test';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { SessionService, ensureNativeSession } from '../../../packages/core/src/sessions/service.ts';
 import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
+import { withNativeHistoryFaults } from '../../support/database.ts';
 import { ContextService } from '../../../packages/core/src/context/service.ts';
 import { appError, fail, ok, ContextSnapshotJsonSchema, type ForkSessionRequest, type NativeSessionEntry, type Result, type RuntimeState,
   type HistoryCommitReceipt, type NativeSessionHistory } from '@flowmate/contracts';
@@ -21,7 +22,7 @@ function fixture(entries: NativeSessionEntry[] = [user('a'), user('b', 'a')]) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p9-fork-'));
   const paths = { root, databaseFile: join(root, 'test.sqlite'), logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'),
     outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') };
-  const store = need(openDatabase(paths)); deferCleanup(() => store.close());
+  const store = withNativeHistoryFaults(need(openDatabase(paths))); deferCleanup(() => store.close());
   let requests = 0, prepares = 0;
   const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir, credentials: new InMemoryCredentialStore(),
     fetch: async () => { requests++; throw new Error('Unexpected fork HTTP'); } });
@@ -31,7 +32,7 @@ function fixture(entries: NativeSessionEntry[] = [user('a'), user('b', 'a')]) {
   const session = need(store.sessions.create({ nativeSessionId: header.id, title: 'Source', at,
     nativeHistory: { storageVersion: 1, header, entries, leafId: entries.at(-1)!.id, unusable: false } }));
   let runtime: RuntimeState = { active: null, blocked: false, error: null };
-  const service = new SessionService(store.sessions, agent, () => runtime, () => at, store.runs, store.memory);
+  const service = new SessionService(agent, () => runtime, () => at, store);
   const request: ForkSessionRequest = { sourceSessionId: session.sessionId, expected: need(store.memory.load(session.sessionId))!.commit,
     targetEntryId: entries.at(-1)!.id, title: 'Fork', clientOperationId: crypto.randomUUID() };
   const published: unknown[] = []; store.runtimeEventStore.onCommitted(refs => published.push(refs));
@@ -58,6 +59,7 @@ function noExecutionChanges(before: ReturnType<typeof facts>, f: ReturnType<type
 // Seed genuine P8 ownership through the ContextRepository and MemoryStore, not NULL legacy associations.
 function appendOwnedInput(f: ReturnType<typeof fixture>, sessionId: number, entryId: string) {
   const row = need(f.store.sessions.get(sessionId)), db = f.store.db;
+  if (row.runtimeKind !== 'agent_session') throw Error('This fixture requires its original Pi Session.');
   const config = { version: 1, name: 'fixture', revision: 1, requestedModel: { provider: 'fixture', model: 'fixture' },
     resolvedModel: null, api: null, endpoint: null, sdk: { codingAgent: '0.85.1', ai: '0.85.1' },
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 }, limits: { timeoutMs: 1000, stopGraceMs: 100 },
@@ -128,7 +130,7 @@ it('P9 T06 creates a new native identity with the exact reference closure', asyn
 it.each(['session', 'header', 'entry-first', 'entry-last', 'leaf', 'revision', 'provenance', 'foreign-key', 'commit'] as const)
 ('P9 T06 commits a fork atomically and leaves no target on failure: %s', async fault => {
   const f = fixture(), db = f.store.db;
-  const originalTransaction = f.store.runtimeEventStore.withTransaction.bind(f.store.runtimeEventStore);
+  const originalTransaction = f.store.transaction;
   const target = f.session.sessionId + 1;
   const windows = { session: ['INSERT', 'sessions', `NEW.title='Fork'`], header: ['INSERT', 'session_native_history', `NEW.session_id=${target}`],
     'entry-first': ['INSERT', 'session_native_entries', `NEW.session_id=${target} AND NEW.sequence=0`],
@@ -140,11 +142,15 @@ it.each(['session', 'header', 'entry-first', 'entry-last', 'leaf', 'revision', '
   if (fault === 'commit' || fault === 'foreign-key') {
     db.exec(`CREATE TABLE fault_parent(id INTEGER PRIMARY KEY); CREATE TABLE fault_child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fault_parent(id) ${fault === 'commit' ? 'DEFERRABLE INITIALLY DEFERRED' : ''});
       CREATE TRIGGER fork_fault AFTER INSERT ON session_forks WHEN NEW.client_operation_id='${f.request.clientOperationId}' BEGIN INSERT INTO fault_child VALUES(1,404); END;`);
-    f.store.runtimeEventStore.withTransaction = write => originalTransaction(() => { const value = write(); completed = true;
-      expect(db.inTransaction).toBe(true); expect(db.query('SELECT * FROM session_forks').all()).toHaveLength(1);
-      expect(db.query('SELECT entry_count,leaf_id,commit_revision FROM session_native_history WHERE session_id=?').get(target))
-        .toEqual({ entry_count: 2, leaf_id: 'b', commit_revision: 1 });
-      expect(db.query('PRAGMA foreign_key_check').all()).toHaveLength(1); return value; });
+    f.store.transaction = write => originalTransaction(scope => {
+      const withTransaction = scope.runtimeEventStore.withTransaction.bind(scope.runtimeEventStore);
+      scope.runtimeEventStore.withTransaction = change => withTransaction(() => { const value = change(); completed = true;
+        expect(scope.db.inTransaction).toBe(true); expect(scope.db.query('SELECT * FROM session_forks').all()).toHaveLength(1);
+        expect(scope.db.query('SELECT entry_count,leaf_id,commit_revision FROM session_native_history WHERE session_id=?').get(target))
+          .toEqual({ entry_count: 2, leaf_id: 'b', commit_revision: 1 });
+        expect(scope.db.query('PRAGMA foreign_key_check').all()).toHaveLength(1); return value; });
+      return write(scope);
+    });
   } else { const [event, table, condition] = windows[fault];
     db.exec(`CREATE TRIGGER fork_fault BEFORE ${event} ON ${table} WHEN ${condition} BEGIN SELECT RAISE(ABORT,'fork fault'); END`); }
   const before = facts(f), source = sourceFacts(f); let builtId = '';
@@ -154,7 +160,7 @@ it.each(['session', 'header', 'entry-first', 'entry-last', 'leaf', 'revision', '
   expect(completed).toBe(fault === 'commit'); expect(facts(f)).toEqual(before); expect(sourceFacts(f)).toEqual(source);
   expect(f.agent.inspect(builtId).availability).toBe('missing'); f.quiet();
   console.log('P9 T06 rollback', JSON.stringify({ fault, completed, source, tables: Object.fromEntries(Object.entries(before).map(([table, rows]) => [table, rows.length])), http: 0, published: f.published }));
-  db.exec('DROP TRIGGER fork_fault'); f.store.runtimeEventStore.withTransaction = originalTransaction;
+  db.exec('DROP TRIGGER fork_fault'); f.store.transaction = originalTransaction;
   if (fault === 'commit' || fault === 'foreign-key') db.exec('DROP TABLE fault_child; DROP TABLE fault_parent');
   const retried = need(await f.service.forkSession(f.request));
   expect(retried.commit).toEqual({ commitRevision: 1, entryCount: 2, leafId: 'b' });
@@ -243,7 +249,7 @@ it('P9 T06 resolves nested original and parent-local owners and rejects revoked 
   f.store.db.query('UPDATE sessions SET metadata_json=? WHERE id=?').run(JSON.stringify({ version: 1,
     model_use_blocked: { reason: 'document_use_revoked', documentIds: [1], at } }), f.session.sessionId);
   expect(await f.service.forkSession(request)).toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
-  expect(ensureNativeSession(f.store.sessions, f.agent, need(f.store.sessions.get(nested.session.sessionId)), f.store.memory))
+  expect(await ensureNativeSession(f.store, f.agent, need(f.store.sessions.get(nested.session.sessionId))))
     .toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } }); f.quiet();
 });
 
@@ -305,8 +311,7 @@ it('P9 T06 preserves real P8 original and parent-local ownership across nested f
   expect(await f.service.forkSession(request)).toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
   expect(await f.service.forkSession({ ...request, clientOperationId: crypto.randomUUID() }))
     .toMatchObject({ ok: false, error: { code: 'session_scope_revoked' } });
-  const runtime = new RuntimeService({ memory: f.store.memory, runs: f.store.runs, sessions: f.store.sessions, sessionInputs: f.store.sessionInputs,
-    contextRepository: f.store.context, agent: f.agent, contextService: new ContextService({ store: f.store,
+  const runtime = new RuntimeService({ database: f.store,  agent: f.agent, contextService: new ContextService({ store: f.store,
       materials: { inspectParsed() { throw new Error('Unexpected material read'); } } }),
     provider: { async prepare() { throw new Error('Unexpected Provider'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
@@ -399,14 +404,25 @@ it.each(['archive', 'hidden', 'delete-pending', 'native-busy', 'native-unusable'
 
 it('P9 T06 rechecks a competing committed operation before rejecting the now-stale source', async () => {
   const f = fixture(), build = f.agent.buildForkSessionHistory.bind(f.agent), before = facts(f);
-  const competitor = new SessionService(f.store.sessions, f.agent, () => ({ active: null, blocked: false, error: null }), () => at, f.store.runs, f.store.memory);
+  const originalTransaction = f.store.transaction;
+  const competitor = new SessionService(f.agent, () => ({ active: null, blocked: false, error: null }), () => at,
+    { read: f.store.read, transaction: originalTransaction });
   let competing: ReturnType<SessionService['forkSession']>;
+  let raced = false;
+  f.store.transaction = async write => {
+    if (!raced) {
+      raced = true; await competing;
+      need(await originalTransaction(scope => {
+        const source = need(scope.memory.load(f.session.sessionId))!;
+        return scope.memory.commit({ sessionId: f.session.sessionId, expected: source.commit, header: source.history.header,
+          appendEntries: [user('newer', 'b')], leafId: 'newer', unusable: false, contexts: [] });
+      }));
+    }
+    return originalTransaction(write);
+  };
   f.agent.buildForkSessionHistory = input => {
     const built = build(input); f.agent.buildForkSessionHistory = build;
     competing = competitor.forkSession(f.request);
-    const source = need(f.store.memory.load(f.session.sessionId))!;
-    need(f.store.memory.commit({ sessionId: f.session.sessionId, expected: source.commit, header: source.history.header,
-      appendEntries: [user('newer', 'b')], leafId: 'newer', unusable: false, contexts: [] }));
     return built;
   };
   const result = need(await f.service.forkSession(f.request)), winner = need(await competing!);

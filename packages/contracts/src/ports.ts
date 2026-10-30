@@ -21,10 +21,10 @@ import type { ProductToolContext, ToolCallContext, ToolResult } from './tools.ts
 import type { CandidateJobDetail, CandidateJobPage, GoalMode, WorkspaceContext, WorkspaceInput } from './workspace.ts';
 import type { ToolCallDelivery } from './activity.ts';
 import type { CandidateSnapshot } from './activity.ts';
-import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput } from './invoice.ts';
+import type { CandidateDraft, CandidateReceipt, CheckResult, InvoiceIssue, InvoiceToolOutput, InvoiceCandidateChildReportReference } from './invoice.ts';
 import type { ContextHooks } from './context.ts';
-import type { FrozenResources, ResourceBinding } from './resources.ts';
-import type { HistoryCommitState, HistoryCommitReceipt, NativeHistoryRecoverySeed, NativeHistoryWrite, NativeHistoryInspection } from './memory.ts';
+import type { FrozenResources, ResourceBinding, ManagedFileContents } from './resources.ts';
+import type { HistoryCommitState, HistoryCommitReceipt, NativeHistoryRecoverySeed, NativeHistoryWriter, NativeHistoryInspection } from './memory.ts';
 import type { CompactionPolicy, CompactionCapacity, SavedCompactionView, CompactionObservation,
   NativeCompactionControl, NativeCompactionOutcome } from './compaction.ts';
 
@@ -34,6 +34,7 @@ export type SaveCandidateRecord = {
   nativeToolCallId: string;
   documentId: DbId;
   candidate: CandidateDraft;
+  childReportRefs?: InvoiceCandidateChildReportReference[];
   checks: CheckResult[];
   issues: InvoiceIssue[];
   at: string;
@@ -42,8 +43,8 @@ export interface CandidateRepository {
   save(input: SaveCandidateRecord): Result<{ receipt: CandidateReceipt; candidate: CandidateSnapshot; created: boolean }>;
   listByJob(input: { jobId: DbId; beforeSequence: DbId | null; limit: number }): Result<CandidateJobPage>;
   readByJob(input: { jobId: DbId; candidateId: DbId }): Result<CandidateJobDetail>;
-  listForRun(input: { runId: DbId; beforeSequence: DbId | null; limit: number }): Result<InvoiceToolOutput<'list_invoice_candidates'>>;
-  readForRun(input: { runId: DbId; candidateId: DbId }): Result<InvoiceToolOutput<'get_invoice_candidate'>>;
+  listForRun(input: { runId: DbId; beforeSequence: DbId | null; limit: number; invoiceWork?: ProductToolContext['scope']['invoiceWork'] }): Result<InvoiceToolOutput<'list_invoice_candidates'>>;
+  readForRun(input: { runId: DbId; candidateId: DbId; invoiceWork?: ProductToolContext['scope']['invoiceWork'] }): Result<InvoiceToolOutput<'get_invoice_candidate'>>;
 }
 
 export type SafeConfigSnapshot = {
@@ -159,10 +160,10 @@ export type AgentNativeOutcome = NativeOutcome & { agent: AgentFacts };
 export type AgentToolInvocation = { result: ToolResult<unknown>; fatal: boolean };
 export type AgentToolBinding = {
   context: ProductToolContext;
-  observeRequest(name: string, raw: unknown, call: ToolCallContext): Result<void>;
-  rejectRequest(name: string, raw: unknown, call: ToolCallContext, error: AppError, stage?: 'sdk_arguments' | 'sdk_before' | 'unknown'): Result<void>;
-  queryCall?(nativeToolCallId: string): Result<import('./activity.ts').ToolCallSnapshot>;
-  recordDelivery(nativeToolCallId: string, delivery: ToolCallDelivery): Result<void>;
+  observeRequest(name: string, raw: unknown, call: ToolCallContext): Result<void> | Promise<Result<void>>;
+  rejectRequest(name: string, raw: unknown, call: ToolCallContext, error: AppError, stage?: 'sdk_arguments' | 'sdk_before' | 'unknown'): Result<void> | Promise<Result<void>>;
+  queryCall?(nativeToolCallId: string): Result<import('./activity.ts').ToolCallSnapshot> | Promise<Result<import('./activity.ts').ToolCallSnapshot>>;
+  recordDelivery(nativeToolCallId: string, delivery: ToolCallDelivery): Result<void> | Promise<Result<void>>;
   /** Keep the observed model arguments separate from the SDK/Hook's final input. */
   execute(name: string, input: unknown, call: ToolCallContext, rawArguments?: unknown): Promise<AgentToolInvocation>;
 };
@@ -187,14 +188,14 @@ export type AgentExecutionInput = NativeInput & {
   remainingRunMs?: () => number;
   budgetAwareness?: boolean;
   toolBinding?: AgentToolBinding;
-  verifyModelUse: () => Result<void>;
+  verifyModelUse: () => Result<void> | Promise<Result<void>>;
   /** P13 root budget, charged once per actual HTTP attempt including retries. */
   reserveModelRequest?: () => Result<void>;
   /** Legacy direct SDK callers may omit these; complete product P5 paths always provide them. */
   inputId?: DbId;
   promptText?: string;
-  verifyInputUse?: (inputId: DbId) => Result<void>;
-  completeInputResult?: (inputIds: readonly DbId[], resultEntryId: string) => Result<void>;
+  verifyInputUse?: (inputIds: readonly DbId[]) => Result<void> | Promise<Result<void>>;
+  completeInputResult?: (inputIds: readonly DbId[], resultEntryId: string) => Result<void> | Promise<Result<void>>;
   onInputAdmissionClosed?: () => void;
 };
 
@@ -284,7 +285,7 @@ export interface AgentPort {
   exportSession?(nativeSessionId: string): Result<import('./runtime.ts').NativeSessionHistory>;
   restoreSession?(nativeSessionId: string, history: import('./runtime.ts').NativeSessionHistory, seed: NativeHistoryRecoverySeed, commit: HistoryCommitState): Result<void>;
   watchSession?(nativeSessionId: string, commit: HistoryCommitState, seed: NativeHistoryRecoverySeed,
-    save: (write: NativeHistoryWrite) => Result<HistoryCommitReceipt>): Result<void>;
+    save: NativeHistoryWriter): Result<void>;
   projectSessionMessages?(input: NativeMessageProjectionInput): Result<Pick<SessionMessagesPage, 'items' | 'nextBeforeEntryId'>>;
   enqueueInput?(nativeSessionId: string, input: AgentInputDispatch): Promise<Result<void>>;
   moveSessionLeaf?(nativeSessionId: string, targetEntryId: string): Promise<Result<import('./runtime.ts').NativeSessionHistory>>;
@@ -301,7 +302,8 @@ export interface AgentPort {
     signal: AbortSignal,
     options?: { activeToolNames?: readonly string[]; inputDefinitions?: FrozenInputDefinitions; inputCommandOwner?: { runId: DbId; sessionId: DbId; inputId: DbId }; chatDelegation?: boolean; researchPhase?: 'planning' | 'researching'; workingDirectory?: string; goalMode?: GoalMode; sessionInputs?: boolean;
       runtimeBudget?: ResolvedRuntimeBudget; runtimeStrategy?: RuntimeStrategySnapshot; compactionPolicy?: CompactionPolicy;
-      resources?: FrozenResources; extensions?: import('./extensions.ts').FrozenExtensions; verifyExtensions?: () => Result<void> },
+      resources?: FrozenResources; resourceContents?: Pick<ManagedFileContents, 'read'>;
+      extensions?: import('./extensions.ts').FrozenExtensions; verifyExtensions?: () => Result<void> },
   ): Promise<Result<PreparedAgent>>;
   releaseSession(nativeSessionId: string): Promise<CloseReport>;
   close(): Promise<CloseReport>;

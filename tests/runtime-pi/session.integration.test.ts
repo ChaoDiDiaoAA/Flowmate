@@ -13,6 +13,12 @@ import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { createNativeTools, getNativeToolParameters } from '../../packages/runtime-pi/src/native-tools.ts';
 import { toPiTool } from '../../packages/runtime-pi/src/tools.ts';
+import { NativeSessionHistorySchema } from '@flowmate/contracts';
+
+function conversationMessages(history: NativeSessionHistory) {
+  return NativeSessionHistorySchema.parse(history).entries.flatMap(entry =>
+    entry.type === 'message' && entry.message.role !== 'system' ? [entry] : []);
+}
 
 
 // Component-only receipt producer. SQL/Application persistence is exercised in context.integration.test.ts.
@@ -176,6 +182,43 @@ describe('PiAgentAdapter', () => {
     }
     expect(outcome.stopped).toBe(true);
   });
+  it('waits for asynchronous input permission before native capture and model use', async () => {
+    const entered = deferred<void>(), release = deferred<void>();
+    const app = await fixture(() => response());
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId, signal = new AbortController().signal;
+    let captured = 0;
+    watchFixture(app.adapter, 21, id, (_history, context) => { if (context?.inputId === 100) captured++; return ok(undefined); });
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    let settled = false;
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: async () => { entered.resolve(); await release.promise; return ok(undefined); },
+      completeInputResult: () => ok(undefined) }, signal, () => {}).then(outcome => { settled = true; return outcome; });
+    try {
+      await entered.promise; await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false); expect(captured).toBe(0); expect(app.requests).toHaveLength(0);
+    } finally { release.resolve(); }
+    expect((await running).error).toBeNull(); expect(captured).toBe(1); expect(app.requests).toHaveLength(1);
+  });
+  it('waits for asynchronous input result commitment before reporting completion', async () => {
+    const entered = deferred<void>(), release = deferred<void>();
+    const app = await fixture(() => response());
+    const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
+    const id = native.data.nativeSessionId, signal = new AbortController().signal;
+    watchFixture(app.adapter, 21, id, () => ok(undefined));
+    const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
+    if (!prepared.ok) throw new Error(prepared.error.code);
+    let settled = false;
+    const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
+      verifyInputUse: () => ok(undefined), completeInputResult: async () => { entered.resolve(); await release.promise; return ok(undefined); } },
+    signal, () => {}).then(outcome => { settled = true; return outcome; });
+    try {
+      await entered.promise; await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false); expect(app.requests).toHaveLength(1);
+    } finally { release.resolve(); }
+    expect((await running).error).toBeNull();
+  });
   it('rechecks admission at actual native enqueue when a high-level dispatch finishes after agent_end', async () => {
     const fetchEntered = deferred<void>(); const reply = deferred<Response>(); const dispatchEntered = deferred<void>(); const dispatchRelease = deferred<void>(); const closed = deferred<void>();
     const app = await fixture(() => { fetchEntered.resolve(); return reply.promise; });
@@ -201,11 +244,13 @@ describe('PiAgentAdapter', () => {
     const app = await fixture(() => { entered.resolve(); return reply.promise; });
     const native = app.adapter.createSession(); if (!native.ok) throw new Error(native.error.code);
     const id = native.data.nativeSessionId; const signal = new AbortController().signal; const consumed: number[] = []; const completed: number[][] = [];
+    const checkedInputs: number[][] = [];
     watchFixture(app.adapter, 21, id, (_history, context) => { if (context?.inputId) consumed.push(context.inputId); return ok(undefined); });
     const prepared = await app.adapter.prepare(id, config, { timeoutMs: 60_000, stopGraceMs: 5_000 }, signal, { sessionInputs: true });
     if (!prepared.ok) throw new Error(prepared.error.code);
     const running = prepared.data.execute({ ...input(71, 21, 'first'), inputId: 100, promptText: 'first',
-      verifyInputUse: inputId => inputId === 101 && consumed.includes(101) ? fail(appError('tool_access_denied', 'runtime', 'Controlled input revocation.')) : ok(undefined),
+      verifyInputUse: inputIds => { checkedInputs.push([...inputIds]);
+        return inputIds.includes(101) && consumed.includes(101) ? fail(appError('tool_access_denied', 'runtime', 'Controlled input revocation.')) : ok(undefined); },
       completeInputResult: ids => { completed.push([...ids]); return ok(undefined); } }, signal, () => {});
     await entered.promise;
     expect(await app.adapter.enqueueInput(id, { inputId: 101, runId: 71, sessionId: 21, mode: 'followUp', text: 'later', promptText: 'later' })).toEqual(ok(undefined));
@@ -213,6 +258,7 @@ describe('PiAgentAdapter', () => {
     const result = await running;
     expect(result.error?.code).toBe('tool_access_denied'); expect(app.requests).toHaveLength(1);
     expect(consumed).toEqual([100, 101]); expect(completed).toEqual([[100]]);
+    expect(checkedInputs).toContainEqual([100, 101]);
   });
 
   it('applies the P5 Chat model budget to queued inputs and reports the one native item that remains unconsumed', async () => {
@@ -589,7 +635,7 @@ describe('PiAgentAdapter', () => {
       execute: async (_name, args, call) => { executions += 1; return { result: { status: 'succeeded',
         data: await read.execute(args, call, { runId: 112, sessionId: 212, scope }) }, fatal: false }; } };
     const selected: ProviderConfig = vision ? { ...config, connection: undefined,
-      modelRef: { provider: 'baseten', model: 'moonshotai/Kimi-K2.5' } } : config;
+      modelRef: { provider: 'baseten', model: 'deepseek-ai/DeepSeek-V4.1-Flash' } } : config;
     const prepared = await app.adapter.prepare(created.data.nativeSessionId, selected,
       { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal,
       { activeToolNames: ['read'], workingDirectory: directory, goalMode: 'answer' });
@@ -632,6 +678,7 @@ describe('PiAgentAdapter', () => {
     expect(messages.some((event) => event.message.role === 'assistant' && event.message.persistence === 'saved')).toBe(true);
     expect(bindings.length).toBe(2);
     if (!saved.ok) throw new Error(saved.error.code);
+    expect(saved.data.entries).toContainEqual(expect.objectContaining({ type: 'message', message: expect.objectContaining({ role: 'system' }) }));
     const projected = app.adapter.projectSessionMessages({ history: saved.data, bindings,
       runInputs: [{ runId: 104, input: { version: 1, goal: runInput.goal, text: runInput.text,
         messageTimestamp: runInput.messageTimestamp }, goalMode: null }], limit: 50 });
@@ -686,9 +733,9 @@ describe('PiAgentAdapter', () => {
     if (!saved.ok) throw new Error(saved.error.message);
     // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
     expect(saved.data.unusable).toBe(false);
-    expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(0);
-    const firstFailure = attempted.findIndex((history) => history.entries.some((entry) => entry.type === 'message'));
-    expect(attempted.slice(firstFailure + 1).every((history) => !history.entries.some((entry) => entry.type === 'message'))).toBe(true);
+    expect(conversationMessages(saved.data)).toHaveLength(0);
+    const firstFailure = attempted.findIndex(history => conversationMessages(history).length > 0);
+    expect(attempted.slice(firstFailure + 1).every(history => conversationMessages(history).length === 0)).toBe(true);
     expect(events.filter((event) => event.type === 'display_message').map((event) => event.message.persistence)).toContain('failed');
     expect(events.some((event) => event.type === 'display_message' && event.message.persistence === 'saved')).toBe(false);
   });
@@ -715,7 +762,7 @@ describe('PiAgentAdapter', () => {
     let saved = app.adapter.exportSession(native.data.nativeSessionId);
     let finalFailed = false;
     watchFixture(app.adapter, 208, native.data.nativeSessionId, (history, context) => {
-      if (!finalFailed && context !== undefined && history.entries.find(entry => entry.id === context.entryId)?.type === 'message' && history.entries.filter((entry) => entry.type === 'message').length === 2) {
+      if (!finalFailed && conversationMessages(history).find(entry => entry.id === context?.entryId)?.message.role === 'assistant') {
         finalFailed = true;
         if (mode === 'throw') throw new Error('Controlled final save exception.');
         return fail(appError('storage_write_failed', 'storage', 'Controlled final save failure.'));
@@ -731,7 +778,7 @@ describe('PiAgentAdapter', () => {
     expect(outcome.stopped).toBe(true);
     expect(app.requests).toHaveLength(1);
     if (!saved.ok) throw new Error(saved.error.message);
-    expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(1);
+    expect(conversationMessages(saved.data)).toHaveLength(1);
     // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
     expect(saved.data.unusable).toBe(false);
     expect(app.adapter.inspect(native.data.nativeSessionId).availability).toBe('unusable');
@@ -800,7 +847,7 @@ describe('PiAgentAdapter', () => {
       expect(outcome.stopped).toBe(true);
       expect(app.requests).toHaveLength(1);
       if (!saved.ok) throw new Error(saved.error.message);
-      expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(2);
+      expect(conversationMessages(saved.data)).toHaveLength(2);
       // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
     expect(saved.data.unusable).toBe(false);
       expect(bindings).toHaveLength(2);
@@ -836,7 +883,7 @@ describe('PiAgentAdapter', () => {
       expect(outcome.stopped).toBe(true);
       expect(app.requests).toHaveLength(0);
       if (!saved.ok) throw new Error(saved.error.message);
-      expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(0);
+      expect(conversationMessages(saved.data)).toHaveLength(0);
       // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
     expect(saved.data.unusable).toBe(false);
       expect((await app.adapter.releaseSession(nativeId.data.nativeSessionId)).closed).toBe(true);
@@ -862,7 +909,7 @@ describe('PiAgentAdapter', () => {
       expect(outcome.stopped).toBe(true);
       expect(app.requests).toHaveLength(1);
       if (!saved.ok) throw new Error(saved.error.message);
-      expect(saved.data.entries.filter((entry) => entry.type === 'message')).toHaveLength(1);
+      expect(conversationMessages(saved.data)).toHaveLength(1);
       // An unconfirmed write cannot advance or rewrite the last acknowledged snapshot.
     expect(saved.data.unusable).toBe(false);
       expect((await app.adapter.releaseSession(created.data.nativeSessionId)).closed).toBe(true);
@@ -1302,7 +1349,7 @@ describe('PiAgentAdapter', () => {
     try {
       const nativeConfig: ProviderConfig = {
         ...config,
-        modelRef: { provider: 'deepseek', model: 'deepseek-v4-flash' },
+        modelRef: { provider: 'deepseek', model: 'deepseek-flash' },
         connection: undefined,
       };
       const prepared = await app.adapter.prepare(created.data.nativeSessionId, nativeConfig, { timeoutMs: 60_000, stopGraceMs: 5_000 }, new AbortController().signal);

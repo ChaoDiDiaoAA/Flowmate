@@ -2,11 +2,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 import { z } from 'zod';
-import { registerSecrets, scanEvidence } from './execution/evidence-safety.ts';
+import { LOCAL_NO_AUTH_API_KEY, registerSecrets, scanEvidence } from './execution/evidence-safety.ts';
 import { fileURLToPath } from 'node:url';
 import { ExtensionManifestSchema } from '../../packages/contracts/src/extensions.ts';
 import { ResourceManifestSchema } from '../../packages/contracts/src/resources.ts';
 import type { ModelCatalogProvider } from '../../packages/contracts/src/settings.ts';
+import { nativeTextModelConfigSchema, type NativeTextModelConfig } from './text-model/codex.ts';
+import { homedir } from 'node:os';
+import { EvaluationAgentOverridesSchema } from '../../packages/contracts/src/runtime-evaluation.ts';
 
 const repository=fileURLToPath(new URL('../../',import.meta.url));
 export function extensionIdentity(ref:{id:string;version:string},repo=repository) {
@@ -19,12 +22,18 @@ export function extensionIdentity(ref:{id:string;version:string},repo=repository
 export function evaluationEnv(repo: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
     const file = join(repo,'agent-eval/configs/.env');
     const values = existsSync(file) ? parseEnv(readFileSync(file,'utf8')) : {};
-    const allowed = /^(FLOWMATE_EVAL_AGENT_(BASE_URL|API_KEY|MODEL|API)|FLOWMATE_JUDGE_(API|PROVIDER|BASE_URL|MODEL|API_KEY|TIMEOUT_MS)|LANGFUSE_(BASE_URL|PUBLIC_KEY|SECRET_KEY))$/;
+    const allowed = /^(FLOWMATE_CODEX_EXECUTABLE|FLOWMATE_EVAL_AGENT_(BASE_URL|API_KEY|MODEL|API|REASONING_EFFORT)|FLOWMATE_EVAL_CONTROL_(BASE_URL|MODEL|API|REASONING_EFFORT)|FLOWMATE_EVAL_DEEPSEEK_API_KEY|FLOWMATE_JUDGE_(API|PROVIDER|BASE_URL|MODEL|API_KEY|TIMEOUT_MS|REASONING_EFFORT)|JUDGE_(MODEL|REASONING_EFFORT|TIMEOUT_MS)|(FLOWMATE_)?MINING_(PROVIDER|MODEL|REASONING_EFFORT|TIMEOUT_MS)|LANGFUSE_(BASE_URL|PUBLIC_KEY|SECRET_KEY))$/;
     if (Object.keys(values).some(key=>!allowed.test(key))) throw Error('configs/.env contains an unsupported variable');
     const merged = {...values,...Object.fromEntries(Object.entries(env).filter(([,value])=>value!==undefined))};
-    registerSecrets(['FLOWMATE_EVAL_AGENT_API_KEY', 'FLOWMATE_JUDGE_API_KEY', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY']
+    registerSecrets(['FLOWMATE_EVAL_AGENT_API_KEY', 'FLOWMATE_EVAL_DEEPSEEK_API_KEY', 'FLOWMATE_JUDGE_API_KEY', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY']
         .map(name => merged[name]?.trim()).filter((value): value is string => !!value));
     return merged;
+}
+export function miningConfig(repo: string, env: NodeJS.ProcessEnv = process.env): NativeTextModelConfig {
+    env = evaluationEnv(repo, env);
+    return nativeTextModelConfigSchema.parse({ provider: env.FLOWMATE_MINING_PROVIDER ?? env.MINING_PROVIDER ?? 'codex-cli', executable: env.FLOWMATE_CODEX_EXECUTABLE ?? 'codex',
+        model: env.FLOWMATE_MINING_MODEL ?? env.MINING_MODEL ?? 'gpt-6-luna', reasoningEffort: env.FLOWMATE_MINING_REASONING_EFFORT ?? env.MINING_REASONING_EFFORT ?? 'max',
+        timeoutMs: Number(env.FLOWMATE_MINING_TIMEOUT_MS ?? env.MINING_TIMEOUT_MS ?? 180000) });
 }
 export function credential(env: NodeJS.ProcessEnv, name: string): string {
     const value = env[name]?.trim();
@@ -37,16 +46,54 @@ const agentConnectionSchema = z.object({ model: z.string().trim().min(1).refine(
     baseUrl: z.string().url().refine(value => {
         const url = new URL(value);
         return ['http:', 'https:'].includes(url.protocol) && url.hostname !== 'replace.invalid' && !url.username && !url.password && !url.search && !url.hash;
-    }), api: agentApiSchema }).strict();
+    }), api: agentApiSchema, reasoning: EvaluationAgentOverridesSchema.shape.reasoning }).strict();
+export type EvaluationAgentCredential = { connection: z.infer<typeof agentConnectionSchema>; apiKey: string };
+export function sameAgentEndpoint(left: { api: string; baseUrl: string }, right: { api: string; baseUrl: string }) {
+    try { return left.api === right.api && new URL(left.baseUrl).href.replace(/\/+$/, '') === new URL(right.baseUrl).href.replace(/\/+$/, ''); }
+    catch { return false; }
+}
+export function sameAgentConnection(left: { api: string; baseUrl: string; model: string }, right: { api: string; baseUrl: string; model: string }) {
+    return left.model === right.model && sameAgentEndpoint(left, right);
+}
+export function localAgentCredential(connection: { model?: unknown; api?: unknown; baseUrl?: unknown }): string | null {
+    return ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6.1-terra'].includes(String(connection.model)) && connection.api === 'openai-completions' && typeof connection.baseUrl === 'string'
+        && sameAgentEndpoint({ api: connection.api, baseUrl: connection.baseUrl }, { api: 'openai-completions', baseUrl: 'http://127.0.0.1:8767/v1' })
+        ? LOCAL_NO_AUTH_API_KEY : null;
+}
+// The existing local gateway validates max_completion_tokens/max_tokens in the inclusive range 1..32768.
+const localCodexGatewayTransport = { maxTokens: 32768, source: 'local-codex-gateway-source' as const };
 export const agentModelCapabilitiesSchema = z.object({ contextWindow: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     maxTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), reasoning: z.boolean(),
-    source: z.enum(['pi-sdk-model-catalog', 'deepseek-models-api']), providers: z.array(z.string().min(1)).min(1) }).strict();
+    transport: z.object({ maxTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), source: z.literal('local-codex-gateway-source') }).strict().optional(),
+    source: z.enum(['pi-sdk-model-catalog', 'deepseek-models-api', 'codex-cli-cache-and-openai-model-reference']), providers: z.array(z.string().min(1)).min(1) }).strict();
 export type AgentModelCapabilities = z.infer<typeof agentModelCapabilitiesSchema>;
-export function agentConfig(repo: string, env: NodeJS.ProcessEnv = process.env, overrides: { model?: unknown; api?: unknown; baseUrl?: unknown } = {}) {
+export function readLocalCodexModelCapabilities(connection: { model: string; api: string; baseUrl: string },
+    cachePath = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'models_cache.json')): AgentModelCapabilities {
+    if (!localAgentCredential(connection)) throw Error('Local Codex capabilities require a verified local gateway model');
+    const cache = z.object({ models: z.array(z.object({ slug: z.string() }).passthrough()) }).parse(JSON.parse(readFileSync(cachePath, 'utf8')));
+    const matching = cache.models.filter(model => model.slug === connection.model);
+    const model = z.object({ context_window: z.number().int().min(128000),
+        supported_reasoning_levels: z.array(z.object({ effort: z.string().min(1) }).passthrough()).min(1) })
+        .safeParse(matching.length === 1 ? matching[0] : null);
+    if (!model.success) throw Error('Local Codex model metadata lacks an exact identity or context; no fallback limit');
+    // Native context comes from the exact CLI cache; the configured models expose 128000 output tokens.
+    // https://developers.openai.com/api/docs/models/gpt-6.1-sol (and gpt-6.1-terra, gpt-6-luna).
+    return agentModelCapabilitiesSchema.parse({ contextWindow: model.data.context_window, maxTokens: 128000,
+        transport: localCodexGatewayTransport,
+        reasoning: model.data.supported_reasoning_levels.some(level => !['none', 'off'].includes(level.effort)),
+        source: 'codex-cli-cache-and-openai-model-reference', providers: ['codex-cli-local-gateway'] });
+}
+export function agentConfig(repo: string, env: NodeJS.ProcessEnv = process.env, overrides: { model?: unknown; api?: unknown; baseUrl?: unknown; reasoning?: unknown } = {}) {
     env = evaluationEnv(repo, env);
-    const apiKey = credential(env, 'FLOWMATE_EVAL_AGENT_API_KEY');
-    return agentConnection({ model: overrides.model ?? env.FLOWMATE_EVAL_AGENT_MODEL,
-        baseUrl: overrides.baseUrl ?? env.FLOWMATE_EVAL_AGENT_BASE_URL, api: overrides.api ?? env.FLOWMATE_EVAL_AGENT_API ?? 'openai-completions' }, apiKey);
+    const connection = { model: overrides.model ?? env.FLOWMATE_EVAL_AGENT_MODEL,
+        baseUrl: overrides.baseUrl ?? env.FLOWMATE_EVAL_AGENT_BASE_URL, api: overrides.api ?? env.FLOWMATE_EVAL_AGENT_API ?? 'openai-completions' };
+    const localKey = localAgentCredential(connection);
+    const reasoning = overrides.reasoning ?? (localKey ? env.FLOWMATE_EVAL_AGENT_REASONING_EFFORT ?? 'max' : undefined);
+    const selected = agentConnection({ ...connection, ...(reasoning === undefined ? {} : { reasoning }) }, localKey ?? credential(env, 'FLOWMATE_EVAL_AGENT_API_KEY'));
+    if (!localKey && env.FLOWMATE_EVAL_AGENT_BASE_URL && !sameAgentEndpoint(selected.configuration,
+        { baseUrl: env.FLOWMATE_EVAL_AGENT_BASE_URL, api: env.FLOWMATE_EVAL_AGENT_API ?? 'openai-completions' }))
+        throw Error('Changed Agent endpoint requires its own explicit credential; default credential cannot be forwarded');
+    return selected;
 }
 export function agentConnection(configuration: unknown, apiKey: string) {
     if (typeof apiKey !== 'string' || !apiKey.trim()) throw Error('Explicit Agent credential is required; no environment fallback');
@@ -86,8 +133,10 @@ export async function prepareAgentConfig(repo: string, env: NodeJS.ProcessEnv = 
 }
 export async function prepareAgentConnection(connection: z.infer<typeof agentConnectionSchema>, apiKey: string,
     catalog?: readonly ModelCatalogProvider[], deps: Parameters<typeof readDeepSeekModelCapabilities>[2] = {}) {
-    const selected = agentConnection(connection, apiKey);
-    const modelCapabilities = await resolveModelCapabilities(selected.configuration, selected.apiKey, catalog, deps);
+    const selected = agentConnection({ ...connection,
+        ...(localAgentCredential(connection) ? { reasoning: connection.reasoning ?? 'max' } : {}) }, apiKey);
+    const native = await resolveModelCapabilities(selected.configuration, selected.apiKey, catalog, deps);
+    const modelCapabilities = localAgentCredential(selected.configuration) ? { ...native, transport: { ...localCodexGatewayTransport } } : native;
     return { ...selected, configuration: { ...selected.configuration, modelCapabilities } };
 }
 export async function resolveModelCapabilities(connection: { model: string; api: string; baseUrl: string }, apiKey: string,
@@ -97,6 +146,8 @@ export async function resolveModelCapabilities(connection: { model: string; api:
         const { createPiModelCatalog } = await import('../../packages/runtime-pi/src/catalog.ts');
         models = await (await createPiModelCatalog()).list();
     }
+    if (localAgentCredential(connection) && !models.some(provider => provider.models.some(model => model.id === connection.model && model.api === connection.api)))
+        return readLocalCodexModelCapabilities(connection);
     if (!models.some(p => p.models.some(m => m.id === connection.model && m.api === connection.api)) &&
         /^deepseek-/.test(connection.model) && ['openai-completions', 'openai-responses', 'anthropic-messages'].includes(connection.api)) {
         return readDeepSeekModelCapabilities(connection, apiKey, deps);

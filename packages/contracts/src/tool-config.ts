@@ -8,6 +8,9 @@ export const RunScopeSchema = z.object({ version: z.literal(2),
   allowedDocumentIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(64),
   allowedArtifactIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).max(128),
   allowedResourcePaths: z.array(z.string().min(1).max(4_096)).max(64),
+  invoiceWork: z.object({ workId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    attemptId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), phaseId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    itemId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict().readonly().optional(),
 }).strict();
 
 /** 业务工具的载荷保护与已有统计策略；Run 预算见 runtime-config.ts。 */

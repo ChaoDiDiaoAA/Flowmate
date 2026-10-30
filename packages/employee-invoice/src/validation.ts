@@ -28,7 +28,7 @@ export function evaluateCandidate(candidate: CandidateDraft,
 }
 
 export function validateHumanInvoiceCandidate(raw: StoredCandidateDraft, documentRef: DocumentRef,
-  documents: DocumentService): Result<{ checks: CheckResult[]; issues: InvoiceIssue[] }> {
+  documents: { readParsedForWorkspace(documentId: number): ReturnType<DocumentService['readParsedForWorkspace']> }): Result<{ checks: CheckResult[]; issues: InvoiceIssue[] }> {
   const parsed = StoredCandidateDraftSchema.safeParse(raw);
   if (!parsed.success) return fail(appError('input_invalid', 'input', '人工候选结构或来源标记无效。'));
   const loaded = documents.readParsedForWorkspace(documentRef.id);

@@ -29,7 +29,8 @@ export async function runEvaluationWorker(repo: string, sessionId: string,
   const reader = createInterface({ input, crlfDelay: Infinity });
   output.on('error', () => { writable = false; void service.shutdown(); });
   async function dispatch(command: EvaluationWorkerCommand) {
-    const result = command.type === 'export_evaluation' ? await service.export(command.input, command.connection)
+    const result = command.type === 'evaluation_workflow' ? await service.workflow(command.input, command.context)
+      : command.type === 'export_evaluation' ? await service.export(command.input, command.connection)
       : command.type === 'query_evaluation_catalog' ? service.catalog(command.input)
       : command.type === 'add_evaluation_feedback' ? service.addFeedback(command.input)
         : command.type === 'query_evaluation_feedback' ? service.feedback(command.input)

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { createServer } from 'node:http';
-import { openDatabase } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
 import { resolveProductPaths } from '@flowmate/shared';
 import { RuntimeToolPageSchema, RuntimeToolViewSchema, SessionMessageViewSchema, serializeDesktopPromptRequest } from '@flowmate/contracts';
 import type { InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, SessionMessagesPage, SessionMessageView, Result,
@@ -1477,7 +1477,7 @@ it('P9 T08 fix1 retries the identical fork after actual Host replacement against
   const seeded = opened.data.sessions.create({ nativeSessionId: header.id, title: 'Original replacement source', at: contextAt,
     nativeHistory: { storageVersion: 1, header, entries: [{ id: 'user', parentId: null, timestamp: contextAt, type: 'message',
       message: { role: 'user', content: 'Replacement source', timestamp: 1 } }], leafId: 'user', unusable: false } });
-  expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]); opened.data.close();
+  expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]); await opened.data.close();
   if (!seeded.ok) throw new Error(seeded.error.code);
   const client = new HostClient(); let first: ChildProcessWithoutNullStreams | null = null;
   const sent: unknown[] = [];

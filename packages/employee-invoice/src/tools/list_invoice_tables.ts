@@ -1,11 +1,10 @@
 import { invoiceToolSchemas, MAX_INVOICE_TABLE_PREVIEW_CHARS } from '@flowmate/contracts';
 import type { InvoiceToolInput, InvoiceToolOutput, ToolDefinition } from '@flowmate/contracts';
-import type { DocumentService } from '@flowmate/data';
 import { appError } from '@flowmate/contracts';
-import { unwrap } from './definition.ts';
+import { unwrap, type InvoiceDocumentReader } from './definition.ts';
 import { MAX_RESULT_BYTES, sourceFor } from './source.ts';
 
-export const listInvoiceTables = (documents: DocumentService) => ({
+export const listInvoiceTables = (documents: InvoiceDocumentReader) => ({
   name: 'list_invoice_tables',
   version: '1',
   label: 'List tables',
@@ -15,7 +14,7 @@ export const listInvoiceTables = (documents: DocumentService) => ({
   effect: 'READ',
   executionMode: 'parallel',
   execute: async (input, _call, context) => {
-    const loaded = unwrap(documents.readParsedForRun(input.documentId, context));
+    const loaded = unwrap(await documents.readParsedForRun(input.documentId, context));
     if (input.page !== null && !loaded.parsed.pages.some((page) => page.page === input.page)) {
       throw appError('tool_invalid_input', 'input', 'The requested page does not exist.');
     }

@@ -28,6 +28,6 @@ it('runs all four definition APIs through the actual Host without Runs, Inputs, 
   } finally { expect(await client.close()).toMatchObject({ok:true,data:{closed:true,stopped:true}}); }
   const db=new Database(join(root,'data/app.sqlite'),{readonly:true});
   try { for (const table of ['runs','session_inputs','tool_calls']) expect(db.query(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({count:0});
-    expect(db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({version:20}); }
+    expect(db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({version:21}); }
   finally { db.close(); }
 });

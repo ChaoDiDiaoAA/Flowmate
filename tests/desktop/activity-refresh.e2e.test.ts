@@ -2,6 +2,7 @@ import { _electron as electron } from 'playwright';
 import { expect, test } from '@playwright/test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { cleanupResources, closeDesktopFixture, mkdtemp, waitFor } from '../support/resources.ts';
 
 test.afterEach(cleanupResources);
@@ -70,6 +71,32 @@ test('P6 Refresh activity retries failed request and invoice lists without an ex
     await expect(page.getByTestId('activity-page').getByRole('alert')).toHaveCount(0);
     const after = await app.evaluate(() => ({ ...Reflect.get(globalThis, 'activityRefresh') }));
     expect(after.requests).toBe(before.requests + 1); expect(after.actions).toBe(before.actions + 1); expect(after.executions).toBe(0);
+    const traceId = '00000000-0000-4000-8000-000000000006', traceRoot = join(userData, 'evaluation-fixture/agent-eval/traces', traceId);
+    mkdirSync(traceRoot, { recursive: true });
+    writeFileSync(join(traceRoot, 'trace.json'), JSON.stringify({ id: traceId, revision: 1, source: { kind: 'product', productRoot: userData, runId: '101', sessionId: '12' }, entry: 'chats',
+      startedAt: '2026-10-28T00:00:00.000Z', endedAt: '2026-10-28T00:00:01.000Z', input: { prompt: 'Recovered saved request' }, output: 'Controlled captured answer',
+      status: 'completed', complete: true, gaps: [], configuration: {}, events: [], facts: {}, materials: [] }));
+    const isolatedTraceId = '00000000-0000-4000-8000-000000000007', isolatedRoot = join(userData, 'evaluation-fixture/agent-eval/traces', isolatedTraceId);
+    mkdirSync(isolatedRoot, { recursive: true });
+    writeFileSync(join(isolatedRoot, 'trace.json'), JSON.stringify({ ...JSON.parse(readFileSync(join(traceRoot, 'trace.json'), 'utf8')),
+      id: isolatedTraceId, source: { kind: 'evaluation', runId: '101', sessionId: '12', executionId: 'isolated-execution', trialId: 'isolated-trial' } }));
+    const foreignTraceId = '00000000-0000-4000-8000-000000000008', foreignRoot = join(userData, 'evaluation-fixture/agent-eval/traces', foreignTraceId);
+    mkdirSync(foreignRoot, { recursive: true });
+    writeFileSync(join(foreignRoot, 'trace.json'), JSON.stringify({ ...JSON.parse(readFileSync(join(traceRoot, 'trace.json'), 'utf8')),
+      id: foreignTraceId, source: { kind: 'product', productRoot: join(userData, 'isolated-host'), runId: '101', sessionId: '12' } }));
+    await page.getByLabel('Processing request', { exact: true }).selectOption('101');
+    await expect(page.getByRole('button', { name: 'Open evaluation trace', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Open evaluation trace', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Evaluation', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: `${traceId} · revision 1`, exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Open source Activity', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Activity', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Open evaluation trace', exact: true }).click();
+    await expect(page.getByRole('heading', { name: `${traceId} · revision 1`, exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Refresh traces', exact: true }).click();
+    await page.getByRole('button', { name: foreignTraceId, exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Open source Activity', exact: true })).toHaveCount(0);
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'activityRefresh').executions)).toBe(0);
   } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
   finally { await closeDesktopFixture(app, userData, failure); }
 });

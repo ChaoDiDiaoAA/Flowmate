@@ -1,7 +1,7 @@
 import { invoiceToolSchemas, MAX_INVOICE_DIFF_VALUE_CHARS } from '@flowmate/contracts';
-import type { CandidateRepository, InvoiceToolOutput, InvoiceToolInput, ToolDefinition } from '@flowmate/contracts';
+import type { InvoiceToolOutput, InvoiceToolInput, ToolDefinition } from '@flowmate/contracts';
 import { appError } from '@flowmate/contracts';
-import { unwrap } from './definition.ts';
+import { unwrap, type InvoiceCandidateRepository } from './definition.ts';
 import { MAX_RESULT_BYTES } from './source.ts';
 
 function compareCodePoints(left: string, right: string): number {
@@ -42,7 +42,7 @@ function compareDrafts(left: unknown, right: unknown): InvoiceToolOutput<'compar
   return differences;
 }
 
-export const compareInvoiceCandidates = (candidates: CandidateRepository) => ({
+export const compareInvoiceCandidates = (candidates: InvoiceCandidateRepository) => ({
   name: 'compare_invoice_candidates',
   version: '1',
   label: 'Compare candidates',
@@ -52,9 +52,10 @@ export const compareInvoiceCandidates = (candidates: CandidateRepository) => ({
   effect: 'READ',
   executionMode: 'parallel',
   execute: async (input, _call, context) => {
-    const left = unwrap(candidates.readForRun({ runId: context.runId, candidateId: input.leftCandidateId }));
+    const invoiceWork = context.scope.invoiceWork ? { invoiceWork: context.scope.invoiceWork } : {};
+    const left = unwrap(await candidates.readForRun({ runId: context.runId, candidateId: input.leftCandidateId, ...invoiceWork }));
     const right = input.rightCandidateId === input.leftCandidateId ? left
-      : unwrap(candidates.readForRun({ runId: context.runId, candidateId: input.rightCandidateId }));
+      : unwrap(await candidates.readForRun({ runId: context.runId, candidateId: input.rightCandidateId, ...invoiceWork }));
     let differences: InvoiceToolOutput<'compare_invoice_candidates'>['differences'];
     try { differences = input.leftCandidateId === input.rightCandidateId ? [] : compareDrafts(left.candidate, right.candidate); }
     catch { throw appError('tool_result_too_large', 'runtime', 'A candidate difference exceeds the result limit.'); }

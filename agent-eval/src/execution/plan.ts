@@ -9,10 +9,12 @@ import { discoverDatasets, selectCases, assertSemanticSelection, judgeSelection,
   REPO_ROOT, type LocalDataset } from '../dataset-loader/local.ts';
 import { compileEvaluatorPlan } from '../scoring/evaluator-plan.ts';
 import { changedSourcePaths, codeIdentity, type EvaluationRuntime } from './source.ts';
-import { supplementalDatasetIds } from '../dataset-loader/declarations.ts';
+import { loadPublishedBenchmark } from '../curation/publication.ts';
+import { EvaluationAgentOverridesSchema } from '../../../packages/contracts/src/runtime-evaluation.ts';
 
 export const evaluationRunDefaults = { timeoutMs: 120_000, stopGraceMs: 5000, environment: 'development' } as const;
 export const runConfigSchema = z.object({
+  ...EvaluationAgentOverridesSchema.shape,
   model: z.string().min(1).optional(), baseUrl: z.string().url().optional(), api: agentApiSchema.optional(),
   repeat: z.number().int().min(1).max(20).optional(),
   timeoutMs: z.number().int().min(100).max(120000).optional(), stopGraceMs: z.number().int().min(100).max(10000).optional(),
@@ -28,10 +30,10 @@ export function parseRunConfig(value: unknown) {
   return parsed.data;
 }
 export function findDataset(repo: string, options: { dataset?: string; version?: number } = {}, resourceRepository = repo) {
-  const supplemental = supplementalDatasetIds.includes(options.dataset ?? '');
-  const directory = join(repo, 'agent-eval/src/datasets', ...(supplemental ? ['badcase'] : []));
-  const matches = discoverDatasets(directory, repo, resourceRepository).filter(d => d.manifest.id === (options.dataset ?? 'flowmate-agent-v1'));
-  if (supplemental && !matches.length) throw Error('暂无可运行成员：' + options.dataset);
+  const directory = join(repo, 'agent-eval/src/datasets');
+  const id = options.dataset ?? 'flowmate-agent-v1';
+  const published = ['flowmate-agent-v1', 'flowmate-research-v1'].includes(id) ? [] : loadPublishedBenchmark(repo, id, options.version);
+  const matches = published.length ? published : discoverDatasets(directory, repo, resourceRepository).filter(d => d.manifest.id === id);
   if (matches.length === 0)
     throw Error(`Dataset ${options.dataset ?? 'flowmate-agent-v1'} 不存在：尚未制作，等待评测工程验收；真实入口与必要采证接通、工程验证通过后，依据 01/02 制作。未调用模型、未创建执行记录。`);
   if (matches.length !== 1) throw Error('Select exactly one local Dataset');

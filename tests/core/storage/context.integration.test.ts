@@ -348,21 +348,21 @@ for (const fault of ['owner-run', 'owner-session', 'owner-job', 'missing', 'corr
   expect(() => db.transaction(() => createNativeOriginReader(db).tool(f.session.sessionId,'inherited-call',true)).deferred())
     .toThrow('context_binding_unknown');
 });
-it('P9 T03 shares origin verification across five read paths and keeps target primary facts', () => {
+it('P9 T03 shares origin verification across five read paths and keeps target primary facts', async () => {
   const f=fixture(),{saved,toolId}=p9ToolHistory(f),target=frozenFork(f,f.session.sessionId,'five',['p8-user','native-call','native-result']),local=p9TargetInput(f,target);
   const binding:RequestContextBinding={...f.binding(saved.inputId,saved.snapshot.id),sessionId:target.sessionId,nativeSessionId:target.nativeSessionId,
     runId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id,includedBindings:[...f.binding(saved.inputId,saved.snapshot.id).includedBindings,
       {nativeEntryId:'target-user',originRunId:local.runId,inputId:local.inputId,snapshotId:local.snapshot.id}],
     includedToolResults:[{nativeToolCallId:'inherited-call',toolCallId:toolId,originRunId:f.runId,context:{snapshotId:saved.snapshot.id,requestSequence:1}}]};
   const original=['runs','session_inputs','context_snapshots','tool_calls'].map(table=>f.store.db.query(`SELECT * FROM ${table} WHERE ${table==='runs'?'id':'run_id'}=?`).all(f.runId));
-  const service=new SessionService(f.store.sessions,{projectSessionMessages,inspect:()=>({availability:'missing'}),
+  const service=new SessionService({projectSessionMessages,inspect:()=>({availability:'missing'}),
     createSession(){throw new Error('No native create during projection');},async prepare(){throw new Error('No model prepare during projection');},
     async close(){return {stopped:true,closed:true,errors:[]};},async releaseSession(){return {stopped:true,closed:true,errors:[]};}},
-    ()=>({active:null,blocked:false,error:null}),()=>at,f.store.runs, f.store.memory);
+    ()=>({active:null,blocked:false,error:null}),()=>at,f.store);
   readRunContextOwner(f.store.db,f.store.db.query('SELECT * FROM runs WHERE id=?').get(f.runId) as Parameters<typeof readRunContextOwner>[1]);
   expect(f.store.runs.get(f.runId).ok).toBe(true);
   expect(f.store.runs.get(local.runId).ok).toBe(true);
-  const projected=need(service.listMessages({sessionId:target.sessionId,limit:50}));
+  const projected=need(await service.listMessages({sessionId:target.sessionId,limit:50}));
   expect(projected.items.find(item=>item.entryId==='p8-user')).toMatchObject({runId:f.runId,role:'user'});
   expect(need(f.store.sessions.loadHistoryForContext(target.sessionId)).seed.inputs).toEqual(binding.includedBindings);
   expect(f.store.db.query("SELECT session_id,sequence,run_id FROM session_native_entries WHERE entry_id='native-call' ORDER BY session_id").all())
@@ -377,7 +377,7 @@ it('P9 T03 shares origin verification across five read paths and keeps target pr
   expect(['runs','session_inputs','context_snapshots','tool_calls'].map(table=>f.store.db.query(`SELECT * FROM ${table} WHERE ${table==='runs'?'id':'run_id'}=?`).all(f.runId))).toEqual(original);
   const raw=f.store.db.query('SELECT entry_json FROM session_native_entries WHERE session_id=? AND entry_id=?').get(target.sessionId,'p8-user') as {entry_json:string};
   f.store.db.query('UPDATE session_native_entries SET entry_json=? WHERE session_id=? AND entry_id=?').run(raw.entry_json.replace('Explain this input.','forged'),target.sessionId,'p8-user');
-  for(const result of [f.store.sessions.loadHistoryForContext(target.sessionId),service.listMessages({sessionId:target.sessionId,limit:1}),f.store.sessions.readHistoryForDisplay(target.sessionId),
+  for(const result of [f.store.sessions.loadHistoryForContext(target.sessionId),await service.listMessages({sessionId:target.sessionId,limit:1}),f.store.sessions.readHistoryForDisplay(target.sessionId),
     f.store.context.resolveToolResult({sessionId:target.sessionId,nativeToolCallId:'inherited-call'}),
     f.store.context.bindRequest({binding,api:'openai-responses',transport:'observed-fetch',at}),
     f.store.context.listContextRequests({sessionId:target.sessionId,runId:local.runId})])
@@ -721,7 +721,7 @@ describe('P8 Context storage', () => {
     const before = old.query('SELECT content_json FROM session_inputs ORDER BY id').all();
     old.close();
     const migrated = need(openTestDatabase(productPaths));
-    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(migrated.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(migrated.db.query('SELECT content_json FROM session_inputs ORDER BY id').all()).toEqual(before);
     expect(migrated.db.query('SELECT current_context_snapshot_id,context_observations_json FROM runs').all())
       .toEqual([{ current_context_snapshot_id: null, context_observations_json: null }]);
@@ -1214,7 +1214,7 @@ describe('P8 Context storage', () => {
   });
 });
 
-it('P9 T07 preserves genuinely absent historical markers and journal bytes after reopen', () => {
+it('P9 T07 preserves genuinely absent historical markers and journal bytes after reopen', async () => {
   // Historical P8 storage fixture: this Run is born without a P9 marker. It is
   // not claimed as an Application-generated request or an image authorization.
   const f = fixture(), saved = f.append(); f.consume(saved.inputId, saved.content.text);
@@ -1224,7 +1224,7 @@ it('P9 T07 preserves genuinely absent historical markers and journal bytes after
     sdkPayload: null, transport: 'observed-fetch', attempts: [] }] }, null, 2);
   f.store.db.query('UPDATE runs SET context_observations_json=? WHERE id=?').run(raw, f.runId); finish(f);
   const before = f.store.db.query('SELECT config_json,context_observations_json FROM runs WHERE id=?').get(f.runId);
-  f.store.close();
+  await f.store.close();
   const reopened = need(openTestDatabase(f.productPaths));
   const page = need(reopened.context.listContextRequests({ sessionId: f.session.sessionId, runId: f.runId }));
   expect(page.items[0]!.binding.includedNativeContexts).toBeNull();

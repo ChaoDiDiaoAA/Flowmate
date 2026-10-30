@@ -26,7 +26,8 @@ describe('P9 T01', () => {
     const session = { sessionId: 5, nativeSessionId: 'native', title: 'Branch', status: 'active', createdAt: at, updatedAt: at,
       availability: 'ready', historyState: 'recoverable', activeRunId: null, modelUseBlocked: false, hasBusinessHistory: false, deletePending: false };
     const value = { ok: true, data: { session, leafId: 'user', entryCount: 1 } };
-    expect(schema('BranchSessionResponseSchema').parse(value)).toEqual(value);
+    expect(schema('BranchSessionResponseSchema').parse(value)).toEqual({ ...value,
+      data: { ...value.data, session: { ...session, runtimeKind: 'agent_session' } } });
     for (const bad of [{ ...value, sdk: {} }, { ...value, data: { ...value.data, receipt: commit } },
       { ...value, data: { ...value.data, entryCount: Number.MAX_SAFE_INTEGER + 1 } },
       { ...value, data: { ...value.data, session: { ...session, cwd: 'private' } } },
@@ -64,8 +65,9 @@ describe('P9 T01', () => {
       createdAt: at, updatedAt: at, availability: 'ready', historyState: 'recoverable', activeRunId: null,
       modelUseBlocked: false, hasBusinessHistory: false, deletePending: false },
       commit: { commitRevision: 3, entryCount: 2, leafId: 'later-entry' }, sourceSessionId: 4, selectedEntryId: 'user' };
-    expect(schema('ForkSessionResultSchema').parse(result)).toEqual(result);
-    expect(schema('ForkSessionResponseSchema').parse({ ok: true, data: result })).toEqual({ ok: true, data: result });
+    const expected = { ...result, session: { ...result.session, runtimeKind: 'agent_session' } };
+    expect(schema('ForkSessionResultSchema').parse(result)).toEqual(expected);
+    expect(schema('ForkSessionResponseSchema').parse({ ok: true, data: result })).toEqual({ ok: true, data: expected });
   });
 
   it('accepts a fork target with inherited entries and a later empty current path', () => {
@@ -73,8 +75,9 @@ describe('P9 T01', () => {
       createdAt: at, updatedAt: at, availability: 'ready', historyState: 'recoverable', activeRunId: null,
       modelUseBlocked: false, hasBusinessHistory: false, deletePending: false },
       commit: { commitRevision: 4, entryCount: 2, leafId: null }, sourceSessionId: 4, selectedEntryId: 'user' };
-    expect(schema('ForkSessionResultSchema').parse(result)).toEqual(result);
-    expect(schema('ForkSessionResponseSchema').parse({ ok: true, data: result })).toEqual({ ok: true, data: result });
+    const expected = { ...result, session: { ...result.session, runtimeKind: 'agent_session' } };
+    expect(schema('ForkSessionResultSchema').parse(result)).toEqual(expected);
+    expect(schema('ForkSessionResponseSchema').parse({ ok: true, data: result })).toEqual({ ok: true, data: expected });
   });
 
   it('retains fork identity, strict public fields, safe errors and complete response budgets', () => {

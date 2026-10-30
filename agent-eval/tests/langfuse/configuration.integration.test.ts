@@ -6,20 +6,28 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { exportReport } from '../../src/langfuse/export.ts';
 import { reportFixture } from '../support/fixtures.ts';
+import { observationRowsFromOtlp } from './otlp-fixture.ts';
 
 test('Langfuse env reaches the real SDK against a local stub and resends without changing scores', async () => {
     const root=mkdtempSync(join(tmpdir(),'eval-lf-config-')), requests:Array<{url:string;auth:string|null;ids:string[]}>=[];
-    let partial=true; const projectAuth: Array<string | null> = [];
+    let partial=true; const projectAuth: Array<string | null> = [], observations: any[] = [], scores: any[] = [];
     const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
         if (new URL(request.url).pathname.endsWith('/projects')) {
             projectAuth.push(request.headers.get('authorization'));
             return Response.json({ data: [{ id: 'synthetic-project', name: 'Synthetic',
                 organization: { id: 'synthetic-org', name: 'Synthetic' }, metadata: {} }] });
         }
-        const body=await request.json() as {batch:Array<{id:string}>};
-        requests.push({url:request.url,auth:request.headers.get('authorization'),ids:body.batch.map(event=>event.id)});
-        return Response.json({successes:body.batch.filter((_,i)=>!partial||i===0).map(event=>({id:event.id,status:201})),
-            errors:partial?body.batch.slice(1).map(event=>({id:event.id,status:500,message:'synthetic partial'})):[]});
+        const pathname = new URL(request.url).pathname;
+        if (pathname.endsWith('/v2/observations')) return Response.json({ data: observations, meta: {} });
+        if (pathname.endsWith('/v3/scores')) return Response.json({ data: partial ? [] : scores, meta: {} });
+        if (pathname.endsWith('/scores') && request.method === 'POST') {
+            const score = await request.json() as any; scores.push({ ...score, subject: { kind: 'trace', id: score.traceId } });
+            return Response.json({ id: score.id });
+        }
+        if (!pathname.endsWith('/otel/v1/traces')) throw Error('Unexpected legacy endpoint');
+        const body = await request.json() as any, rows = observationRowsFromOtlp(body), ids = rows.map(row => row.metadata.localObservationId);
+        observations.push(...rows);
+        requests.push({url:request.url,auth:request.headers.get('authorization'),ids}); return Response.json({});
     }});
     const oldPublic=process.env.LANGFUSE_PUBLIC_KEY,oldSecret=process.env.LANGFUSE_SECRET_KEY;
     try {
@@ -30,10 +38,9 @@ test('Langfuse env reaches the real SDK against a local stub and resends without
         saveReport(file,report);
         await exportReport(report,file,undefined,root);expect(report.export,JSON.stringify(report.export)).toMatchObject({status:'partial'});
         partial=false;await main(['resend','--execution-id',report.executionId],root);expect(readReport(file).export.status).toBe('complete');
-        expect(JSON.stringify(report.trials)).toBe(scores);expect(requests).toHaveLength(2);
+        expect(JSON.stringify(report.trials)).toBe(scores);expect(requests).toHaveLength(1);
         expect(requests[0]!.auth).toBe('Basic '+Buffer.from('test-lf-public:test-lf-secret').toString('base64'));
         expect(projectAuth).toEqual([requests[0]!.auth, requests[0]!.auth]);
-        expect(requests[1]!.ids).toEqual(requests[0]!.ids.slice(1));
         expect(report.export.url).toBe(`http://127.0.0.1:${server.port}`);
         expect(report.export.target).toEqual({ baseUrl: `http://127.0.0.1:${server.port}`, projectId: 'synthetic-project' });
         expect(JSON.stringify(report)).not.toContain('test-lf-secret');

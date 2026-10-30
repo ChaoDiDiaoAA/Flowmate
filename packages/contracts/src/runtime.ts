@@ -2,8 +2,14 @@ import { z } from 'zod';
 import { WorkspaceInputSchema } from './workspace.ts';
 import { RUNTIME_CONFIG } from './runtime-config.ts';
 import type { ResearchQueryApi } from './research.ts';
+import type { DurableRunScope, DurableSubagentRunScope } from './durable-run.ts';
+import type { PersonalAgentApi, InvoiceWorksApi, PersonalTasksApi } from './personal-agent.ts';
 
 export type DbId = number;
+
+export const SessionRuntimeKindSchema = z.enum(['agent_session', 'durable']);
+export type SessionRuntimeKind = z.infer<typeof SessionRuntimeKindSchema>;
+export const RunStatusSchema = z.enum(['created', 'running', 'completed', 'failed', 'cancelled']);
 
 export const RuntimeBudgetOverridesSchema = z.object({
   maxToolCalls: z.number().int().min(RUNTIME_CONFIG.ranges.maxToolCalls.min).max(RUNTIME_CONFIG.ranges.maxToolCalls.max).optional(),
@@ -35,7 +41,7 @@ export type ProductPaths = {
   runtimeDir: string;
 };
 
-export type RunStatus = 'created' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = z.infer<typeof RunStatusSchema>;
 
 export type ErrorCategory =
   | 'provider'
@@ -274,9 +280,8 @@ export type NativeSessionHistory = {
   unusable: boolean;
 };
 
-export type SessionSnapshot = {
+type SessionSnapshotFacts = {
   sessionId: DbId;
-  nativeSessionId: string;
   title: string;
   status: SessionStatus;
   createdAt: string;
@@ -288,6 +293,9 @@ export type SessionSnapshot = {
   hasBusinessHistory: boolean;
   deletePending: boolean;
 };
+export type AgentSessionSnapshot = SessionSnapshotFacts & { runtimeKind?: 'agent_session'; nativeSessionId: string };
+export type DurableSessionSnapshot = SessionSnapshotFacts & { runtimeKind: 'durable'; nativeSessionId: null };
+export type SessionSnapshot = AgentSessionSnapshot | DurableSessionSnapshot;
 
 export type MessageTextBlock = { type: 'text'; text: string };
 export type MessageToolCallBlock = { type: 'toolCall'; id: string; name: string };
@@ -391,13 +399,19 @@ export function normalizeSessionMessagesRequest(raw: unknown): Result<Normalized
   return parsed.success ? { ok: true, data: parsed.data } : { ok: false,
     error: { code: 'input_invalid', category: 'input', message: 'Conversation message query is invalid.', retryable: false } };
 }
-export const SessionSnapshotSchema: z.ZodType<SessionSnapshot> = z.object({
-  sessionId: messageDbIdSchema, nativeSessionId: messageIdSchema, title: z.string(),
+const sessionSnapshotShape = {
+  sessionId: messageDbIdSchema, title: z.string(),
   status: z.enum(['active', 'archived']), createdAt: z.string().datetime({ offset: true }), updatedAt: z.string().datetime({ offset: true }),
   availability: z.enum(['ready', 'busy', 'unusable', 'history-unavailable', 'archived']),
   historyState: z.enum(['recoverable', 'legacy-read-only', 'invalid']), activeRunId: messageDbIdSchema.nullable(),
   modelUseBlocked: z.boolean(), hasBusinessHistory: z.boolean(), deletePending: z.boolean(),
-}).strict();
+};
+export const AgentSessionSnapshotSchema: z.ZodType<AgentSessionSnapshot> =
+  z.object({ ...sessionSnapshotShape, runtimeKind: z.literal('agent_session').default('agent_session'), nativeSessionId: messageIdSchema }).strict();
+export const SessionSnapshotSchema: z.ZodType<SessionSnapshot> = z.union([
+  AgentSessionSnapshotSchema,
+  z.object({ ...sessionSnapshotShape, runtimeKind: z.literal('durable'), nativeSessionId: z.null() }).strict(),
+]);
 export const SessionMessagesPageSchema: z.ZodType<SessionMessagesPage> = z.object({
   session: SessionSnapshotSchema, leafId: messageIdSchema.nullable(), entryCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   items: z.array(SessionMessageViewSchema).max(100), nextBeforeEntryId: messageCursorSchema.nullable(),
@@ -427,7 +441,7 @@ export type RenameSessionRequest = { sessionId: DbId; title: string };
 export type SessionCursor = { updatedAt: string; sessionId: DbId };
 export type ListSessionsRequest = { limit?: number; before?: SessionCursor };
 export type NormalizedListSessionsRequest = { limit: number; before?: SessionCursor };
-export type SessionPage = { items: SessionSnapshot[]; next: SessionCursor | null };
+export type SessionPage = { items: AgentSessionSnapshot[]; next: SessionCursor | null };
 
 export type AgentRunRequest = {
   research?: import('./research.ts').ResearchIntent;
@@ -470,7 +484,7 @@ export type AgentRunEvent = {
   | { type: 'run_finished'; result: Result<AgentOutcome> }
 );
 
-export type AgentControl = { onEvent?: (event: AgentRunEvent) => void;
+export type AgentControl = { signal?: AbortSignal; onEvent?: (event: AgentRunEvent) => void;
   /** Original normalized Desktop request facts captured by the trusted Host. */
   desktopRequestIdentity?: string };
 
@@ -506,17 +520,27 @@ export type ProviderRunSnapshot = RunSnapshotBase & {
   scope: null;
 };
 
-export type AgentRunSnapshot = RunSnapshotBase & {
+export type AgentSessionRunSnapshot = RunSnapshotBase & {
   kind: 'agent';
   jobId: DbId | null;
   sessionId: DbId;
   scope: ChatScope | import('./tools.ts').RunScope | import('./tools.ts').LegacyRunScope;
 };
 
-export type SubagentRunSnapshot = Omit<AgentRunSnapshot, 'kind' | 'scope'> & {
+export type DurableAgentRunSnapshot = RunSnapshotBase & {
+  kind: 'agent'; runtimeKind: 'durable'; jobId: null; sessionId: DbId; scope: DurableRunScope;
+};
+export type AgentRunSnapshot = AgentSessionRunSnapshot | DurableAgentRunSnapshot;
+
+export type AgentSessionSubagentRunSnapshot = Omit<AgentSessionRunSnapshot, 'kind' | 'scope'> & {
   kind: 'subagent'; scope: import('./tools.ts').RunScope;
   parentRunId: DbId; originToolCallId: DbId; pluginAgentId: string;
 };
+export type DurableSubagentRunSnapshot = RunSnapshotBase & {
+  kind: 'subagent'; runtimeKind: 'durable'; sessionId: DbId; jobId: null; scope: DurableSubagentRunScope;
+  parentRunId: DbId; originToolCallId: DbId;
+};
+export type SubagentRunSnapshot = AgentSessionSubagentRunSnapshot | DurableSubagentRunSnapshot;
 export type RunSnapshot = ProviderRunSnapshot | AgentRunSnapshot | SubagentRunSnapshot;
 
 export type CloseReport = {
@@ -526,6 +550,9 @@ export type CloseReport = {
 };
 
 export interface Application extends ResearchQueryApi {
+  personalAgent: PersonalAgentApi;
+  invoiceWorks: InvoiceWorksApi;
+  personalTasks: PersonalTasksApi;
   querySessionExtensions(input: import('./extensions.ts').SessionExtensionQuery): Promise<Result<import('./extensions.ts').SessionExtensionView>>;
   queryRunExtensions(input: import('./extensions.ts').RunExtensionQuery): Promise<Result<import('./extensions.ts').RunExtensionView>>;
   executeExtensionCommand(input: import('./extensions.ts').ExtensionCommandRequest): Promise<Result<import('./extensions.ts').ExtensionCommandReceipt>>;
@@ -539,7 +566,7 @@ export interface Application extends ResearchQueryApi {
   queryRunResources(input: import('./resources.ts').RunResourceQuery): Promise<Result<import('./resources.ts').RunResourceView>>;
   readRunResourceFile(input: import('./resources.ts').RunResourceFileRequest): Promise<Result<import('./resources.ts').ResourceFilePage>>;
   /** Host configuration validation only; never exposed to Renderer/IPC. */
-  validateResourceSelection(selection: import('./resources.ts').ResourceSelection, extensions?: import('./extensions.ts').ExtensionSelection): Result<void>;
+  validateResourceSelection(selection: import('./resources.ts').ResourceSelection, extensions?: import('./extensions.ts').ExtensionSelection): Promise<Result<void>>;
   callProvider(
     request: ProviderRequest,
     control?: ProviderControl,
@@ -556,12 +583,12 @@ export interface Application extends ResearchQueryApi {
   listContextSnapshots(input: import('./context.ts').ContextSnapshotsRequest): Promise<Result<import('./context.ts').ContextSnapshotsPage>>;
   queryContextSnapshot(input: import('./context.ts').ContextSnapshotRequest): Promise<Result<import('./context.ts').ContextSnapshotDetail>>;
   listContextRequests(input: import('./context.ts').ContextRequestsRequest): Promise<Result<import('./context.ts').ContextRequestsPage>>;
-  createSession(request?: CreateSessionRequest): Promise<Result<SessionSnapshot>>;
+  createSession(request?: CreateSessionRequest): Promise<Result<AgentSessionSnapshot>>;
   queryNativeTools(): Promise<Result<readonly import('./tools.ts').NativeToolAvailability[]>>;
   renameSession(request: RenameSessionRequest): Promise<Result<SessionSnapshot>>;
   deleteSession(sessionId: DbId): Promise<Result<DeleteSessionResult>>;
   listSessions(request?: ListSessionsRequest): Promise<Result<SessionPage>>;
-  querySession(sessionId: DbId): Promise<Result<SessionSnapshot>>;
+  querySession(sessionId: DbId): Promise<Result<AgentSessionSnapshot>>;
   listSessionRuns(request: SessionRunsRequest): Promise<Result<SessionRunsPage>>;
   listSessionMessages(request: SessionMessagesRequest): Promise<Result<SessionMessagesPage>>;
   queryPromptTrace(runId: DbId, callSequence?: number): Promise<Result<import('./diagnostics.ts').PromptTraceResult>>;
@@ -611,7 +638,7 @@ export interface Application extends ResearchQueryApi {
   listSubagents(request: import('./subagents.ts').ListSubagentsRequest): Promise<Result<import('./subagents.ts').SubagentPage>>;
   querySubagent(request: import('./subagents.ts').QuerySubagentRequest): Promise<Result<import('./subagents.ts').SubagentDetail>>;
   queryRuntimeState(): Promise<Result<RuntimeState>>;
-  compactSession(request: import('./compaction.ts').SessionCompactionRequest): Promise<Result<import('./compaction.ts').CompactionAccepted>>;
+  compactSession(request: import('./compaction.ts').SessionCompactionRequest, control?: { signal?: AbortSignal }): Promise<Result<import('./compaction.ts').CompactionAccepted>>;
   querySessionCompaction(request: import('./compaction.ts').SessionCompactionQuery): Promise<Result<import('./compaction.ts').SessionCompactionSnapshot>>;
   cancelSessionCompaction(request: import('./compaction.ts').SessionCompactionCancel): Promise<Result<{ sessionId: DbId; operationId: string; accepted: boolean }>>;
   close(): Promise<Result<CloseReport>>;

@@ -6,9 +6,9 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'bun:test';
 import { PiProviderAdapter } from '../../../packages/runtime-pi/src/provider.ts';
 import type { NativeOutcome, PreparedProvider, ProviderPort, SafeConfigSnapshot } from '../../../packages/contracts/src/ports.ts';
-import type { RunRepository } from '../../../packages/core/src/storage/repositories.ts';
+import { appError, fail } from '@flowmate/contracts';
 import type { ProviderConfig, ProviderRequest } from '../../../packages/contracts/src/runtime.ts';
-import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
+import { RuntimeService, type RuntimeDependencies } from '../../../packages/core/src/runtime/service.ts';
 import { makeApplication } from '../../../packages/core/src/application.ts';
 
 const config: ProviderConfig = {
@@ -84,12 +84,11 @@ class ControlledProvider implements ProviderPort {
   }
 }
 
-function serviceFor(provider: ProviderPort, runsOverride?: RunRepository, monotonicNow = () => performance.now()) {
+function serviceFor(provider: ProviderPort, monotonicNow = () => performance.now()) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-'));
   const db = openDatabase(paths(root));
   if (!db.ok) throw new Error(db.error.message);
-  const service = new RuntimeService({ memory: db.data.memory,
-    runs: runsOverride ?? db.data.runs,
+  const service = new RuntimeService({ database: db.data,
     provider,
     log: { write: () => undefined, close: async () => undefined },
     now: () => '2026-09-21T00:00:00.000Z',
@@ -137,7 +136,7 @@ describe('RuntimeService lifecycle', () => {
       expect(queried.ok).toBe(true);
       if (queried.ok) expect(queried.data.cancelRequestedAt).not.toBeNull();
     }
-    db.close();
+    await db.close();
   });
 
   it('[F-db-create-failure] does not dispatch provider work when the initial Run insert fails', async () => {
@@ -146,10 +145,7 @@ describe('RuntimeService lifecycle', () => {
     expect(db.ok).toBe(true);
     if (!db.ok) return;
     let prepared = false;
-    const runs: RunRepository = {
-      ...db.data.runs,
-      create: () => ({ ok: false, error: { code: 'storage_write_failed', category: 'storage', message: '模拟创建失败。', retryable: true } }),
-    };
+    db.data.db.exec("CREATE TRIGGER reject_provider_insert BEFORE INSERT ON runs WHEN NEW.kind='provider' BEGIN SELECT RAISE(ABORT,'controlled Provider insert failure'); END;");
     const provider: ProviderPort = {
       async prepare() {
         prepared = true;
@@ -158,7 +154,7 @@ describe('RuntimeService lifecycle', () => {
       async close() { return { stopped: true, closed: true, errors: [] as const }; },
     };
     const service = new RuntimeService({
-      memory: db.data.memory, runs,
+      database: db.data,
       provider,
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
@@ -170,7 +166,7 @@ describe('RuntimeService lifecycle', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe('storage_write_failed');
     expect(prepared).toBe(false);
-    db.data.close();
+    await db.data.close();
   });
 
   it('[F-timeout-prepare] applies the total deadline while Provider preparation is still pending', async () => {
@@ -186,7 +182,7 @@ describe('RuntimeService lifecycle', () => {
       async close() { return { stopped: !preparing, closed: !preparing, errors: preparing ? [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: 'Provider 初始化仍在收口。', retryable: true }] : [] }; },
     };
     // Pin this scenario to pending preparation; the separate total-deadline cases cover time spent in storage.
-    const { db, service } = serviceFor(provider, undefined, () => prepareStartedAt === null ? 0 : performance.now() - prepareStartedAt);
+    const { db, service } = serviceFor(provider, () => prepareStartedAt === null ? 0 : performance.now() - prepareStartedAt);
 
     const result = await service.callProvider({ ...request, timeoutMs: 20, stopGraceMs: 10 });
 
@@ -200,7 +196,7 @@ describe('RuntimeService lifecycle', () => {
     expect(aborted).toBe(true);
     preparing = false;
     expect((await service.close()).closed).toBe(true);
-    db.close();
+    await db.close();
   });
 
   it('[F-cancel-prepare-settle] waits for preparation to stop within grace without executing the cancelled Run', async () => {
@@ -221,7 +217,7 @@ describe('RuntimeService lifecycle', () => {
     };
     const { db, service } = serviceFor(provider);
     const app = makeApplication(service, db.runs, async () => {
-      db.close();
+      await db.close();
       return { stopped: true, closed: true, errors: [] };
     });
     let runId!: number;
@@ -263,7 +259,7 @@ describe('RuntimeService lifecycle', () => {
       expect(result.data.status).toBe('completed');
       expect(db.runs.get(result.data.runId).ok).toBe(true);
     }
-    db.close();
+    await db.close();
   });
 
   it('[F-config-new-run] takes a new configuration snapshot for each new Run', async () => {
@@ -283,8 +279,7 @@ describe('RuntimeService lifecycle', () => {
       },
       async close() { return { stopped: true, closed: true, errors: [] as const }; },
     };
-    const service = new RuntimeService({ memory: db.data.memory,
-      runs: db.data.runs,
+    const service = new RuntimeService({ database: db.data,
       provider,
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
@@ -307,7 +302,7 @@ describe('RuntimeService lifecycle', () => {
         expect(secondSnapshot.data.config).toMatchObject({ name: 'fixture-next', revision: 2, requestedModel: { provider: 'deepseek', model: 'next-model' } });
       }
     }
-    db.data.close();
+    await db.data.close();
   });
 
   it('[F-cancel-race] turns an in-flight caller abort into cancelled only after provider stop', async () => {
@@ -329,7 +324,7 @@ describe('RuntimeService lifecycle', () => {
       expect(queried.ok).toBe(true);
       if (queried.ok) expect(queried.data.cancelRequestedAt).not.toBeNull();
     }
-    db.close();
+    await db.close();
   });
 
   it('[V01/V02] keeps an accepted stop and read-only feedback separate from actual stopping and commit', async () => {
@@ -351,7 +346,7 @@ describe('RuntimeService lifecycle', () => {
     };
     const { db, service } = serviceFor(provider);
     const app = makeApplication(service, db.runs, async () => {
-      db.close();
+      await db.close();
       return { stopped: true, closed: true, errors: [] };
     });
     let runId!: number;
@@ -406,7 +401,7 @@ describe('RuntimeService lifecycle', () => {
       expect(result.data.status).toBe('cancelled');
       expect(result.data.error?.code).toBe('provider_cancelled');
     }
-    db.close();
+    await db.close();
   });
 
   it('[F-timeout-cancel-order] keeps a deadline terminal when a later cancel arrives', async () => {
@@ -423,7 +418,7 @@ describe('RuntimeService lifecycle', () => {
       expect(snapshot.ok).toBe(true);
       if (snapshot.ok) expect(snapshot.data.cancelRequestedAt).toBeNull();
     }
-    db.close();
+    await db.close();
   });
 
   it('[F-cancel-complete-race] does not record a cancel after completed commit', async () => {
@@ -439,7 +434,7 @@ describe('RuntimeService lifecycle', () => {
       expect(snapshot.ok).toBe(true);
       if (snapshot.ok) expect(snapshot.data.cancelRequestedAt).toBeNull();
     }
-    db.close();
+    await db.close();
   });
 
   it('rejects a second call while the first provider run is active', async () => {
@@ -452,7 +447,7 @@ describe('RuntimeService lifecycle', () => {
     if (!second.ok) expect(second.error.code).toBe('runtime_busy');
     controller.abort();
     await pending;
-    db.close();
+    await db.close();
   });
 
   it('maps a deadline stop to failed/provider_timeout and preserves the stop observation', async () => {
@@ -467,7 +462,7 @@ describe('RuntimeService lifecycle', () => {
     }
     expect(observations).toContain('stop_requested');
     expect(observations).toContain('stopped');
-    db.close();
+    await db.close();
   });
 
   it('[F-stop-unconfirmed] does not reuse the instance when the provider ignores the stop signal', async () => {
@@ -485,7 +480,7 @@ describe('RuntimeService lifecycle', () => {
     if (!retry.ok) expect(retry.error.code).toBe('runtime_unusable');
     const close = await service.close();
     expect(close.closed).toBe(false);
-    db.close();
+    await db.close();
   });
 
   it('[F-cancel-unconfirmed] persists an unconfirmed user cancellation as failed with no stopped timestamp', async () => {
@@ -511,7 +506,7 @@ describe('RuntimeService lifecycle', () => {
       }
     }
     expect((await service.callProvider(request)).ok).toBe(false);
-    db.close();
+    await db.close();
   });
 
   it('[F-db-finish-failure] blocks reuse when the terminal database write fails', async () => {
@@ -520,15 +515,14 @@ describe('RuntimeService lifecycle', () => {
     expect(db.ok).toBe(true);
     if (!db.ok) return;
     let finishCalls = 0;
-    const runs: RunRepository = {
-      ...db.data.runs,
-      finish: (runId, terminal) => {
-        finishCalls += 1;
-        return { ok: false, error: { code: 'storage_write_failed', category: 'storage', message: '模拟终态写失败。', retryable: true, runId } };
-      },
-    };
+    const database: RuntimeDependencies['database'] = { read: db.data.read,
+      transaction: operation => db.data.transaction(scope => operation({ ...scope, runs: { ...scope.runs,
+        finish(runId) {
+          finishCalls += 1;
+          return fail(appError('storage_write_failed', 'storage', '模拟终态写失败。', true, runId));
+        } } })) };
     const service = new RuntimeService({
-      memory: db.data.memory, runs,
+      database,
       provider: new ControlledProvider('success'),
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
@@ -543,7 +537,7 @@ describe('RuntimeService lifecycle', () => {
     expect(retry.ok).toBe(false);
     if (!retry.ok) expect(retry.error.code).toBe('runtime_unusable');
     expect((await service.close()).closed).toBe(true);
-    db.data.close();
+    await db.data.close();
   });
 
   it.each(['returned', 'thrown'] as const)('[F-cancel-record-failure] stops and blocks after a $failure storage failure', async (failure) => {
@@ -551,18 +545,14 @@ describe('RuntimeService lifecycle', () => {
     const db = openDatabase(paths(root));
     expect(db.ok).toBe(true);
     if (!db.ok) return;
-    const runs: RunRepository = new Proxy(db.data.runs, {
-      get(target, key, receiver) {
-        if (key === 'recordCancel') return (runId: number) => {
+    const database: RuntimeDependencies['database'] = { read: db.data.read,
+      transaction: operation => db.data.transaction(scope => operation({ ...scope, runs: { ...scope.runs,
+        recordCancel(runId) {
           if (failure === 'thrown') throw new Error('synthetic private storage exception');
-          return { ok: false, error: { code: 'storage_write_failed', category: 'storage', message: '模拟取消记录失败。', retryable: true, runId } };
-        };
-        const value = Reflect.get(target, key, receiver) as unknown;
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
+          return fail(appError('storage_write_failed', 'storage', '模拟取消记录失败。', true, runId));
+        } } })) };
     const service = new RuntimeService({
-      memory: db.data.memory, runs,
+      database,
       provider: new ControlledProvider('abort'),
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
@@ -578,7 +568,7 @@ describe('RuntimeService lifecycle', () => {
     await entered;
     let cancel;
     let thrown: unknown;
-    try { cancel = service.cancel(runId); } catch (error) { thrown = error; }
+    try { cancel = await service.cancel(runId); } catch (error) { thrown = error; }
     const result = await pending;
 
     expect(thrown).toBeUndefined();
@@ -595,7 +585,7 @@ describe('RuntimeService lifecycle', () => {
     expect(service.state()).toMatchObject({ blocked: true });
     expect(await service.callProvider(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
     expect((await service.close()).closed).toBe(true);
-    db.data.close();
+    await db.data.close();
   });
 
   it.each(['run-created', 'prepare'] as const)('[F-total-deadline] refuses dispatch after time is spent in $phase', async (phase) => {
@@ -611,7 +601,7 @@ describe('RuntimeService lifecycle', () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-deadline-'));
     const opened = openDatabase(paths(root));
     if (!opened.ok) throw new Error(opened.error.code);
-    const service = new RuntimeService({ memory: opened.data.memory, runs: opened.data.runs, provider,
+    const service = new RuntimeService({ database: opened.data, provider,
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z', monotonicNow: () => elapsed });
     const result = await service.callProvider(request, { onObservation(event) {
@@ -620,7 +610,7 @@ describe('RuntimeService lifecycle', () => {
     expect(result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true, error: { code: 'provider_timeout' } } });
     expect(executed).toBe(false);
     await service.close();
-    opened.data.close();
+    await opened.data.close();
   });
 
   it('[F-late-result] does not allow a late provider result to revive an unconfirmed stopped Run', async () => {
@@ -661,15 +651,14 @@ describe('RuntimeService lifecycle', () => {
       },
       async close() { return { stopped: !pendingWork, closed: !pendingWork, errors: pendingWork ? [{ code: 'stop_unconfirmed', category: 'runtime' as const, message: 'Provider 请求仍在收口。', retryable: true }] : [] }; },
     };
-    const service = new RuntimeService({ memory: db.data.memory,
-      runs: db.data.runs,
+    const service = new RuntimeService({ database: db.data,
       provider,
       log: { write: () => undefined, close: async () => undefined },
       now: () => '2026-09-21T00:00:00.000Z',
       monotonicNow: () => performance.now(),
     });
-    const app = makeApplication(service, db.data.runs, async () => {
-      db.data.close();
+    const app = makeApplication(service, { get: runId => db.data.read(scope => scope.runs.get(runId)) }, async () => {
+      await db.data.close();
       return { stopped: true, closed: true, errors: [] };
     });
     try {

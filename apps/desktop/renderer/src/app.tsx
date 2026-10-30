@@ -1,12 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type ReactNode } from 'react';
 import { usePanelLayout } from './panel-layout.tsx';
 import { ResearchPage } from './research.tsx';
+import { PersonalAgentPage } from './personal-agent.tsx';
+import { readPersonalDraft, savePersonalDraft, type PersonalReviewTarget } from './personal-state.ts';
 import { EvaluationModels } from './evaluation-models.tsx';
 import { EvaluationPage } from './evaluation.tsx';
 import { applyEvaluationControl, applyEvaluationEvent, createEvaluationView, evaluationBusy } from './evaluation-state.ts';
 import type { EvaluationControlState } from '../../../../packages/contracts/src/evaluation.ts';
 import type { ResearchTask, ResearchIntent, ResearchPlanBody } from '@flowmate/contracts';
 import type { DiagnosticsSnapshot } from '@flowmate/contracts';
+import type { BackgroundServiceActivationView, BackgroundServiceEnableRequest } from '@flowmate/contracts';
 import { InvoiceFormBridgeRequestSchema, InvoiceFormTargetSchema, StoredCandidateDraftSchema,
   MAX_INVOICE_FIELD_CHARS, MAX_INVOICE_LINES, MAX_INVOICE_NOTES, MAX_INVOICE_NOTE_CHARS, MAX_INVOICE_BLOCKS_PER_PAGE } from '../../../../packages/contracts/src/invoice.ts';
 import { serializeDesktopPromptRequest } from '../../../../packages/contracts/src/settings.ts';
@@ -34,10 +37,10 @@ import { createEventView, bindEventSubscription, applyEventWake, applyEventRead,
   selectEventSegment, retryEventPrefix, enqueueEventRead, drainEventReadQueue, type EventViewState } from './event-state.ts';
 import type { RuntimeEventsWake, RuntimeToolView } from '@flowmate/contracts';
 
-type Page = 'conversation' | 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'research' | 'activity' | 'models' | 'evaluation' | 'settings' | 'prompts' | 'skills' | 'extensions';
+type Page = 'conversation' | 'workspace' | 'workspace-detail' | 'tasks' | 'chats' | 'research' | 'personal' | 'activity' | 'models' | 'evaluation' | 'settings' | 'prompts' | 'skills' | 'extensions';
 const pageLabels: Record<Page, string> = {
   conversation: 'Conversation',
-  workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats', research: 'Deep Research',
+  workspace: 'Invoices', 'workspace-detail': 'Workspace', tasks: 'Processing History', chats: 'Chats', research: 'Deep Research', personal: 'Personal Agent',
   activity: 'Activity', models: 'Models', evaluation: 'Evaluation', settings: 'Settings', prompts: 'Prompts', skills: 'Skills', extensions: 'Extensions',
 };
 
@@ -49,6 +52,7 @@ function NavigationIcon({ name }: { name: Exclude<Page, 'conversation'> | 'new-c
     tasks: 'M4 6h16M4 12h10M4 18h10m3-5 4 4-4 4',
     chats: 'M4 4h16v12H9l-5 4V4Zm4 5h8m-8 3h5',
     research: 'M10.5 3a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15Zm5.5 13 5 5',
+    personal: 'M12 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM5 21v-3a7 7 0 0 1 14 0v3M5 21h14',
     activity: 'M3 12h4l3-8 4 16 3-8h4',
     models: 'm12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5',
     evaluation: 'M4 4h16v16H4V4Zm4 12v-4m4 4V8m4 8v-6',
@@ -173,6 +177,7 @@ export function App() {
   const [settingsTab, setSettingsTab] = useState('General');
   const [state, setState] = useState<DesktopState | null>(null);
   const [evaluationView, setEvaluationView] = useState(createEvaluationView);
+  const [evaluationTraceTarget, setEvaluationTraceTarget] = useState<{ runId: number; sessionId: number | null } | null>(null);
   const evaluationViewRef = useRef(evaluationView);
   function receiveEvaluationControl(control: EvaluationControlState, revision: number) {
     const next = applyEvaluationControl(evaluationViewRef.current, control, revision);
@@ -203,6 +208,9 @@ export function App() {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsSnapshot | null>(null);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [diagnosticsBusy, setDiagnosticsBusy] = useState<'refresh' | 'export' | 'recheck' | null>(null);
+  const [activationBusy, setActivationBusy] = useState<'prepare' | 'enable' | 'query' | null>(null);
+  const [activationView, setActivationView] = useState<BackgroundServiceActivationView | null>(null);
+  const activationRequest = useRef<BackgroundServiceEnableRequest | null>(null);
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [messageState, setMessageState] = useState<MessageViewState | null>(null);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
@@ -251,6 +259,9 @@ export function App() {
   const [humanOperationUnknown, setHumanOperationUnknown] = useState(false);
   const [rejectPrompt, setRejectPrompt] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
+  const [personalReview, setPersonalReview] = useState<PersonalReviewTarget | null>(() => {
+    const saved = readPersonalDraft(localStorage); return saved.ok ? saved.data.review?.target ?? null : null;
+  });
   const [activity, setActivity] = useState<BusinessEventSnapshot[]>([]);
   const [parsedPage, setParsedPage] = useState<InvoiceToolOutput<'read_invoice_document'> | null>(null);
   const [originalImage, setOriginalImage] = useState<DocumentOriginalImage | null>(null);
@@ -864,6 +875,20 @@ export function App() {
       expectedCandidateId: form.basis.candidateId, expectedRevision: current.revision };
     const operation: InvoiceCandidateOperationQuery = kind === 'accept'
       ? { kind, request: { ...base, dirty: false } } : { kind, request: { ...base, reason: reason!.trim() } };
+    let acceptanceReview: PersonalReviewTarget | null = null;
+    if (operation.kind === 'accept' && personalReview && current.documentRef?.id === personalReview.documentRef.id
+      && current.documentRef.version === personalReview.documentRef.version && (personalReview.jobId === null || personalReview.jobId === base.jobId)) {
+      const saved = readPersonalDraft(localStorage);
+      if (!saved.ok) {
+        setFormFeedback('The original acceptance request could not be retained for this invoice Work. No acceptance was submitted.'); return;
+      }
+      if (saved.data.review?.target.workId === personalReview.workId && saved.data.review.target.itemId === personalReview.itemId) {
+        if (!savePersonalDraft(localStorage, { ...saved.data, review: { target: personalReview, acceptRequest: operation.request } })) {
+          setFormFeedback('The original acceptance request could not be retained for this invoice Work. No acceptance was submitted.'); return;
+        }
+        acceptanceReview = personalReview;
+      } else setPersonalReview(null);
+    }
     lastHumanOperation.current = operation; setFormSubmission(true);
     try {
       const result = operation.kind === 'accept' ? await window.flowmate.acceptInvoiceCandidate(operation.request)
@@ -872,7 +897,8 @@ export function App() {
       await discardForm(); acceptWorkspace(result.data.workspace);
       const detail = await window.flowmate.queryJobCandidate({ jobId: base.jobId, candidateId: base.candidateId });
       if (detail.ok) setCandidateDetail(detail.data);
-      setNotice({ tone: 'good', message: kind === 'accept' ? 'Result accepted.' : 'Result rejected.' });
+      setNotice({ tone: 'good', message: kind === 'accept' ? acceptanceReview
+        ? 'Result accepted. Return to Personal Agent to attach this confirmed acceptance to the original invoice Work.' : 'Result accepted.' : 'Result rejected.' });
       await loadTaskDetails(base.jobId); await loadProductLists();
     } finally { setFormSubmission(false); }
   }
@@ -1409,6 +1435,45 @@ export function App() {
     else setNotice({ tone: 'bad', message: errorMessage(result) });
   }
 
+  async function openPersonalInvoice(target: PersonalReviewTarget): Promise<void> {
+    const epoch = workspaceHostEpoch.current;
+    const draft = readPersonalDraft(localStorage); if (!draft.ok) throw new Error(draft.error.message);
+    if (draft.data.review?.acceptRequest && (draft.data.review.target.workId !== target.workId || draft.data.review.target.itemId !== target.itemId))
+      throw new Error(`The original acceptance for invoice item ${draft.data.review.target.itemId} is retained. Attach it or check its receipt in its Personal Agent Work before reviewing another item.`);
+    const original = await window.flowmate.invoiceWorks.get({ view: 'item', workId: target.workId, itemId: target.itemId, limit: 1 });
+    if (!original.ok) throw new Error(errorMessage(original));
+    if (original.data.view !== 'item' || original.data.item.documentRef.id !== target.documentRef.id
+      || original.data.item.documentRef.version !== target.documentRef.version || original.data.item.jobId !== target.jobId
+      || original.data.item.candidateRef?.id !== target.candidateRef?.id || original.data.item.candidateRef?.sequence !== target.candidateRef?.sequence)
+      throw new Error('The original Work invoice changed. Refresh it before opening review.');
+    if (epoch !== workspaceHostEpoch.current || !await confirmFormLeave()) return;
+    setFormPreparing(true);
+    try {
+      if (!await navigate('workspace')) return;
+      await selectWorkspaceDocument(target.documentRef.id);
+      if (target.jobId !== null) {
+        const selected = await changeWorkspace({ kind: 'job', jobId: target.jobId });
+        if (!selected || selected.documentRef?.id !== target.documentRef.id || selected.documentRef.version !== target.documentRef.version)
+          throw new Error('The original invoice Job could not be selected for review.');
+        selectHistoryJob(target.jobId);
+        await loadProductLists(); await loadTaskDetails(target.jobId);
+        if (target.candidateRef !== null) await openCandidate(target.jobId, target.candidateRef.id);
+      }
+      await workspaceChanges.current;
+      const refreshed = await loadWorkspace();
+      if (epoch !== workspaceHostEpoch.current) return;
+      if (!refreshed || refreshed.documentRef?.id !== target.documentRef.id || refreshed.documentRef.version !== target.documentRef.version
+        || refreshed.jobId !== target.jobId || refreshed.candidateRef?.id !== target.candidateRef?.id || refreshed.candidateRef?.sequence !== target.candidateRef?.sequence)
+        throw new Error('The original invoice review selection changed. Refresh the Work before opening it again.');
+      const saved = readPersonalDraft(localStorage); if (!saved.ok) throw new Error(saved.error.message);
+      const acceptRequest = saved.data.review?.target.workId === target.workId && saved.data.review.target.itemId === target.itemId ? saved.data.review.acceptRequest : null;
+      if (!savePersonalDraft(localStorage, { ...saved.data, selectedWorkId: target.workId, review: { target, acceptRequest } }))
+        throw new Error('The original Work review target could not be retained.');
+      setPersonalReview(target);
+      setNotice({ tone: 'info', message: `Reviewing invoice item ${target.itemId} for Personal Agent Work ${target.workId}. Existing editing, acceptance, Fill and export rules apply.` });
+    } finally { setFormPreparing(false); }
+  }
+
   async function selectCandidate(jobId: number, candidateId: number) {
     if (!await confirmFormLeave()) return;
     const result = await mutateWorkspace(current => window.flowmate.selectCandidate({
@@ -1771,6 +1836,39 @@ export function App() {
     const result = await window.flowmate.queryNativeTools();
     if (result.ok) { setNativeTools(result.data); setNativeToolsError(null); }
     else setNativeToolsError(errorMessage(result));
+  }
+
+  async function serviceActivationAction(action: 'prepare' | 'enable' | 'query') {
+    if (activationBusy || !state?.backgroundService) return;
+    const service = state.backgroundService;
+    setActivationBusy(action);
+    try {
+      if (action === 'prepare') {
+        const result = await window.flowmate.backgroundService.prepare({});
+        setNotice(result.ok ? { tone: 'good', message: 'Service configuration prepared. Enable it explicitly when ready.' }
+          : { tone: 'bad', message: errorMessage(result) });
+      } else {
+        if (!service.installationId) return;
+        const operationId = service.activationOperationId ?? activationRequest.current?.operationId;
+        if (action === 'query') {
+          if (!operationId) return;
+          const result = await window.flowmate.backgroundService.queryActivation({ installationId: service.installationId, operationId });
+          if (result.ok) setActivationView(result.data); else setNotice({ tone: 'bad', message: errorMessage(result) });
+        } else {
+          const expectedSettingsRevision = service.activationOperationId ? service.activationSettingsRevision : state.settings.revision;
+          if (expectedSettingsRevision === null || expectedSettingsRevision === undefined) {
+            setNotice({ tone: 'bad', message: 'The original activation configuration revision is unavailable. Check the saved activation before continuing.' }); return;
+          }
+          const input = { installationId: service.installationId, operationId: operationId ?? crypto.randomUUID(), expectedSettingsRevision };
+          activationRequest.current = input;
+          const result = await window.flowmate.backgroundService.enable(input);
+          if (result.ok) { setActivationView(result.data); if (result.data.error) setNotice({ tone: 'bad', message: result.data.error.message }); }
+          else setNotice({ tone: 'bad', message: errorMessage(result) });
+        }
+      }
+      const current = await window.flowmate.getState(); if (current.ok) receiveDesktopState(current.data);
+    } catch { setNotice({ tone: 'bad', message: 'The original activation reply is unknown. Check its saved operation before continuing.' }); }
+    finally { setActivationBusy(null); }
   }
 
   async function diagnosticsAction(action: 'refresh' | 'export' | 'recheck') {
@@ -2710,7 +2808,7 @@ export function App() {
             </> : null;
 
   return (
-    <div ref={panels.shellRef} style={panels.style} className={`desktop-shell theme-${profileDraft.theme} ${chatPresentation === 'main' ? 'conversation-is-main' : ''} ${assistantCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''} ${panels.dragging ? 'panels-resizing' : ''}`}>
+    <div ref={panels.shellRef} style={panels.style} className={`desktop-shell theme-${profileDraft.theme} ${page === 'personal' ? 'personal-is-main' : ''} ${chatPresentation === 'main' ? 'conversation-is-main' : ''} ${assistantCollapsed ? 'chat-is-collapsed' : ''} ${navOpen ? 'nav-is-open' : ''} ${panels.dragging ? 'panels-resizing' : ''}`}>
       {panels.separators}
       {rejectPrompt && <div role="dialog" aria-modal="true" aria-label="Reject invoice result"
         style={{ position: 'fixed', inset: 0, zIndex: 100, background: 'rgba(0,0,0,.45)', display: 'grid', placeItems: 'center' }}>
@@ -2749,6 +2847,7 @@ export function App() {
             ['tasks', 'Processing History'],
             ['chats', 'Chats'],
             ['research', 'Deep Research'],
+            ['personal', 'Personal Agent'],
             ['activity', 'Activity'],
           ] as const).map(([target, label]) => <button key={target} type="button"
             className={`nav-item ${page === target ? 'active' : ''}`} aria-label={label} title={label}
@@ -2820,12 +2919,20 @@ export function App() {
         </section>}
         <header className="topline">
           <div><span className="crumb">{pageLabels[page]}</span></div>
-          <div className="top-state"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />{state?.ready ? 'LOCAL' : 'OFFLINE'}</div>
+          <div className="top-state"><span className={`status-dot ${state?.ready ? 'is-ready' : 'is-error'}`} />{state?.backgroundService && state.backgroundService.state !== 'disabled'
+            ? `SERVICE · ${state.backgroundService.state}` : state?.ready ? 'LOCAL' : 'OFFLINE'}</div>
         </header>
+
+        {personalReview && (page === 'workspace' || page === 'workspace-detail') && workspace?.documentRef?.id === personalReview.documentRef.id
+          && workspace.documentRef.version === personalReview.documentRef.version && <section className="notice personal-review-return" aria-label="Personal Agent invoice review">
+            <span>Original invoice item {personalReview.itemId} · Personal Agent Work {personalReview.workId}. Candidate acceptance and Work disposition are recorded separately.</span>
+            <button type="button" disabled={formSubmitting || formPreparing || workspacePending > 0} onClick={() => void navigate('personal')}>Return to Personal Agent Work {personalReview.workId}</button>
+          </section>}
 
         <PromptOptimizer visible={page === 'prompts'} hostEpoch={workspaceHostEpoch.current} ready={Boolean(modelReady && runtimeReady && !busy && !saving)}
           model={persistedModel} onUse={text => { updateChatInput(chatInputRef.current ? `${chatInputRef.current}\n\n${text}` : text); setChatCollapsed(false); }} />
         {page === 'conversation' ? null : page === 'evaluation' ? <EvaluationPage desktop={state} control={evaluationView.control} revision={() => evaluationViewRef.current.revision}
+          traceTarget={evaluationTraceTarget} onOpenActivity={(runId, sessionId) => { void navigate('activity').then(moved => { if (moved) observeActivity(runId, sessionId); }); }}
           onControl={receiveEvaluationControl} onModels={() => navigate('models')} /> : page === 'prompts' ? null : page === 'workspace' ? (
           <InvoicesPage
             workspace={workspace}
@@ -2901,6 +3008,9 @@ export function App() {
             ready={Boolean(state?.ready && !sessionLoading && !sessionMutating)}
             mutating={sessionMutating} notice={notice} onSelect={openChat}
             onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onLoadMore={() => void loadMoreSessions()} />
+        ) : page === 'personal' && state ? (
+          <PersonalAgentPage key={`personal:${workspaceHostEpoch.current}`} ready={state.ready} hostEpoch={workspaceHostEpoch.current}
+            models={state.settings.models} onModels={() => void navigate('models')} onOpenInvoice={openPersonalInvoice} />
         ) : page === 'research' && state ? (
           <ResearchPage key={`research:${workspaceHostEpoch.current}`} ready={state.ready} documents={documents}
             canRun={canChat && researchSelected} selectedId={researchTask?.researchId ?? null} refreshToken={`${contextRefresh}:${busy}:${runId}`}
@@ -2913,6 +3023,7 @@ export function App() {
           <ActivityPage key={`activity:${workspaceHostEpoch.current}`} hostEpoch={workspaceHostEpoch.current} ready={Boolean(state?.ready)}
             sessions={sessions} selectedSessionId={selectedSessionId} jobs={jobs} documents={documents}
             onOpenContextBasis={basis => openSessionDetails(basis.sessionId, basis)}
+            onOpenEvaluationTrace={(runId, sessionId) => { void navigate('evaluation').then(moved => { if (moved) setEvaluationTraceTarget({ runId, sessionId }); }); }}
             currentRun={run} runtime={runtimeState} view={activityView} snapshot={activitySnapshot} tools={activityTools}
             snapshotError={activitySnapshotError} toolsError={activityToolsError} toolsVerified={activityToolsVerified}
             nextToolId={activityToolCursor} toolsLoading={activityToolsLoading} onLoadMoreTools={() => void loadEarlierActivityTools()}
@@ -3072,6 +3183,32 @@ export function App() {
                 <h3>Tools on this device</h3><button className="quiet-button" disabled={!state?.ready} onClick={() => void loadNativeTools()}>Refresh tools</button>
                 {nativeToolsError ? <p role="alert">{nativeToolsError}</p> : <ul>{nativeTools.map(tool => <li key={tool.name}><strong>{tool.name}</strong>: {tool.available ? 'Available' : tool.reason ?? 'Unavailable'}</li>)}</ul>}</div>
             </details>}
+            {page === 'settings' && settingsTab === 'Performance' && state?.backgroundService && <section className="panel" aria-label="Background service connection"><h2>Background service</h2>
+              <p role="status">{state.backgroundService.state}</p>{state.backgroundService.error && <p role="alert">{state.backgroundService.error.message}</p>}
+              <p>Enabling saves an offline backup, moves configured product credentials into the service account store and hands background work to the installed service.</p>
+              <div className="button-row">
+                {state.backgroundService.state === 'disabled' && <button type="button" disabled={activationBusy !== null} onClick={() => void serviceActivationAction('prepare')}>Prepare service</button>}
+                {state.backgroundService.installationId && (state.backgroundService.state === 'disabled' || state.backgroundService.activationOperationId && state.backgroundService.state !== 'ready')
+                  && <button type="button" disabled={activationBusy !== null || state.backgroundService.state === 'stopping'} onClick={() => void serviceActivationAction('enable')}>
+                    {state.backgroundService.activationOperationId ? 'Continue original activation' : 'Enable background service'}</button>}
+                {(state.backgroundService.activationOperationId || activationRequest.current) && <button type="button" disabled={activationBusy !== null} onClick={() => void serviceActivationAction('query')}>Check activation</button>}
+                <button type="button" disabled={activationBusy !== null} onClick={() => void window.flowmate.backgroundService.getServiceState().then(async result => {
+                if (!result.ok) { setNotice({ tone: 'bad', message: errorMessage(result) }); return; }
+                const refreshed = await window.flowmate.getState(); if (refreshed.ok) receiveDesktopState(refreshed.data);
+              })}>Refresh service state</button>
+                {state.backgroundService.installationId && state.backgroundService.state !== 'disabled' && state.backgroundService.state !== 'blocked' && <button type="button" disabled={activationBusy !== null || state.backgroundService.state === 'starting'}
+                  onClick={() => { const service = state.backgroundService!; if (!service.installationId) return;
+                    void (service.state === 'ready' || service.state === 'stopping' ? window.flowmate.backgroundService.disconnect({ installationId: service.installationId })
+                      : window.flowmate.backgroundService.connect({ installationId: service.installationId })).then(async result => {
+                        if (!result.ok) setNotice({ tone: 'bad', message: errorMessage(result) }); const refreshed = await window.flowmate.getState(); if (refreshed.ok) receiveDesktopState(refreshed.data);
+                      }); }}>{state.backgroundService.state === 'stopping' ? 'Check foreground stop' : state.backgroundService.state === 'ready' ? 'Disconnect desktop' : 'Connect service'}</button>}</div>
+              {activationBusy && <p role="status">{activationBusy === 'prepare' ? 'Preparing the installed service configuration…' : activationBusy === 'query' ? 'Reading the original activation facts…' : 'Continuing the original service handoff…'}</p>}
+              {(activationView?.operationId || state.backgroundService.activationOperationId) && <p>Original activation: {activationView?.operationId ?? state.backgroundService.activationOperationId}</p>}
+              {activationView && <div data-testid="service-activation-facts"><p>Backup: {activationView.backupId ?? 'not confirmed'}. Product credentials: {activationView.credentialsPublished === null ? 'unknown' : activationView.credentialsPublished ? 'published' : 'not published'}.</p>
+                <p>Enabled: {activationView.enabled ? 'yes' : 'no'}. Connected: {activationView.connected ? 'yes' : 'no'}. Background scheduling: {activationView.active === null ? 'unknown' : activationView.active ? 'active' : 'inactive'}.</p>
+                {activationView.error && <p role="alert">{activationView.error.message}</p>}</div>}
+              {state.backgroundService.error?.code === 'service_elevation_required' && <p>Install and start the prepared Flowmate service from an elevated console, then continue this original activation. No elevation was requested by the desktop.</p>}
+            </section>}
             {page === 'settings' && settingsTab === 'Performance' && <section className="panel runtime-limits-panel" aria-labelledby="runtime-limits-heading">
               <div className="panel-head"><h2 id="runtime-limits-heading">Run limits</h2></div>
               <p>Empty values use task defaults. Saved limits apply to new Runs.</p>
@@ -3095,7 +3232,7 @@ export function App() {
           </section>
         )}
       </main>
-      <AgentChatPanel
+      {page !== 'personal' && <AgentChatPanel
         key={`chat:${workspaceHostEpoch.current}`}
         presentation={chatPresentation}
         notice={chatPresentation === 'main' ? notice : null}
@@ -3164,7 +3301,7 @@ export function App() {
               : selectedSession.availability === 'busy' ? 'This chat is responding.'
                 : !modelReady ? 'Save a model and its API key to start a chat.'
                   : goalMode === 'save-candidate' && (!workspace?.documentRef || !workspace.jobId) ? 'Process an invoice first to generate a result.' : ''}
-      />
+      />}
       {contextSourceError && !sessionDetails && <p className="notice bad context-source-error" role="alert">{contextSourceError}</p>}
       {sessionDetails && <SessionDetails key={sessionDetails.token} sessionId={sessionDetails.sessionId} basis={sessionDetails.basis}
         modelId={selectedModelId} models={(state?.settings.models ?? []).filter(model => model.kind !== 'legacy'

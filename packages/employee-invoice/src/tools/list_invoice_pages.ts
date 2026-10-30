@@ -1,9 +1,8 @@
-import type { DocumentService } from '@flowmate/data';
 import { invoiceToolSchemas } from '@flowmate/contracts';
 import type { InvoiceToolInput, InvoiceToolOutput, ToolDefinition } from '@flowmate/contracts';
-import { unwrap } from './definition.ts';
+import { unwrap, type InvoiceDocumentReader } from './definition.ts';
 
-export const listInvoicePages = (documents: DocumentService) => ({
+export const listInvoicePages = (documents: InvoiceDocumentReader) => ({
   name: 'list_invoice_pages',
   version: '1',
   label: 'List pages',
@@ -13,7 +12,7 @@ export const listInvoicePages = (documents: DocumentService) => ({
   effect: 'READ',
   executionMode: 'parallel',
   execute: async (input, _call, context) => {
-    const loaded = unwrap(documents.readParsedForRun(input.documentId, context));
+    const loaded = unwrap(await documents.readParsedForRun(input.documentId, context));
     const pages = loaded.parsed.pages.map((page) => ({ page: page.page, blockCount: page.blocks.length,
       tableCount: page.blocks.filter((block) => block.kind === 'table').length }));
     return { documentRef: loaded.document.documentRef, parsedArtifactId: loaded.document.parsedArtifactId,

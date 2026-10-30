@@ -1,6 +1,7 @@
 import { saveTestHistory } from '../../support/history.ts';
 import { describe, expect, it } from 'bun:test';
-import { createContextRepository, createFileStore, openDatabase } from '@flowmate/core';
+import { createContextRepository, createFileStore } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { createDocumentService, DocumentService } from '@flowmate/data';
 import { appError, CandidateDraftSchema, ContextSnapshotJsonSchema, formatExecutionPrompt, InvoiceFormDraftSchema, invoiceHeaderFields, invoiceFieldDisplayValue } from '@flowmate/contracts';
 import { validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
@@ -11,12 +12,11 @@ import { Database } from 'bun:sqlite';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createApplication } from '../../../apps/composition.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import type { AgentRunEvent } from '@flowmate/contracts';
-import type { RuntimeEventStore } from '../../../packages/core/src/events/store.ts';
 
 function writeContextMaterial(directory: string, sampleId: string, text: string) {
   mkdirSync(directory, { recursive: true });
@@ -54,7 +54,7 @@ async function materialApplicationFixture(text = 'FIRST税 total 113.00 LAST税'
     parameters: { maxRetries: 0, maxRetryDelayMs: 100 } };
   const open = async () => {
     const app = need(await createApplication({ paths, invoiceSourceRoot: sourceRoot, logger: { write() {}, async close() {} },
-      agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+      agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-t10-material-key' }) }));
     deferCleanup(() => app.close()); return app;
   };
@@ -111,9 +111,9 @@ describe('T10 real managed material evidence', () => {
     const attempted: Array<{ id: number; version: string }> = [];
     const inspections: Array<{ documentId: number; version: string; parsedArtifactId: number }> = [];
     const inspect = DocumentService.prototype.inspectParsedForContext;
-    DocumentService.prototype.inspectParsedForContext = function (this: DocumentService, input) {
+    DocumentService.prototype.inspectParsedForContext = function (this: DocumentService, input, scope) {
       attempted.push(structuredClone(input.documentRef));
-      const result = inspect.call(this, input);
+      const result = inspect.call(this, input, scope);
       if (result.ok) inspections.push({ documentId: input.documentRef.id, version: input.documentRef.version,
         parsedArtifactId: result.data.document.parsedArtifactId });
       return result;
@@ -188,9 +188,11 @@ describe('T10 real managed material evidence', () => {
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.error.code); return result.data; }
 function fixture(selection: WorkspaceSelection | null = null, fill = false, human = false, workingDirectory?: string) {
-  const base = makeSelectedCandidate(false, true);
+  const selected = makeSelectedCandidate(false, true);
+  if (!selected.currentStore) throw new Error('Current Context fixtures require the owner-backed database.');
+  const base = { ...selected, ...selected.currentStore };
   const store = { ...base, context: createContextRepository({ db: base.db, loadHistory: id => base.sessions.loadHistory(id) }) };
-  need(saveTestHistory(store.db, 'runtimeEventStore' in store ? store.runtimeEventStore as RuntimeEventStore : undefined, store.session.sessionId, { storageVersion: 1,
+  need(saveTestHistory(store.db, store.runtimeEventStore, store.session.sessionId, { storageVersion: 1,
     header: { type: 'session', id: store.session.nativeSessionId, timestamp: store.stamp, cwd: store.root, version: 3 },
     entries: [], leafId: null, unusable: false }));
   let workspace = store.selectedWorkspace;
@@ -198,8 +200,11 @@ function fixture(selection: WorkspaceSelection | null = null, fill = false, huma
     change: { kind: 'selection', selection }, at: store.stamp }, store.verify));
   const paths = { root: store.root, databaseFile: '', artifactsDir: `${store.root}/artifacts`, logsDir: `${store.root}/logs`,
     outputsDir: `${store.root}/outputs`, runtimeDir: `${store.root}/runtime` };
-  const files = createFileStore(paths, store.documents);
-  const documents = createDocumentService({ paths, repository: store.documents, files, allowedSourceRoot: store.root, now: () => store.stamp });
+  const files = createFileStore(paths, store);
+  const inspect = { repository: store.documents, files: { read: (artifact: Parameters<typeof files.read>[0], name?: string) => files.read(artifact, name, store.contents) } };
+  const documents = createDocumentService({ paths, files, allowedSourceRoot: store.root, now: () => store.stamp,
+    transaction: operation => store.transaction(scope => operation({ repository: scope.documents,
+      files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })) });
   if (human) {
     const basis = need(store.candidates.readByJob({ jobId: store.jobId, candidateId: store.candidateId })).candidate;
     const draft = InvoiceFormDraftSchema.parse({ fields: Object.fromEntries(invoiceHeaderFields.map(name =>
@@ -207,10 +212,13 @@ function fixture(selection: WorkspaceSelection | null = null, fill = false, huma
     draft.fields.invoiceNumber = 'Human invoice';
     workspace = need(store.candidates.saveHuman({ operationRef: 'context-human', jobId: store.jobId, basedOnCandidateId: basis.candidateId,
       expectedCandidateId: basis.candidateId, expectedRevision: workspace.revision, draft, at: store.stamp,
-      validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, documents) })).workspace;
+      validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, {
+        readParsedForWorkspace: id => documents.readParsedForWorkspace(id, inspect),
+      }) })).workspace;
   }
   let reads = 0;
-  const service = new ContextService({ store, materials: { inspectParsed: input => { reads++; return documents.inspectParsedForContext(input); } } });
+  const service = new ContextService({ store, materials: { inspectParsed: (input, scope) => { reads++; return documents.inspectParsedForContext(input,
+    { repository: scope.documents, files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }); } } });
   const admitted = need(store.runs.createWorkspaceAgent({ sessionId: store.session.sessionId,
     expected: { revision: workspace.revision, documentRef: workspace.documentRef, jobId: workspace.jobId,
       candidateRef: workspace.candidateRef, sessionId: store.session.sessionId }, goalMode: fill ? 'fill-form' : 'answer', text: 'Explain the tax amount.',
@@ -227,7 +235,7 @@ function fixture(selection: WorkspaceSelection | null = null, fill = false, huma
     text: 'Explain the tax amount.', goalMode: fill ? 'fill-form' : 'answer', workspaceContext: admitted.workspaceContext,
     workspaceInput: admitted.workspaceInput, allowedDocumentIds: admitted.scope.allowedDocumentIds,
     allowedArtifactIds: admitted.scope.allowedArtifactIds, workingDirectory: workingDirectory ?? null, createdAt: store.stamp };
-  return { store, documents, service, request, reads: () => reads };
+  return { store, paths, files, documents, inspect, service, request, reads: () => reads };
 }
 function count(f: ReturnType<typeof fixture>) { return f.store.db.query('SELECT * FROM context_snapshots').all().length; }
 
@@ -242,8 +250,8 @@ async function publicContextFixture(state: 'active' | 'archived' | 'blocked' | '
       + '\n\ndata: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n',
       { headers: { 'content-type': 'text/event-stream' } }); } });
   deferCleanup(() => server.stop(true));
-  const create = async () => need(await createApplication({ paths, logger: { write() {}, async close() {} }, agentFactory: (tools, resourceContents) => {
-    const agent = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+  const create = async () => need(await createApplication({ paths, logger: { write() {}, async close() {} }, agentFactory: tools => {
+    const agent = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-public-context-key' });
     const restore = agent.restoreSession.bind(agent), leaf = agent.restoreSessionLeaf.bind(agent), watch = agent.watchSession.bind(agent),
       prepare = agent.prepare.bind(agent), enqueue = agent.enqueueInput.bind(agent);
@@ -276,7 +284,7 @@ async function publicContextFixture(state: 'active' | 'archived' | 'blocked' | '
   let readRunId = accepted.runId;
   if (state === 'legacy' || state === 'empty') {
     const prepared = preparations[0];
-    if (originalRun.kind !== 'agent' || originalRun.scope.version !== 1 || !prepared) throw new Error('Actual chat Agent fixture required.');
+    if (originalRun.kind !== 'agent' || 'runtimeKind' in originalRun || originalRun.scope.version !== 1 || !prepared) throw new Error('Actual chat Agent fixture required.');
     const opened = need(openDatabase(paths));
     try {
       const { contextPolicyVersion: _marker, ...legacyConfig } = prepared;
@@ -292,7 +300,7 @@ async function publicContextFixture(state: 'active' | 'archived' | 'blocked' | '
       need(opened.runs.finish(readRunId, { status: 'failed', output: null,
         error: appError('runtime_not_started', 'runtime', 'This fixture was never dispatched.'), usage: originalRun.usage, tokens: originalRun.tokens,
         cleanup, endedAt: originalRun.endedAt!, stoppedAt: originalRun.stoppedAt, durationMs: null }));
-    } finally { opened.close(); }
+    } finally { await opened.close(); }
   }
   const db = new Database(paths.databaseFile);
   deferCleanup(() => db.close());
@@ -375,10 +383,93 @@ describe('T08 real Application readonly Context', () => {
 });
 
 describe('T03 Context build on real frozen storage and material', () => {
+  it('reads and saves through each supplied SQL scope after its constructor scope expires', async () => {
+    const f = fixture(); f.store.db.exec('COMMIT');
+    const database = f.store;
+    const service = await database.read(scope => new ContextService({ store: { ...scope, read: database.read },
+      materials: { inspectParsed: (input, current) => f.documents.inspectParsedForContext(input, { repository: current.documents,
+        files: { read: (artifact, name) => f.files.read(artifact, name, current.contents) } }) } }));
+    expect(await database.read(scope => service.build(f.request, scope)))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    const first = need(await database.transaction(scope => service.build(f.request, scope)));
+    const second = need(await database.transaction(scope => service.build(f.request, scope)));
+    expect(first.snapshot.json.modelProjection).toMatchObject({ taskGoal: 'Review form fixture',
+      candidate: { sequence: 1, origin: 'model', statusAtSelection: 'generated' } });
+    expect(second.snapshot.id).not.toBe(first.snapshot.id);
+    expect(second.snapshot.sequence).toBe(2);
+    expect(await database.read(scope => ({
+      pointer: need(scope.runs.get(f.request.runId)).currentContextSnapshotId,
+      snapshots: scope.db.query('SELECT id,run_id,session_id FROM context_snapshots ORDER BY sequence').all(),
+      inputs: scope.db.query('SELECT * FROM session_inputs').all(),
+    }))).toEqual({ pointer: second.snapshot.id, snapshots: [
+      { id: first.snapshot.id, run_id: f.request.runId, session_id: f.request.sessionId },
+      { id: second.snapshot.id, run_id: f.request.runId, session_id: f.request.sessionId },
+    ], inputs: [] });
+  });
+
+  it('rolls back the supplied SQL transaction after its snapshot insert succeeds and Run pointer fails', async () => {
+    const f = fixture(); f.store.db.exec('COMMIT');
+    const database = f.store;
+    const service = await database.read(scope => new ContextService({ store: { ...scope, read: database.read },
+      materials: { inspectParsed: (input, current) => f.documents.inspectParsedForContext(input, { repository: current.documents,
+        files: { read: (artifact, name) => f.files.read(artifact, name, current.contents) } }) } }));
+    const rows = () => database.read(scope => ({ runs: scope.db.query('SELECT * FROM runs').all(),
+      snapshots: scope.db.query('SELECT * FROM context_snapshots').all(),
+      documents: scope.db.query('SELECT * FROM documents').all() }));
+    const before = await rows();
+    await database.transaction(scope => scope.db.exec("CREATE TRIGGER scoped_context_reject_pointer BEFORE UPDATE OF current_context_snapshot_id ON runs WHEN NEW.current_context_snapshot_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'scoped_context_pointer_failure'); END"));
+    await expect(database.transaction(scope => need(service.build(f.request, scope))))
+      .rejects.toThrow('storage_write_failed');
+    expect(await rows()).toEqual(before);
+  });
+
+  it('inspects actual managed files with the supplied SQL material scope after explicit component bindings expire', async () => {
+    const f = fixture(); f.store.db.exec('COMMIT');
+    const database = f.store;
+    const bindings = await database.read(scope => {
+      const files = createFileStore(f.paths, database);
+      const documents = createDocumentService({ paths: f.paths, files,
+        allowedSourceRoot: f.store.root, now: () => f.store.stamp,
+        transaction: operation => database.transaction(current => operation({ repository: current.documents,
+          files: { read: (artifact, name) => files.read(artifact, name, current.contents) } })) });
+      return { files, documents, expired: { repository: scope.documents,
+        files: { read: (artifact: Parameters<typeof files.read>[0], name?: string) => files.read(artifact, name, scope.contents) } }, expiredContents: scope.contents };
+    });
+    const input = { documentRef: f.request.workspaceContext!.documentRef!, allowedDocumentIds: f.request.allowedDocumentIds,
+      allowedArtifactIds: f.request.allowedArtifactIds };
+    expect(bindings.documents.inspectParsedForContext(input, bindings.expired))
+      .toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
+    const artifact = need(await database.read(scope => scope.documents.getArtifact(2)));
+    expect(bindings.files.read(artifact, 'parsed.json', bindings.expiredContents))
+      .toMatchObject({ ok: false, error: { code: 'input_unavailable' } });
+    const service = new ContextService({ store: database, materials: {
+      inspectParsed: (request, scope) => bindings.documents.inspectParsedForContext(request, {
+        repository: scope.documents, files: { read: (artifact, name) => bindings.files.read(artifact, name, scope.contents) },
+      }),
+    } });
+    const built = need(await database.transaction(scope => service.build(f.request, scope)));
+    expect(built.snapshot.json.modelProjection.fragments).toMatchObject([
+      { documentRef: { id: 1, version: 'v1' }, artifactId: 2, page: 1, blockId: 'b1' },
+    ]);
+    expect(built.promptText).toContain('Total 113.00');
+    const rows = () => database.read(scope => ({ documents: scope.db.query('SELECT * FROM documents').all(),
+      snapshots: scope.db.query('SELECT * FROM context_snapshots').all(),
+      pointer: need(scope.runs.get(f.request.runId)).currentContextSnapshotId }));
+    const before = await rows();
+    const parsedPath = join(f.paths.artifactsDir, '2', 'parsed.json');
+    const original = readFileSync(parsedPath, 'utf8');
+    try {
+      writeFileSync(parsedPath, original.replace('Total 113.00', 'Total 999.00'));
+      expect(await database.transaction(scope => service.build(f.request, scope)))
+        .toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+      expect(await rows()).toEqual(before);
+    } finally { writeFileSync(parsedPath, original); }
+  });
+
   it('saves a real bounded snapshot and Run pointer inside the caller transaction without inserting an Input', () => {
     const f = fixture(), before = f.store.db.query('SELECT * FROM documents').all();
     try {
-      const built = need(f.service.build(f.request));
+      const built = need(f.service.build(f.request, f.store));
       expect(built.snapshot.json.modelProjection.taskGoal).toBe('Review form fixture');
       expect(built.snapshot.json.modelProjection.candidate).toMatchObject({ id: f.store.candidateId, sequence: 1, origin: 'model', statusAtSelection: 'generated' });
       expect(built.snapshot.json.modelProjection.fragments[0]?.windows[0]?.text).toBe('Total 113.00');
@@ -393,7 +484,7 @@ describe('T03 Context build on real frozen storage and material', () => {
   });
   it('refuses missing outer transaction before reading managed materials', () => {
     const f = fixture(); f.store.db.exec('COMMIT');
-    expect(f.service.build(f.request)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(f.service.build(f.request, f.store)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(f.reads()).toBe(0); expect(count(f)).toBe(0);
   });
   it.each(['scope', 'snapshot-owner', 'candidate-sequence', 'directory', 'cancelled', 'revoked', 'job-hidden'] as const)
@@ -408,7 +499,7 @@ describe('T03 Context build on real frozen storage and material', () => {
         if (cause === 'revoked') f.store.db.query("UPDATE sessions SET metadata_json=json_set(metadata_json,'$.model_use_blocked',json(?)) WHERE id=?")
           .run(JSON.stringify({ documentIds: [1], at: f.store.stamp, reason: 'document_use_revoked' }), request.sessionId);
         if (cause === 'job-hidden') f.store.db.query('UPDATE jobs SET hidden_at=? WHERE id=?').run(f.store.stamp, f.store.jobId);
-        expect(f.service.build(request).ok).toBe(false); expect(count(f)).toBe(0); expect(f.reads()).toBe(0);
+        expect(f.service.build(request, f.store).ok).toBe(false); expect(count(f)).toBe(0); expect(f.reads()).toBe(0);
       } finally { f.store.db.exec('ROLLBACK'); }
     });
   it('rejects forged selected quote and oversize snapshot with no pointer or snapshot partial write', () => {
@@ -422,7 +513,7 @@ describe('T03 Context build on real frozen storage and material', () => {
           request = { ...request, workspaceInput: { ...request.workspaceInput!, candidate: { id: actual.candidateId, sequence: actual.sequence,
             fields: actual.fields, lines: actual.lines, issues: actual.issues } } };
         } else request = { ...request, text: '\u0000'.repeat(65000) };
-        expect(f.service.build(request)).toMatchObject({ ok: false, error: { code: kind === 'quote' ? 'source_invalid' : 'input_too_large' } });
+        expect(f.service.build(request, f.store)).toMatchObject({ ok: false, error: { code: kind === 'quote' ? 'source_invalid' : 'input_too_large' } });
         expect(count(f)).toBe(0); expect(need(f.store.runs.get(request.runId)).currentContextSnapshotId).toBe(null);
       } finally { f.store.db.exec('ROLLBACK'); }
     }
@@ -430,7 +521,7 @@ describe('T03 Context build on real frozen storage and material', () => {
   it('uses original complete Fill material and fixed target while the snapshot and formatter stay reference-only', () => {
     const f = fixture(null, true);
     try {
-      const built = need(f.service.build(f.request));
+      const built = need(f.service.build(f.request, f.store));
       expect(built.snapshot.json.modelProjection.candidate?.values).toEqual([]);
       expect(built.snapshot.json.modelProjection.fragments).toEqual([]);
       const original = formatExecutionPrompt({ text: f.request.text, workspaceInput: f.request.workspaceInput!, workspaceContext: f.request.workspaceContext!,
@@ -447,14 +538,14 @@ describe('T03 Context build on real frozen storage and material', () => {
     const f = fixture(null, true);
     try {
       f.store.db.query("UPDATE invoice_candidates SET status='rejected' WHERE id=?").run(f.store.candidateId);
-      expect(f.service.build(f.request)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+      expect(f.service.build(f.request, f.store)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
       expect(count(f)).toBe(0); expect(f.reads()).toBe(0);
     } finally { f.store.db.exec('ROLLBACK'); }
   });
   it('formats ordinary user text and frozen directories without copying the full frozen candidate', () => {
     const f = fixture(null, false, false, 'C:/verified');
     try {
-      const built = need(f.service.build(f.request));
+      const built = need(f.service.build(f.request, f.store));
       const snapshot = built.snapshot;
       expect(need(f.store.runs.get(f.request.runId)).config.workingDirectory).toBe('C:/verified');
       expect(formatContextPrompt(snapshot)).toContain('"workingDirectory":"C:/verified"');
@@ -488,7 +579,7 @@ describe('T03 Context build on real frozen storage and material', () => {
     f.store.db.exec('BEGIN IMMEDIATE');
     try {
       const built = need(f.service.build({ runId, sessionId: session.sessionId, jobId: null, text, goalMode: 'answer',
-        workspaceContext: null, workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [], workingDirectory: null, createdAt: f.store.stamp }));
+        workspaceContext: null, workspaceInput: null, allowedDocumentIds: [], allowedArtifactIds: [], workingDirectory: null, createdAt: f.store.stamp }, f.store));
       expect(built.promptText).toBe(text); expect(built.snapshot.json.text).toBe(text);
       expect(built.snapshot.json.modelProjection.taskGoal).toBe('Original chat goal'); expect(f.reads()).toBe(0);
     } finally { f.store.db.exec('ROLLBACK'); }
@@ -499,7 +590,7 @@ describe('T03 Context build on real frozen storage and material', () => {
     const before = { runs: f.store.db.query('SELECT * FROM runs').all(), documents: f.store.db.query('SELECT * FROM documents').all() };
     f.store.db.exec("CREATE TRIGGER t03_reject_pointer BEFORE UPDATE OF current_context_snapshot_id ON runs WHEN NEW.current_context_snapshot_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'t03_pointer_failure'); END");
     expect(() => f.store.db.transaction(() => {
-      const built = f.service.build(f.request);
+      const built = f.service.build(f.request, f.store);
       if (!built.ok) throw new Error(built.error.code);
       throw new Error('expected injected pointer failure');
     }).immediate()).toThrow('storage_write_failed');
@@ -510,7 +601,7 @@ describe('T03 Context build on real frozen storage and material', () => {
   it('derives human origin from its real saved row and keeps preserved model evidence and new manual values distinct', () => {
     const f = fixture(null, false, true);
     try {
-      const built = need(f.service.build(f.request));
+      const built = need(f.service.build(f.request, f.store));
       expect(built.snapshot.json.modelProjection.candidate).toMatchObject({ sequence: 2, origin: 'human_edit', statusAtSelection: 'generated' });
       expect(built.snapshot.json.modelProjection.candidate?.values.find(value => value.fieldPath === 'fields.invoiceNumber')?.value)
         .toMatchObject({ raw: 'Human invoice', valueOrigin: 'user-provided', sources: [] });
@@ -534,7 +625,7 @@ describe('T03 Context build on real frozen storage and material', () => {
         if (cause === 'invalid-history') f.store.db.query('UPDATE session_native_history SET entry_count=1 WHERE session_id=?').run(f.request.sessionId);
         const codes = { archived: 'session_archived', hidden: 'session_not_found', 'delete-pending': 'session_delete_incomplete',
           'unusable-history': 'session_history_invalid', 'legacy-history': 'session_history_unavailable', 'invalid-history': 'session_history_invalid' };
-        expect(f.service.build(f.request)).toMatchObject({ ok: false, error: { code: codes[cause] } });
+        expect(f.service.build(f.request, f.store)).toMatchObject({ ok: false, error: { code: codes[cause] } });
         expect(count(f)).toBe(0); expect(f.reads()).toBe(0);
       } finally { f.store.db.exec('ROLLBACK'); }
     });
@@ -543,9 +634,11 @@ describe('T03 Context build on real frozen storage and material', () => {
     const f = fixture();
     const accept = () => f.store.candidates.accept({ operationRef: 'context-accept', jobId: f.store.jobId, candidateId: f.store.candidateId,
       expectedCandidateId: f.store.candidateId, expectedRevision: f.store.selectedWorkspace.revision, dirty: false, at: f.store.stamp,
-      validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, f.documents) });
+      validate: (draft, ref) => validateHumanInvoiceCandidate(draft, ref, {
+        readParsedForWorkspace: id => f.documents.readParsedForWorkspace(id, f.inspect),
+      }) });
     try {
-      const built = need(f.service.build(f.request));
+      const built = need(f.service.build(f.request, f.store));
       expect(accept()).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
       f.store.db.exec('COMMIT');
       expect(f.store.db.inTransaction).toBe(false);

@@ -1,4 +1,4 @@
-import type { Database } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor } from './write-coordinator.ts';
 
 export type ManagedFileOwner = { ownerKind: string; ownerId: string; relativePath: string };
 export type ManagedFileContents = {
@@ -6,7 +6,7 @@ export type ManagedFileContents = {
   remember(owner: ManagedFileOwner, content: Uint8Array): void;
 };
 
-export function createManagedFileContents(db: Database): ManagedFileContents {
+export function createManagedFileContents(db: SynchronousDatabaseExecutor): ManagedFileContents {
   const identity = (owner: ManagedFileOwner) => {
     if (!owner.ownerKind || !owner.ownerId || !owner.relativePath || owner.relativePath.startsWith('/')
       || owner.relativePath.split('/').some(part => !part || part === '.' || part === '..' || /[\\:\x00-\x1f]/.test(part)))

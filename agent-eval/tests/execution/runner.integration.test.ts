@@ -12,7 +12,8 @@ import type { AgentKernel, AgentTrial } from '../../src/adapters/agent.ts';
 import { executeCase } from '../../src/execution/execute-case.ts';
 import { caseV2Schema, manifestSchema } from '../../src/dataset-loader/schema.ts';
 import { metricCatalog } from '../../src/scoring/catalog.ts';
-import { readReport } from '../../src/reports/store.ts';
+import { readReport, readReportMetadata } from '../../src/reports/store.ts';
+import { archiveFile, readSnapshot } from '../../src/reports/archive.ts';
 import { formalFixture } from '../support/formal.ts';
 import { compileFormalSemanticPlan } from '../../src/scoring/formal-rules.ts';
 import type { EvaluationProgress } from '../../src/execution/runner.ts';
@@ -45,7 +46,7 @@ test('source drift preserves original scores, records changed paths and announce
         expect(events.filter(e=>e.type==='source-invalidated')).toHaveLength(1);
         expect(events.at(-1)).toMatchObject({type:'dataset-end',counts:{ERROR:1}});
         expect(readReport(run.file).sourceInvalidation).toEqual(run.report.sourceInvalidation);
-        expect(readFileSync(run.file,'utf8')).not.toContain('workspaceHash');
+        expect(readFileSync(archiveFile(run.file),'utf8')).not.toContain('workspaceHash');
     }finally{unlinkSync(file);}
 },30000);
 
@@ -92,8 +93,8 @@ test('a necessary semantic specialist check survives Runner, formal aggregation 
             fetcher:async()=>{generations++;return judgeResponse({choices:[{message:{content:namedJudgment(item.expected.semantic!,{v:1,r:[[0,1,0]],f:[[0,0,1]]})},finish_reason:'stop'}]});}});
     const report=readReport(run.file),trial=report.trials[0]!;
     expect(generations).toBe(1);
-    expect(trial.evaluatorPlan?.find(p=>p.evaluatorId==='task-judge')).toMatchObject({applicable:true});
-    expect(trial.scores.find(s=>s.metricId==='diagnostic-partial-failure-explanation')).toMatchObject({evaluatorId:'task-judge',category:'diagnostic',status:'FAIL',required:true});
+    expect(trial.evaluatorPlan?.find(p=>p.evaluatorId==='diagnostic-partial-failure-explanation')).toMatchObject({applicable:true});
+    expect(trial.scores.find(s=>s.metricId==='diagnostic-partial-failure-explanation')).toMatchObject({evaluatorId:'diagnostic-partial-failure-explanation',category:'diagnostic',status:'FAIL',required:true});
     expect(trial.scores.find(s=>s.metricId==='task-success')).toMatchObject({status:'FAIL'});
     expect(report.aggregation!.metrics).toHaveLength(39);
     expect(report.aggregation!.metrics.some(m=>m.metricId.startsWith('diagnostic-'))).toBe(false);
@@ -158,7 +159,7 @@ test('a simple authored Case without a Fixture executes and saves no placeholder
     const result = await runLocal(REPO_ROOT, { dataset: data, executionId: 'no-fixture-' + randomUUID(), backend: 'local', judge: 'off' }, { kernel: product });
     expect(prepared).toBe(1);
     expect(readReport(result.file).trials[0]!.execution!.status).toBe('completed');
-    expect(JSON.parse(readFileSync(join(result.file, '../snapshot.json'), 'utf8')).fixtures).toEqual({});
+    expect(readSnapshot(result.file).fixtures ?? {}).toEqual({});
 });
 
 test('Runner binds one compact Judge per Trial, distinct ratios and original counts without exposing grading plans to Agent', async () => {
@@ -213,7 +214,7 @@ test('a linked result root is rejected before creating an Execution or preparing
     symlinkSync(outside, join(repo, 'agent-eval/runs'), 'junction');
     let prepared = 0;
     const product = kernel(); product.prepare = async () => { prepared++; throw new Error('must not prepare'); };
-    await expect(runLocal(repo, { dataset, executionId: 'linked-root', backend: 'local', judge: 'off' }, { kernel: product })).rejects.toThrow('result root');
+    await expect(runLocal(repo, { dataset, executionId: 'linked-root', backend: 'local', judge: 'off' }, { kernel: product })).rejects.toThrow('Linked Run');
     expect(prepared).toBe(0);
     expect(readdirSync(outside)).toEqual([]);
 });
@@ -234,7 +235,7 @@ test('local orchestration stores all selected members, independent trials and mi
         expect(report.trials[1]!.execution!.identity.trialId).not.toBe(report.trials[3]!.execution!.identity.trialId);
         expect(report.export.status).toBe('disabled');
         expect(report.manualReview).toBe('none');
-        expect(JSON.parse(readFileSync(join(file, '../snapshot.json'), 'utf8')).cases).toHaveLength(2);
+        expect(readSnapshot(file).cases).toHaveLength(2);
         await expect(runLocal(REPO_ROOT, { dataset: data, executionId: id, backend: 'local', judge: 'off' }, { kernel: kernel() })).rejects.toThrow();
     }
     finally {
@@ -413,7 +414,7 @@ test('unknown semantic denominators do not restore a removed Judge output budget
   env:{FLOWMATE_JUDGE_API:'openai-completions',FLOWMATE_JUDGE_PROVIDER:'openai-compatible',FLOWMATE_JUDGE_MODEL:'llama-3.3-70b-versatile',FLOWMATE_JUDGE_API_KEY:'synthetic-bound-key',FLOWMATE_JUDGE_BASE_URL:'https://unused.invalid/v1'},
   fetcher:async(_url,init)=>{requests++;expect(JSON.parse(String(init.body))).toHaveProperty('max_completion_tokens', 32768);
    return judgeResponse({choices:[{message:{content:namedJudgment({criteria:[{metricId:'tool-selection'},{metricId:'tool-arguments'}]},'{"v":1,"r":[[2,3,0],[4,4,0]],"f":[[0,2,1]]}')},finish_reason:'stop'}]});}});
- expect(requests).toBe(1);expect(run.report.trials[0]!.judgeCalls).toHaveLength(1);expect(existsSync(run.file)).toBe(true);
+ expect(requests).toBe(1);expect(run.report.trials[0]!.judgeCalls).toHaveLength(1);expect(existsSync(archiveFile(run.file))).toBe(true);
 });
 for(const metric of ['skill-guidance','model-violation'] as const)test('declared '+metric+' grades survive saving and a hard failure cannot become a passing report',async()=>{
  const data=structuredClone(dataset),item=formalFixture(metric).task;
@@ -431,7 +432,7 @@ for(const metric of ['skill-guidance','model-violation'] as const)test('declared
  if(!score)throw new Error('Missing declared score: '+trial.reason+' '+JSON.stringify(trial.execution?.error));
  expect(score).toMatchObject({status:'FAIL',required:true});
  expect(trial.status).toBe('FAIL');
- expect(JSON.parse(readFileSync(run.file,'utf8')).trials[0].dimensions[metric==='model-violation'?'safety':'process'].status).toBe('FAIL');
+ expect(readReportMetadata(run.file).metadata.trials[0]!.dimensions![metric==='model-violation'?'safety':'process']!.status).toBe('FAIL');
 });
 
 test('cancellation during the only Judge request aborts transport and preserves all later planned Trials', async () => {

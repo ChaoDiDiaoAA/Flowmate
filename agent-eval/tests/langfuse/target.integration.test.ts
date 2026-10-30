@@ -7,6 +7,7 @@ import { exportEvents, exportReport } from '../../src/langfuse/export.ts';
 import { readReport, saveReport } from '../../src/reports/store.ts';
 import { reportFixture } from '../support/fixtures.ts';
 import * as reportFiles from '../../src/reports/files.ts';
+import { observationRowsFromOtlp } from './otlp-fixture.ts';
 
 async function platform() {
     const root = mkdtempSync(join(tmpdir(), 'eval-target-')), report = reportFixture();
@@ -15,7 +16,7 @@ async function platform() {
     const original = readFileSync(file, 'utf8');
     const state = { projectId: 'synthetic-project', projects: 0, partial: false, unavailable: false,
         queryStatus: 200, extraProjects: false, multiplePages: false, afterQuery: () => {}, afterSend: () => {} };
-    const sends: Array<{ ids: string[]; auth: string | null; saved: unknown }> = [];
+    const sends: Array<{ ids: string[]; auth: string | null; saved: unknown }> = [], observations: any[] = [], scores: any[] = [];
     const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
         if (new URL(request.url).pathname.endsWith('/projects')) {
             state.projects++; state.afterQuery();
@@ -24,14 +25,20 @@ async function platform() {
             return Response.json({ data: state.extraProjects ? [project, { ...project, id: 'another-project' }] : [project],
                 ...(state.multiplePages ? { meta: { page: 1, limit: 1, totalItems: 2, totalPages: 2 } } : {}) });
         }
-        if (!new URL(request.url).pathname.endsWith('/ingestion')) return new Response(null, { status: 404 });
-        const body = await request.json() as { batch: Array<{ id: string }> };
-        sends.push({ ids: body.batch.map(event => event.id), auth: request.headers.get('authorization'),
+        const pathname = new URL(request.url).pathname;
+        if (pathname.endsWith('/v2/observations')) return Response.json({ data: state.unavailable ? [] : observations, meta: {} });
+        if (pathname.endsWith('/v3/scores')) return Response.json({ data: state.partial || state.unavailable ? [] : scores, meta: {} });
+        if (pathname.endsWith('/scores') && request.method === 'POST') {
+            const score = await request.json() as any; scores.push({ ...score, subject: { kind: 'trace', id: score.traceId } });
+            return Response.json({ id: score.id });
+        }
+        if (!pathname.endsWith('/otel/v1/traces')) return new Response(null, { status: 404 });
+        const body = await request.json() as any, rows = observationRowsFromOtlp(body), ids = rows.map(row => row.metadata.localObservationId);
+        observations.push(...rows);
+        sends.push({ ids, auth: request.headers.get('authorization'),
             saved: existsSync(sidecar) ? JSON.parse(readFileSync(sidecar, 'utf8')) : null });
         state.afterSend();
-        if (state.unavailable) return Response.json({ message: 'synthetic receipt lost' }, { status: 503 });
-        return Response.json({ successes: body.batch.filter((_, i) => !state.partial || i === 0).map(event => ({ id: event.id, status: 201 })),
-            errors: state.partial ? body.batch.slice(1).map(event => ({ id: event.id, status: 500, message: 'synthetic partial' })) : [] });
+        return Response.json({});
     } });
     const connection = { baseUrl: `http://127.0.0.1:${server.port}`, publicKey: 'synthetic-public', secretKey: 'synthetic-secret' };
     const before = Object.fromEntries(['LANGFUSE_BASE_URL', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY'].map(key => [key, process.env[key]]));
@@ -50,7 +57,7 @@ test('target is saved before ingestion; completed repeats verify the target with
         expect(p.report.export).toMatchObject({ status: 'complete', target: { baseUrl: p.connection.baseUrl, projectId: 'synthetic-project' } });
         expect(p.sends).toHaveLength(1);
         expect(p.sends[0]!.saved).toMatchObject({ status: 'pending', target: { baseUrl: p.connection.baseUrl, projectId: 'synthetic-project' },
-            progress: { total: 3, acceptedEventIds: [], rejectedEventIds: [] } });
+            progress: { total: 2, acceptedEventIds: [], rejectedEventIds: [] } });
         const completed = readFileSync(p.sidecar, 'utf8');
         await exportReport(p.report, p.file, undefined, p.root, { connection: p.connection });
         expect(p.state.projects).toBe(2); expect(p.sends).toHaveLength(1);
@@ -108,8 +115,7 @@ test('project or address changes preserve prior receipts; the same project permi
         await expect(exportReport(p.report, p.file, undefined, p.root, { connection: { ...p.connection, baseUrl: p.connection.baseUrl + '/other' } })).rejects.toThrow('target');
         expect(p.sends).toHaveLength(1); expect(readFileSync(p.sidecar, 'utf8')).toBe(partial);
         await exportReport(p.report, p.file, undefined, p.root, { connection: { ...p.connection, secretKey: 'rotated-synthetic-secret' } });
-        expect(p.sends).toHaveLength(2); expect(p.sends[1]!.ids).toEqual(p.sends[0]!.ids.slice(1));
-        expect(p.sends[1]!.auth).toBe('Basic ' + Buffer.from('synthetic-public:rotated-synthetic-secret').toString('base64'));
+        expect(p.sends).toHaveLength(1);
         expect(readReport(p.file).export.status).toBe('complete');
     } finally { await p.close(); }
 });
@@ -124,8 +130,8 @@ test('one upload keeps its initial connection through all event batches', async 
         p.state.afterSend = () => { process.env.LANGFUSE_BASE_URL = 'http://127.0.0.1:1'; process.env.LANGFUSE_SECRET_KEY = 'changed-ambient-secret'; };
         await exportReport(p.report, file, undefined, p.root, { connection: p.connection });
         expect(readReport(file).export.status).toBe('complete');
-        expect(p.state.projects).toBe(1); expect(p.sends).toHaveLength(2);
-        expect(p.sends[0]!.auth).toBe(p.sends[1]!.auth);
+        expect(p.state.projects).toBe(1); expect(p.sends).toHaveLength(1);
+        expect(p.sends[0]!.auth).toBe('Basic ' + Buffer.from('synthetic-public:synthetic-secret').toString('base64'));
     } finally { await p.close(); }
 });
 
@@ -154,17 +160,17 @@ test('a supported inline report cannot lose its saved sidecar target when the pr
     } finally { await p.close(); }
 });
 
-test('a lost ingestion response stays unconfirmed and explicit resend reuses original event IDs', async () => {
+test('unconfirmed OTEL visibility is rechecked without resending original observations', async () => {
     const p = await platform();
     try {
         p.state.unavailable = true;
         await exportReport(p.report, p.file, undefined, p.root, { connection: p.connection });
         expect(p.sends).toHaveLength(1);
-        expect(readReport(p.file).export).toMatchObject({ status: 'error', target: { projectId: 'synthetic-project' },
+        expect(readReport(p.file).export).toMatchObject({ status: 'pending', target: { projectId: 'synthetic-project' },
             progress: { acceptedEventIds: [], rejectedEventIds: [] } });
         p.state.unavailable = false;
         await exportReport(p.report, p.file, undefined, p.root, { connection: p.connection });
-        expect(p.sends).toHaveLength(2); expect(p.sends[1]!.ids).toEqual(p.sends[0]!.ids);
+        expect(p.sends).toHaveLength(1);
         expect(readReport(p.file).export.status).toBe('complete');
     } finally { await p.close(); }
 });
@@ -178,7 +184,7 @@ test('incomplete receipts do not invent rejected IDs for events without a receip
     } finally { await p.close(); }
 });
 
-test('a receipt save failure retains the pre-send target and allows explicit resend of unconfirmed IDs', async () => {
+test('a confirmation save failure retains the pre-send target and rechecks without a second OTEL send', async () => {
     const p = await platform(), atomicJson = reportFiles.atomicJson;
     let writes = 0;
     const writing = spyOn(reportFiles, 'atomicJson').mockImplementation((file, value) => {
@@ -192,7 +198,7 @@ test('a receipt save failure retains the pre-send target and allows explicit res
             progress: { acceptedEventIds: [], rejectedEventIds: [] } });
         writing.mockRestore();
         await exportReport(p.report, p.file, undefined, p.root, { connection: p.connection });
-        expect(p.sends).toHaveLength(2); expect(p.sends[1]!.ids).toEqual(p.sends[0]!.ids);
+        expect(p.sends).toHaveLength(1);
         expect(readReport(p.file).export.status).toBe('complete');
         expect(readFileSync(p.file, 'utf8')).toBe(p.original);
     } finally { writing.mockRestore(); await p.close(); }

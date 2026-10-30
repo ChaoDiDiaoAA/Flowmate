@@ -28,7 +28,7 @@ function config(root: string, profile: FixtureProfile): ProviderConfig {
     revision: 1,
     modelRef: {
       provider: 'deepseek',
-    model: profile === 'model' ? 'flowmate-p1-intentionally-absent-model' : 'deepseek-v4-flash',
+    model: profile === 'model' ? 'flowmate-p1-intentionally-absent-model' : 'deepseek-flash',
     },
     native: { authPath: join(root, 'auth.json'), modelsPath: null },
     parameters: { maxRetries: profile === 'rate-limit' ? 1 : 0, maxRetryDelayMs: 10 },

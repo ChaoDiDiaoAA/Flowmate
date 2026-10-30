@@ -10,7 +10,7 @@ import { appError, fail } from '@flowmate/contracts';
 import type { AgentNativeOutcome, AgentRunEvent, AgentToolBinding, Application, NativeSessionHistory, ProviderConfig, Result, ToolCallSnapshot } from '@flowmate/contracts';
 import { createApplication } from '../../apps/composition.ts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
-import { openDatabase } from '../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
 import { deferCleanup, mkdtempSync } from '../support/resources.ts';
 import { CandidateDraftSchema, INVOICE_TOOL_NAMES, invoiceToolSchemas } from '../../packages/contracts/src/invoice.ts';
 import { toPiParameters } from '../../packages/runtime-pi/src/schema.ts';
@@ -82,7 +82,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
         seeded.data.db.exec("CREATE TRIGGER reject_unsafe_marker BEFORE UPDATE OF unusable ON session_native_history WHEN NEW.unusable=1 BEGIN SELECT RAISE(ABORT,'unsafe marker failed'); END;");
         seeded.data.db.exec("CREATE TRIGGER reject_failed_terminal BEFORE UPDATE ON runs WHEN NEW.status='failed' BEGIN SELECT RAISE(ABORT,'terminal failed'); END;");
       }
-      seeded.data.close();
+      await seeded.data.close();
     }
     const callId = `p4-save-${fault}`;
     let documentId = 0;
@@ -123,7 +123,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
           ...(afterFault ? { sessionSetup(session) {
             const originalAfter = session.agent.afterToolCall;
             session.agent.afterToolCall = async (...call) => {
-              const saved = queryCall?.(call[0].toolCall.id);
+              const saved = await queryCall?.(call[0].toolCall.id);
               if (!saved?.ok) throw new Error('Missing saved candidate ToolCall before SDK after.');
               fixedFacts = { result: saved.data.result, runtimeObservation: saved.data.runtimeObservation,
                 endedAt: saved.data.endedAt, stoppedAt: saved.data.stoppedAt };
@@ -135,7 +135,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
             };
           } } : {}) });
         const watch = adapter.watchSession.bind(adapter);
-        adapter.watchSession = (nativeId, commit, seed, save) => watch(nativeId, commit, seed, write => {
+        adapter.watchSession = (nativeId, commit, seed, save) => watch(nativeId, commit, seed, async write => {
           const history = write.history; const context = write.contexts[0];
           const entry = history.entries.at(-1);
           const message = entry?.type === 'message' ? entry.message as Record<string, unknown> : null;
@@ -148,7 +148,7 @@ describe('P4 real candidate commit and message persistence failures', () => {
             failedEntryId = context.entryId;
             return fail(appError('storage_write_failed', 'storage', 'Controlled native message save failure.', true));
           }
-          const result = save(write);
+          const result = await save(write);
           if (result.ok) priorPrefix = structuredClone(history);
           return result;
         });
@@ -163,18 +163,18 @@ describe('P4 real candidate commit and message persistence failures', () => {
             queryCall = binding.queryCall;
             outcome = await nativeExecute({ ...input, toolBinding: { ...binding,
               execute: async (...call) => { executions += 1; return binding.execute(...call); },
-              recordDelivery: (id, delivery) => {
-                const actual = binding.recordDelivery(id, delivery);
+              recordDelivery: async (id, delivery) => {
+                const actual = await binding.recordDelivery(id, delivery);
                 deliveries.push({ state: delivery.state, result: actual });
                 if (delivery.state === 'message_observed' && actual.ok) {
-                  const repeated = binding.recordDelivery(id, structuredClone(delivery));
+                  const repeated = await binding.recordDelivery(id, structuredClone(delivery));
                   expect(repeated).toEqual(actual);
                   repeatedDeliveries += 1;
                   deliveries.push({ state: 'repeated', result: repeated });
                 }
                 if (fault === 'delivery-conflict' && delivery.state === 'message_observed' && actual.ok && !injected) {
                   injected = true;
-                  const conflict = binding.recordDelivery(id, { ...delivery, messageObservedAt: '2000-01-01T00:00:00.000Z' });
+                  const conflict = await binding.recordDelivery(id, { ...delivery, messageObservedAt: '2000-01-01T00:00:00.000Z' });
                   deliveries.push({ state: 'conflict', result: conflict });
                   return conflict;
                 }
@@ -409,7 +409,7 @@ it('F6-04 preserves the actual SDK candidate and Activity when its Tool settleme
       SELECT 1 FROM invoice_candidates candidate JOIN business_events activity ON activity.candidate_id=candidate.id
       WHERE candidate.tool_call_id=NEW.tool_call_id AND activity.type='candidate_generated' AND activity.result='succeeded')
     BEGIN SELECT RAISE(ABORT,'candidate Tool settlement event unavailable'); END;`);
-  seeded.data.close();
+  await seeded.data.close();
   let documentId = 0;
   const callId = 'p6-save-event-failure';
   let httpCalls = 0;
@@ -452,13 +452,13 @@ it('F6-04 preserves the actual SDK candidate and Activity when its Tool settleme
             execute: async (...call) => {
               executorCalls += 1;
               invocation = await binding.execute(...call);
-              const queried = binding.queryCall?.(call[2].nativeToolCallId);
+              const queried = await binding.queryCall?.(call[2].nativeToolCallId);
               if (!queried?.ok) throw new Error('Missing original ToolCall after settlement rollback.');
               savedCall = queried.data;
               return invocation;
             },
-            recordDelivery: (...call) => {
-              const result = binding.recordDelivery(...call);
+            recordDelivery: async (...call) => {
+              const result = await binding.recordDelivery(...call);
               if (result.ok) deliveries += 1;
               deliveryAttempts.push({ state: call[1].state, result });
               return result;

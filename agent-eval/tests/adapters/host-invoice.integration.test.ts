@@ -315,8 +315,10 @@ test('024 commits its declared user history before native manual compaction and 
     } finally { if (session) expect((await session.close()).present).toBe(true); await server.stop(); }
 }, 60000);
 
-for(const expose of [true,false])test('025 builds public user turns and only saves after an actual native auto summary, expose='+expose,async()=>{
+for(const {expose,contextWindow} of [{expose:true,contextWindow:64000},{expose:true,contextWindow:40960},{expose:false,contextWindow:262144}])test('025 builds public user turns and only saves after an actual native auto summary, expose='+expose+', window='+contextWindow,async()=>{
     const f=fixture(false,false,true),requests:Array<Record<string,unknown>>=[];
+    // Pi 1.4 counts tool declarations; keep the original smaller window as refusal coverage.
+    const insufficientCapacity=expose&&contextWindow===40960;
     const seed=structuredClone(scenariosByName['compaction-continue-automatic-history'].files['quality-controls/FM-025/history-seed.json'].json);
     const finalRequest='Continue and save using my latest currency declaration and its user origin; preserve the original source.';
     delete seed.finalRequest;
@@ -345,7 +347,7 @@ for(const expose of [true,false])test('025 builds public user turns and only sav
         const content=expose?Array.from({length:120},(_,index)=>`Review ${answers}, observation ${index}: the selected invoice total is 113.00 and the original currency is $. This read-only review does not authorize saving.\n`).join(''):'Read-only review completed.';
         const chunk=(delta:object,finish:string|null)=>'data: '+JSON.stringify({id:'auto-history',choices:[{index:0,delta,finish_reason:finish}]})+'\n\n';
         // Synthetic provider usage triggers only after enough actual responses form an eligible prefix.
-        const input=expose&&answers===10?25000:10;
+        const input=expose&&answers===10?(insufficientCapacity?25000:50000):10;
         providerInput+=input;providerOutput+=Math.ceil(content.length/4);
         return new Response(chunk({role:'assistant',content},null)+chunk({},'stop')+'data: '+JSON.stringify({choices:[],usage:{prompt_tokens:input,completion_tokens:Math.ceil(content.length/4),total_tokens:input+Math.ceil(content.length/4)}})+'\n\ndata: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
     });
@@ -354,7 +356,7 @@ for(const expose of [true,false])test('025 builds public user turns and only sav
         turns:[...seedTurns,{id:'final-save',role:'user',content:finalRequest}],
         invoiceSource:{root:f.source,files:f.files,materials:f.materials.filter(m=>m.sample==='000001')},requires:['agent','invoice','workspace','history','compaction'],
         setup:{interactionProfile:profile,controllerBinding:{relativePath:'quality-controls/FM-025/controller.json'}},controllerInput:{profile,payload},
-        steps:[{id:'request',action:'invoice-message',instruction:prompt,sample:'000001',goalMode:'answer'}],configuration:{modelCapabilities: {...syntheticNativeModel,contextWindow:expose?40960:262144,maxTokens:16384}, model:'invoice-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'}};
+        steps:[{id:'request',action:'invoice-message',instruction:prompt,sample:'000001',goalMode:'answer'}],configuration:{modelCapabilities: {...syntheticNativeModel,contextWindow,maxTokens:16384}, model:'invoice-fixture',baseUrl:`http://127.0.0.1:${server.port}/v1`,api:'openai-completions'}};
     mkdirSync(item.directory);let session:AgentTrialSession|undefined;
     try{
         session=await prepareHostTrial(item,new AbortController().signal,{repo:REPO_ROOT,credential:'synthetic-auto-key'});
@@ -363,13 +365,23 @@ for(const expose of [true,false])test('025 builds public user turns and only sav
         const result=await session.execute(AbortSignal.timeout(45000));
         expect(result.usage).toEqual({inputTokens:providerInput,outputTokens:providerOutput,totalTokens:providerInput+providerOutput,cost:null});
         const inputs=result.evidence.inputs!.actual as Array<{mode:string;content:{text:string};status:string}>;
+        if(insufficientCapacity){
+            expect(result).toMatchObject({status:'failed',error:{code:'compaction_capacity_exceeded'}});
+            expect(summaryCalls).toBeGreaterThan(0);expect(inputs.filter(input=>input.status==='consumed')).toHaveLength(10);
+            expect(result.evidence.invoice).toMatchObject({actual:{candidates:[]}});
+            expect(result.evidence['case-controller']).toMatchObject({present:false,actual:{exposure:null}});
+            expect(result.evidence.history.present).toBe(true);
+            const history=result.evidence.history.actual as {entries:Array<{fields:{type:string}}>};
+            expect(history.entries.some(entry=>entry.fields.type==='compaction')).toBe(true);
+            expect(JSON.stringify(requests)).not.toContain(finalRequest);return;
+        }
         expect(inputs.filter(input=>input.status==='consumed')).toHaveLength(expose?18:17);
         expect(result.evidence['user-turns'].actual).toHaveLength(17);
         expect((result.evidence['user-turns'].actual as Array<{consumed:boolean}>).filter(turn=>turn.consumed)).toHaveLength(expose?17:16);
         expect(inputs.every(input=>input.mode==='prompt')).toBe(true);
         expect(result.evidence['interaction-history']!.present).toBe(true);
         if(expose){
-            expect(summaryCalls).toBeGreaterThan(0);expect(result.evidence['case-controller']).toMatchObject({present:true,actual:{exposure:{verified:true,seedTurns:16,finalInputConsumed:true,summaryWireInclusion:'confirmed',capacity:{contextWindow:40960,thresholdTokens:24576}}}});
+            expect(summaryCalls).toBeGreaterThan(0);expect(result.evidence['case-controller']).toMatchObject({present:true,actual:{exposure:{verified:true,seedTurns:16,finalInputConsumed:true,summaryWireInclusion:'confirmed',capacity:{contextWindow:64000,thresholdTokens:47616}}}});
             expect(result.evidence.invoice).toMatchObject({actual:{candidates:[{fields:{currency:{normalized:'USD'}}}]}});
             expect(result.evidence['tool-evidence']!.present).toBe(true);
             expect(JSON.stringify(requests.find(body=>JSON.stringify(body).includes(finalRequest)))).toContain('USD');

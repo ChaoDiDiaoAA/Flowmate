@@ -1,0 +1,79 @@
+diff --git a/dist/core/compaction/compaction.js b/dist/core/compaction/compaction.js
+index 9b1a409d96b39413d8598c79f14fee72f4cd533c..fb24eeceaa10fe4c8e63bea5f5e034eb0b850c5d 100644
+--- a/dist/core/compaction/compaction.js
++++ b/dist/core/compaction/compaction.js
+@@ -110,9 +110,11 @@ function getLastAssistantUsageInfo(messages) {
+ export function estimateContextTokens(messages) {
+     const usageInfo = getLastAssistantUsageInfo(messages);
+     if (!usageInfo) {
+-        let estimated = 0;
++        const system = getCurrentSystemMessage(messages);
++        let estimated = system ? estimateTokens(system) : 0;
+         for (const message of messages) {
+-            estimated += estimateTokens(message);
++            if (message.role !== "system")
++                estimated += estimateTokens(message);
+         }
+         return {
+             tokens: estimated,
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 3821d9f41564a68e990d233b260427d6a5681f42..9e9e7dfd033b8cbb0549aeaf1025d4ffd79cacb3 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -38,6 +38,8 @@ export { ArminComponent, AssistantMessageComponent, BashExecutionComponent, Bord
+ export { getLanguageFromPath, getMarkdownTheme, getSelectListTheme, getSettingsListTheme, highlightCode, initTheme, Theme, type ThemeAppearance, type ThemeBg, type ThemeColor, type ThemeStyle, type ThemeToken, } from "./modes/interactive/theme/theme.ts";
+ export { copyToClipboard } from "./utils/clipboard.ts";
+ export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.ts";
++export { loadPromptTemplates, expandPromptTemplate } from "./core/prompt-templates.js";
++export { getToolPath } from "./utils/tools-manager.js";
+ export { convertToPng } from "./utils/image-convert.ts";
+ export { formatDimensionNote, type ResizedImage, resizeImage } from "./utils/image-resize.ts";
+ export { detectSupportedImageMimeTypeFromFile } from "./utils/mime.ts";
+diff --git a/dist/index.js b/dist/index.js
+index ab5cfccc3a90939e533b9118122189507a7af326..915c0d9caa5a9069018e9cfb24db623a6b78d2ab 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -46,6 +46,8 @@ export { getLanguageFromPath, getMarkdownTheme, getSelectListTheme, getSettingsL
+ // Clipboard utilities
+ export { copyToClipboard } from "./utils/clipboard.js";
+ export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.js";
++export { loadPromptTemplates, expandPromptTemplate } from "./core/prompt-templates.js";
++export { getToolPath } from "./utils/tools-manager.js";
+ export { convertToPng } from "./utils/image-convert.js";
+ export { formatDimensionNote, resizeImage } from "./utils/image-resize.js";
+ export { detectSupportedImageMimeTypeFromFile } from "./utils/mime.js";
+diff --git a/dist/utils/tools-manager.js b/dist/utils/tools-manager.js
+index fdb4a12c02a9f48be3d2d5c37bb20db67dbc4993..9eab8e2e8b748aae225877ae6f37843bec4916dc 100644
+--- a/dist/utils/tools-manager.js
++++ b/dist/utils/tools-manager.js
+@@ -1,7 +1,7 @@
+ import { spawnSync } from "child_process";
+ import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
+ import { arch, platform } from "os";
+-import { join } from "path";
++import { isAbsolute, join } from "path";
+ import { Readable } from "stream";
+ import { pipeline } from "stream/promises";
+ import { getBinDir, VERSION } from "../config.js";
+@@ -64,7 +64,7 @@ const TOOLS = {
+ // Check if a command exists in PATH by trying to run it
+ function commandExists(cmd) {
+     try {
+-        const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
++        const result = spawnSync(cmd, ["--version"], { stdio: "pipe", timeout: 5000, windowsHide: true });
+         // Check for ENOENT error (command not found)
+         return result.error === undefined || result.error === null;
+     }
+@@ -77,6 +77,12 @@ export function getToolPath(tool) {
+     const config = TOOLS[tool];
+     if (!config)
+         return null;
++    // Flowmate launchers bind PI_PACKAGE_DIR to fixed runtime assets before SDK import.
++    const packageDir = process.env.PI_PACKAGE_DIR;
++    if (packageDir && isAbsolute(packageDir)) {
++        const bundledPath = join(packageDir, "..", "bin", config.binaryName + (platform() === "win32" ? ".exe" : ""));
++        if (existsSync(bundledPath)) return bundledPath;
++    }
+     // Check our tools directory first
+     const localPath = join(TOOLS_DIR, config.binaryName + (platform() === "win32" ? ".exe" : ""));
+     if (existsSync(localPath)) {

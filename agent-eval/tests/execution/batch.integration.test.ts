@@ -45,12 +45,12 @@ function datasets() {
         const data = structuredClone(dataset);
         data.manifest.id = group ? 'flowmate-research-v1' : 'flowmate-agent-v1';
         data.cases = Array.from({length:count}, (_,i) => ({...structuredClone(task),id:`FM-${String(i+1+group*50).padStart(3,'0')}`}));
-        data.manifest.smoke = data.cases.slice(0,group?4:10).map(c=>c.id);
+        data.manifest.smoke = data.cases.filter(c=>['FM-001','FM-002','FM-027','FM-033','FM-046','FM-051','FM-055'].includes(c.id)).map(c=>c.id);
         return data;
     });
 }
 
-test('batch selects 14 smoke or 62 full cases in two local Judge-enabled executions', async () => {
+test('batch selects 7 smoke or 62 full cases in two local Judge-enabled executions', async () => {
     expect(runner.runBatch).toBeFunction();
     for (const selection of ['smoke','full'] as const) {
         const selected: number[] = [], names: string[] = [];
@@ -62,7 +62,7 @@ test('batch selects 14 smoke or 62 full cases in two local Judge-enabled executi
                 selected.push(selectCases(options.dataset,selection).length);names.push(options.dataset.manifest.id);
                 return { report:reportFixture(),file:'synthetic-report.json',stopped:false };
             } });
-        expect(selected).toEqual(selection==='smoke'?[10,4]:[50,12]);
+        expect(selected).toEqual(selection==='smoke'?[5,2]:[50,12]);
         expect(names).toEqual(['flowmate-agent-v1','flowmate-research-v1']);expect(results).toHaveLength(2);
     }
 });
@@ -88,7 +88,7 @@ test('all datasets are checked before the first execution; ordinary failed resul
 });
 
 test('batch progress uses one plan and global indices for smoke, full and repeated Trials', async () => {
-    for (const [selection, repeat, total] of [['smoke',1,14],['full',1,62],['smoke',2,28],['smoke',5,70],['full',5,310]] as const) {
+    for (const [selection, repeat, total] of [['smoke',1,7],['full',1,62],['smoke',2,14],['smoke',5,35],['full',5,310]] as const) {
         const events: EvaluationProgress[] = [];
         await runner.runBatch(fixtureRepo, { datasets: datasets(), selection, repeat, backend: 'local', judge: 'required' },
             { env, kernel, onProgress: event => { events.push(event); }, run: async (_, options, deps) => {
@@ -103,9 +103,9 @@ test('batch progress uses one plan and global indices for smoke, full and repeat
                 return { report: reportFixture(), file: 'synthetic-report.json', stopped: false };
             } });
         expect(events.filter(e => e.type === 'plan')).toEqual([{ type: 'plan' as const, selection, total,
-            caseCount: selection === 'full' ? 62 : 14, trialsPerCase: repeat,
-            datasets: [{ id: 'flowmate-agent-v1', caseCount: selection === 'full' ? 50 : 10, total: (selection === 'full' ? 50 : 10) * repeat },
-                { id: 'flowmate-research-v1', caseCount: selection === 'full' ? 12 : 4, total: (selection === 'full' ? 12 : 4) * repeat }] }]);
+            caseCount: selection === 'full' ? 62 : 7, trialsPerCase: repeat,
+            datasets: [{ id: 'flowmate-agent-v1', caseCount: selection === 'full' ? 50 : 5, total: (selection === 'full' ? 50 : 5) * repeat },
+                { id: 'flowmate-research-v1', caseCount: selection === 'full' ? 12 : 2, total: (selection === 'full' ? 12 : 2) * repeat }] }]);
         expect(events.filter(e => e.type === 'trial-phase').map(e => [e.index,e.total]))
             .toEqual(Array.from({ length: total }, (_,i) => [i+1,total]));
         for (const completed of [events.filter(e => e.type === 'agent-end'), events.filter(e => e.type === 'scoring-end')])

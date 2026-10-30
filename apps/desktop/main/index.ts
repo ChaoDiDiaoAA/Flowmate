@@ -1,9 +1,10 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../host/protocol.ts';
 import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, researchOperations } from '../../../packages/contracts/src/research-commands.ts';
+import { isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure, personalAgentHostCommandTypes } from '../../../packages/contracts/src/personal-agent-commands.ts';
 import { ResourceRefSchema } from '@flowmate/contracts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, lstat, open, readFile, rename, rm } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -93,8 +94,15 @@ import { createCredentialStore } from '../../../packages/shared/src/secure-crede
 import type { CredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import { systemSecureStorage } from './secure-storage.ts';
 import { HostClient } from './host-client.ts';
-import { validateBusinessSettings, saveEvaluationSettings, evaluationCredentialStatus, evaluationConfigurationSnapshot, prepareEvaluationCredentials } from './evaluation-settings.ts';
+import { ServiceClient, type ServiceCommandInput } from './service-client.ts';
+import { createServiceActivation } from './service-activation.ts';
+import { readDesktopServiceSelection, type ServiceInstallation } from '../../../packages/shared/src/service-layout.ts';
+import { BackgroundServiceConnectRequestSchema, BackgroundServiceDisconnectRequestSchema, BackgroundServicePrepareRequestSchema,
+  BackgroundServiceEnableRequestSchema, BackgroundServiceActivationQuerySchema, type BackgroundServiceState } from '@flowmate/contracts';
+import { SERVICE_PROTOCOL_VERSION, SERVICE_DATA_VERSION } from '../../service/protocol.ts';
+import { validateBusinessSettings, saveEvaluationSettings, evaluationCredentialStatus, evaluationConfigurationSnapshot, prepareEvaluationCredentials, prepareExperimentCredentials } from './evaluation-settings.ts';
 import { EvaluationClient } from './evaluation-client.ts';
+import { EvaluationWorkflowRequestSchema, isWorkflowReadOnly, EVALUATION_WORKSPACE_UNAVAILABLE_REASON } from '../../../packages/contracts/src/evaluation-workflow.ts';
 import { evaluationResponses, parseEvaluationCommand, parseEvaluationResponse, type EvaluationResponseType } from '@flowmate/contracts';
 import { registerSecrets, scanEvidence } from '../../../agent-eval/src/execution/evidence-safety.ts';
 import type { HostCredentialRequest } from '../../host/protocol.ts';
@@ -114,6 +122,7 @@ import { publishExportCopy } from './invoice-export.ts';
 import { ResearchReportRequestSchema, ResearchExportResultSchema } from '@flowmate/contracts';
 
 const channels = {
+  evaluationWorkflow: 'flowmate:evaluation-workflow',
   getState: 'flowmate:get-state',
   listModelCatalog: 'flowmate:list-model-catalog',
   loginModel: 'flowmate:login-model',
@@ -220,10 +229,26 @@ let runtimeLayout: RuntimeLayout | null = null;
 let invoiceSourceRoot = '';
 let hostLaunch: { executable: string; args: readonly string[] } | undefined;
 let stateBroadcastSequence = 0;
-const host = new HostClient();
+const legacyHost = new HostClient(), serviceClient = new ServiceClient();
+let host: HostClient | ServiceClient = legacyHost;
+let transportEpoch = 0, transportGeneration = 0;
+let clientSubscription: (() => void) | null = null;
+let serviceMode = false, legacyAllowed = true;
+let serviceInstallation: ServiceInstallation | null = null;
+let backgroundService: BackgroundServiceState = { state: 'disabled', installationId: null, protocolVersion: null, dataVersion: null, error: null };
+let lastServiceSettings = defaultProductSettings();
+let serviceConnectionId: string | null = null, pendingServiceDisconnectId: string | null = null;
+let serviceSettingsSaving = false;
+let configurationWriting = false;
+const serviceSettingsRequestSchema = z.object({ version: z.literal(1), installationId: z.string().uuid(), operationId: z.string().uuid() }).strict();
+type ServiceSettingsRequest = z.infer<typeof serviceSettingsRequestSchema>;
 const mainLog = createRuntimeLogBuffer();
 mainLog.write({ at: new Date().toISOString(), level: 'info', component: 'main', event: 'desktop_started' });
 let evaluation: EvaluationClient | null = null;
+let evaluationWorkspaceRoot: string | undefined;
+const handleEvaluationTrace: Parameters<HostClient['setEvaluationTraceHandler']>[0] = value => {
+  if (evaluationWorkspaceRoot && resolve(value.workspaceRoot) === resolve(evaluationWorkspaceRoot)) evaluation?.enqueueTrace(value.traceId);
+};
 const subscriptions = new Map<number, () => void>();
 type RuntimeOwner = { token: string; contents: Electron.WebContents; frame: Electron.WebFrameMain;
   url: string; generation: number; epoch: number };
@@ -235,6 +260,43 @@ const runtimeBindings = new Map<string, RuntimeBinding>();
 const runtimeReleased = new Map<string, string>();
 const runtimeQueries = new Set<string>();
 const credentialStores = new Map<string, CredentialStore>();
+const serviceActivation = createServiceActivation({ client: serviceClient, dataRoot: () => userDataRoot, runtimeLayout: () => runtimeLayout,
+  installation: () => { const selected = serviceSelection(); return selected.ok ? ok(selected.data.installation) : selected; },
+  readSettings: async () => {
+    if (host === legacyHost && legacyAllowed) return readSavedSettings();
+    // Resume reads the original validated product configuration without migration writes or evaluation credentials.
+    try { return validateProductSettings(JSON.parse(await readFile(join(userDataRoot, 'data/settings.json'), 'utf8'))); }
+    catch (cause) { return cause && typeof cause === 'object' && 'code' in cause && cause.code === 'ENOENT'
+      && serviceInstallation?.activationSettingsRevision === 0 ? ok(defaultProductSettings())
+      : fail(appError('config_settings_read_failed', 'storage', 'The original product configuration is unreadable. No credential migration was submitted.')); }
+  },
+  readCredential: reference => credentialStore(reference).read(), confirmForm: confirmInvoiceFormClose,
+  closing: () => desktopClosing, canBegin: () => !pendingServiceDisconnectId && !configurationWriting && !serviceSettingsSaving && (!evaluation || evaluation.canRestartHost),
+  pending: installation => {
+    serviceInstallation = installation; legacyAllowed = false; serviceMode = true; hostError = true; hostErrorCode = 'service_activation_pending';
+    projectService('blocked', appError('service_activation_pending', 'runtime', 'Continue the original service activation operation.'));
+    revokeDesktopConnection(); void broadcastState();
+  },
+  closeLegacy: async () => {
+    // A reopened Main has no original handle. The offline backup lease excludes an owner still holding this root.
+    if (host === legacyHost) {
+      const closed = await legacyHost.close();
+      if (!closed.ok) return closed;
+      if (!closed.data.closed || !closed.data.stopped || legacyHost.hasLiveProcess) return fail(appError('host_close_unconfirmed', 'runtime',
+        'The original Host has not confirmed stopping and process exit. Continue its original handoff.', true));
+      installProductClient(serviceClient);
+    }
+    return ok(undefined);
+  },
+  active: async installation => {
+    serviceInstallation = installation;
+    if (host !== serviceClient) installProductClient(serviceClient);
+    serviceConnectionId = serviceClient.serverConnectionId;
+    if (!serviceClient.isConnected || !serviceConnectionId) return fail(appError('service_disconnected', 'runtime', 'The activated service connection was lost.', true));
+    const recovered = await recoverServiceSettingsRequest(); if (!recovered.ok) return recovered;
+    projectService('ready'); hostError = false; hostErrorCode = 'host_not_ready'; await broadcastState(); return ok(undefined);
+  },
+});
 const piCredentialPrefix = 'pi-credential-v1:';
 type DesktopFormBinding = InvoiceFormTargetBinding & { currentRevision: number; mutationPending?: boolean; unknownOperationRef?: string; clientSequence?: number; requestId?: string; modelId?: string };
 let invoiceFormBinding: DesktopFormBinding | null = null;
@@ -291,6 +353,146 @@ async function sendDevelopmentNotice(value: Record<string, unknown>): Promise<vo
   });
 }
 
+function transportAvailable(): boolean { return host === legacyHost ? legacyHost.hasLiveProcess : serviceClient.isConnected; }
+async function requestProduct(command: Parameters<HostClient['request']>[0], timeoutMs?: number): Promise<unknown> {
+  const original = host, epoch = transportEpoch, generation = transportGeneration;
+  let result: unknown;
+  if (original instanceof HostClient) result = await original.request(command, timeoutMs);
+  else {
+    if (command.type === 'close' || command.type === 'credential_response' || command.type === 'invoice_form_response') throw Error('service_command_forbidden');
+    result = await original.request(command, timeoutMs);
+  }
+  if (host !== original || transportEpoch !== epoch || transportGeneration !== generation) throw Error('host_connection_changed');
+  return result;
+}
+function revokeDesktopConnection(): void {
+  transportEpoch++;
+  releaseAllRuntimeOwners();
+  if (invoiceFormBinding) invoiceFormBinding.valid = false;
+  for (const pending of pendingInvoiceForms.values()) pending.resolve(unknownInvoiceForm(pending.request));
+  for (const pending of pendingFormInspections.values()) pending.resolve(null);
+}
+function projectService(state: BackgroundServiceState['state'], error: BackgroundServiceState['error'] = null): void {
+  backgroundService = { state, installationId: serviceInstallation?.installationId ?? null,
+    protocolVersion: state === 'ready' ? SERVICE_PROTOCOL_VERSION : null, dataVersion: state === 'ready' ? SERVICE_DATA_VERSION : null,
+    activationOperationId: serviceInstallation?.activationOperationId ?? null,
+    activationSettingsRevision: serviceInstallation?.activationSettingsRevision ?? null, error };
+}
+function serviceSelection() {
+  return readDesktopServiceSelection({ dataRoot: userDataRoot,
+    ...(app.isPackaged && runtimeLayout ? { runtimeRoot: runtimeLayout.runtimeRoot, releaseId: runtimeLayout.release?.releaseId } : {}) });
+}
+function serviceSettingsRequestFile(): string { return join(userDataRoot, 'data', 'desktop-service-settings-request.json'); }
+async function readServiceSettingsRequest(): Promise<Result<ServiceSettingsRequest | null>> {
+  try {
+    const file = serviceSettingsRequestFile(), stat = await lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) throw Error('invalid_request');
+    const parsed = serviceSettingsRequestSchema.safeParse(JSON.parse(await readFile(file, 'utf8')));
+    if (!parsed.success || parsed.data.installationId !== serviceInstallation?.installationId) throw Error('invalid_request');
+    return ok(parsed.data);
+  } catch (cause) {
+    if (cause && typeof cause === 'object' && 'code' in cause && cause.code === 'ENOENT') return ok(null);
+    return fail(appError('service_settings_request_invalid', 'storage', 'The original desktop settings request is unreadable or belongs to another installation. It was retained.'));
+  }
+}
+async function saveServiceSettingsRequest(request: ServiceSettingsRequest): Promise<Result<void>> {
+  const file = serviceSettingsRequestFile(), temporary = file + '.' + randomUUID() + '.tmp';
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, 'wx', 0o600); await handle.writeFile(JSON.stringify(request) + '\n'); await handle.sync();
+    await handle.close(); handle = undefined; await rename(temporary, file); return ok(undefined);
+  } catch {
+    try { await handle?.close(); } catch { /* Preserve the original failure. */ }
+    try { await rm(temporary, { force: true }); } catch { /* Only this unpublished ID-only file is eligible. */ }
+    return fail(appError('service_settings_request_write_failed', 'storage', 'The original settings request ID could not be saved. No service write was submitted.', true));
+  }
+}
+async function clearServiceSettingsRequest(request: ServiceSettingsRequest): Promise<Result<void>> {
+  const current = await readServiceSettingsRequest(); if (!current.ok) return current;
+  if (current.data && current.data.operationId !== request.operationId) return fail(appError('service_settings_request_invalid', 'storage', 'The original settings request changed. It was retained.'));
+  try { await rm(serviceSettingsRequestFile(), { force: true }); return ok(undefined); }
+  catch { return fail(appError('service_settings_request_clear_failed', 'storage', 'The confirmed settings request ID could not be cleared. Its original result is retained.', true)); }
+}
+async function recoverServiceSettingsRequest(): Promise<Result<{ operationId: string | null }>> {
+  const pending = await readServiceSettingsRequest(); if (!pending.ok) return pending;
+  if (!pending.data) return ok({ operationId: null });
+  const request = pending.data;
+  const original = await serviceClient.queryCredentialOperation({ installationId: request.installationId, operationId: request.operationId });
+  if (!original.ok || !original.data || original.data.phase === 'pending' || original.data.phase === 'prepared'
+    || original.data.phase === 'failed' && (!original.data.error || original.data.error.code === 'operation_result_unknown')) return fail(appError('service_settings_request_pending', 'runtime',
+    `The original service settings request ${request.operationId} is awaiting confirmation. No new save was submitted.`, true));
+  if (original.data.phase === 'failed') {
+    const cleared = await clearServiceSettingsRequest(request); if (!cleared.ok) return cleared;
+    return fail(original.data.error ?? appError('service_settings_failed', 'storage', 'The original service settings save was refused.'));
+  }
+  if (!original.data.settings || original.data.settings.revision !== original.data.settingsRevision) return fail(appError('service_settings_request_pending', 'runtime',
+    `The original committed settings snapshot for request ${request.operationId} could not be confirmed.`, true));
+  const cleared = await clearServiceSettingsRequest(request); if (!cleared.ok) return cleared;
+  lastServiceSettings = original.data.settings; return ok({ operationId: request.operationId });
+}
+async function connectBackgroundService(installationId: string): Promise<Result<BackgroundServiceState>> {
+  const selection = serviceSelection();
+  if (!selection.ok) { projectService('incompatible', selection.error); return selection; }
+  if (selection.data.kind !== 'service') return fail(appError(selection.data.kind === 'pending' ? 'service_activation_pending' : 'service_disabled',
+    'runtime', 'The background service has not been enabled.'));
+  if (selection.data.installation.installationId !== installationId) return fail(appError('service_installation_invalid', 'input', 'The selected service installation changed.'));
+  if (host !== serviceClient || !serviceMode) return fail(appError('service_transition_required', 'runtime', 'Restart the desktop after the original owner transition is complete.'));
+  const installation = selection.data.installation; serviceInstallation = installation;
+  if (serviceClient.isConnected) return ok(backgroundService);
+  if (serviceClient.connectionState === 'connecting') return ok(backgroundService);
+  projectService('starting'); hostError = true; hostErrorCode = 'service_connecting';
+  void broadcastState();
+  const result = await serviceClient.connect(installation);
+  if (result.ok) {
+    serviceConnectionId = serviceClient.serverConnectionId ?? serviceClient.lastServerConnectionId;
+    if (!serviceClient.isConnected) {
+      pendingServiceDisconnectId ??= serviceConnectionId;
+      const error = appError('service_disconnected', 'runtime', 'The original service connection was lost while opening.', true);
+      projectService('offline', error); hostError = true; hostErrorCode = error.code; return ok(backgroundService);
+    }
+    if (pendingServiceDisconnectId) {
+      const original = await serviceClient.queryDisconnect(pendingServiceDisconnectId);
+      if (!original.ok || !original.data.stopped) {
+        const error = original.ok ? appError('service_foreground_stop_unconfirmed', 'runtime', 'The original connection still has unconfirmed foreground work.', true) : original.error;
+        projectService('stopping', error); hostError = true; hostErrorCode = error.code; return ok(backgroundService);
+      }
+      pendingServiceDisconnectId = null;
+    }
+    const recovered = await recoverServiceSettingsRequest();
+    if (!recovered.ok) { projectService('blocked', recovered.error); hostError = true; hostErrorCode = recovered.error.code; return ok(backgroundService); }
+    projectService(desktopClosing ? 'stopping' : 'ready'); hostError = desktopClosing; hostErrorCode = desktopClosing ? 'runtime_closing' : 'host_not_ready';
+  }
+  else { projectService(result.error.code === 'host_protocol_invalid' ? 'incompatible' : 'offline', result.error); hostError = true; hostErrorCode = result.error.code; }
+  return ok(backgroundService);
+}
+async function disconnectBackgroundService(): Promise<Result<BackgroundServiceState>> {
+  if (!serviceMode || host !== serviceClient) return fail(appError('service_disabled', 'runtime', 'The desktop uses its local Host.'));
+  if (!serviceClient.isConnected) {
+    if (pendingServiceDisconnectId) return fail(appError('service_foreground_stop_unconfirmed', 'runtime', 'Reconnect to check the original foreground stop before closing.', true));
+    serviceClient.disconnect(); return ok(backgroundService);
+  }
+  if (pendingServiceDisconnectId && pendingServiceDisconnectId !== serviceConnectionId) {
+    const original = await serviceClient.queryDisconnect(pendingServiceDisconnectId);
+    if (!original.ok || !original.data.stopped) {
+      const error = original.ok ? appError('service_foreground_stop_unconfirmed', 'runtime', 'The original connection still has unconfirmed foreground work.', true) : original.error;
+      projectService('stopping', error); return fail(error);
+    }
+    pendingServiceDisconnectId = null;
+  }
+  pendingServiceDisconnectId = serviceConnectionId;
+  projectService('stopping');
+  void broadcastState();
+  const report = await serviceClient.prepareDisconnect().catch(() => fail(appError('service_foreground_stop_unconfirmed', 'runtime', 'The original foreground stop response is unknown.', true)));
+  if (!report.ok || !report.data.stopped) {
+    const error = report.ok ? appError('service_foreground_stop_unconfirmed', 'runtime', 'The original foreground execution has not confirmed stopping.', true) : report.error;
+    projectService('stopping', error); hostError = true; hostErrorCode = error.code;
+    return fail(error);
+  }
+  pendingServiceDisconnectId = null; serviceConnectionId = null; revokeDesktopConnection();
+  projectService('offline'); serviceClient.disconnect(); hostError = true; hostErrorCode = 'service_disconnected';
+  return ok(backgroundService);
+}
+
 async function bootstrap(): Promise<void> {
   const appRoot = app.isPackaged ? app.getAppPath() : resolveWorkspaceRoot(app.getAppPath());
   const testRoot = !app.isPackaged && process.env.FLOWMATE_TEST_MODE === '1'
@@ -307,12 +509,24 @@ async function bootstrap(): Promise<void> {
   }
   runtimeLayout = layout.data;
   appVersion = runtimeLayout.release?.productVersion ?? appVersion;
+  const selection = serviceSelection();
+  legacyAllowed = selection.ok && selection.data.kind === 'legacy'; serviceMode = !legacyAllowed;
+  serviceInstallation = selection.ok ? selection.data.installation : null;
+  host = serviceMode ? serviceClient : legacyHost; transportGeneration++; revokeDesktopConnection();
+  if (!selection.ok) projectService('incompatible', selection.error);
+  else if (selection.data.kind === 'pending') projectService('blocked', appError('service_activation_pending', 'runtime', 'The original credential activation has not completed.'));
+  else if (selection.data.kind === 'service') projectService('offline');
+  else projectService('disabled');
   // The existing local test kernel owns this fixed synthetic data root; production keeps the workspace root.
   evaluation = new EvaluationClient(appRoot, app.isPackaged ? runtimeLayout.evaluationRoot
     : testRoot && isAbsolutePath(testRoot) ? join(userDataRoot, 'evaluation-fixture') : appRoot,
     runtimeLayout.mode === 'installed' && runtimeLayout.release ? { executable: runtimeLayout.bunExecutable,
       entry: runtimeLayout.workerLauncher, cwd: runtimeLayout.runtimeRoot,
       runtime: { mode: 'installed', layout: runtimeLayout, release: runtimeLayout.release } } : undefined);
+  evaluationWorkspaceRoot = app.isPackaged ? undefined
+    : testRoot && isAbsolutePath(testRoot) ? join(userDataRoot, 'evaluation-fixture') : appRoot;
+  if (evaluationWorkspaceRoot) mkdirSync(evaluationWorkspaceRoot, { recursive: true });
+  legacyHost.setEvaluationTraceHandler(handleEvaluationTrace);
   evaluation.subscribe(value => {
     for (const [webContentsId] of subscriptions) {
       const contents = BrowserWindow.getAllWindows().find(window => window.webContents.id === webContentsId)?.webContents;
@@ -323,11 +537,11 @@ async function bootstrap(): Promise<void> {
     ? process.env.FLOWMATE_TEST_INVOICE_SOURCE_ROOT : undefined;
   invoiceSourceRoot = testInvoiceSourceRoot && isAbsolutePath(testInvoiceSourceRoot)
     ? testInvoiceSourceRoot : runtimeLayout.invoiceSourceRoot;
-  if (app.isPackaged) mkdirSync(invoiceSourceRoot, { recursive: true });
+  if (app.isPackaged && legacyAllowed) mkdirSync(invoiceSourceRoot, { recursive: true });
   hostLaunch = { executable: runtimeLayout.bunExecutable, args: ['--no-env-file', app.isPackaged ? runtimeLayout.hostLauncher : 'apps/host/main.ts',
     '--user-data-root', userDataRoot, '--invoice-source-root', invoiceSourceRoot] };
   let retiredCredentialRef: string | null = null;
-  try {
+  try { if (legacyAllowed) {
     const old = JSON.parse(readFileSync(join(userDataRoot, 'data', 'settings.json'), 'utf8')) as { version?: unknown; models?: unknown[] };
     if (old.version === 1 && Array.isArray(old.models)) {
       const retired = old.models.find((model) => model && typeof model === 'object'
@@ -336,39 +550,12 @@ async function bootstrap(): Promise<void> {
       if (typeof retired?.credentialRef === 'string' && /^[a-zA-Z0-9_-]{16,80}$/.test(retired.credentialRef))
         retiredCredentialRef = retired.credentialRef;
     }
-  } catch { /* No legacy settings to clean up. */ }
-  host.subscribe((event) => {
-    if (event.type === 'runtime_events_available') { receiveRuntimeWake(event); return; }
-    if (event.type === 'host_state' && event.state.host === 'error') {
-      mainLog.write({ at: new Date().toISOString(), level: 'error', component: 'main', event: 'host_unavailable', code: 'host_exited' });
-      hostError = true;
-      hostErrorCode = 'host_exited';
-    }
-    if (event.type === 'host_state' && event.state.host === 'ready') {
-      hostError = false;
-      hostErrorCode = 'host_not_ready';
-    }
-    if (event.type === 'host_state') {
-      void broadcastState();
-      return;
-    }
-    const desktopEvent = event.type === 'agent_run_event' ? event.value : event as DesktopEvent;
-    if (desktopEvent.type === 'compaction_observation' && !parseCompactionNotification(desktopEvent)) return;
-    if (desktopEvent.type === 'message_upsert' && !MessageUpsertEventSchema.safeParse(desktopEvent).success) return;
-    for (const [webContentsId] of subscriptions) {
-      const contents = BrowserWindow.getAllWindows().find((window) => window.webContents.id === webContentsId)?.webContents;
-      if (contents && !contents.isDestroyed()) contents.send('flowmate:event', desktopEvent);
-    }
-  });
-  host.setCredentialHandler(handleHostCredentialRequest);
-  host.setInvoiceFormHandler(handleInvoiceFormRequest);
-  host.setConnectionChangeHandler(() => {
-    releaseAllRuntimeOwners();
-    if (invoiceFormBinding) invoiceFormBinding.valid = false;
-    for (const pending of pendingInvoiceForms.values()) pending.resolve(unknownInvoiceForm(pending.request));
-    for (const pending of pendingFormInspections.values()) pending.resolve(null);
-  });
-  const started = await host.start(userDataRoot, appVersion, runtimeLayout.runtimeRoot, invoiceSourceRoot, hostLaunch);
+  } } catch { /* No legacy settings to clean up. */ }
+  installProductClient(host);
+  const started = legacyAllowed ? await legacyHost.start(userDataRoot, appVersion, runtimeLayout.runtimeRoot, invoiceSourceRoot, hostLaunch, evaluationWorkspaceRoot)
+    : selection.ok && selection.data.kind === 'service' ? await connectBackgroundService(selection.data.installation.installationId).then(result => result.ok
+      ? serviceClient.state ? ok(serviceClient.state) : fail(result.data.error ?? appError('service_offline', 'runtime', 'The background service is offline.')) : result)
+      : fail(backgroundService.error ?? appError('service_unavailable', 'runtime', 'The background service is unavailable.'));
   if (started.ok && started.data.ready && retiredCredentialRef) {
     const removed = await credentialStore(retiredCredentialRef).remove();
     if (!removed.ok) process.stderr.write('[Flowmate] A retired encrypted credential could not be deleted.\n');
@@ -384,13 +571,62 @@ async function bootstrap(): Promise<void> {
   await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_ready', ready: !hostError });
 }
 
+function installProductClient(client: HostClient | ServiceClient): void {
+  clientSubscription?.(); clientSubscription = null;
+  transportGeneration++; revokeDesktopConnection(); host = client;
+  const originalClient = client, clientGeneration = transportGeneration;
+  clientSubscription = client.subscribe((event) => {
+    if (host !== originalClient || transportGeneration !== clientGeneration) return;
+    if (event.type === 'runtime_events_available') { receiveRuntimeWake(event); return; }
+    if (event.type === 'host_state' && event.state.host === 'error') {
+      mainLog.write({ at: new Date().toISOString(), level: 'error', component: 'main', event: 'host_unavailable', code: 'host_exited' });
+      hostError = true;
+      hostErrorCode = 'host_exited';
+    }
+    if (event.type === 'host_state' && event.state.host === 'ready') {
+      hostError = serviceMode && backgroundService.state !== 'ready';
+      hostErrorCode = 'host_not_ready';
+    }
+    if (event.type === 'host_state') {
+      void broadcastState();
+      return;
+    }
+    const desktopEvent = event.type === 'agent_run_event' ? event.value : event as DesktopEvent;
+    if (desktopEvent.type === 'compaction_observation' && !parseCompactionNotification(desktopEvent)) return;
+    if (desktopEvent.type === 'message_upsert' && !MessageUpsertEventSchema.safeParse(desktopEvent).success) return;
+    for (const [webContentsId] of subscriptions) {
+      const contents = BrowserWindow.getAllWindows().find((window) => window.webContents.id === webContentsId)?.webContents;
+      if (contents && !contents.isDestroyed()) contents.send('flowmate:event', desktopEvent);
+    }
+  });
+  legacyHost.setCredentialHandler(request => host === legacyHost && legacyAllowed ? handleHostCredentialRequest(request) : Promise.resolve({ ok: false }));
+  client.setInvoiceFormHandler((request) => host === originalClient && transportGeneration === clientGeneration
+    ? handleInvoiceFormRequest(request, transportEpoch) : Promise.resolve(unknownInvoiceForm(request)));
+  client.setConnectionChangeHandler(() => {
+    if (host !== originalClient || transportGeneration !== clientGeneration) return;
+    revokeDesktopConnection();
+    if (originalClient === serviceClient) {
+      pendingServiceDisconnectId ??= serviceConnectionId;
+      serviceConnectionId = serviceClient.serverConnectionId;
+    }
+    if (serviceMode && (backgroundService.state === 'ready' || backgroundService.state === 'stopping')) {
+      const error = appError('service_disconnected', 'runtime', 'The original background service connection was lost.', true);
+      projectService('offline', error); hostError = true; hostErrorCode = error.code; void broadcastState();
+    }
+  });
+}
+
 async function restartHost(): Promise<Result<DesktopState>> {
   await startup;
-  if (desktopClosing || host.hasLiveProcess || evaluation && !evaluation.canRestartHost)
+  if (serviceMode) {
+    if (serviceInstallation && backgroundService.state !== 'blocked') await connectBackgroundService(serviceInstallation.installationId);
+    await broadcastState(); return readDesktopState();
+  }
+  if (desktopClosing || transportAvailable() || evaluation && !evaluation.canRestartHost)
     return fail(appError('host_still_running', 'runtime', 'The original controller or stopping state must be resolved before Recheck.', true));
   if (!runtimeLayout || !hostLaunch) return fail(appError('installation_runtime_invalid', 'runtime', 'Runtime layout is unavailable.'));
   mainLog.write({ at: new Date().toISOString(), level: 'info', component: 'main', event: 'host_recheck_started' });
-  const started = await host.start(userDataRoot, appVersion, runtimeLayout.runtimeRoot, invoiceSourceRoot, hostLaunch);
+  const started = await legacyHost.start(userDataRoot, appVersion, runtimeLayout.runtimeRoot, invoiceSourceRoot, hostLaunch, evaluationWorkspaceRoot);
   hostError = !started.ok || !started.data.ready;
   hostErrorCode = started.ok ? hostError ? 'host_start_failed' : 'host_not_ready' : started.error.code;
   await broadcastState();
@@ -398,16 +634,16 @@ async function restartHost(): Promise<Result<DesktopState>> {
 }
 
 async function queryDiagnostics(): Promise<Result<DiagnosticsSnapshot>> {
-  const epoch = host.connectionEpoch, gaps: string[] = [];
+  const epoch = transportEpoch, gaps: string[] = [];
   let availability: DiagnosticsSnapshot['host']['availability'] = 'source-unavailable';
   let source: import('zod').z.infer<typeof HostDiagnosticsResultSchema> | null = null;
-  if (host.hasLiveProcess && host.state?.ready) {
+  if (transportAvailable() && host.state?.ready) {
     try {
-      const checked = HostDiagnosticsResultSchema.safeParse(await host.request({ type: 'query_diagnostics' }, 2000));
-      if (checked.success && checked.data.ok && epoch === host.connectionEpoch) { source = checked.data; availability = 'available'; }
-    } catch (error) { if (epoch === host.connectionEpoch && error instanceof Error && error.message === 'host_request_timeout') availability = 'timeout'; }
+      const checked = HostDiagnosticsResultSchema.safeParse(await requestProduct({ type: 'query_diagnostics' }, 2000));
+      if (checked.success && checked.data.ok && epoch === transportEpoch) { source = checked.data; availability = 'available'; }
+    } catch (error) { if (epoch === transportEpoch && error instanceof Error && error.message === 'host_request_timeout') availability = 'timeout'; }
   }
-  if (epoch !== host.connectionEpoch) { availability = 'source-unavailable'; source = null; gaps.push('host_connection_changed'); }
+  if (epoch !== transportEpoch) { availability = 'source-unavailable'; source = null; gaps.push('host_connection_changed'); }
   if (availability !== 'available') gaps.push(availability === 'timeout' ? 'host_query_timeout' : 'host_memory_unavailable');
   const clean = (value: { entries: readonly import('@flowmate/contracts').DiagnosticLogEntry[]; dropped: number }) => {
     const entries = value.entries.filter(entry => !(scanEvidence(entry).fact.actual as { leaked: boolean }).leaked);
@@ -415,22 +651,23 @@ async function queryDiagnostics(): Promise<Result<DiagnosticsSnapshot>> {
     return { entries, dropped: value.dropped + value.entries.length - entries.length };
   };
   try {
-    const settings = validateProductSettings(epoch === host.connectionEpoch && host.hasLiveProcess && host.state?.ready ? host.state.settings : null);
+    const settings = validateProductSettings(epoch === transportEpoch && transportAvailable() && host.state?.ready ? host.state.settings : null);
     let modelId = settings.ok ? settings.data.defaultModelId : null;
     const model = settings.ok ? settings.data.models.find(item => item.id === modelId) : null;
     let credential: DiagnosticsSnapshot['configuration']['credential'] = settings.ok
-      ? model ? await credentialStore(model.credentialRef).status() : 'missing' : 'unavailable';
+      ? model ? await modelCredentialStatus(model) : 'missing' : 'unavailable';
     if (!settings.ok) gaps.push('model_configuration_unavailable');
-    if (epoch !== host.connectionEpoch || !host.hasLiveProcess || !host.state?.ready) {
+    if (epoch !== transportEpoch || !transportAvailable() || !host.state?.ready) {
       availability = 'source-unavailable'; source = null; modelId = null; credential = 'unavailable';
-      gaps.push(epoch !== host.connectionEpoch ? 'host_connection_changed' : 'host_memory_unavailable', 'model_configuration_unavailable');
+      gaps.push(epoch !== transportEpoch ? 'host_connection_changed' : 'host_memory_unavailable', 'model_configuration_unavailable');
     }
-    const stderr = host.diagnosticsStderr;
+    const stderr = host === legacyHost ? legacyHost.diagnosticsStderr : { tail: '', truncated: false };
+    if (host === serviceClient) gaps.push('service_stderr_unavailable');
     if (stderr.truncated) gaps.push('host_stderr_omitted');
     const hostRecords = source?.ok ? clean(source.data) : { entries: [], dropped: null };
     const snapshot = { version: 1, collectedAt: new Date().toISOString(), productVersion: appVersion, main: clean(mainLog.snapshot()),
       host: { availability, ...hostRecords, stderrTail: stderr.tail, stderrTruncated: stderr.truncated },
-      runtime: source?.ok ? source.data.runtime : { bunVersion: null, sdkVersion: runtimeLayout?.release?.sdkVersion ?? '0.85.1',
+      runtime: source?.ok ? source.data.runtime : { bunVersion: null, sdkVersion: runtimeLayout?.release?.sdkVersion ?? 'unknown',
         platform: process.platform, arch: process.arch }, configuration: { modelId, credential }, gaps: [...new Set(gaps)] };
     if ((scanEvidence(snapshot).fact.actual as { leaked: boolean }).leaked) throw Error('Unsafe diagnostics');
     return ok(DiagnosticsSnapshotSchema.parse(snapshot));
@@ -461,15 +698,18 @@ function closeHostAndQuit(): Promise<void> {
 }
 
 async function closeDesktop(): Promise<void> {
+  if (serviceActivation.busy) { hostError = true; hostErrorCode = 'service_activation_busy'; await broadcastState(); return; }
   desktopClosing = true;
   await startup;
-  releaseAllRuntimeOwners();
-  const [closed, evaluationClosed] = await Promise.all([host.close(), evaluation?.close() ?? Promise.resolve(ok({ closed: true, stopped: true, errors: [] }))]);
+  const [closed, evaluationClosed] = await Promise.all([host === serviceClient ? disconnectBackgroundService().then(result => result.ok
+    ? ok({ closed: true, stopped: true, errors: [] }) : result) : legacyHost.close(),
+    evaluation?.close() ?? Promise.resolve(ok({ closed: true, stopped: true, errors: [] }))]);
   const allClosed = closed.ok && closed.data.closed && evaluationClosed.ok && evaluationClosed.data.closed;
   const allStopped = closed.ok && closed.data.stopped && evaluationClosed.ok && evaluationClosed.data.stopped;
   await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_closed', requestId: devShutdownRequestId,
     closed: allClosed, stopped: allStopped });
   if (allClosed && allStopped) {
+    releaseAllRuntimeOwners();
     allowWindowClose = true;
     allowQuit = true;
     for (const unsubscribe of subscriptions.values()) unsubscribe();
@@ -545,7 +785,7 @@ function readProductVersion(appRoot: string): string {
 async function contextIpcQuery(command: Extract<HostCommand, { type: 'list_context_snapshots' | 'query_context_snapshot' | 'list_context_requests' }>) {
   try {
     const { version: _version, requestId: _requestId, ...request } = command;
-    const checked = parseContextHostResult(command.type, await host.request(request));
+    const checked = parseContextHostResult(command.type, await requestProduct(request));
     return checked !== null && matchesContextResponse(command, checked) ? checked : contextHostFailure();
   } catch { return contextHostFailure(); }
 }
@@ -555,23 +795,25 @@ async function assemblyIpcQuery(type: string, input?: unknown) {
   const extension = isExtensionHostCommand(type);
   const subagent = isSubagentHostCommand(type);
   const definition = isInputDefinitionHostCommand(type);
-  if (!command || !extension && !subagent && !definition && !isResearchHostCommand(type) && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
-  const [parse, matches, failure] = isResearchHostCommand(type) ? [parseResearchHostResult, matchesResearchResponse, researchHostFailure] : definition ? [parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure] : subagent ? [parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
+  const personal = isPersonalAgentHostCommand(type);
+  if (!command || !extension && !subagent && !definition && !personal && !isResearchHostCommand(type) && !isResourceHostCommand(type)) return fail(appError('input_invalid', 'input', 'Resource request is invalid.'));
+  const [parse, matches, failure] = personal ? [parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure]
+    : isResearchHostCommand(type) ? [parseResearchHostResult, matchesResearchResponse, researchHostFailure] : definition ? [parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure] : subagent ? [parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure]
     : extension ? [parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure]
       : [parseResourceHostResult, matchesResourceResponse, resourceHostFailure];
-  const epoch = host.connectionEpoch;
+  const epoch = transportEpoch;
   try {
     const { version: _version, requestId: _requestId, ...request } = command;
-    const checked = parse(type, await host.request(request));
-    return epoch === host.connectionEpoch && checked !== null && matches(command, checked) ? checked : failure(type);
+    const checked = parse(type, await requestProduct(request));
+    return epoch === transportEpoch && checked !== null && matches(command, checked) ? checked : failure(type);
   } catch { return failure(type); }
 }
 async function compactionIpcRequest(command: HostCommand) {
-  const epoch = host.connectionEpoch;
+  const epoch = transportEpoch;
   try {
     const { version: _version, ...request } = command;
-    const checked = parseCompactionHostResult(command.type, await host.request(request));
-    return epoch === host.connectionEpoch && checked !== null && matchesCompactionResponse(command, checked)
+    const checked = parseCompactionHostResult(command.type, await requestProduct(request));
+    return epoch === transportEpoch && checked !== null && matchesCompactionResponse(command, checked)
       ? checked : compactionHostFailure();
   } catch {
     return command.type === 'compact_session'
@@ -583,6 +825,8 @@ async function compactionIpcRequest(command: HostCommand) {
 function registerIpc(): void {
   if (ipcRegistered) return;
   ipcRegistered = true;
+  const configurationWrites = new Set([channels.saveSettings, 'flowmate:save-evaluation-settings',
+    'flowmate:update-resource-selection', 'flowmate:update-extension-selection']);
   const handle = (channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>) => {
     ipcMain.handle(channel, async (event, ...args) => {
       const failure = (error: import('@flowmate/contracts').AppError) => [channels.compactSession, channels.querySessionCompaction, channels.cancelSessionCompaction].some(value => value === channel)
@@ -593,22 +837,71 @@ function registerIpc(): void {
           ? (() => { const parsed = ContextErrorSchema.safeParse(error); return parsed.success ? fail(parsed.data) : contextHostFailure(); })()
           : fail(error);
       if (!isTrustedSender(event)) return failure(appError('ipc_forbidden', 'input', '请求来源不受信任。'));
-      if (desktopClosing && !['flowmate:query-diagnostics', 'flowmate:export-diagnostics', 'flowmate:query-evaluation-control', 'flowmate:cancel-evaluation', 'flowmate:list-evaluation-executions', 'flowmate:query-evaluation-result', 'flowmate:compare-evaluation', 'flowmate:query-evaluation-catalog', 'flowmate:query-evaluation-feedback'].includes(channel))
+      if (desktopClosing && !['flowmate:get-state', 'flowmate:get-service-state', 'flowmate:query-service-activation', 'flowmate:connect-service', 'flowmate:disconnect-service', 'flowmate:query-diagnostics', 'flowmate:export-diagnostics', 'flowmate:query-evaluation-control', 'flowmate:cancel-evaluation', 'flowmate:list-evaluation-executions', 'flowmate:query-evaluation-result', 'flowmate:compare-evaluation', 'flowmate:query-evaluation-catalog', 'flowmate:query-evaluation-feedback'].includes(channel))
         return failure(appError('runtime_busy', 'runtime', '桌面应用正在关闭。'));
+      const configurationWrite = configurationWrites.has(channel);
+      if (configurationWrite && (configurationWriting || serviceActivation.busy)) return failure(appError('config_settings_write_busy', 'runtime',
+        'The original configuration save or service activation is still in progress. No new configuration write was submitted.', true));
+      if (configurationWrite) configurationWriting = true;
       try { return await handler(event, ...args); }
       catch { return failure(appError('desktop_operation_failed', 'runtime', '桌面操作失败。', true)); }
+      finally { if (configurationWrite) configurationWriting = false; }
     });
   };
   handle('flowmate:restart-host', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Recheck takes no arguments.')) : restartHost());
+  handle('flowmate:prepare-service', async (_event, raw, ...extra) => {
+    if (extra.length || !BackgroundServicePrepareRequestSchema.safeParse(raw).success) return fail(appError('input_invalid', 'input', 'The service preparation request is invalid.'));
+    await startup; const prepared = await serviceActivation.prepare();
+    if (prepared.ok) { const selected = serviceSelection(); if (selected.ok) serviceInstallation = selected.data.installation; projectService(backgroundService.state, backgroundService.error); }
+    await broadcastState(); return prepared;
+  });
+  handle('flowmate:enable-service', async (_event, raw, ...extra) => {
+    const input = BackgroundServiceEnableRequestSchema.safeParse(raw);
+    if (extra.length || !input.success) return fail(appError('input_invalid', 'input', 'The service activation request is invalid.'));
+    await startup; const result = await serviceActivation.enable(input.data);
+    if (result.ok && result.data.error && serviceMode) {
+      const selected = serviceSelection(); if (selected.ok) serviceInstallation = selected.data.installation;
+      projectService(serviceInstallation?.enabled ? 'offline' : 'blocked', result.data.error); hostError = true; hostErrorCode = result.data.error.code;
+    }
+    await broadcastState(); return result;
+  });
+  handle('flowmate:query-service-activation', async (_event, raw, ...extra) => {
+    const input = BackgroundServiceActivationQuerySchema.safeParse(raw);
+    if (extra.length || !input.success) return fail(appError('input_invalid', 'input', 'The original activation query is invalid.'));
+    await startup; return serviceActivation.query(input.data);
+  });
+  handle('flowmate:get-service-state', async (_event, ...args) => {
+    if (args.length) return fail(appError('input_invalid', 'input', 'Service state takes no arguments.'));
+    await startup;
+    if (serviceClient.isConnected && !serviceSettingsSaving && backgroundService.state === 'blocked' && backgroundService.error?.code.startsWith('service_settings_')) {
+      const recovered = await recoverServiceSettingsRequest();
+      if (recovered.ok) { projectService(desktopClosing ? 'stopping' : 'ready'); hostError = desktopClosing; }
+      else projectService('blocked', recovered.error);
+    }
+    return ok(backgroundService);
+  });
+  handle('flowmate:connect-service', async (_event, raw, ...extra) => {
+    const input = BackgroundServiceConnectRequestSchema.safeParse(raw);
+    if (extra.length || !input.success) return fail(appError('input_invalid', 'input', 'The service connection request is invalid.'));
+    await startup; const result = await connectBackgroundService(input.data.installationId); await broadcastState(); return result;
+  });
+  handle('flowmate:disconnect-service', async (_event, raw, ...extra) => {
+    const input = BackgroundServiceDisconnectRequestSchema.safeParse(raw);
+    if (extra.length || !input.success) return fail(appError('input_invalid', 'input', 'The service disconnection request is invalid.'));
+    await startup;
+    if (serviceInstallation?.installationId !== input.data.installationId) return fail(appError('service_installation_invalid', 'input', 'The original service installation changed.'));
+    if (!await confirmInvoiceFormClose()) return fail(appError('state_conflict', 'input', 'The original invoice draft is retained.'));
+    const result = await disconnectBackgroundService(); await broadcastState(); return result;
+  });
   handle('flowmate:query-diagnostics', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Diagnostics takes no arguments.')) : queryDiagnostics());
   handle('flowmate:export-diagnostics', async (event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Diagnostics export takes no arguments.')) : exportDiagnostics(event));
 
   handle('flowmate:save-research-export', async (event, raw) => {
     const parsed = ResearchReportRequestSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'Report export request is invalid.'));
-    const owner = mainWindow, frame = event.senderFrame, epoch = host.connectionEpoch;
+    const owner = mainWindow, frame = event.senderFrame, epoch = transportEpoch;
     const current = () => owner !== null && owner === mainWindow && !owner.isDestroyed()
-      && event.sender === owner.webContents && frame === owner.webContents.mainFrame && epoch === host.connectionEpoch;
+      && event.sender === owner.webContents && frame === owner.webContents.mainFrame && epoch === transportEpoch;
     if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed.'));
     const exported = ResearchExportResultSchema.safeParse(await assemblyIpcQuery('export_research_report', parsed.data));
     if (!exported.success) return fail(appError('host_protocol_invalid', 'runtime', 'Report export could not be verified.'));
@@ -626,6 +919,16 @@ function registerIpc(): void {
   });
   handle(channels.getState, async () => readDesktopState());
   handle(channels.saveSettings, async (_event, settingsRaw, credentialUpdateRaw) => saveSettings(settingsRaw, credentialUpdateRaw));
+  handle(channels.evaluationWorkflow, async (_event, input) => {
+    const request = EvaluationWorkflowRequestSchema.safeParse(input);
+    if (!request.success || !evaluation) return fail(appError('input_invalid', 'input', '评测闭环请求或控制器不可用。'));
+    if (runtimeLayout?.mode === 'installed' && !isWorkflowReadOnly(request.data.action))
+      return fail(appError('evaluation_workspace_unavailable', 'runtime', EVALUATION_WORKSPACE_UNAVAILABLE_REASON));
+    if (request.data.action !== 'experiment.run') return evaluation.workflow(request.data);
+    const settings = await readSavedSettings(); if (!settings.ok) return settings;
+    const credentials = await prepareExperimentCredentials(request.data.plan, settings.data, credentialStore);
+    return credentials.ok ? evaluation.workflow(request.data, credentials.data) : credentials;
+  });
   for (const type of Object.keys(evaluationResponses) as EvaluationResponseType[]) {
     handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, input) => {
       const command = parseEvaluationCommand({ type, input });
@@ -710,16 +1013,16 @@ function registerIpc(): void {
   handle(channels.listRunToolCalls, async (_event, raw) => {
     const input = RunToolCallsRequestSchema.safeParse(raw);
     if (!input.success) return fail(appError('input_invalid', 'input', 'Run tool list request is invalid.'));
-    try { return RuntimeToolPageResultSchema.parse(await host.request({ type: 'list_run_tool_calls', input: input.data })); }
+    try { return RuntimeToolPageResultSchema.parse(await requestProduct({ type: 'list_run_tool_calls', input: input.data })); }
     catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool list could not be confirmed.', true)); }
   });
   handle(channels.queryRunToolCall, async (_event, raw) => {
     const input = RunToolCallRequestSchema.safeParse(raw);
     if (!input.success) return fail(appError('input_invalid', 'input', 'Run tool request is invalid.'));
-    try { return RuntimeToolResultSchema.parse(await host.request({ type: 'query_run_tool_call', input: input.data })); }
+    try { return RuntimeToolResultSchema.parse(await requestProduct({ type: 'query_run_tool_call', input: input.data })); }
     catch { return fail(appError('host_protocol_invalid', 'runtime', 'Run tool could not be confirmed.', true)); }
   });
-  for (const type of [...Object.keys(researchOperations), 'list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file',
+  for (const type of [...personalAgentHostCommandTypes(), ...Object.keys(researchOperations), 'list_resources', 'read_resource_file', 'update_resource_selection', 'query_run_resources', 'read_run_resource_file',
     'list_extensions', 'update_extension_selection', 'query_session_extensions', 'query_run_extensions', 'execute_extension_command', 'dispose_session_extensions',
     'list_subagents', 'query_subagent', 'cancel_subagent', 'list_input_commands', 'list_subagent_definitions', 'get_subagent_definition', 'save_subagent_definition'] as const)
     handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => assemblyIpcQuery(type, raw));
@@ -789,11 +1092,11 @@ function registerIpc(): void {
     handle(channel, async (_event, raw) => {
       const command = parseHostCommand({ version: 1, requestId: randomUUID(), type, input: raw });
       if (!command || !isHistoryHostCommand(command.type)) return fail(appError('input_invalid', 'input', 'Session history request is invalid.'));
-      const epoch = host.connectionEpoch;
+      const epoch = transportEpoch;
       try {
         const { version: _version, ...request } = command;
-        const value = parseHistoryHostResult(type, await host.request(request));
-        return epoch === host.connectionEpoch && value !== null && matchesHistoryResponse(command, value) ? value : historyHostFailure();
+        const value = parseHistoryHostResult(type, await requestProduct(request));
+        return epoch === transportEpoch && value !== null && matchesHistoryResponse(command, value) ? value : historyHostFailure();
       } catch { return historyHostFailure(); }
     });
   }
@@ -813,14 +1116,14 @@ function registerIpc(): void {
   handle(channels.replyInvoiceFormInspect, async (event, id, raw) => {
     const pending = typeof id === 'string' ? pendingFormInspections.get(id) : undefined;
     if (!pending || pending.owner !== invoiceFormBinding) return fail(appError('state_conflict', 'input', 'Form inspection is no longer current.'));
-    const checked = checkedInvoiceFormInspection(pending.owner, raw, { frame: event.senderFrame!, contents: event.sender, epoch: host.connectionEpoch });
+    const checked = checkedInvoiceFormInspection(pending.owner, raw, { frame: event.senderFrame!, contents: event.sender, epoch: transportEpoch });
     pending.resolve(checked);
     return checked ? ok(undefined) : fail(appError('state_conflict', 'input', 'Form inspection does not match its owner or current revision.'));
   });
   for (const [channel, kind] of [[channels.saveInvoiceCandidate, 'save'], [channels.acceptInvoiceCandidate, 'accept'],
     [channels.rejectInvoiceCandidate, 'reject'], [channels.exportInvoiceCandidate, 'export']] as const) {
     handle(channel, async (event, raw) => {
-      try { return await submitInvoiceCandidateOperation({ kind, request: raw }, { frame: event.senderFrame!, contents: event.sender, epoch: host.connectionEpoch }); }
+      try { return await submitInvoiceCandidateOperation({ kind, request: raw }, { frame: event.senderFrame!, contents: event.sender, epoch: transportEpoch }); }
       finally { if (!event.sender.isDestroyed()) event.sender.send('flowmate:invoice-form-inspect-finished'); }
     });
   }
@@ -887,7 +1190,7 @@ function registerIpc(): void {
 }
 
 function runtimeOwnerIsCurrent(owner: RuntimeOwner): boolean {
-  return !owner.contents.isDestroyed() && owner.epoch === host.connectionEpoch
+  return !owner.contents.isDestroyed() && owner.epoch === transportEpoch
     && owner.generation === (runtimeGenerations.get(owner.contents.id) ?? 0)
     && owner.contents.mainFrame === owner.frame && owner.frame.url === owner.url && isAllowedPage(owner.url)
     && runtimeOwners.get(owner.contents.id) === owner;
@@ -898,7 +1201,7 @@ function runtimeOwner(event: Electron.IpcMainInvokeEvent): RuntimeOwner {
   if (existing && runtimeOwnerIsCurrent(existing)) return existing;
   releaseRuntimeOwner(event.sender.id);
   const owner: RuntimeOwner = { token: randomUUID(), contents: event.sender, frame: event.senderFrame!,
-    url: event.senderFrame!.url, generation: runtimeGenerations.get(event.sender.id) ?? 0, epoch: host.connectionEpoch };
+    url: event.senderFrame!.url, generation: runtimeGenerations.get(event.sender.id) ?? 0, epoch: transportEpoch };
   runtimeOwners.set(event.sender.id, owner);
   return owner;
 }
@@ -963,7 +1266,7 @@ async function subscribeRuntimeEvents(event: Electron.IpcMainInvokeEvent, raw: u
     pendingWake: null, cleanup: host.captureRuntimeSubscriptionCleanup(owner.token, id) };
   runtimeBindings.set(id, binding);
   try {
-    const result = RuntimeSubscriptionResultSchema.parse(await host.request({ type: 'subscribe_runtime_events',
+    const result = RuntimeSubscriptionResultSchema.parse(await requestProduct({ type: 'subscribe_runtime_events',
       ownerToken: owner.token, subscriptionId: id, input: input.data }));
     if (!result.ok) { releaseRuntimeBinding(binding); return result; }
     if (runtimeBindings.get(id) !== binding || !runtimeOwnerIsCurrent(owner)) {
@@ -995,7 +1298,7 @@ async function queryRuntimeEvents(event: Electron.IpcMainInvokeEvent, raw: unkno
   if (runtimeQueries.has(owner.token)) return failure('event_query_busy', 'runtime', 'An event query is already in flight.', true);
   runtimeQueries.add(owner.token);
   try {
-    const result = RuntimeEventsReadResultSchema.parse(await host.request({ type: 'query_runtime_events', ownerToken: owner.token, input: input.data }));
+    const result = RuntimeEventsReadResultSchema.parse(await requestProduct({ type: 'query_runtime_events', ownerToken: owner.token, input: input.data }));
     if (!runtimeOwnerIsCurrent(owner)) return failure('event_subscription_invalid', 'input', 'The observation page or connection changed.');
     if (!result.ok && result.error.code === 'event_subscription_invalid' && input.data.subscriptionId !== undefined) {
       const binding = runtimeBindings.get(input.data.subscriptionId);
@@ -1016,7 +1319,7 @@ async function unsubscribeRuntimeEvents(event: Electron.IpcMainInvokeEvent, raw:
   if (!binding && previousOwner === owner.token) return ok(undefined);
   if (binding) releaseRuntimeBinding(binding, false);
   try {
-    const result = RuntimeSubscriptionReleaseResultSchema.parse(await host.request({ type: 'unsubscribe_runtime_events', ownerToken: owner.token, subscriptionId: id }));
+    const result = RuntimeSubscriptionReleaseResultSchema.parse(await requestProduct({ type: 'unsubscribe_runtime_events', ownerToken: owner.token, subscriptionId: id }));
     if (result.ok) rememberRuntimeRelease(id, owner.token);
     else binding?.cleanup();
     return result;
@@ -1027,22 +1330,33 @@ async function unsubscribeRuntimeEvents(event: Electron.IpcMainInvokeEvent, raw:
 }
 
 async function readDesktopState(): Promise<Result<DesktopState>> {
+  const originalEpoch = transportEpoch;
+  if (serviceMode && !serviceClient.isConnected) return ok({ version: 1, ready: false, host: 'error', settings: lastServiceSettings,
+    modelCredentials: Object.fromEntries(lastServiceSettings.models.map(model => [model.id, 'unavailable' as const])),
+    evaluationCredentials: await evaluationCredentialStatus(lastServiceSettings, credentialStore), evaluationControl: evaluation?.state ?? null,
+    appVersion, userDataPath: userDataRoot, backgroundService });
   let base: Result<Omit<DesktopState, 'modelCredentials'>>;
-  try { base = await host.request({ type: 'get_state' }) as Result<Omit<DesktopState, 'modelCredentials'>>; }
+  try { base = await requestProduct({ type: 'get_state' }) as Result<Omit<DesktopState, 'modelCredentials'>>; }
   catch { return fail(appError(hostErrorCode, 'runtime', 'Bun Host 当前不可用。', true)); }
   if (!base.ok) return base;
+  if (serviceMode) { const saved = validateProductSettings(base.data.settings); if (!saved.ok) return saved; lastServiceSettings = saved.data; }
   const modelCredentials: Record<string, 'missing' | 'configured' | 'unavailable'> = {};
   if (base.data.settings) {
     const settings = base.data.settings as ProductSettings;
-    await Promise.all(settings.models.map(async (model) => {
-      modelCredentials[model.id] = await modelCredentialStatus(model);
-    }));
+    if (serviceMode) {
+      const status = await serviceClient.getCredentialStatus();
+      for (const model of settings.models) modelCredentials[model.id] = status.ok && status.data.installationId === serviceInstallation?.installationId
+        && status.data.settingsRevision === settings.revision ? status.data.models.find(item => item.modelId === model.id && item.credentialRef === model.credentialRef)?.status ?? 'unavailable' : 'unavailable';
+    } else await Promise.all(settings.models.map(async (model) => { modelCredentials[model.id] = await modelCredentialStatus(model); }));
   }
+  const evaluationCredentials = await evaluationCredentialStatus(base.data.settings, credentialStore);
+  if (originalEpoch !== transportEpoch) return fail(appError('host_connection_changed', 'runtime', 'The original runtime connection changed.', true));
   return { ok: true, data: {
     ...base.data,
-    ...(hostError ? { ready: false, host: 'error' as const } : {}),
+    ...(hostError || desktopClosing || serviceMode && backgroundService.state !== 'ready' ? { ready: false, host: desktopClosing ? 'closing' as const : 'error' as const } : {}),
+    backgroundService,
     modelCredentials,
-    evaluationCredentials: await evaluationCredentialStatus(base.data.settings, credentialStore),
+    evaluationCredentials,
     evaluationControl: evaluation?.state ?? null,
   } };
 }
@@ -1054,6 +1368,12 @@ async function readSavedSettings(): Promise<Result<ProductSettings>> {
 }
 
 async function modelCredentialStatus(model: ProductSettings['models'][number]): Promise<'missing' | 'configured' | 'unavailable'> {
+  if (serviceMode) {
+    if (!serviceClient.isConnected) return 'unavailable';
+    const result = await serviceClient.getCredentialStatus();
+    return result.ok && result.data.installationId === serviceInstallation?.installationId
+      ? result.data.models.find(item => item.modelId === model.id && item.credentialRef === model.credentialRef)?.status ?? 'unavailable' : 'unavailable';
+  }
   const store = credentialStore(model.credentialRef);
   const status = await store.status();
   if (status !== 'configured' || model.kind !== 'catalog') return status;
@@ -1074,6 +1394,39 @@ async function saveSettings(settingsRaw: unknown, credentialUpdateRaw: unknown):
   const previous = previousResult.data.settings as ProductSettings;
   const parsed = validateBusinessSettings(settingsRaw, previous);
   if (!parsed.ok) return parsed;
+  if (serviceMode) {
+    if (!serviceInstallation || !serviceClient.isConnected) return fail(appError('service_offline', 'runtime', 'Connect the enabled service before saving product settings.'));
+    if (backgroundService.state !== 'ready') return fail(backgroundService.error ?? appError('service_offline', 'runtime', 'The original service connection is not ready for a settings save.'));
+    if (serviceSettingsSaving) return fail(appError('config_settings_write_busy', 'runtime', 'The original settings request is still being checked.', true));
+    serviceSettingsSaving = true;
+    try {
+    const recovered = await recoverServiceSettingsRequest(); if (!recovered.ok) return recovered;
+    if (recovered.data.operationId) { await broadcastState(); return fail(appError('config_revision_conflict', 'input',
+      `Original settings request ${recovered.data.operationId} was committed. Reload its saved settings before submitting a new draft.`, true)); }
+    let credentialUpdate: { modelId: string; apiKey: string } | undefined;
+    if (credentialUpdateRaw !== undefined && credentialUpdateRaw !== null) {
+      const candidate = z.object({ modelId: z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/), apiKey: z.string().min(1).max(4096).refine(value => Boolean(value.trim())) }).strict().safeParse(credentialUpdateRaw);
+      if (!candidate.success) return fail(appError('credential_invalid', 'input', 'The selected model credential is invalid.'));
+      credentialUpdate = candidate.data; registerSecrets([credentialUpdate.apiKey]);
+    }
+    const request: ServiceSettingsRequest = { version: 1, installationId: serviceInstallation.installationId, operationId: randomUUID() };
+    const persisted = await saveServiceSettingsRequest(request); if (!persisted.ok) return persisted;
+    const receipt = await serviceClient.saveServiceSettings({ installationId: request.installationId, operationId: request.operationId,
+      settings: parsed.data, ...(credentialUpdate ? { credentialUpdate } : {}) });
+    if (!receipt.ok) {
+      if (receipt.error.category === 'input' && receipt.error.code !== 'operation_result_unknown') { const cleared = await clearServiceSettingsRequest(request); if (!cleared.ok) return cleared; return receipt; }
+      return fail(appError('operation_result_unknown', 'runtime', `Original service settings request ${request.operationId} is retained. Check it before submitting another save.`, true));
+    }
+    if (receipt.data.phase === 'pending' || receipt.data.phase === 'prepared'
+      || receipt.data.phase === 'failed' && (!receipt.data.error || receipt.data.error.code === 'operation_result_unknown')) return fail(appError('operation_result_unknown', 'runtime', `Original settings request ${request.operationId} is still pending.`, true));
+    if (receipt.data.phase === 'failed') { const cleared = await clearServiceSettingsRequest(request); return cleared.ok
+      ? fail(receipt.data.error ?? appError('service_settings_failed', 'storage', 'The service did not publish the requested settings.')) : cleared; }
+    const saved = receipt.data.settings;
+    if (!saved || saved.revision !== receipt.data.settingsRevision) return fail(appError('operation_result_unknown', 'runtime', 'The original committed settings snapshot is unavailable. Query the retained save before changing its draft.', true));
+    const cleared = await clearServiceSettingsRequest(request); if (!cleared.ok) return cleared;
+    await broadcastState(); return ok(saved);
+    } finally { serviceSettingsSaving = false; }
+  }
   let next = parsed.data;
   let newCredentialRef: string | null = null;
   let update: { modelId: string; apiKey: string } | null = null;
@@ -1141,7 +1494,7 @@ async function callProvider(inputRaw: unknown): Promise<Result<{ requestId: stri
       && event.requestId === requestId && Number.isSafeInteger(event.runId) && event.runId > 0) admittedRunId = event.runId;
   });
   try {
-    const value = await host.request({
+    const value = await requestProduct({
       type: 'call_provider',
       requestId,
       input: inputRaw,
@@ -1161,13 +1514,13 @@ async function callProvider(inputRaw: unknown): Promise<Result<{ requestId: stri
 async function cancelProvider(value: unknown): Promise<Result<{ accepted: boolean; runId: number | null }>> {
   if (typeof value !== 'string' || value.length > 128) return fail(appError('input_invalid', 'input', '取消请求身份无效。'));
   try {
-    return await host.request({ type: 'cancel_provider', targetRequestId: value }) as Result<{ accepted: boolean; runId: number | null }>;
+    return await requestProduct({ type: 'cancel_provider', targetRequestId: value }) as Result<{ accepted: boolean; runId: number | null }>;
   } catch { return fail(appError('host_request_failed', 'runtime', '取消命令未能提交给 Bun Host。', true)); }
 }
 
 async function queryRun(value: unknown): Promise<Result<RunSnapshot>> {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
-  try { return await host.request({ type: 'query_run', runId: Number(value) }) as Result<RunSnapshot>; }
+  try { return await requestProduct({ type: 'query_run', runId: Number(value) }) as Result<RunSnapshot>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Run 查询未能提交给 Bun Host。', true)); }
 }
 
@@ -1309,12 +1662,12 @@ function pageInput(raw: unknown, extraKeys: readonly string[]): MainPageInput | 
 
 function validId(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0; }
 
-async function productHostRequest<T = unknown>(command: Parameters<HostClient['request']>[0], message: string,
+async function productHostRequest<T = unknown>(command: ServiceCommandInput, message: string,
   timeoutMs = 10_000, transportErrorCode = hostErrorCode): Promise<Result<T>> {
-  const epoch = host.connectionEpoch;
+  const epoch = transportEpoch;
   try {
-    const result = await host.request(command, timeoutMs) as Result<T>;
-    return epoch === host.connectionEpoch ? result : fail(appError(transportErrorCode, 'runtime', message, true));
+    const result = await requestProduct(command, timeoutMs) as Result<T>;
+    return epoch === transportEpoch ? result : fail(appError(transportErrorCode, 'runtime', message, true));
   } catch (error) {
     return fail(appError(error instanceof Error && error.message === 'host_protocol_invalid' ? 'host_protocol_invalid' : transportErrorCode,
       'runtime', message, true));
@@ -1324,41 +1677,41 @@ async function productHostRequest<T = unknown>(command: Parameters<HostClient['r
 async function createSession(raw: unknown): Promise<Result<SessionSnapshot>> {
   const input = normalizeCreateSessionRequest(raw);
   if (!input.ok) return input;
-  try { return await host.request({ type: 'create_session', input: input.data }) as Result<SessionSnapshot>; }
+  try { return await requestProduct({ type: 'create_session', input: input.data }) as Result<SessionSnapshot>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'New Session 未能提交给 Bun Host。', true)); }
 }
 
 async function renameSession(raw: unknown): Promise<Result<SessionSnapshot>> {
   const input = normalizeRenameSessionRequest(raw);
   if (!input.ok) return input;
-  try { return await host.request({ type: 'rename_session', input: input.data }) as Result<SessionSnapshot>; }
+  try { return await requestProduct({ type: 'rename_session', input: input.data }) as Result<SessionSnapshot>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Session 重命名未能提交给 Bun Host。', true)); }
 }
 
 async function deleteSession(raw: unknown): Promise<Result<import('@flowmate/contracts').DeleteSessionResult>> {
   const sessionId = normalizeSessionId(raw);
   if (!sessionId.ok) return sessionId;
-  try { return await host.request({ type: 'delete_session', sessionId: sessionId.data }) as Result<import('@flowmate/contracts').DeleteSessionResult>; }
+  try { return await requestProduct({ type: 'delete_session', sessionId: sessionId.data }) as Result<import('@flowmate/contracts').DeleteSessionResult>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Session could not be submitted for deletion to Bun Host.', true)); }
 }
 
 async function listSessions(raw?: unknown): Promise<Result<SessionPage>> {
   const input = normalizeListSessionsRequest(raw);
   if (!input.ok) return input;
-  try { return await host.request({ type: 'list_sessions', input: input.data }) as Result<SessionPage>; }
+  try { return await requestProduct({ type: 'list_sessions', input: input.data }) as Result<SessionPage>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Session 列表暂不可用。', true)); }
 }
 
 async function querySession(value: unknown): Promise<Result<SessionSnapshot>> {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Session ID 无效。'));
-  try { return await host.request({ type: 'query_session', sessionId: Number(value) }) as Result<SessionSnapshot>; }
+  try { return await requestProduct({ type: 'query_session', sessionId: Number(value) }) as Result<SessionSnapshot>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Session 查询暂不可用。', true)); }
 }
 
 async function listSessionRuns(raw: unknown): Promise<Result<SessionRunsPage>> {
   const input = normalizeSessionRunsRequest(raw);
   if (!input.ok) return input;
-  try { return await host.request({ type: 'list_session_runs', input: input.data }) as Result<SessionRunsPage>; }
+  try { return await requestProduct({ type: 'list_session_runs', input: input.data }) as Result<SessionRunsPage>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Session Run 历史暂不可用。', true)); }
 }
 
@@ -1366,7 +1719,7 @@ async function listSessionMessages(raw: unknown): Promise<Result<SessionMessages
   const input = normalizeSessionMessagesRequest(raw);
   if (!input.ok) return input;
   try {
-    const result = await host.request({ type: 'list_session_messages', input: input.data }) as Result<unknown>;
+    const result = await requestProduct({ type: 'list_session_messages', input: input.data }) as Result<unknown>;
     if (!result || typeof result !== 'object' || result.ok !== true && result.ok !== false) {
       return fail(appError('session_history_invalid', 'session', 'Message query returned an invalid result.'));
     }
@@ -1387,7 +1740,7 @@ async function queryPromptTrace(runIdRaw: unknown, sequenceRaw?: unknown): Promi
     return fail(appError('input_invalid', 'input', 'Prompt Trace 查询参数无效。'));
   }
   try {
-    return await host.request({ type: 'query_prompt_trace', runId: Number(runIdRaw), ...(sequenceRaw === undefined ? {} : { callSequence: Number(sequenceRaw) }) }) as Result<PromptTraceResult>;
+    return await requestProduct({ type: 'query_prompt_trace', runId: Number(runIdRaw), ...(sequenceRaw === undefined ? {} : { callSequence: Number(sequenceRaw) }) }) as Result<PromptTraceResult>;
   } catch {
     return { ok: true, data: { availability: 'source-unavailable', calls: [], droppedCalls: null } };
   }
@@ -1405,7 +1758,7 @@ async function startRun(raw: unknown): Promise<Result<RunAccepted & { requestId:
 
   const requestId = randomUUID();
   try {
-    const value = await host.request({
+    const value = await requestProduct({
       type: 'start_run',
       requestId,
       input: raw,
@@ -1437,7 +1790,7 @@ async function submitInput(raw: unknown): Promise<Result<SessionInputAccepted & 
     if (profile) preparation = { expectedSettingsRevision: state.data.settings.revision, expectedCredentialRef: profile.credentialRef };
   }
   try {
-    const value = await host.request({ type: 'submit_session_input', requestId, input, ...preparation }, 15_000) as Result<SessionInputAccepted & { requestId: string }>;
+    const value = await requestProduct({ type: 'submit_session_input', requestId, input, ...preparation }, 15_000) as Result<SessionInputAccepted & { requestId: string }>;
     if (!value.ok) return value;
     if (value.data.requestId !== requestId || value.data.sessionId !== input.sessionId
       || !Number.isSafeInteger(value.data.runId) || value.data.runId <= 0
@@ -1452,12 +1805,12 @@ async function submitInput(raw: unknown): Promise<Result<SessionInputAccepted & 
 
 async function cancelRun(value: unknown): Promise<Result<{ accepted: boolean; runId: number }>> {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) return fail(appError('input_invalid', 'input', 'Run ID 无效。'));
-  try { return await host.request({ type: 'cancel_run', runId: Number(value) }) as Result<{ accepted: boolean; runId: number }>; }
+  try { return await requestProduct({ type: 'cancel_run', runId: Number(value) }) as Result<{ accepted: boolean; runId: number }>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Stop 命令未能提交给 Bun Host。', true)); }
 }
 
 async function queryRuntimeState(): Promise<Result<RuntimeState>> {
-  try { return await host.request({ type: 'query_runtime_state' }) as Result<RuntimeState>; }
+  try { return await requestProduct({ type: 'query_runtime_state' }) as Result<RuntimeState>; }
   catch { return fail(appError('host_request_failed', 'runtime', 'Runtime 状态暂不可用。', true)); }
 }
 
@@ -1523,8 +1876,8 @@ function validPiCredential(value: unknown): boolean {
   try { return JSON.stringify(value).length <= 65_536; } catch { return false; }
 }
 
-async function requestHost(command: Parameters<HostClient['request']>[0]): Promise<unknown> {
-  try { return await host.request(command); }
+async function requestHost(command: ServiceCommandInput): Promise<unknown> {
+  try { return await requestProduct(command); }
   catch { return fail(appError('host_request_failed', 'runtime', 'Bun Host 命令未能完成。', true)); }
 }
 
@@ -1540,6 +1893,7 @@ async function broadcastState(): Promise<void> {
     settings: defaultProductSettings(),
     appVersion,
     userDataPath: userDataRoot,
+    backgroundService,
   };
   const event: DesktopEvent = { type: 'host_state', state };
   for (const window of BrowserWindow.getAllWindows()) {
@@ -1593,7 +1947,7 @@ async function registerInvoiceFormTarget(event: Electron.IpcMainInvokeEvent, raw
     if (session.data.modelUseBlocked || session.data.availability !== 'ready') return fail(appError('session_scope_revoked', 'session', 'This Session is unavailable for model use.'));
   }
   const target = { formInstanceId: randomUUID(), expectedRevision: input.data.formRevision };
-  invoiceFormBinding = { frame: event.senderFrame!, contents: event.sender, epoch: host.connectionEpoch, currentRevision: input.data.formRevision,
+  invoiceFormBinding = { frame: event.senderFrame!, contents: event.sender, epoch: transportEpoch, currentRevision: input.data.formRevision,
     workspace: expected, purpose: input.data.purpose, target, valid: true, dirty: false, runId: null, pendingFill: false };
   return ok(target);
 }
@@ -1602,7 +1956,7 @@ async function startInvoiceFormRun(event: Electron.IpcMainInvokeEvent, raw: unkn
   const input = InvoiceFormRunInputSchema.safeParse(raw);
   const binding = invoiceFormBinding;
   if (!input.success || !binding || !ownedInvoiceForm(event, input.data.target.formInstanceId) || !binding.valid
-    || binding.epoch !== host.connectionEpoch || binding.purpose !== 'fill' || binding.dirty
+    || binding.epoch !== transportEpoch || binding.purpose !== 'fill' || binding.dirty
     || binding.target.expectedRevision !== input.data.target.expectedRevision || !sameFormWorkspace(binding.workspace, input.data.workspace)) {
     return fail(appError('state_conflict', 'input', 'The form target changed. Prepare a new Fill after checking the current form.'));
   }
@@ -1633,7 +1987,7 @@ async function startInvoiceFormRun(event: Electron.IpcMainInvokeEvent, raw: unkn
   }
   const current = await readDesktopState();
   if (invoiceFormBinding !== binding || !ownedInvoiceForm(event, input.data.target.formInstanceId) || !binding.valid
-    || binding.epoch !== host.connectionEpoch || binding.purpose !== 'fill' || binding.dirty
+    || binding.epoch !== transportEpoch || binding.purpose !== 'fill' || binding.dirty
     || binding.target.expectedRevision !== input.data.target.expectedRevision || !sameFormWorkspace(binding.workspace, input.data.workspace))
     return fail(appError('state_conflict', 'input', 'The form target changed while preparing Fill. Check the current form.'));
   if (binding.clientSequence !== undefined) return startInvoiceFormRun(event, raw);
@@ -1642,7 +1996,7 @@ async function startInvoiceFormRun(event: Electron.IpcMainInvokeEvent, raw: unkn
   if (!current.data.ready || !profile || current.data.modelCredentials[profile.id] !== 'configured') return fail(appError('model_credential_missing', 'input', 'Configure a model before Fill with Agent.'));
   binding.requestId = randomUUID(); binding.clientSequence = input.data.clientSequence; binding.modelId = input.data.modelId; binding.pendingFill = true;
   try {
-    const accepted = await host.request({ type: 'submit_invoice_form_input', requestId: binding.requestId, input: input.data,
+    const accepted = await requestProduct({ type: 'submit_invoice_form_input', requestId: binding.requestId, input: input.data,
       expectedSettingsRevision: current.data.settings.revision, expectedCredentialRef: profile.credentialRef }, 15_000) as Result<RunAccepted & { requestId: string }>;
     if (!accepted.ok) { binding.pendingFill = accepted.error.code === 'operation_result_unknown'; return accepted; }
     if (accepted.data.requestId !== binding.requestId || accepted.data.sessionId !== input.data.workspace.sessionId
@@ -1661,11 +2015,11 @@ function unknownInvoiceForm(request: InvoiceFormBridgeRequest): InvoiceFormAppli
 async function handleInvoiceFormRequest(request: InvoiceFormBridgeRequest, epoch: number): Promise<InvoiceFormApplicationReceipt> {
   const binding = invoiceFormBinding;
   const window = mainWindow;
-  if (!binding || !window || window.webContents.isDestroyed() || epoch !== host.connectionEpoch
+  if (!binding || !window || window.webContents.isDestroyed() || epoch !== transportEpoch
     || !matchesInvoiceFormTarget(binding, request, { frame: window.webContents.mainFrame, contents: window.webContents, epoch })) return unknownInvoiceForm(request);
   const run = await productHostRequest<RunSnapshot>({ type: 'query_run', runId: request.runId }, 'Fill Run could not be confirmed.', 1500);
   if (!run.ok || !matchesInvoiceFormRun(binding, request, run.data) || invoiceFormBinding !== binding || !binding.valid
-    || host.connectionEpoch !== epoch || window.webContents.mainFrame !== binding.frame) return unknownInvoiceForm(request);
+    || transportEpoch !== epoch || window.webContents.mainFrame !== binding.frame) return unknownInvoiceForm(request);
   binding.runId = request.runId;
   return new Promise(resolve => {
     const requestId = randomUUID();
@@ -1682,7 +2036,7 @@ async function replyInvoiceFormRequest(event: Electron.IpcMainInvokeEvent, id: u
   const pending = typeof id === 'string' ? pendingInvoiceForms.get(id) : undefined;
   const receipt = InvoiceFormApplicationReceiptSchema.safeParse(raw);
   if (!pending || !receipt.success || pending.owner.frame !== event.senderFrame || pending.owner.contents !== event.sender
-    || pending.owner.epoch !== host.connectionEpoch || receipt.data.runId !== pending.request.runId
+    || pending.owner.epoch !== transportEpoch || receipt.data.runId !== pending.request.runId
     || receipt.data.toolCallId !== pending.request.toolCallId || receipt.data.formInstanceId !== pending.request.target.formInstanceId
     || receipt.data.candidateId !== pending.request.candidateId || receipt.data.candidateSequence !== pending.request.candidateSequence
     || receipt.data.outcome === 'applied' && receipt.data.appliedRevision !== pending.request.target.expectedRevision + 1) {
@@ -1693,7 +2047,7 @@ async function replyInvoiceFormRequest(event: Electron.IpcMainInvokeEvent, id: u
 }
 
 async function inspectCurrentInvoiceForm(binding: DesktopFormBinding): Promise<DesktopInvoiceFormInspection | null> {
-  if (!mainWindow || binding !== invoiceFormBinding || !binding.valid || binding.epoch !== host.connectionEpoch
+  if (!mainWindow || binding !== invoiceFormBinding || !binding.valid || binding.epoch !== transportEpoch
     || binding.frame !== mainWindow.webContents.mainFrame || binding.contents !== mainWindow.webContents) return null;
   return new Promise(resolve => {
     const requestId = randomUUID();
@@ -1709,8 +2063,8 @@ async function saveInvoiceExport(event: Electron.IpcMainInvokeEvent, raw: unknow
   const parsed = ExportInvoiceCandidateRequestSchema.safeParse(raw);
   if (!parsed.success) return fail(appError('input_invalid', 'input', 'Invoice export request is invalid.'));
   if (!mainWindow || pendingInvoiceExports.has(event.sender)) return fail(appError('state_conflict', 'input', 'An invoice Save dialog is already open.'));
-  const window = mainWindow, frame = event.senderFrame, epoch = host.connectionEpoch;
-  const currentOwner = () => mainWindow === window && !window.isDestroyed() && epoch === host.connectionEpoch
+  const window = mainWindow, frame = event.senderFrame, epoch = transportEpoch;
+  const currentOwner = () => mainWindow === window && !window.isDestroyed() && epoch === transportEpoch
     && !event.sender.isDestroyed() && event.sender.mainFrame === frame && isTrustedSender(event);
   pendingInvoiceExports.add(event.sender);
   try {
@@ -1758,7 +2112,7 @@ async function submitInvoiceCandidateOperation(raw: unknown, owner: InvoiceFormO
   if (!prior.ok || prior.data !== null) return prior;
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()
     || generation !== (runtimeGenerations.get(mainWindow.webContents.id) ?? 0)
-    || owner.contents !== mainWindow.webContents || owner.frame !== mainWindow.webContents.mainFrame || owner.epoch !== host.connectionEpoch)
+    || owner.contents !== mainWindow.webContents || owner.frame !== mainWindow.webContents.mainFrame || owner.epoch !== transportEpoch)
     return fail(appError('state_conflict', 'input', 'The invoice operation window or Host changed. Open the current result again.'));
   if (input.kind === 'export') return productHostRequest({ type: 'export_invoice_candidate', input: input.request }, 'Export result is unknown. Query the original operation.', 10_000, 'operation_result_unknown');
   const binding = invoiceFormBinding;

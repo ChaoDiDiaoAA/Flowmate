@@ -1,4 +1,5 @@
-import { SQLiteError, type Database } from 'bun:sqlite';
+import { SQLiteError } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from './write-coordinator.ts';
 import { appError, fail } from '@flowmate/contracts';
 import { NativeOriginFault } from '../memory/origins.ts';
 

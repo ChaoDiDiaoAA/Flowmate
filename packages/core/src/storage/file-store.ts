@@ -2,9 +2,12 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { randomUUID } from 'node:crypto';
 import type { Dirent } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { appError, fail, ok } from '@flowmate/contracts';
-import type { DbId, ProductPaths, Result, ExportInvoiceCandidateRequest, InvoiceExportReference, SourceSnapshot } from '@flowmate/contracts';
+import { appError, fail, ok, invoiceExportName } from '@flowmate/contracts';
+import type { DbId, ProductPaths, Result, ExportInvoiceCandidateRequest, InvoiceExportReference, SourceSnapshot, ManagedFileContents, ResearchMaterial } from '@flowmate/contracts';
 import type { DocumentRepository, StoredArtifact } from './repositories.ts';
+import type { DbHandle } from './database.ts';
+
+export const MAX_INVOICE_EXPORT_BYTES = 64 * 1024 * 1024;
 
 export type ArtifactPayload = {
   kind: 'original' | 'parsed';
@@ -14,6 +17,11 @@ export type ArtifactPayload = {
 
 export type PublishedArtifact = StoredArtifact & { createdAt: string };
 export type PublishedArtifactPair = { documentId: DbId; original: PublishedArtifact; parsed: PublishedArtifact };
+type ResearchMaterialInput = { title: string; format: 'text' | 'markdown'; text: string; at: string };
+type ResearchMaterialWorkflow = {
+  findExisting(): Promise<Result<ResearchMaterial | null>>;
+  register(published: PublishedArtifact): Promise<Result<ResearchMaterial>>;
+};
 
 export type PublishArtifactInput = {
   sourceKey: string;
@@ -87,7 +95,7 @@ function invoiceExportPath(paths: Pick<ProductPaths, 'root' | 'outputsDir'>, rel
 export function readManagedInvoiceExport(paths: Pick<ProductPaths, 'root' | 'outputsDir'>, reference: InvoiceExportReference, expectedContent: Uint8Array): Result<Uint8Array> {
   try {
     if (!(expectedContent instanceof Uint8Array) || !Number.isSafeInteger(reference.bytes) || reference.bytes < 1
-      || reference.bytes > 64 * 1024 * 1024) throw new Error('invalid_export_reference');
+      || reference.bytes > MAX_INVOICE_EXPORT_BYTES) throw new Error('invalid_export_reference');
     const path = invoiceExportPath(paths, reference.relativePath);
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== reference.bytes) throw new Error('invalid_export_file');
@@ -97,24 +105,124 @@ export function readManagedInvoiceExport(paths: Pick<ProductPaths, 'root' | 'out
   } catch { return fail(appError('artifact_unavailable', 'storage', '已导出文件缺失或变化，需按原事实核对。')); }
 }
 
+export function readManagedArtifact(paths: Pick<ProductPaths, 'root' | 'artifactsDir'>, artifact: StoredArtifact,
+  fileName: string | undefined, contents: Pick<ManagedFileContents, 'read'>): Result<Uint8Array> {
+  const rootPath = resolve(paths.root), artifactRoot = resolve(paths.artifactsDir);
+  let rootsVerified = false;
+  let verifiedRoots: Array<{ path: string; real: string; dev: number; ino: number; ctimeMs: number }> = [];
+  try {
+    const root = realpathSync(rootPath);
+    const managedArtifactRoot = realpathSync(artifactRoot);
+    if (!within(root, managedArtifactRoot)) throw new Error('path_outside_root');
+    const rootInfo = lstatSync(root), artifactRootInfo = lstatSync(managedArtifactRoot);
+    if (!rootInfo.isDirectory() || !artifactRootInfo.isDirectory()) throw new Error('managed_root_unavailable');
+    verifiedRoots = [{ path: rootPath, real: root, ...rootInfo }, { path: artifactRoot, real: managedArtifactRoot, ...artifactRootInfo }];
+    rootsVerified = true;
+    const artifactDirectory = resolve(rootPath, dirname(artifact.relativePath));
+    const expectedDirectory = resolve(artifactRoot, String(artifact.artifactId));
+    if (!within(root, artifactDirectory) || artifactDirectory !== expectedDirectory) throw new Error('path_outside_root');
+    const directory = realpathSync(artifactDirectory);
+    if (!within(managedArtifactRoot, directory)) throw new Error('path_outside_root');
+    const name = fileName ?? artifact.relativePath.slice(artifact.relativePath.lastIndexOf('/') + 1);
+    if (!validArtifactName(name) || !artifact.metadata.files.some((file) => file.relativePath === name)) throw new Error('artifact_file_not_registered');
+    const path = join(directory, name);
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || !info.isFile() || !within(directory, realpathSync(path))) throw new Error('path_outside_root');
+    const file = artifact.metadata.files.find((entry) => entry.relativePath === name)!;
+    if (info.size !== file.bytes || info.size > 10 * 1024 * 1024) throw new Error('artifact_size_mismatch');
+    const bytes = readFileSync(path);
+    if (bytes.byteLength !== file.bytes) throw new Error('artifact_size_mismatch');
+    const expected = contents?.read({ ownerKind: 'artifact', ownerId: String(artifact.artifactId), relativePath: name });
+    if (!expected || !Buffer.from(expected).equals(bytes)) throw new Error('artifact_size_mismatch');
+    return ok(bytes);
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+    if (code === 'ENOENT' && rootsVerified) {
+      // An earlier root check cannot classify a later missing-path error: a
+      // mount may have disappeared or returned while this read was in flight.
+      // These probes are conservative evidence, not a filesystem snapshot.
+      try {
+        const rootsUnchanged = () => verifiedRoots.every(previous => {
+          const current = lstatSync(previous.path);
+          return current.isDirectory() && !current.isSymbolicLink() && realpathSync(previous.path) === previous.real
+            && current.dev === previous.dev && current.ino === previous.ino && current.ctimeMs === previous.ctimeMs;
+        });
+        if (!rootsUnchanged()) throw new Error('managed_root_changed');
+        const name = fileName ?? artifact.relativePath.slice(artifact.relativePath.lastIndexOf('/') + 1);
+        if (!validArtifactName(name) || !artifact.metadata.files.some(file => file.relativePath === name))
+          throw new Error('artifact_read_transient');
+        // ENOENT does not identify the absent path component. A successful
+        // parent listing must itself lack the expected child before absence
+        // can be durable; a temporarily absent parent only yields a retry.
+        const artifactName = String(artifact.artifactId);
+        if (readdirSync(artifactRoot).includes(artifactName)) {
+          const directory = join(artifactRoot, artifactName);
+          const info = lstatSync(directory);
+          if (!info.isDirectory() || info.isSymbolicLink() || !within(verifiedRoots[1]!.real, realpathSync(directory)))
+            throw new Error('artifact_read_transient');
+          if (readdirSync(directory).includes(name)) throw new Error('artifact_read_transient');
+        }
+        // Retain the root checks around the observation; this still does not
+        // promise a cross-process filesystem snapshot.
+        if (!rootsUnchanged()) throw new Error('managed_root_changed');
+        return fail(appError('artifact_unavailable', 'storage', '受管文件缺失或格式损坏。'));
+      } catch { return fail(appError('input_unavailable', 'input', '受管材料当前不可读取。', true)); }
+    }
+    if (error instanceof Error && ['path_outside_root', 'artifact_file_not_registered', 'artifact_size_mismatch'].includes(error.message)) {
+      return fail(appError('artifact_unavailable', 'storage', '受管文件缺失或格式损坏。'));
+    }
+    return fail(appError('input_unavailable', 'input', '受管材料当前不可读取。', true));
+  }
+}
+
+function managedResearchSourcePath(paths: Pick<ProductPaths, 'root' | 'artifactsDir'>, researchId: number, toolCallId: number, create: boolean): string {
+  if (!Number.isSafeInteger(researchId) || researchId < 1 || !Number.isSafeInteger(toolCallId) || toolCallId < 1) throw new Error('research_source_reference');
+  const root = realpathSync(resolve(paths.root)), artifactRoot = resolve(paths.artifactsDir);
+  for (const directory of [artifactRoot, join(artifactRoot, 'research'), join(artifactRoot, 'research', String(researchId))]) {
+    if (!within(root, directory)) throw new Error('research_source_directory');
+    if (create && !existsSync(directory)) mkdirSync(directory);
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || !within(root, directory) || realpathSync(directory) !== resolve(directory)) throw new Error('research_source_directory');
+  }
+  return join(artifactRoot, 'research', String(researchId), `source-${toolCallId}.txt`);
+}
+
+export function readManagedResearchSource(paths: Pick<ProductPaths, 'root' | 'artifactsDir'>, reference: Pick<SourceSnapshot, 'researchId' | 'toolCallId' | 'relativePath' | 'bytes' | 'characters'>,
+  contents: Pick<ManagedFileContents, 'read'>): Result<string> {
+  try {
+    if (reference.relativePath !== `artifacts/research/${reference.researchId}/source-${reference.toolCallId}.txt`
+      || !Number.isSafeInteger(reference.bytes) || reference.bytes < 1 || reference.bytes > 2_000_000) throw new Error('research_source_reference');
+    const original = contents.read({ ownerKind: 'research-source', ownerId: String(reference.toolCallId), relativePath: reference.relativePath });
+    const path = managedResearchSourcePath(paths, reference.researchId, reference.toolCallId, false), stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== reference.bytes) throw new Error('research_source_file');
+    const bytes = readFileSync(path);
+    if (bytes.length !== reference.bytes || !Buffer.from(original ?? []).equals(bytes)) throw new Error('research_source_content');
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    if (text.length !== reference.characters) throw new Error('research_source_characters');
+    return ok(text);
+  } catch { return fail(appError('research_source_unavailable', 'tool', 'Saved research evidence is missing or changed.')); }
+}
+
 export class FileStore {
   private tail: Promise<void> = Promise.resolve();
   private readonly root: string;
   private readonly artifactRoot: string;
 
-  public constructor(private readonly paths: ProductPaths, private readonly documents: DocumentRepository) {
+  public constructor(private readonly paths: ProductPaths, private readonly owner: Pick<DbHandle, 'read' | 'transaction'>) {
     this.root = resolve(paths.root);
     this.artifactRoot = resolve(paths.artifactsDir);
   }
 
-  public publishResearchSource(input: { researchId: number; toolCallId: number; text: string }): Result<Pick<SourceSnapshot, 'relativePath' | 'bytes' | 'characters'>> {
+  public async publishResearchSource(input: { researchId: number; toolCallId: number; text: string }): Promise<Result<Pick<SourceSnapshot, 'relativePath' | 'bytes' | 'characters'>>> {
+    input = { ...input };
     try {
       const data = Buffer.from(input.text, 'utf8');
       if (data.length < 1 || data.length > 2_000_000 || data.toString('utf8') !== input.text) throw new Error('research_source_size');
       const relativePath = `artifacts/research/${input.researchId}/source-${input.toolCallId}.txt`;
-      const target = this.researchSourcePath(input.researchId, input.toolCallId, true);
       const owner = { ownerKind: 'research-source', ownerId: String(input.toolCallId), relativePath };
-      this.documents.contents!.remember(owner, data);
+      const original = await this.readDocuments(documents => ok(documents.contents!.read(owner)));
+      if (!original.ok || original.data !== null && !Buffer.from(original.data).equals(data)) throw new Error('research_source_conflict');
+      const target = this.researchSourcePath(input.researchId, input.toolCallId, true);
       if (existsSync(target)) {
         const stat = lstatSync(target);
         if (!stat.isFile() || stat.isSymbolicLink() || !readFileSync(target).equals(data)) throw new Error('research_source_conflict');
@@ -123,75 +231,86 @@ export class FileStore {
         try { writeFileSync(temporary, data, { flag: 'wx' }); linkSync(temporary, target); }
         finally { if (existsSync(temporary)) rmSync(temporary); }
       }
+      const remembered = await this.writeDocuments(documents => { documents.contents!.remember(owner, data); return ok(undefined); });
+      if (!remembered.ok) throw new Error('research_source_original_unconfirmed');
       return ok({ relativePath, bytes: data.length, characters: input.text.length });
     } catch { return fail(appError('research_source_unavailable', 'storage', 'Research source could not be published.', true)); }
   }
 
-  public publishResearchMaterial(input: { title: string; format: 'text' | 'markdown'; text: string; at: string }): Result<PublishedArtifact> {
+  public publishResearchMaterial(input: ResearchMaterialInput): Promise<Result<PublishedArtifact>>;
+  public publishResearchMaterial(input: ResearchMaterialInput, workflow: ResearchMaterialWorkflow): Promise<Result<ResearchMaterial>>;
+  public publishResearchMaterial(input: ResearchMaterialInput, workflow?: ResearchMaterialWorkflow): Promise<Result<PublishedArtifact | ResearchMaterial>> {
+    input = { ...input };
     const bytes = Buffer.from(input.text, 'utf8'), name = input.format === 'markdown' ? 'source.md' : 'source.txt';
-    if (bytes.length < 1 || bytes.length > 2_000_000 || bytes.toString('utf8') !== input.text) return fail(appError('input_invalid', 'input', 'Selected text is invalid.'));
-    let staging: string | null = null;
-    try {
-      if (!within(realpathSync(this.root), this.artifactRoot) || lstatSync(this.artifactRoot).isSymbolicLink()
-        || realpathSync(this.artifactRoot) !== this.artifactRoot) throw new Error('research_material_root');
-      const known = this.documents.listArtifactIds(); if (!known.ok) return known;
-      const occupied = new Set([...known.data, ...readdirSync(this.artifactRoot).filter(value => /^[1-9]\d*$/.test(value)).map(Number)]);
-      let artifactId = 1; while (occupied.has(artifactId)) artifactId++;
-      if (!Number.isSafeInteger(artifactId)) throw new Error('artifact_id_exhausted');
-      const mimeType = input.format === 'markdown' ? 'text/markdown' : 'text/plain';
-      const metadata = { version: 1 as const, sourceKey: 'research-local-v1', sourceRecordId: input.title,
-        sourceVersion: randomUUID(), files: [{ relativePath: name, bytes: bytes.length, mimeType }] };
-      staging = mkdtempSync(join(this.artifactRoot, '.research-material-'));
-      writeFileSync(join(staging, name), bytes, { flag: 'wx' });
-      writeFileSync(join(staging, 'manifest.json'), jsonBytes({ ...metadata, kind: 'original', files: [{ name, bytes: bytes.length, mimeType }] }), { flag: 'wx' });
-      if (!readFileSync(join(staging, name)).equals(bytes)) throw new Error('research_material_publication');
-      renameSync(staging, join(this.artifactRoot, String(artifactId))); staging = null;
-      this.documents.contents!.remember({ ownerKind: 'artifact', ownerId: String(artifactId), relativePath: name }, bytes);
-      return ok({ artifactId, kind: 'original', relativePath: `artifacts/${artifactId}/${name}`, bytes: bytes.length, mimeType, metadata, createdAt: input.at });
-    } catch { return fail(appError('storage_write_failed', 'storage', 'Research material publication failed.', true)); }
-    finally {
-      if (staging) try { for (const name of ['source.md', 'source.txt', 'manifest.json']) if (existsSync(join(staging, name))) rmSync(join(staging, name)); rmdirSync(staging); }
-      catch { /* keep owned staging for inspection */ }
-    }
+    if (bytes.length < 1 || bytes.length > 2_000_000 || bytes.toString('utf8') !== input.text)
+      return Promise.resolve(fail(appError('input_invalid', 'input', 'Selected text is invalid.')));
+    return this.enqueuePublication<PublishedArtifact | ResearchMaterial>(async () => {
+      let staging: string | null = null;
+      try {
+        if (workflow) {
+          const existing = await workflow.findExisting();
+          if (!existing.ok) return existing;
+          if (existing.data !== null) return ok(existing.data);
+        }
+        const known = await this.readDocuments(documents => documents.listArtifactIds()); if (!known.ok) return known;
+        if (!within(realpathSync(this.root), this.artifactRoot) || lstatSync(this.artifactRoot).isSymbolicLink()
+          || realpathSync(this.artifactRoot) !== this.artifactRoot) throw new Error('research_material_root');
+        const occupied = new Set([...known.data, ...readdirSync(this.artifactRoot).filter(value => /^[1-9]\d*$/.test(value)).map(Number)]);
+        let artifactId = 1; while (occupied.has(artifactId)) artifactId++;
+        if (!Number.isSafeInteger(artifactId)) throw new Error('artifact_id_exhausted');
+        const mimeType = input.format === 'markdown' ? 'text/markdown' : 'text/plain';
+        const metadata = { version: 1 as const, sourceKey: 'research-local-v1', sourceRecordId: input.title,
+          sourceVersion: randomUUID(), files: [{ relativePath: name, bytes: bytes.length, mimeType }] };
+        staging = mkdtempSync(join(this.artifactRoot, '.research-material-'));
+        writeFileSync(join(staging, name), bytes, { flag: 'wx' });
+        writeFileSync(join(staging, 'manifest.json'), jsonBytes({ ...metadata, kind: 'original', files: [{ name, bytes: bytes.length, mimeType }] }), { flag: 'wx' });
+        if (!readFileSync(join(staging, name)).equals(bytes)) throw new Error('research_material_publication');
+        renameSync(staging, join(this.artifactRoot, String(artifactId))); staging = null;
+        const remembered = await this.writeDocuments(documents => {
+          documents.contents!.remember({ ownerKind: 'artifact', ownerId: String(artifactId), relativePath: name }, bytes); return ok(undefined);
+        });
+        if (!remembered.ok) return remembered;
+        const published: PublishedArtifact = { artifactId, kind: 'original', relativePath: `artifacts/${artifactId}/${name}`,
+          bytes: bytes.length, mimeType, metadata, createdAt: input.at };
+        return workflow ? await workflow.register(published) : ok(published);
+      } catch { return fail(appError('storage_write_failed', 'storage', 'Research material publication failed.', true)); }
+      finally {
+        if (staging) try { for (const name of ['source.md', 'source.txt', 'manifest.json']) if (existsSync(join(staging, name))) rmSync(join(staging, name)); rmdirSync(staging); }
+        catch { /* keep owned staging for inspection */ }
+      }
+    }).catch(() => fail(appError('storage_write_failed', 'storage', 'Research material publication failed.', true)));
   }
 
-  public readResearchSource(reference: Pick<SourceSnapshot, 'researchId' | 'toolCallId' | 'relativePath' | 'bytes' | 'characters'>): Result<string> {
+  public async readResearchSource(reference: Pick<SourceSnapshot, 'researchId' | 'toolCallId' | 'relativePath' | 'bytes' | 'characters'>): Promise<Result<string>> {
+    reference = { ...reference };
     try {
-      if (reference.relativePath !== `artifacts/research/${reference.researchId}/source-${reference.toolCallId}.txt`
-        || !Number.isSafeInteger(reference.bytes) || reference.bytes < 1 || reference.bytes > 2_000_000) throw new Error('research_source_reference');
-      const path = this.researchSourcePath(reference.researchId, reference.toolCallId, false), stat = lstatSync(path);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== reference.bytes) throw new Error('research_source_file');
-      const bytes = readFileSync(path);
-      if (bytes.length !== reference.bytes || !Buffer.from(this.documents.contents!.read({ ownerKind: 'research-source', ownerId: String(reference.toolCallId), relativePath: reference.relativePath }) ?? []).equals(bytes)) throw new Error('research_source_content');
-      const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-      if (text.length !== reference.characters) throw new Error('research_source_characters');
-      return ok(text);
+      const owner = { ownerKind: 'research-source', ownerId: String(reference.toolCallId), relativePath: reference.relativePath };
+      const original = await this.readDocuments(documents => ok(documents.contents!.read(owner)));
+      if (!original.ok) throw new Error('research_source_original_unavailable');
+      return this.inspectResearchSource(reference, { read: current => current.ownerKind === owner.ownerKind
+        && current.ownerId === owner.ownerId && current.relativePath === owner.relativePath ? original.data : null });
     } catch { return fail(appError('research_source_unavailable', 'tool', 'Saved research evidence is missing or changed.')); }
   }
 
+  public inspectResearchSource(reference: Pick<SourceSnapshot, 'researchId' | 'toolCallId' | 'relativePath' | 'bytes' | 'characters'>,
+    contents: Pick<ManagedFileContents, 'read'>): Result<string> {
+    return readManagedResearchSource({ root: this.root, artifactsDir: this.artifactRoot }, reference, contents);
+  }
+
   private researchSourcePath(researchId: number, toolCallId: number, create: boolean): string {
-    if (!Number.isSafeInteger(researchId) || researchId < 1 || !Number.isSafeInteger(toolCallId) || toolCallId < 1) throw new Error('research_source_reference');
-    const root = realpathSync(this.root);
-    for (const directory of [this.artifactRoot, join(this.artifactRoot, 'research'), join(this.artifactRoot, 'research', String(researchId))]) {
-      if (!within(root, directory)) throw new Error('research_source_directory');
-      if (create && !existsSync(directory)) mkdirSync(directory);
-      const stat = lstatSync(directory);
-      if (!stat.isDirectory() || stat.isSymbolicLink() || !within(root, directory) || realpathSync(directory) !== resolve(directory)) throw new Error('research_source_directory');
-    }
-    return join(this.artifactRoot, 'research', String(researchId), `source-${toolCallId}.txt`);
+    return managedResearchSourcePath({ root: this.root, artifactsDir: this.artifactRoot }, researchId, toolCallId, create);
   }
 
   public publishInvoiceExport(input: { candidateId: DbId; jobId: DbId; sequence: number;
     format: ExportInvoiceCandidateRequest['format']; bytes: Uint8Array }): Result<{ relativePath: string; bytes: number }> {
     if (![input.candidateId, input.jobId, input.sequence].every(value => Number.isSafeInteger(value) && value > 0)
-      || !['json', 'csv', 'markdown'].includes(input.format) || input.bytes.byteLength < 1 || input.bytes.byteLength > 64 * 1024 * 1024) {
+      || !['json', 'csv', 'markdown'].includes(input.format) || input.bytes.byteLength < 1 || input.bytes.byteLength > MAX_INVOICE_EXPORT_BYTES) {
       return fail(appError('input_invalid', 'input', '导出文件参数无效。'));
     }
-    const relativePath = `outputs/invoice-${input.jobId}-result-${input.sequence}.${input.format === 'markdown' ? 'md' : input.format}`;
+    const relativePath = invoiceExportName(input, input.format);
     let temporary: string | null = null;
     try {
       const target = this.invoiceExportPath(relativePath);
-      this.documents.contents!.remember({ ownerKind: 'invoice-export', ownerId: String(input.candidateId), relativePath }, input.bytes);
       if (existsSync(target)) {
         if (!lstatSync(target).isFile() || lstatSync(target).isSymbolicLink()
           || !Buffer.from(readFileSync(target)).equals(Buffer.from(input.bytes))) {
@@ -217,104 +336,70 @@ export class FileStore {
     finally { if (temporary !== null) try { rmSync(temporary); } catch { /* preserve publication result */ } }
   }
 
-  public readInvoiceExport(reference: InvoiceExportReference): Result<Uint8Array> {
-    const expected = this.documents.contents?.read({ ownerKind: 'invoice-export', ownerId: String(reference.candidateId), relativePath: reference.relativePath });
-    return expected ? readManagedInvoiceExport(this.paths, reference, expected)
-      : fail(appError('artifact_unavailable', 'storage', 'Original export bytes are unavailable.'));
+  public readInvoiceExport(reference: InvoiceExportReference, expectedContent: Uint8Array): Result<Uint8Array> {
+    return readManagedInvoiceExport(this.paths, reference, expectedContent);
   }
 
   private invoiceExportPath(relativePath: string): string {
     return invoiceExportPath(this.paths, relativePath);
   }
 
-  public publish(input: PublishArtifactInput): Promise<Result<PublishedArtifactPair>> {
+  private enqueuePublication<T>(operation: () => Promise<Result<T>>): Promise<Result<T>> {
     const previous = this.tail;
     let release!: () => void;
     this.tail = new Promise<void>((resolveLock) => { release = resolveLock; });
-    return previous.then(() => this.publishLocked(input)).catch(() =>
-      fail(appError('artifact_publish_failed', 'storage', '受管文件发布失败。', true)),
-    ).finally(release);
+    return previous.then(operation).finally(release);
   }
 
-  public read(artifact: StoredArtifact, fileName?: string): Result<Uint8Array> {
-    let rootsVerified = false;
-    let verifiedRoots: Array<{ path: string; real: string; dev: number; ino: number; ctimeMs: number }> = [];
-    try {
-      const root = realpathSync(this.root);
-      const managedArtifactRoot = realpathSync(this.artifactRoot);
-      if (!within(root, managedArtifactRoot)) throw new Error('path_outside_root');
-      const rootInfo = lstatSync(root), artifactRootInfo = lstatSync(managedArtifactRoot);
-      if (!rootInfo.isDirectory() || !artifactRootInfo.isDirectory()) throw new Error('managed_root_unavailable');
-      verifiedRoots = [{ path: this.root, real: root, ...rootInfo }, { path: this.artifactRoot, real: managedArtifactRoot, ...artifactRootInfo }];
-      rootsVerified = true;
-      const artifactDirectory = resolve(this.root, dirname(artifact.relativePath));
-      const expectedDirectory = resolve(this.artifactRoot, String(artifact.artifactId));
-      if (!within(root, artifactDirectory) || artifactDirectory !== expectedDirectory) throw new Error('path_outside_root');
-      const directory = realpathSync(artifactDirectory);
-      if (!within(managedArtifactRoot, directory)) throw new Error('path_outside_root');
-      const name = fileName ?? artifact.relativePath.slice(artifact.relativePath.lastIndexOf('/') + 1);
-      if (!validArtifactName(name) || !artifact.metadata.files.some((file) => file.relativePath === name)) throw new Error('artifact_file_not_registered');
-      const path = join(directory, name);
-      const info = lstatSync(path);
-      if (info.isSymbolicLink() || !info.isFile() || !within(directory, realpathSync(path))) throw new Error('path_outside_root');
-      const file = artifact.metadata.files.find((entry) => entry.relativePath === name)!;
-      if (info.size !== file.bytes || info.size > 10 * 1024 * 1024) throw new Error('artifact_size_mismatch');
-      const bytes = readFileSync(path);
-      if (bytes.byteLength !== file.bytes) throw new Error('artifact_size_mismatch');
-      const expected = this.documents.contents?.read({ ownerKind: 'artifact', ownerId: String(artifact.artifactId), relativePath: name });
-      if (!expected || !Buffer.from(expected).equals(bytes)) throw new Error('artifact_size_mismatch');
-      return ok(bytes);
-    } catch (error) {
-      const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-      if (code === 'ENOENT' && rootsVerified) {
-        // An earlier root check cannot classify a later missing-path error: a
-        // mount may have disappeared or returned while this read was in flight.
-        // These probes are conservative evidence, not a filesystem snapshot.
-        try {
-          const rootsUnchanged = () => verifiedRoots.every(previous => {
-            const current = lstatSync(previous.path);
-            return current.isDirectory() && !current.isSymbolicLink() && realpathSync(previous.path) === previous.real
-              && current.dev === previous.dev && current.ino === previous.ino && current.ctimeMs === previous.ctimeMs;
-          });
-          if (!rootsUnchanged()) throw new Error('managed_root_changed');
-          const name = fileName ?? artifact.relativePath.slice(artifact.relativePath.lastIndexOf('/') + 1);
-          if (!validArtifactName(name) || !artifact.metadata.files.some(file => file.relativePath === name))
-            throw new Error('artifact_read_transient');
-          // ENOENT does not identify the absent path component. A successful
-          // parent listing must itself lack the expected child before absence
-          // can be durable; a temporarily absent parent only yields a retry.
-          const artifactName = String(artifact.artifactId);
-          if (readdirSync(this.artifactRoot).includes(artifactName)) {
-            const directory = join(this.artifactRoot, artifactName);
-            const info = lstatSync(directory);
-            if (!info.isDirectory() || info.isSymbolicLink() || !within(verifiedRoots[1]!.real, realpathSync(directory)))
-              throw new Error('artifact_read_transient');
-            if (readdirSync(directory).includes(name)) throw new Error('artifact_read_transient');
-          }
-          // Retain the root checks around the observation; this still does not
-          // promise a cross-process filesystem snapshot.
-          if (!rootsUnchanged()) throw new Error('managed_root_changed');
-          return fail(appError('artifact_unavailable', 'storage', '受管文件缺失或格式损坏。'));
-        } catch { return fail(appError('input_unavailable', 'input', '受管材料当前不可读取。', true)); }
+  private async readDocuments<T>(operation: (documents: DocumentRepository) => Result<T>): Promise<Result<T>> {
+    try { return await this.owner.read(scope => operation(scope.documents)); }
+    catch { return fail(appError('storage_read_failed', 'storage', 'Managed file metadata could not be read.', true)); }
+  }
+
+  private async writeDocuments<T>(operation: (documents: DocumentRepository) => Result<T>): Promise<Result<T>> {
+    try { return await this.owner.transaction(scope => operation(scope.documents)); }
+    catch { return fail(appError('storage_write_failed', 'storage', 'Managed file content could not be saved.', true)); }
+  }
+
+  public publish(input: PublishArtifactInput): Promise<Result<PublishedArtifactPair>>;
+  public publish<T>(input: PublishArtifactInput, workflow: {
+    findExisting(): Promise<Result<T | null>>;
+    register(published: PublishedArtifactPair): Promise<Result<T>>;
+  }): Promise<Result<T>>;
+  public publish<T>(input: PublishArtifactInput, workflow?: {
+    findExisting(): Promise<Result<T | null>>;
+    register(published: PublishedArtifactPair): Promise<Result<T>>;
+  }): Promise<Result<PublishedArtifactPair | T>> {
+    try { input = structuredClone(input); }
+    catch { return Promise.resolve(fail(appError('artifact_publish_failed', 'storage', '受管文件发布失败。', true))); }
+    return this.enqueuePublication<PublishedArtifactPair | T>(async () => {
+      if (workflow) {
+        const existing = await workflow.findExisting();
+        if (!existing.ok) return existing;
+        if (existing.data !== null) return ok(existing.data);
       }
-      if (error instanceof Error && ['path_outside_root', 'artifact_file_not_registered', 'artifact_size_mismatch'].includes(error.message)) {
-        return fail(appError('artifact_unavailable', 'storage', '受管文件缺失或格式损坏。'));
-      }
-      return fail(appError('input_unavailable', 'input', '受管材料当前不可读取。', true));
-    }
+      const published = await this.publishLocked(input);
+      return published.ok && workflow ? workflow.register(published.data) : published;
+    }).catch(() => fail(appError('artifact_publish_failed', 'storage', '受管文件发布失败。', true)));
+  }
+
+  public read(artifact: StoredArtifact, fileName: string | undefined, contents: Pick<ManagedFileContents, 'read'>): Result<Uint8Array> {
+    return readManagedArtifact({ root: this.root, artifactsDir: this.artifactRoot }, artifact, fileName, contents);
   }
 
   private async publishLocked(input: PublishArtifactInput): Promise<Result<PublishedArtifactPair>> {
     let stagingPaths: string[] = [];
     let publishedPaths: string[] = [];
     try {
+      const allocated = await this.readDocuments(documents => {
+        const artifacts = documents.listArtifactIds(); if (!artifacts.ok) return artifacts;
+        const documentsIds = documents.listDocumentIds(); if (!documentsIds.ok) return documentsIds;
+        return ok({ artifactIds: artifacts.data, documentIds: documentsIds.data });
+      });
+      if (!allocated.ok) return allocated;
       mkdirSync(this.artifactRoot, { recursive: true });
       if (!within(realpathSync(this.root), realpathSync(this.artifactRoot))) throw new Error('path_outside_root');
-      const artifactIds = this.documents.listArtifactIds();
-      if (!artifactIds.ok) return artifactIds;
-      const documentIds = this.documents.listDocumentIds();
-      if (!documentIds.ok) return documentIds;
-      const occupiedDocuments = new Set(documentIds.data);
+      const occupiedDocuments = new Set(allocated.data.documentIds);
       const allocateDocument = () => {
         let candidate = 1;
         while (occupiedDocuments.has(candidate)) candidate += 1;
@@ -322,14 +407,14 @@ export class FileStore {
         occupiedDocuments.add(candidate);
         return candidate;
       };
-      const known = new Set(artifactIds.data);
+      const known = new Set(allocated.data.artifactIds);
       const dirs = readdirSync(this.artifactRoot, { withFileTypes: true });
       const existingDirs = new Set(dirs.filter((entry) => entry.isDirectory() && /^[1-9]\d*$/.test(entry.name)).map((entry) => Number(entry.name)));
       const orphan = this.findOrphan(input, known, dirs);
       if (orphan === 'conflict') return fail(appError('document_version_conflict', 'input', '同一来源版本存在无法核验的孤儿文件。'));
       if (orphan) {
         const reused = this.readPublishedPair(orphan, input, allocateDocument());
-        return reused;
+        return reused.ok ? this.rememberPublished(input, reused.data) : reused;
       }
       const occupied = new Set([...known, ...existingDirs]);
       const allocate = () => {
@@ -362,7 +447,7 @@ export class FileStore {
         stagingPaths = stagingPaths.filter((entry) => entry !== stage);
         publishedPaths.push(final);
       }
-      return ok({
+      return this.rememberPublished(input, {
         documentId,
         original: this.published(originalId, 'original', original, input, input.at),
         parsed: this.published(parsedId, 'parsed', parsed, input, input.at),
@@ -398,7 +483,6 @@ export class FileStore {
   }
 
   private published(id: number, kind: ArtifactPayload['kind'], payload: ArtifactPayload, input: PublishArtifactInput, at: string): PublishedArtifact {
-    for (const file of payload.files) this.documents.contents!.remember({ ownerKind: 'artifact', ownerId: String(id), relativePath: file.name }, file.bytes);
     const primary = payload.files.find((file) => file.name === payload.primaryName)!;
     return {
       artifactId: id, kind, relativePath: `artifacts/${id}/${payload.primaryName}`,
@@ -409,6 +493,15 @@ export class FileStore {
         })) },
       createdAt: at,
     };
+  }
+
+  private rememberPublished(input: PublishArtifactInput, pair: PublishedArtifactPair): Promise<Result<PublishedArtifactPair>> {
+    return this.writeDocuments(documents => {
+      for (const [artifact, payload] of [[pair.original, input.original], [pair.parsed, input.parsed]] as const) {
+        for (const file of payload.files) documents.contents!.remember({ ownerKind: 'artifact', ownerId: String(artifact.artifactId), relativePath: file.name }, file.bytes);
+      }
+      return ok(pair);
+    });
   }
 
   private findOrphan(input: PublishArtifactInput, known: Set<number>, dirs: Dirent[]): number[] | 'conflict' | null {
@@ -465,9 +558,9 @@ export class FileStore {
   }
 }
 
-export function createFileStore(paths: ProductPaths, documents: DocumentRepository): FileStore {
+export function createFileStore(paths: ProductPaths, owner: Pick<DbHandle, 'read' | 'transaction'>): FileStore {
   if (!isAbsolute(paths.root) || !isAbsolute(paths.artifactsDir) || !within(paths.root, paths.artifactsDir)) {
     throw new Error('invalid_product_artifacts_path');
   }
-  return new FileStore(paths, documents);
+  return new FileStore(paths, owner);
 }

@@ -49,7 +49,7 @@ function fixture(legacy = false, preparedMarker: 'p8-context-v1' | undefined = u
     enqueueInput: async (_nativeId, input) => { expect(store.db.inTransaction).toBe(false); enqueued.push(input); return ok(undefined); },
     prepare: async () => { preparing++; return ok({ snapshot: prepared, execute: async (input, signal, observe) => {
       expect(store.db.inTransaction).toBe(false); execution = input; busy = true;
-      history.saveUser(session.nativeSessionId, input);
+      await history.saveUser(session.nativeSessionId, input);
       observe({ type: 'agent_event', at, monotonicMs: performance.now(), data: { eventName: 'agent_start' } }); entered();
       await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }); });
       busy = false;
@@ -60,12 +60,12 @@ function fixture(legacy = false, preparedMarker: 'p8-context-v1' | undefined = u
       return outcome;
     } }); }, releaseSession: async () => ({ stopped: true, closed: true, errors: [] }), close: async () => ({ stopped: true, closed: true, errors: [] }) };
   const service = new ContextService({ store, materials: { inspectParsed() { throw new Error('Chat cannot inspect material.'); } } });
-  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, agent,
-    contextRepository: store.context,
-    ...(legacy ? {} : { contextService: { build: request => { builds++; expect(store.db.inTransaction).toBe(true); return service.build(request); } } }),
+  const runtime = new RuntimeService({ database: store,  agent,
+
+    ...(legacy ? {} : { contextService: { build: (request, scope) => { builds++; expect(store.db.inTransaction).toBe(true); return service.build(request, scope); } } }),
     provider: { async prepare() { throw new Error('No direct provider.'); }, async close() { return { stopped: true, closed: true, errors: [] }; } },
     log: { write() {}, async close() {} }, now: () => at, monotonicNow: () => performance.now() });
-  const sessions = new SessionService(store.sessions, agent, () => runtime.state(), () => at, store.runs, store.memory, store.sessionInputs,
+  const sessions = new SessionService(agent, () => runtime.state(), () => at, store,
     (request, submission, control) => runtime.start(request, control, submission), request => runtime.appendInput(request));
   deferCleanup(async () => { await runtime.close(); });
   const request = { sessionId: session.sessionId, clientSequence: 1, mode: 'prompt' as const, text: 'same text', config,
@@ -114,7 +114,7 @@ describe('T04 real Ledger Context admission', () => {
   it('keeps direct Provider config behavior independent of Agent context admission', async () => {
     const f = fixture(); const { agent: _agent, contextPolicyVersion: _marker, historyPolicyVersion: _history, ...snapshot } = f.prepared;
     const providerSnapshot = snapshot;
-    const runtime = new RuntimeService({ memory: f.store.memory, runs: f.store.runs, contextService: { build() { throw new Error('Provider cannot build Agent context.'); } },
+    const runtime = new RuntimeService({ database: f.store, contextService: { build() { throw new Error('Provider cannot build Agent context.'); } },
       provider: { async prepare() { return ok({ snapshot: providerSnapshot, async execute() { return { text: 'Provider reply', partial: false,
         stopReason: 'stop', responseId: null, responseModel: null, error: null, stopped: true, cleanupErrors: [],
         usage: { version: 1 as const, source: 'unknown' as const, reason: 'fixture', sdkValues: null, attempts: 1,
@@ -172,13 +172,31 @@ describe('T04 real Ledger Context admission', () => {
       { inputId: third.inputId, contextSnapshotId: third.contextSnapshotId, promptText: third.content.promptText }]);
     const after = f.rows(); expect(await f.sessions.submitInput(followRequest)).toEqual(ok(follow)); expect(f.rows()).toEqual(after);
     expect(f.counts()).toEqual({ builds: 3, preparing: 1, enqueued: 2 });
-    expect(f.execution().verifyInputUse?.(first.inputId)).toEqual(ok(undefined));
+    expect(await f.execution().verifyInputUse?.([first.inputId])).toEqual(ok(undefined));
+  });
+  it('verifies only the requested Input-use batch and rejects a corrupt last member without writes', async () => {
+    const f = fixture(); const initial = need(await f.sessions.submitInput(f.request)); await f.executing;
+    const follow = need(await f.sessions.submitInput({ sessionId: f.session.sessionId, clientSequence: 2, mode: 'followUp', runId: initial.runId, text: 'Follow-up input' }));
+    const steer = need(await f.sessions.submitInput({ sessionId: f.session.sessionId, clientSequence: 3, mode: 'steer', runId: initial.runId, text: 'Later input' }));
+    const original = f.store.db.query('SELECT content_json FROM session_inputs WHERE id=?').get(steer.inputId) as { content_json: string };
+    f.store.db.query("UPDATE session_inputs SET content_json=json_set(content_json,'$.promptText','corrupt') WHERE id=?").run(steer.inputId);
+    try {
+      const before = f.rows();
+      const selected = f.store.sessionInputs.forRun(initial.runId, [initial.inputId, follow.inputId]);
+      expect(selected.ok && selected.data.map(input => input.inputId)).toEqual([initial.inputId, follow.inputId]);
+      expect(await f.execution().verifyInputUse?.([initial.inputId, follow.inputId])).toEqual(ok(undefined));
+      expect(await f.execution().verifyInputUse?.([initial.inputId, follow.inputId, steer.inputId]))
+        .toMatchObject({ ok: false, error: { code: 'storage_corrupt', retryable: false } });
+      expect(f.rows()).toEqual(before);
+    } finally {
+      f.store.db.query('UPDATE session_inputs SET content_json=? WHERE id=?').run(original.content_json, steer.inputId);
+    }
   });
   it('rejects a saved prompt that no longer matches its original immutable snapshot', async () => {
     const f = fixture(); const initial = need(await f.sessions.submitInput(f.request)); await f.executing;
     f.store.db.query("UPDATE session_inputs SET content_json=json_set(content_json,'$.promptText','corrupt') WHERE id=?").run(initial.inputId);
     const before = f.rows();
-    expect(f.execution().verifyInputUse?.(initial.inputId)).toMatchObject({ ok: false, error: { code: 'storage_corrupt', retryable: false } });
+    expect(await f.execution().verifyInputUse?.([initial.inputId])).toMatchObject({ ok: false, error: { code: 'storage_corrupt', retryable: false } });
     expect(f.rows()).toEqual(before);
   });
 });
@@ -205,7 +223,7 @@ describe('T04 readonly persisted context seeds', () => {
       prepare: async () => { throw new Error('No prepare.'); }, restoreSession: () => { throw new Error('No restore.'); },
       restoreSessionLeaf: () => { throw new Error('No leaf restore.'); }, watchSession: () => { throw new Error('No watch.'); },
       releaseSession: async () => ({ stopped: true, closed: true, errors: [] }), close: async () => ({ stopped: true, closed: true, errors: [] }) };
-    expect(ensureNativeSession(f.store.sessions, port, need(f.store.sessions.get(f.session.sessionId)), f.store.memory)).toMatchObject({ ok: false, error: { code: 'session_busy' } });
+    expect(await ensureNativeSession(f.store, port, need(f.store.sessions.get(f.session.sessionId)))).toMatchObject({ ok: false, error: { code: 'session_busy' } });
     expect(f.history.restorations).toEqual(before);
   });
   it('joins the consumed original Input and excludes later queued inputs without consulting the current pointer', async () => {

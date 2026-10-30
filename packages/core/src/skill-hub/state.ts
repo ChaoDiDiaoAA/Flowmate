@@ -1,5 +1,5 @@
 import { ResourceCatalogSchema, ResourceFileRequestSchema, ResourceSelectionSchema, resourceRefKey } from '@flowmate/contracts';
-import type { ResourceCatalog, ResourceFilePage, ResourceFileRequest, ResourceSelection, Result } from '@flowmate/contracts';
+import type { ResourceCatalog, ResourceFilePage, ResourceFileRequest, ResourceSelection, Result, ManagedFileContents } from '@flowmate/contracts';
 import { find, type AvailableExtensions, type CatalogInput, type createResourceLoader } from './loader.ts';
 import { dependencies, checkDependency } from './capability-map.ts';
 import { checked, reject, page } from './resources.ts';
@@ -7,8 +7,8 @@ import { checked, reject, page } from './resources.ts';
 export function createResourceState(loader: ReturnType<typeof createResourceLoader>, registeredTools: ReadonlySet<string>) {
   const { discover } = loader;
   return {
-    catalog(input: CatalogInput): Result<ResourceCatalog> { return checked(() => {
-      const selection = ResourceSelectionSchema.parse(input.selection), { packages, diagnostics } = discover();
+    catalog(input: CatalogInput, contents?: ManagedFileContents): Result<ResourceCatalog> { return checked(() => {
+      const selection = ResourceSelectionSchema.parse(input.selection), { packages, diagnostics } = discover(contents);
       const items = packages.map(pack => {
         const enabled = (pack.ref.kind === 'prompt' ? selection.prompt && resourceRefKey(selection.prompt) === resourceRefKey(pack.ref)
           : selection.enabledSkills.some(ref => resourceRefKey(ref) === resourceRefKey(pack.ref))) === true;
@@ -27,15 +27,15 @@ export function createResourceState(loader: ReturnType<typeof createResourceLoad
       }
       return ResourceCatalogSchema.parse({ settingsRevision: input.revision, selection, diagnostics, items });
     }); },
-    validateSelection(input: ResourceSelection, availableExtensions: AvailableExtensions = []): Result<void> { return checked(() => {
+    validateSelection(input: ResourceSelection, availableExtensions: AvailableExtensions = [], contents?: ManagedFileContents): Result<void> { return checked(() => {
       const selection = ResourceSelectionSchema.parse(input);
       if (selection.prompt === null && selection.enabledSkills.length === 0) return;
-      const { packages } = discover();
+      const { packages } = discover(contents);
       for (const ref of [...(selection.prompt ? [selection.prompt] : []), ...selection.enabledSkills])
         dependencies(find(packages, ref), packages, selection, registeredTools, availableExtensions);
     }); },
-    readFile(raw: ResourceFileRequest, input: ResourceSelection, availableExtensions: AvailableExtensions = []): Result<ResourceFilePage> { return checked(() => {
-      const request = ResourceFileRequestSchema.parse(raw), selection = ResourceSelectionSchema.parse(input), { packages } = discover();
+    readFile(raw: ResourceFileRequest, input: ResourceSelection, availableExtensions: AvailableExtensions = [], contents?: ManagedFileContents): Result<ResourceFilePage> { return checked(() => {
+      const request = ResourceFileRequestSchema.parse(raw), selection = ResourceSelectionSchema.parse(input), { packages } = discover(contents);
       if (request.ref.kind === 'skill' && !selection.enabledSkills.some(ref => resourceRefKey(ref) === resourceRefKey(request.ref)))
         reject('resource_required_unavailable', 'Enable this Skill version before requesting its content.');
       const pack = find(packages, request.ref); dependencies(pack, packages, selection, registeredTools, availableExtensions);

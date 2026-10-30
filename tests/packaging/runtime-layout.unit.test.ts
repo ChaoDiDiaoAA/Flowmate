@@ -9,7 +9,7 @@ const migrations = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_t
   '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql',
   '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql',
   '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql',
-  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql'];
+  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql'];
 
 function installation() {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-package-'));
@@ -17,17 +17,17 @@ function installation() {
   const files = ['bin/bun.exe', 'bin/photon_rs_bg.wasm', 'bin/rg.exe', 'bin/fd.exe',
     'licenses/ripgrep@15.2.0/LICENSE-MIT', 'licenses/fd@10.4.2/LICENSE-MIT', 'apps/image-resize-worker.js',
     'apps/fill-controls/main.mjs', 'apps/fill-controls/preload.cjs', 'apps/fill-controls/renderer.mjs', 'apps/fill-controls/index.html',
-    'native/win32/prebuilds/win32-x64/win32-console-mode.node', 'apps/host.js', 'apps/start-host.js', 'apps/evaluation-worker.js',
+    'native/win32/prebuilds/win32-x64/win32-platform.node', 'apps/host.js', 'apps/start-host.js', 'apps/evaluation-worker.js',
     'apps/start-evaluation.js', 'apps/maintenance.js', 'sdk/package.json', 'sdk/README.md',
     'sdk/dist/modes/interactive/theme/dark.json', 'sdk/dist/modes/interactive/theme/light.json',
     'sdk/docs/sdk.md', 'resources/prompts/invoice/prompt.md', ...migrations.map(name => `apps/migrations/${name}`)];
   const release = { version: 1, releaseId: '7fcdf7d9-c2ed-4ac9-860d-98ee69ad7ceb', productVersion: '0.1.0',
     platform: 'win32', arch: 'x64',
-    bunVersion: '1.4.0', electronVersion: '44.4.5', sdkVersion: '0.85.1', pluginVersion: '0.19.0',
-    schemaVersion: 20, settingsVersion: 7, files } as const;
+    bunVersion: '1.4.4', electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0',
+    schemaVersion: 21, settingsVersion: 7, files } as const;
   for (const file of files) {
     const path = join(runtime, file); mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, file === 'sdk/package.json' ? JSON.stringify({ version: '0.85.1' }) : 'synthetic package asset');
+    writeFileSync(path, file === 'sdk/package.json' ? JSON.stringify({ version: '1.4.0' }) : 'synthetic package asset');
   }
   const manifest = join(runtime, 'release.json');
   writeFileSync(manifest, JSON.stringify(release));
@@ -55,6 +55,11 @@ describe('P17 runtime layout', () => {
     } });
   });
 
+  it.each(['1.4.0', '1.4.4'])('recognizes only an explicitly supported Bun release for original and target package lookup: %s', bunVersion => {
+    const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, bunVersion }));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: { bunVersion } } });
+  });
+
   it.each(['bin/bun.exe', 'bin/rg.exe', 'bin/fd.exe', 'licenses/ripgrep@15.2.0/LICENSE-MIT', 'licenses/fd@10.4.2/LICENSE-MIT',
     'apps/host.js', 'apps/maintenance.js', 'sdk/package.json',
     'sdk/dist/modes/interactive/theme/dark.json', 'apps/migrations/020_direct_content.sql'])
@@ -67,7 +72,7 @@ describe('P17 runtime layout', () => {
     if (!result.ok) expect(result.error.code).toBe('installation_dependency_missing');
   });
 
-  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 21 }, { settingsVersion: 8 },
+  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 22 }, { settingsVersion: 8 },
     { arch: 'arm64' }, { platform: 'linux' }, { releaseId: 'not-an-id' }, { extra: 'untrusted' }])
   ('rejects an incompatible or malformed release: %j', change => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, ...change }));

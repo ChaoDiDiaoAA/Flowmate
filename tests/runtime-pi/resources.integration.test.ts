@@ -1,5 +1,5 @@
 import { createManagedFileContents } from '../../packages/core/src/storage/managed-file-contents.ts';
-import { openDatabase } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
 import { describe, expect, it, spyOn } from 'bun:test';
 import * as fsPromises from 'node:fs/promises';
 import { Database } from 'bun:sqlite';
@@ -102,7 +102,7 @@ describe('P11 controlled native resources', () => {
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
       toolDefinitions: definitions => definitions.filter(tool => !['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'].includes(tool.name)),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir,
         tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
@@ -174,7 +174,7 @@ describe('P11 controlled native resources', () => {
     const server = await createHttpProvider(async request => { payloads.push(await request.json()); return reply(); }); deferCleanup(() => server.stop());
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: settings.revision, selection: settings.resources! }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Explicit resource fallback' })); need(await app.close());
@@ -212,7 +212,7 @@ describe('P11 controlled native resources', () => {
     expect(await app.submitInput(request)).toEqual({ ok: true, data: accepted });
     expect(await app.submitInput({ ...request, clientSequence: 2 })).toMatchObject({ ok: false, error: { code: 'resource_required_unavailable' } }); expect(payloads).toHaveLength(1);
     f.pack('skill', 'v1', true); // Restore the prior author package before explicitly selecting it.
-    const fallback = { prompt: null, enabledSkills: [older.ref] }; need(app.validateResourceSelection(fallback));
+    const fallback = { prompt: null, enabledSkills: [older.ref] }; need(await app.validateResourceSelection(fallback));
     settings = need(await saveProductSettings(settingsFile, { ...settings, resources: fallback }));
     const later = await execute({ ...request, clientSequence: 2, requiredSkill: older.ref });
     expect(need(await app.queryRunResources({ sessionId: session.sessionId, runId: later.runId })).frozen?.discoveredSkills).toEqual([older.ref]);
@@ -232,7 +232,7 @@ describe('P11 controlled native resources', () => {
     }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) })); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Resource auto summary' }));
     const w = need(await app.readWorkspace()); need(await app.updateWorkspace({ expectedRevision: w.revision, change: { kind: 'session', sessionId: session.sessionId } }));
@@ -270,7 +270,7 @@ describe('P11 controlled native resources', () => {
     }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: session => { natives.push(session); } }) })); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Resource auto summary' }));
     const w = need(await app.readWorkspace()); need(await app.updateWorkspace({ expectedRevision: w.revision, change: { kind: 'session', sessionId: session.sessionId } }));
@@ -318,7 +318,7 @@ describe('P11 controlled native resources', () => {
     let selection: ResourceSelection = { prompt: null, enabledSkills: [skill.ref] };
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Real resource read' }));
@@ -424,7 +424,7 @@ describe('P11 controlled native resources', () => {
     }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) })); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Changed actual read' })), original = need(await app.readWorkspace());
     const workspace = need(await app.updateWorkspace({ expectedRevision: original.revision, change: { kind: 'session', sessionId: session.sessionId } }));
@@ -448,7 +448,7 @@ describe('P11 controlled native resources', () => {
     let selection: ResourceSelection = { prompt: null, enabledSkills: [skill.ref] };
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection }),
-      agentFactory: (definitions, resourceContents) => adapter = new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => adapter = new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'Explicit Skill' })), text = '/skill:invoice Explain missing values.';
@@ -518,7 +518,7 @@ describe('P11 controlled native resources', () => {
     const server = await createHttpProvider(() => { requests++; return reply(); }); deferCleanup(() => server.stop());
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: sdk => {
           if (fault !== 'sdk-read-fallback') return;
           const prompt = sdk.prompt.bind(sdk);
@@ -564,7 +564,7 @@ describe('P11 controlled native resources', () => {
       return toolReply([{ name: 'read', args: { path } }]); }); deferCleanup(() => server.stop());
     const open = () => createApplication({ paths: f.paths, resourceRoot: f.resourceRoot,
       resourceDefaults: () => ok({ revision: 1, selection: { prompt: null, enabledSkills: [skill.ref] } }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback' }) });
     let app = need(await open()); deferCleanup(() => app.close()); need(await app.close());
     const db = new Database(f.paths.databaseFile); db.exec("CREATE TRIGGER p11_read_failure BEFORE UPDATE OF context_observations_json ON runs WHEN json_array_length(NEW.context_observations_json,'$.resources.reads')>0 BEGIN SELECT RAISE(ABORT,'P11 read receipt failure'); END;"); db.close(); app = need(await open());
@@ -597,7 +597,7 @@ describe('P11 controlled native resources', () => {
     const inputMode = mode === 'cancel' || mode === 'followUp-fallback' ? 'followUp' : mode === 'steer-fallback' ? 'steer' : mode;
     let native!: AgentSession, attemptedExpansion = 0;
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot, resourceDefaults: () => ok({ revision, selection }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: session => {
           native = session;
           if (!mode.endsWith('-fallback')) return;
@@ -686,7 +686,7 @@ describe('P11 controlled native resources', () => {
     const payloads: Array<{ messages: Array<{ role: string; content: string }> }> = [], sessions: AgentSession[] = [];
     const server = await createHttpProvider(async request => { payloads.push(await request.json()); return reply(); }); deferCleanup(() => server.stop());
     const app = need(await createApplication({ paths: f.paths, resourceRoot: f.resourceRoot, resourceDefaults: () => ok({ revision, selection }),
-      agentFactory: (definitions, resourceContents) => new pi.PiAgentAdapter({ resourceContents, cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => new pi.PiAgentAdapter({ cwd: f.paths.runtimeDir, agentDir: f.paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'p11-loopback', sessionSetup: session => { sessions.push(session); } }) }));
     deferCleanup(() => app.close());
     const session = need(await app.createSession({ title: 'P11 cache' }));

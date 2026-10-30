@@ -29,6 +29,7 @@ export function createToolRecorder(repository: ToolCallRepository, now: () => st
       return repository.request({ runId: input.context.runId, sessionId: input.context.sessionId,
         nativeToolCallId: input.call.nativeToolCallId, toolName: input.name,
         toolVersion: input.definition?.version ?? null, effect: input.definition?.effect ?? null,
+        ...(input.context.scope.invoiceWork ? { invoiceWorkScope: input.context.scope } : {}),
         rawArguments: input.raw, context: input.call.requestBinding ? {
           snapshotId: input.call.requestBinding.snapshotId, requestSequence: input.call.requestBinding.requestSequence } : null, requestedAt: now() });
     },

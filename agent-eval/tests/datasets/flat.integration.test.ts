@@ -36,8 +36,8 @@ test('declared conditions retain actual original and resource contents without d
   expect(caseFiles(dataset,task)).not.toEqual(prior);expect(feedbackStatus(temporary,undefined,dataset).stale).toBe(1);
  }finally{rmSync(temporary,{recursive:true,force:true});}
 });
-test('three TS declarations load 62 cases with the original partitions',()=>{
- const data=discoverDatasets(root);expect(data.map(d=>d.cases.length)).toEqual([50,12]);expect(data.map(d=>d.manifest.smoke.length)).toEqual([10,4]);
+test('three TS declarations load 62 cases with the seven-case Smoke selection',()=>{
+ const data=discoverDatasets(root);expect(data.map(d=>d.cases.length)).toEqual([50,12]);expect(data.map(d=>d.manifest.smoke.length)).toEqual([5,2]);
  for(const d of data)for(const c of d.cases)expect(resolveCase(d,c).projected.materials).toHaveLength(c.input.materials.length);
  for(const d of data)expect(d.cases.map(c=>c.id)).toEqual(d.cases.map(c=>c.id).sort());
 });

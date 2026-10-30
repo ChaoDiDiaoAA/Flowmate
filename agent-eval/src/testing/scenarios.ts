@@ -1766,7 +1766,7 @@ export const scenariosByName: Record<string, any> = {
               ],
               "id": "invoice-assist",
               "version": "v1",
-              "sdkVersion": "0.85.1",
+              "sdkVersion": "1.4.0",
               "entryId": "invoice-assist-v1",
               "tools": [
                 {
@@ -1906,7 +1906,7 @@ export const scenariosByName: Record<string, any> = {
               ],
               "id": "invoice-assist",
               "version": "v1",
-              "sdkVersion": "0.85.1",
+              "sdkVersion": "1.4.0",
               "entryId": "invoice-assist-v1",
               "tools": [
                 {

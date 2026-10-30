@@ -12,11 +12,11 @@ test('saved-result upload requires exactly one explicit target', async () => {
     for(const args of [[],['--execution-id','one','--report',resolve('one.json')]])
         await expect(main(['resend',...args],fixtureRepo)).rejects.toThrow('Exactly one');
 });
-test('public shortcuts require a local judged batch; upload has no run action', () => {
+test('public shortcuts select fixed single-Trial Benchmarks; upload has no run action', () => {
     const scripts=JSON.parse(readFileSync(resolve(import.meta.dir,'../../../package.json'),'utf8')).scripts;
     for(const selection of ['smoke','full']) {
-        expect(scripts['eval:'+selection]).toContain('run --dataset all --selection '+selection);
-        expect(scripts['eval:'+selection]).toContain('--judge required --backend local');
+        expect(scripts['eval:'+selection]).toEndWith('benchmark run --selection '+selection);
+        expect(scripts['eval:'+selection]).not.toContain('--trials');
     }
     expect(scripts['eval:upload']).toEndWith('resend');
 });

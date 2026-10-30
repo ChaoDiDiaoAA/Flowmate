@@ -41,6 +41,19 @@ it('freezes only the two closed evaluation profiles on an active P13 invoice ext
 });
 
 describe('P12 controlled extension contracts', () => {
+  it('reads historical SDK evidence without relabelling it and rejects mixing SDK eras', () => {
+    const historical = contracts.FrozenExtensionsSchema.parse(frozen);
+    const historicalAssembly = contracts.ExtensionAssemblyEvidenceSchema.parse(assembly);
+    expect(historical.included[0]!.manifest.sdkVersion).toBe('0.85.1');
+    expect(contracts.matchesExtensionAssembly(historical, historicalAssembly)).toBe(true);
+    const current = contracts.FrozenExtensionsSchema.parse({ ...frozen,
+      included: [{ ref, manifest: { ...manifest, sdkVersion: '1.4.0' } }] });
+    const currentAssembly = contracts.ExtensionAssemblyEvidenceSchema.parse({ ...assembly, sdkVersion: '1.4.0' });
+    expect(contracts.matchesExtensionAssembly(current, currentAssembly)).toBe(true);
+    expect(contracts.matchesExtensionAssembly(historical, currentAssembly)).toBe(false);
+    expect(contracts.matchesExtensionAssembly(current, historicalAssembly)).toBe(false);
+    expect(historicalAssembly.sdkVersion).toBe('0.85.1');
+  });
   it('[F13-27] keeps two fixed extension ledgers and rejects crossed registration or legacy expansion', () => {
     const subagentRef = { id: 'subagents', version: 'v1' };
     const subagentManifest = { ...manifest, id: 'subagents', entryId: 'pi-subagents-managed-v1',

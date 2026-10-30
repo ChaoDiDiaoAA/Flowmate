@@ -60,3 +60,14 @@ test('only the private export operation carries a validated fixed platform conne
   expect(parse({ ...command, connection: { ...command.connection, baseUrl: 'https://user:secret@platform.invalid' } })).toBeNull();
   expect(parse({ ...command, input: { ...command.input, secretKey: 'untrusted' } })).toBeNull();
 });
+
+test('only a private experiment command accepts explicitly matched Subject credentials', () => {
+  const context: Extract<EvaluationWorkerCommand, { type: 'evaluation_workflow' }>['context'] = {
+    agentCredentials: [{ connection: { model: 'synthetic-agent', api: 'openai-completions', baseUrl: 'https://synthetic.invalid/v1' }, apiKey: 'synthetic-arm-key' }] };
+  const command = { ...envelope, type: 'evaluation_workflow', input: { action: 'experiment.run', plan: { id: 'synthetic-experiment' } }, context } satisfies EvaluationWorkerCommand;
+  expect(parse(command)).toEqual(command);
+  expect(parse({ ...command, input: { ...command.input, apiKey: 'untrusted-public-key' } })).toBeNull();
+  expect(parse({ ...command, input: { action: 'settings.get' } })).toBeNull();
+  expect(parse({ ...command, context: { ...context, env: {} } })).toBeNull();
+  expect(parse({ ...command, context: { agentCredentials: [{ ...context.agentCredentials[0], connection: { ...context.agentCredentials[0]!.connection, cwd: 'C:/private' } }] } })).toBeNull();
+});

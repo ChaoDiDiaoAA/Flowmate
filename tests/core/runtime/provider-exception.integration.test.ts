@@ -24,7 +24,7 @@ function fixture(provider: ProviderPort, monotonicNow = () => performance.now())
     logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'),
     outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime') });
   if (!database.ok) throw new Error(database.error.code);
-  const service = new RuntimeService({ memory: database.data.memory, runs: database.data.runs, provider,
+  const service = new RuntimeService({ database: database.data, provider,
     log: { write() {}, close: async () => undefined }, now: () => new Date().toISOString(), monotonicNow });
   return { service, database: database.data };
 }
@@ -71,7 +71,7 @@ it.each(['sync', 'async', 'after-cancel'] as const)('saves and blocks a Provider
     expect(await service.callProvider(request)).toMatchObject({ ok: false, error: { code: 'runtime_unusable' } });
   } finally {
     await service.close();
-    database.close();
+    await database.close();
   }
 });
 
@@ -104,7 +104,7 @@ it.each(['auth', 'length', 'output-limit'] as const)('preserves a real Pi %s fai
     expect(Number.isFinite(terminalFacts?.failureMonotonicMs)).toBe(true);
   } finally {
     await service.close();
-    database.close();
+    await database.close();
   }
 });
 
@@ -125,7 +125,7 @@ it.each(['cancel', 'timeout'] as const)('keeps a prior %s as the main cause when
       status: reason === 'cancel' ? 'cancelled' : 'failed', error: { code: reason === 'cancel' ? 'provider_cancelled' : 'provider_timeout' } } });
   } finally {
     await service.close();
-    database.close();
+    await database.close();
   }
 });
 
@@ -137,19 +137,23 @@ it('does not dispatch after the start transaction exhausts the total deadline', 
     async close() { return { stopped: true, closed: true, errors: [] }; },
   };
   const { service, database } = fixture(provider, () => elapsed);
-  const start = database.runs.start;
-  database.runs.start = (...args) => { const saved = start(...args); elapsed = 2_000; return saved; };
+  const transaction = database.transaction;
+  database.transaction = operation => transaction(scope => {
+    const start = scope.runs.start;
+    scope.runs.start = (...args) => { const saved = start(...args); elapsed = 2_000; return saved; };
+    return operation(scope);
+  });
   try {
     const result = await service.callProvider(request);
     expect(executed).toBe(false);
     expect(result).toMatchObject({ ok: true, data: { status: 'failed', stopped: true, error: { code: 'provider_timeout' } } });
   } finally {
     await service.close();
-    database.close();
+    await database.close();
   }
 });
 
-it('does not defer Provider dispatch past a cancellation queued by the start transaction', async () => {
+it('does not dispatch Provider work after cancellation queued by the start transaction', async () => {
   const controller = new AbortController();
   let abortedAtDispatch: boolean | undefined;
   const provider: ProviderPort = {
@@ -160,17 +164,20 @@ it('does not defer Provider dispatch past a cancellation queued by the start tra
     async close() { return { stopped: true, closed: true, errors: [] }; },
   };
   const { service, database } = fixture(provider);
-  const start = database.runs.start;
-  database.runs.start = (...args) => {
-    const saved = start(...args);
-    queueMicrotask(() => controller.abort());
-    return saved;
-  };
+  const transaction = database.transaction;
+  database.transaction = operation => transaction(scope => {
+    const start = scope.runs.start;
+    scope.runs.start = (...args) => {
+      const saved = start(...args); scope.db.afterCommit!(() => queueMicrotask(() => controller.abort())); return saved;
+    };
+    return operation(scope);
+  });
   try {
-    await service.callProvider(request, { signal: controller.signal });
-    expect(abortedAtDispatch).toBe(false);
+    expect(await service.callProvider(request, { signal: controller.signal }))
+      .toMatchObject({ ok: true, data: { status: 'cancelled', stopped: true, error: { code: 'provider_cancelled' } } });
+    expect(abortedAtDispatch).toBeUndefined();
   } finally {
     await service.close();
-    database.close();
+    await database.close();
   }
 });

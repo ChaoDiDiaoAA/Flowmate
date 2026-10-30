@@ -71,7 +71,8 @@ export function expandHarness(raw:any,gold:any,review:any,registry:any,repo:stri
         const binding=setup.controllerBinding as any;load(binding.relativePath);
     }
     const values=structuredClone(gold.values);
-    for(const key of Object.keys(constraintShape))if(Object.hasOwn(values,key))throw Error('Gold must not overwrite Case constraint: '+key);
+    for(const key of [...Object.keys(constraintShape),'success','failure','checks','metrics'])
+        if(Object.hasOwn(values,key))throw Error('Gold must not overwrite Case constraint: '+key);
     for(const claim of values.research?.claims??[])for(const evidence of claim.evidence) {
         const matches=materials.filter(m=>m.sample===evidence.sample);if(matches.length!==1)throw Error('Gold source must identify one material');
     }

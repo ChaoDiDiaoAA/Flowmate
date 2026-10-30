@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, deferCleanup } from '../../support/resources.ts';
 import { openTestDatabase } from '../../support/database.ts';
-import { openDatabase } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import type { Result } from '@flowmate/contracts';
 
 const at = '2026-10-10T00:00:00.000Z';
@@ -68,16 +68,22 @@ it.each([['unknown', 'gap', 'partial', 'research_coverage_invalid', 'coverage'],
 
 function legacy18(p: ReturnType<typeof paths>) {
   mkdirSync(join(p.root, 'data'), { recursive: true });
-  const db = new Database(p.databaseFile); db.exec('PRAGMA foreign_keys=ON');
-  for (const [version, name] of ['001_provider','002_agent_sessions','003_invoice_tools','004_parsed_documents','005_native_session_history',
-    '006_hidden_processing','007_hidden_chats_invoices','008_native_entry_runs','009_session_inputs','010_human_candidates','011_session_management',
-    '012_tool_runtime_observations','013_runtime_events','014_workspace_selection','015_context_snapshots','016_native_history_commits','017_subagent_runs','018_subagent_parallel'].entries()) {
-    if (version === 16) db.exec('PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;');
-    db.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${name}.sql`, import.meta.url), 'utf8'));
-    if ([14,15,16,17].includes(version)) db.exec('COMMIT');
-    if (version === 16) db.exec('PRAGMA foreign_keys=ON; PRAGMA legacy_alter_table=OFF;');
+  const db = new Database(p.databaseFile);
+  try {
+    db.exec('PRAGMA foreign_keys=ON');
+    for (const [version, name] of ['001_provider','002_agent_sessions','003_invoice_tools','004_parsed_documents','005_native_session_history',
+      '006_hidden_processing','007_hidden_chats_invoices','008_native_entry_runs','009_session_inputs','010_human_candidates','011_session_management',
+      '012_tool_runtime_observations','013_runtime_events','014_workspace_selection','015_context_snapshots','016_native_history_commits','017_subagent_runs','018_subagent_parallel'].entries()) {
+      if (version === 16) db.exec('PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;');
+      db.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${name}.sql`, import.meta.url), 'utf8'));
+      if (db.inTransaction) db.exec('COMMIT');
+      if (version === 16) db.exec('PRAGMA foreign_keys=ON; PRAGMA legacy_alter_table=OFF;');
+    }
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
   }
-  return db;
 }
 
 describe('P15 research storage, isolated engineering fixtures', () => {
@@ -197,10 +203,13 @@ describe('P15 research storage, isolated engineering fixtures', () => {
   it('upgrades an existing v18 store without fabricating research identities or changing old records', () => {
     const p = paths(), db = legacy18(p);
     db.query("INSERT INTO sessions(native_session_id,title,status,created_at,updated_at) VALUES ('legacy-research-fixture','Legacy','active',?,?)").run(at, at);
+    const columns = db.query<{ name: string }, []>('PRAGMA table_info(sessions)').all().map(row => row.name);
     const before = db.query('SELECT * FROM sessions').all(); db.close();
     const store = need(openDatabase(p)); deferCleanup(() => store.close());
-    expect(store.db.query('SELECT * FROM sessions').all()).toEqual(before);
-    expect(store.db.query('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 20 });
+    expect(store.db.query(`SELECT ${columns.join(',')} FROM sessions`).all()).toEqual(before);
+    expect(store.db.query('SELECT runtime_kind,durable_conversation_id FROM sessions').all())
+      .toEqual([{ runtime_kind: 'agent_session', durable_conversation_id: null }]);
+    expect(store.db.query('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1').get()).toEqual({ version: 21 });
     expect(need(store.research.list({ limit: 50 })).items).toEqual([]);
     expect(store.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });

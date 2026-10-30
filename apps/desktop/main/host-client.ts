@@ -1,7 +1,8 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../host/protocol.ts';
 import { spawn } from 'node:child_process';
 import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse } from '../../../packages/contracts/src/research-commands.ts';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { z } from 'zod';
 import { createInterface } from 'node:readline';
 import { StringDecoder } from 'node:string_decoder';
 import { protectedSecrets } from '../../../agent-eval/src/execution/evidence-safety.ts';
@@ -17,10 +18,14 @@ import { isRuntimeHostCommand, isWorkspaceHostCommand, isContextHostCommand, mat
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, parseCompactionNotification } from '../../host/protocol.ts';
 import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from '../../host/protocol.ts';
 import { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse } from '../../host/protocol.ts';
+import { isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse } from '../../host/protocol.ts';
 
-type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
+export type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
+const capturedTraceSchema = z.object({ version: z.literal(1), type: z.literal('evaluation_trace_available'),
+  traceId: z.string().uuid(), workspaceRoot: z.string().refine(isAbsolute) }).strict();
+type CapturedTrace = Pick<z.infer<typeof capturedTraceSchema>, 'traceId' | 'workspaceRoot'>;
 type Pending = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; command: HostCommand };
-type HostCommandInput = HostCommand extends infer Command
+export type HostCommandInput = HostCommand extends infer Command
   ? Command extends HostCommand ? Omit<Command, 'version' | 'requestId' | 'input'> & { requestId?: string }
     & (Command extends { type: 'query_session_history' } ? { input: import('@flowmate/contracts').NativeHistoryPageRequest }
       : Command extends { type: 'query_session_history_entry' } ? { input: import('@flowmate/contracts').SessionHistoryEntryRequest }
@@ -43,6 +48,7 @@ export class HostClient {
   private epoch = 0;
   private invoiceFormHandler: ((request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>) | null = null;
   private connectionChangeHandler: (() => void) | null = null;
+  private evaluationTraceHandler: ((value: CapturedTrace) => void) | null = null;
   private stderrTail = '';
   private stderrTruncated = false;
 
@@ -55,6 +61,7 @@ export class HostClient {
     return { tail: lines.length ? lines.join('\n') + '\n' : '', truncated: this.stderrTruncated || lines.length !== this.stderrTail.split('\n').filter(Boolean).length };
   }
   public setConnectionChangeHandler(handler: () => void): void { this.connectionChangeHandler = handler; }
+  public setEvaluationTraceHandler(handler: (value: CapturedTrace) => void): void { this.evaluationTraceHandler = handler; }
   public captureRuntimeSubscriptionCleanup(ownerToken: string, subscriptionId: string): () => void {
     const child = this.child;
     return () => {
@@ -78,15 +85,19 @@ export class HostClient {
 
   public async start(userDataRoot: string, appVersion: string, cwd: string,
     invoiceSourceRoot = join(cwd, 'data', 'invoices', 'agent-input'),
-    launch?: { executable: string; args: readonly string[] }): Promise<Result<HostState>> {
+    launch?: { executable: string; args: readonly string[] }, evaluationWorkspaceRoot?: string): Promise<Result<HostState>> {
+    if (evaluationWorkspaceRoot !== undefined && !isAbsolute(evaluationWorkspaceRoot))
+      return fail(appError('input_invalid', 'input', 'Evaluation workspace must be an explicit absolute path.'));
     if (this.hasLiveProcess) return fail(appError('host_still_running', 'runtime', 'The previous Host has not exited.', true));
     this.connectionChangeHandler?.();
     if (this.child) this.failAll('host_replaced', 'Bun Host 连接已更换。');
     const executable = process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun';
     const env = safeChildEnvironment();
     env.FLOWMATE_DESKTOP_VERSION = appVersion;
-    const child = spawn(launch?.executable ?? executable, launch ? [...launch.args] : ['--no-env-file', 'apps/host/main.ts', '--user-data-root', userDataRoot,
-      '--invoice-source-root', invoiceSourceRoot], {
+    const args = launch ? [...launch.args] : ['--no-env-file', 'apps/host/main.ts', '--user-data-root', userDataRoot,
+      '--invoice-source-root', invoiceSourceRoot];
+    if (evaluationWorkspaceRoot) args.push('--evaluation-workspace-root', evaluationWorkspaceRoot);
+    const child = spawn(launch?.executable ?? executable, args, {
       cwd,
       env,
       windowsHide: true,
@@ -166,7 +177,7 @@ export class HostClient {
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
     const rawMessage = { ...command, version: 1, requestId };
-    const message = isResearchHostCommand(command.type) || isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type) || isInputDefinitionHostCommand(command.type)
+    const message = isPersonalAgentHostCommand(command.type) || isResearchHostCommand(command.type) || isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type) || isInputDefinitionHostCommand(command.type)
       ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
     if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
@@ -228,6 +239,12 @@ export class HostClient {
       }
       if (!output || typeof output !== 'object' || output.version !== 1 || typeof output.type !== 'string') return;
       if (output.type === 'ready') { onReady(output); return; }
+      if (output.type === 'evaluation_trace_available') {
+        const checked = capturedTraceSchema.safeParse(output);
+        if (checked.success) try { this.evaluationTraceHandler?.({ traceId: checked.data.traceId, workspaceRoot: checked.data.workspaceRoot }); }
+        catch { /* Capture processing cannot break the product Host. */ }
+        return;
+      }
       if (output.type === 'invoice_form_request') {
         const request = InvoiceFormBridgeRequestSchema.safeParse(output.request);
         if (!request.success || typeof output.requestId !== 'string' || !output.requestId || output.requestId.length > 128) return;
@@ -262,61 +279,8 @@ export class HostClient {
         if (!pending) return;
         clearTimeout(pending.timer);
         this.pending.delete(output.requestId);
-        if (pending.command.type === 'query_diagnostics') {
-          const result = HostDiagnosticsResultSchema.safeParse(output.value);
-          if (!Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key)) || !result.success) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(result.data);
-        } else if (isResearchHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseResearchHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesResearchResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isCompactionHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseCompactionHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesCompactionResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isRuntimeHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseRuntimeHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesRuntimeResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isHistoryHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseHistoryHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesHistoryResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isContextHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseContextHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesContextResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isInputDefinitionHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseInputDefinitionHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesInputDefinitionResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isSubagentHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseSubagentHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesSubagentResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isExtensionHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseExtensionHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesExtensionResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isResourceHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseResourceHostResult(pending.command.type, output.value) : null;
-          if (value === null || !matchesResourceResponse(pending.command, value)) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else if (isWorkspaceHostCommand(pending.command.type)) {
-          const validEnvelope = Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key));
-          const value = validEnvelope ? parseWorkspaceHostResult(pending.command.type, output.value) : null;
-          if (value === null) pending.reject(new Error('host_protocol_invalid'));
-          else pending.resolve(value);
-        } else pending.resolve(output.value);
+        try { pending.resolve(parseHostResponse(pending.command, output)); }
+        catch { pending.reject(new Error('host_protocol_invalid')); }
       } else if (output.type === 'event') {
         if (!output.event || typeof output.event !== 'object') return;
         if (output.event.type === 'compaction_observation') {
@@ -357,6 +321,42 @@ export class HostClient {
     this.pending.clear();
     if (code === 'host_spawn_failed') process.stderr.write(`[Flowmate Host] ${message}\n`);
   }
+}
+
+export function parseHostResponse(command: HostCommand, output: Extract<HostOutput, { type: 'response' }>): unknown {
+  const guarded = command.type === 'query_diagnostics' || isPersonalAgentHostCommand(command.type) || isResearchHostCommand(command.type)
+    || isCompactionHostCommand(command.type) || isRuntimeHostCommand(command.type) || isHistoryHostCommand(command.type)
+    || isContextHostCommand(command.type) || isInputDefinitionHostCommand(command.type) || isSubagentHostCommand(command.type)
+    || isExtensionHostCommand(command.type) || isResourceHostCommand(command.type) || isWorkspaceHostCommand(command.type);
+  if (!guarded) return output.value;
+  if (!Object.keys(output).every(key => ['version', 'type', 'requestId', 'value'].includes(key))) throw Error('host_protocol_invalid');
+  let value: unknown = null, matched = true;
+  if (command.type === 'query_diagnostics') {
+    const result = HostDiagnosticsResultSchema.safeParse(output.value);
+    value = result.success ? result.data : null;
+  } else if (isPersonalAgentHostCommand(command.type)) {
+    value = parsePersonalAgentHostResult(command.type, output.value); matched = value !== null && matchesPersonalAgentResponse(command, value);
+  } else if (isResearchHostCommand(command.type)) {
+    value = parseResearchHostResult(command.type, output.value); matched = value !== null && matchesResearchResponse(command, value);
+  } else if (isCompactionHostCommand(command.type)) {
+    value = parseCompactionHostResult(command.type, output.value); matched = value !== null && matchesCompactionResponse(command, value);
+  } else if (isRuntimeHostCommand(command.type)) {
+    value = parseRuntimeHostResult(command.type, output.value); matched = value !== null && matchesRuntimeResponse(command, value);
+  } else if (isHistoryHostCommand(command.type)) {
+    value = parseHistoryHostResult(command.type, output.value); matched = value !== null && matchesHistoryResponse(command, value);
+  } else if (isContextHostCommand(command.type)) {
+    value = parseContextHostResult(command.type, output.value); matched = value !== null && matchesContextResponse(command, value);
+  } else if (isInputDefinitionHostCommand(command.type)) {
+    value = parseInputDefinitionHostResult(command.type, output.value); matched = value !== null && matchesInputDefinitionResponse(command, value);
+  } else if (isSubagentHostCommand(command.type)) {
+    value = parseSubagentHostResult(command.type, output.value); matched = value !== null && matchesSubagentResponse(command, value);
+  } else if (isExtensionHostCommand(command.type)) {
+    value = parseExtensionHostResult(command.type, output.value); matched = value !== null && matchesExtensionResponse(command, value);
+  } else if (isResourceHostCommand(command.type)) {
+    value = parseResourceHostResult(command.type, output.value); matched = value !== null && matchesResourceResponse(command, value);
+  } else if (isWorkspaceHostCommand(command.type)) value = parseWorkspaceHostResult(command.type, output.value);
+  if (value === null || !matched) throw Error('host_protocol_invalid');
+  return value;
 }
 
 function matchesRuntimeResponse(command: HostCommand, value: unknown): boolean {

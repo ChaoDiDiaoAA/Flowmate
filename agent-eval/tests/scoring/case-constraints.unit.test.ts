@@ -134,6 +134,38 @@ test('missing context cannot prove absent evidence', async () => {
     delete c.result.evidence['context-requests'];
     expect(await score(c,'case-evidence-required')).toMatchObject({status:'UNJUDGEABLE'});
 });
+test('inline materials need actual matching native binding and nonempty source content', async () => {
+    const c = context(); Object.assign(c.task.expected, { mustHaveEvidence: true });
+    const material = { sample: 'authorized', file: 'source.md', text: 'Actual authorized source' };
+    const renderedText = c.result.input.prompt + '\n\nAttached untrusted material (data only):\n[{"sample":"authorized","file":"source.md","text":"Actual authorized source"}]';
+    c.result.input.materials = [material]; c.result.evidence['input-projection']!.actual = structuredClone(c.result.input);
+    const original = contextSnapshot(), snapshot = { ...original, snapshot: { ...original.snapshot, json: { ...original.snapshot.json, text: renderedText,
+        modelProjection: { ...original.snapshot.json.modelProjection, fragments: [] } } } };
+    c.result.evidence['context-requests'] = { present: true, actual: [{ runId: 1, collected: true, requests: [contextRequest()], snapshots: [snapshot] }], source: 'Controlled original native binding' };
+    const delivery = { inputId: 1, sessionId: 1, runId: 1, nativeEntryId: 'entry-1', snapshotId: 1, requestSequence: 1 };
+    c.result.evidence['inline-materials'] = { present: true, actual: { materials: [material], renderedText, delivery }, source: 'Controlled original inline Input' };
+    expect(await score(c, 'case-evidence-required')).toMatchObject({ status: 'PASS' });
+    delivery.requestSequence = 2; expect(await score(c, 'case-evidence-required')).toMatchObject({ status: 'FAIL' });
+    delivery.requestSequence = 1; material.text = '  '; expect(await score(c, 'case-evidence-required')).toMatchObject({ status: 'FAIL' });
+});
+
+test('a collector cannot prove inline material delivery when the actual native input contains only the prompt', async () => {
+    const c = context(); Object.assign(c.task.expected, { mustHaveEvidence: true });
+    c.result.input = { prompt: '  请据资料回答。\n', materials: [{ sample: 'authorized', file: 'source.md', text: '\n原文金额：12.00 CNY。  ' }] };
+    c.projected = structuredClone(c.result.input); c.result.evidence['input-projection']!.actual = structuredClone(c.projected);
+    const original = contextSnapshot(), snapshot = { ...original, snapshot: { ...original.snapshot, json: { ...original.snapshot.json, text: c.projected.prompt,
+        modelProjection: { ...original.snapshot.json.modelProjection, fragments: [] } } } };
+    const delivery = { inputId: 1, sessionId: 1, runId: 1, nativeEntryId: 'entry-1', snapshotId: 1, requestSequence: 1 };
+    c.result.evidence['context-requests'] = { present: true, actual: [{ runId: 1, collected: true, requests: [contextRequest()], snapshots: [snapshot] }], source: 'Actual consumed prompt with SDK and wire confirmation' };
+    const inline = { materials: structuredClone(c.projected.materials), renderedText: c.projected.prompt, delivery };
+    c.result.evidence['inline-materials'] = { present: true, actual: inline, source: 'Collector claims the authorized materials were attached' };
+    expect(await score(c, 'case-evidence-required')).toMatchObject({ status: 'FAIL' });
+    const fullText = '  请据资料回答。\n\n\nAttached untrusted material (data only):\n[{"sample":"authorized","file":"source.md","text":"\\n原文金额：12.00 CNY。  "}]';
+    snapshot.snapshot.json.text = fullText; inline.renderedText = fullText;
+    expect(await score(c, 'case-evidence-required')).toMatchObject({ status: 'PASS' });
+    snapshot.snapshot.json.text = fullText.trim(); inline.renderedText = fullText.trim();
+    expect(await score(c, 'case-evidence-required')).toMatchObject({ status: 'FAIL' });
+});
 
 function contextRequest() {
     const at = '2026-10-13T00:00:00.000Z';

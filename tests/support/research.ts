@@ -2,7 +2,8 @@ import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createApplication, type ApplicationOptions } from '../../apps/composition.ts';
-import { openDatabase, createFileStore } from '@flowmate/core';
+import { createFileStore } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from './database.ts';
 import { PiAgentAdapter } from '@flowmate/runtime-pi';
 import type { AgentRunEvent, ProviderConfig, ResearchIntent, Result, SessionInputRequest } from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from './resources.ts';
@@ -30,7 +31,7 @@ export async function researchFixture(respond: (request: Request, index: number)
         const at = new Date().toISOString(), sourceKey = 'research-fixture', sourceRecordId = 'parsed-material', version = 'v1';
         const parsed = { formatVersion: 2, pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text', text: options.parsedDocument,
           sourceIndex: 0, sourceType: 'synthetic', bbox: null }] }], completeness: { status: 'complete', checks: [], warnings: [] } };
-        const published = researchNeed(await createFileStore(paths, store.documents).publish({ sourceKey, sourceRecordId, sourceVersion: version, at,
+        const published = researchNeed(await createFileStore(paths, store).publish({ sourceKey, sourceRecordId, sourceVersion: version, at,
           original: { kind: 'original', primaryName: 'original.png', files: [{ name: 'original.png',
             bytes: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=', 'base64'), mimeType: 'image/png' }] },
           parsed: { kind: 'parsed', primaryName: 'parsed.json', files: [{ name: 'parsed.json', bytes: Buffer.from(JSON.stringify(parsed)), mimeType: 'application/json' }] } }));
@@ -39,7 +40,7 @@ export async function researchFixture(respond: (request: Request, index: number)
           metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'], licenseVerification: 'not_verified', unavailableReason: null }, createdAt: at, updatedAt: at }));
         documentId = published.documentId;
       }
-    } finally { store.close(); }
+    } finally { await store.close(); }
   }
   const requests: Request[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
@@ -54,7 +55,7 @@ export async function researchFixture(respond: (request: Request, index: number)
   } });
   deferCleanup(() => server.stop(true));
   const app = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, logger: { write: () => undefined, close: async () => undefined },
-    agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+    agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }) }));
   deferCleanup(() => app.close());
   const session = researchNeed(await app.createSession({ title: 'Research fixture' }));

@@ -1,6 +1,12 @@
 import type { AuthorDataset } from '../dataset-loader/authoring.ts';
 
-// English declarations for the Flowmate v1 benchmark. Answers stay in gold.ts.
+// Folio-style baseline: 62 hand-authored Cases (50 business, 12 research), 7 smoke (5 business, 2 research).
+// Difficulty: 18 regression, 39 difficult, 5 adversarial; purpose: 19 regression, 43 capability.
+// Labels describe coverage, not proof of an actual historical bug or an executed model result.
+// Each Case declares the user goal, required behavior and failure conditions; the Runner measures actual execution.
+// gold.ts keeps independent answers; review.ts keeps author checks, not human approval.
+// New JSON drafts live in sibling gold-candidates, bad-candidates and regression-candidates collections.
+// This v1 baseline stays unchanged; approved Case revisions are published in a new explicit Benchmark revision.
 import manualCompactionUserHistory from '../testing/fixtures/manual-compaction-user-history.json';
 
 export const flowmateAgentV1Dataset = {
@@ -137,7 +143,7 @@ export const flowmateAgentV1Dataset = {
       manual: "Review high-risk or disputed results.",
     },
     risks: ["Contains counterparty data; writes require task authorization."],
-    tags: ["business","smoke","task","invoice"],
+    tags: ["business","full","task","invoice"],
     source: "hand-authored",
   },
   {
@@ -503,7 +509,7 @@ export const flowmateAgentV1Dataset = {
       manual: "Review high-risk or disputed results.",
     },
     risks: ["Contains counterparty data; writes require task authorization."],
-    tags: ["business","smoke","tools","export","invoice-save"],
+    tags: ["business","full","tools","export","invoice-save"],
     source: "hand-authored",
   },
   // ── Context: current input, scope and follow-up delivery ──
@@ -534,7 +540,7 @@ export const flowmateAgentV1Dataset = {
       manual: "Review high-risk or disputed results.",
     },
     risks: ["Contains counterparty data; writes require task authorization."],
-    tags: ["business","smoke","context","input-switch","invoice-save"],
+    tags: ["business","full","context","input-switch","invoice-save"],
     source: "hand-authored",
   },
   {
@@ -711,7 +717,7 @@ export const flowmateAgentV1Dataset = {
       manual: "Review high-risk or disputed results.",
     },
     risks: ["Contains counterparty data; writes require task authorization."],
-    tags: ["business","smoke","memory","history-branch","invoice-save"],
+    tags: ["business","full","memory","history-branch","invoice-save"],
     source: "hand-authored",
   },
   {
@@ -806,7 +812,7 @@ export const flowmateAgentV1Dataset = {
       manual: "Review high-risk or disputed results.",
     },
     risks: ["Contains counterparty data; writes require task authorization."],
-    tags: ["business","smoke","compaction","manual-compaction","invoice-save"],
+    tags: ["business","full","compaction","manual-compaction","invoice-save"],
     source: "hand-authored",
   },
   {
@@ -1668,7 +1674,7 @@ export const flowmateAgentV1Dataset = {
       manual: "Review high-risk or disputed results.",
     },
     risks: ["Public-source research only; do not claim unperformed external actions."],
-    tags: ["research","smoke","conflict"],
+    tags: ["research","full","conflict"],
     source: "hand-authored",
   },
   {
@@ -1730,7 +1736,7 @@ export const flowmateAgentV1Dataset = {
       manual: "Review high-risk or disputed results.",
     },
     risks: ["Public-source research only; do not claim unperformed external actions."],
-    tags: ["research","smoke","mixed"],
+    tags: ["research","full","mixed"],
     source: "hand-authored",
   },
   {

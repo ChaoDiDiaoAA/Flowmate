@@ -1,8 +1,9 @@
 import type { EvidenceFact } from '../types.ts';
+export const LOCAL_NO_AUTH_API_KEY = 'flowmate-local-no-auth';
 const configuredSecrets = new Set<string>();
-export function registerSecrets(secrets: string[]) { for (const secret of secrets) if (secret) configuredSecrets.add(secret); }
+export function registerSecrets(secrets: string[]) { for (const secret of secrets) if (secret && secret !== LOCAL_NO_AUTH_API_KEY) configuredSecrets.add(secret); }
 export function protectedSecrets(): string[] { return [...configuredSecrets, process.env.FLOWMATE_JUDGE_API_KEY, process.env.FLOWMATE_EVAL_AGENT_API_KEY, process.env.FLOWMATE_LLM_API_KEY,
-    process.env.LANGFUSE_SECRET_KEY, process.env.LANGFUSE_PUBLIC_KEY, 'fixture-synthetic-key'].filter((item): item is string => Boolean(item)); }
+    process.env.LANGFUSE_SECRET_KEY, process.env.LANGFUSE_PUBLIC_KEY, 'fixture-synthetic-key'].filter((item): item is string => Boolean(item) && item !== LOCAL_NO_AUTH_API_KEY); }
 /** Keep the scan outcome as evidence, but never write the detected secret itself. */
 export function scanEvidence<T>(value: T, secrets: string[] = protectedSecrets()): {
     value: T;
@@ -11,7 +12,7 @@ export function scanEvidence<T>(value: T, secrets: string[] = protectedSecrets()
     let leaked = false;
     const redact = (text: string): string => {
         let safe = text;
-        for (const secret of secrets.filter(Boolean).sort((a, b) => b.length - a.length)) {
+        for (const secret of secrets.filter(secret => Boolean(secret) && secret !== LOCAL_NO_AUTH_API_KEY).sort((a, b) => b.length - a.length)) {
             if (safe.includes(secret)) {
                 leaked = true;
                 safe = safe.split(secret).join('[REDACTED]');

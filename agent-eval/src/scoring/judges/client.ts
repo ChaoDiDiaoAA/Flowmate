@@ -1,13 +1,15 @@
 import { z } from 'zod';
 import { REPO_ROOT } from '../../dataset-loader/local.ts';
-import { evaluationEnv, agentApiSchema, agentModelCapabilitiesSchema, resolveModelCapabilities } from '../../configuration.ts';
+import { evaluationEnv, agentApiSchema, agentModelCapabilitiesSchema, resolveModelCapabilities, localAgentCredential } from '../../configuration.ts';
 import { registerSecrets } from '../../execution/evidence-safety.ts';
 import type { PreparedModelRuntime } from '../../../../packages/runtime-pi/src/model-runtime.ts';
 import packageJson from '../../../../package.json';
+import { generateJSON, NativeJSONError, nativeTextModelConfigSchema, type NativeTextModelConfig, type ProcessRunner } from '../../text-model/codex.ts';
 
 const configSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatible']).optional(), api: agentApiSchema,
     model: z.string().trim().min(1), baseUrl: z.string().url(), apiKey: z.string().trim().min(1),
-    timeoutMs: z.number().int().positive().max(300000), modelCapabilities: agentModelCapabilitiesSchema.optional()
+    timeoutMs: z.number().int().positive().max(300000), modelCapabilities: agentModelCapabilitiesSchema.optional(),
+    reasoningEffort: nativeTextModelConfigSchema.shape.reasoningEffort.optional()
 }).strict().superRefine((config, context) => {
     const url = new URL(config.baseUrl);
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
@@ -15,10 +17,15 @@ const configSchema = z.object({ provider: z.enum(['anthropic', 'openai-compatibl
     if (url.hostname === 'api.deepseek.com' && /^\/anthropic(?:\/|$)/.test(url.pathname) && config.api !== 'anthropic-messages')
         context.addIssue({ code: 'custom', message: 'DeepSeek /anthropic requires the anthropic-messages API' });
 });
-export type JudgeConfig = z.infer<typeof configSchema>;
+export type HttpJudgeConfig = z.infer<typeof configSchema>;
+export type NativeJudgeConfig = NativeTextModelConfig & { api?: never; baseUrl?: never; apiKey?: never; modelCapabilities?: never };
+export type JudgeConfig = HttpJudgeConfig | NativeJudgeConfig;
+type NativeJudgeConfiguration = Omit<NativeTextModelConfig, 'executable'> & { transport: 'codex-cli'; protocolVersion: string;
+    rubric?: { id: string; version: number }; api?: never; sdk?: never; baseUrl?: never; modelCapabilities?: never };
 export type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
-const prepared = new WeakMap<JudgeConfig, { config: JudgeConfig; model: PreparedModelRuntime }>();
+const prepared = new WeakMap<HttpJudgeConfig, { config: HttpJudgeConfig; model: PreparedModelRuntime }>();
 export function judgeConnection(value: unknown): JudgeConfig {
+    if (value && typeof value === 'object' && 'provider' in value && value.provider === 'codex-cli') return nativeTextModelConfigSchema.parse(value);
     const parsed = configSchema.safeParse(value);
     if (!parsed.success) throw Error('Invalid FLOWMATE_JUDGE configuration; check API, URL and timeout');
     registerSecrets([parsed.data.apiKey]);
@@ -27,15 +34,25 @@ export function judgeConnection(value: unknown): JudgeConfig {
 export function judgeConfig(env: NodeJS.ProcessEnv, repo = REPO_ROOT, explicit?: string): JudgeConfig | null {
     if (explicit) throw Error('Judge file configuration is retired; use configs/.env');
     env = evaluationEnv(repo, env);
+    if (env.FLOWMATE_JUDGE_PROVIDER?.trim() === 'codex-cli') return judgeConnection({ provider: 'codex-cli',
+        executable: env.FLOWMATE_CODEX_EXECUTABLE ?? 'codex', model: env.FLOWMATE_JUDGE_MODEL ?? env.JUDGE_MODEL ?? 'gpt-6.1-terra',
+        reasoningEffort: env.FLOWMATE_JUDGE_REASONING_EFFORT ?? env.JUDGE_REASONING_EFFORT ?? 'medium',
+        timeoutMs: Number(env.FLOWMATE_JUDGE_TIMEOUT_MS ?? env.JUDGE_TIMEOUT_MS ?? 180000) });
     const values = (['MODEL', 'BASE_URL', 'API_KEY'] as const).map(key => env[`FLOWMATE_JUDGE_${key}`]?.trim());
     const legacy = env.FLOWMATE_JUDGE_PROVIDER?.trim(), explicitApi = env.FLOWMATE_JUDGE_API?.trim();
     if (values.every(v => !v) && !legacy && !explicitApi) return null;
-    if (values.some(v => !v)) throw Error('Incomplete FLOWMATE_JUDGE configuration; no Agent fallback');
     const api = explicitApi || (legacy === 'anthropic' ? 'anthropic-messages' : !legacy || legacy === 'openai-compatible' ? 'openai-completions' : legacy);
+    const localKey = localAgentCredential({ model: values[0], baseUrl: values[1], api });
+    const apiKey = localKey ?? values[2];
+    if (!values[0] || !values[1] || !apiKey) throw Error('Incomplete FLOWMATE_JUDGE configuration; no Agent fallback');
     return judgeConnection({ api, provider: api === 'anthropic-messages' ? 'anthropic' : api.startsWith('openai-') ? 'openai-compatible' : undefined,
-        model: values[0], baseUrl: values[1], apiKey: values[2], timeoutMs: Number(env.FLOWMATE_JUDGE_TIMEOUT_MS ?? 180000) });
+        model: values[0], baseUrl: values[1], apiKey, timeoutMs: Number(env.FLOWMATE_JUDGE_TIMEOUT_MS ?? 180000),
+        ...(localKey && env.FLOWMATE_JUDGE_REASONING_EFFORT ? { reasoningEffort: env.FLOWMATE_JUDGE_REASONING_EFFORT } : {}) });
 }
 export function publicJudgeConfig(config: JudgeConfig, rubric?: { id: string; version: number; prompt: string }) {
+    if (config.provider === 'codex-cli') return { transport: 'codex-cli', provider: config.provider, model: config.model,
+        reasoningEffort: config.reasoningEffort, timeoutMs: config.timeoutMs, protocolVersion: 'flowmate-judge/v2',
+        ...(rubric ? { rubric: { id: rubric.id, version: rubric.version } } : {}) } as NativeJudgeConfiguration;
     const { apiKey, ...parameters } = config;
     const sdk = prepared.get(config)?.model.snapshot.sdk ?? {
         codingAgent: packageJson.dependencies['@earendil-works/pi-coding-agent'], ai: packageJson.dependencies['@earendil-works/pi-ai'] };
@@ -63,6 +80,7 @@ async function withJudgeTimeout<T>(config: JudgeConfig, signal: AbortSignal | un
 }
 export async function prepareJudge(config: JudgeConfig, fetcher: Fetcher = fetch, signal?: AbortSignal): Promise<JudgeConfig> {
     if (signal?.aborted) throw Error('Judge cancelled');
+    if (config.provider === 'codex-cli') { nativeTextModelConfigSchema.parse(config); return config; }
     const cached = prepared.get(config);
     if (cached) return cached.config;
     const selected = configSchema.parse(config);
@@ -74,7 +92,7 @@ export async function prepareJudge(config: JudgeConfig, fetcher: Fetcher = fetch
         const model = await prepareModelRuntime({ version: 1, name: 'Evaluation Judge', revision: 1,
             modelRef: { provider: 'flowmate-judge', model: selected.model }, native: { authPath: 'flowmate-judge-in-memory', modelsPath: null },
             connection: { api: selected.api, baseUrl: selected.baseUrl, contextWindow: modelCapabilities.contextWindow,
-                maxTokens: modelCapabilities.maxTokens, reasoning: modelCapabilities.reasoning }, parameters: { maxRetries: 0, maxRetryDelayMs: 0 }
+                maxTokens: modelCapabilities.transport?.maxTokens ?? modelCapabilities.maxTokens, reasoning: modelCapabilities.reasoning }, parameters: { maxRetries: 0, maxRetryDelayMs: 0 }
         }, { timeoutMs: selected.timeoutMs, stopGraceMs: 0 }, signal,
         { credentials: new InMemoryCredentialStore(), runtimeApiKey: selected.apiKey });
         if (!model.ok) throw Error(model.error.message);
@@ -83,16 +101,34 @@ export async function prepareJudge(config: JudgeConfig, fetcher: Fetcher = fetch
         return resolved;
     });
 }
-export async function requestJudge(config: JudgeConfig, system: string, data: string, fetcher: Fetcher = fetch, signal?: AbortSignal) {
+export async function requestJudge(config: JudgeConfig, system: string, data: string, fetcher: Fetcher = fetch, signal?: AbortSignal,
+    schema: Record<string, unknown> = { type: 'object', properties: { score: { type: 'number', minimum: 0, maximum: 1 }, reason: { type: 'string' } }, required: ['score', 'reason'], additionalProperties: false },
+    nativeRunner?: ProcessRunner) {
+    if (config.provider === 'codex-cli') {
+        try {
+            const result = await generateJSON(config, { system, data, schema, signal }, { runner: nativeRunner });
+            return { ...result, stopReason: 'stop' as const, rawStopReason: 'turn.completed', responseComplete: true, transportStatus: null, error: null };
+        } catch (error) {
+            if (!(error instanceof NativeJSONError)) throw error;
+            return { ...error.response, stopReason: 'stop' as const, rawStopReason: 'turn.completed', responseComplete: true, transportStatus: null, error: error.message };
+        }
+    }
     configSchema.parse(config);
-    config = await prepareJudge(config, fetcher, signal);
+    config = await prepareJudge(config, fetcher, signal) as HttpJudgeConfig;
     const { observedFetch, normalizeUsage } = await import('../../../../packages/runtime-pi/src/model-runtime.ts');
     const { runtime, model } = prepared.get(config)!.model;
+    const gatewayEffort = localAgentCredential(config) ? config.reasoningEffort : undefined;
     let transportStatus:number|null=null;
     try{return await withJudgeTimeout(config, signal, async signal => {
         const message = await runtime.completeSimple(model, { systemPrompt: system,
             messages: [{ role: 'user', content: data, timestamp: Date.now() }] }, {
             signal, timeoutMs: config.timeoutMs, maxRetries: 0,
+            ...(config.reasoningEffort && config.reasoningEffort !== 'none' ? { reasoning: config.reasoningEffort } : {}),
+            ...(gatewayEffort ? { onPayload: (payload: unknown) => {
+                if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw Error('Invalid local Judge payload');
+                // The SDK's unknown-model fallback lowers max to high; this gateway validates the exact configured effort.
+                return { ...payload, reasoning_effort: gatewayEffort };
+            } } : {}),
             fetch: observedFetch(config.api, async (url, init) => {
                 const response=await fetcher(String(url),init??{});transportStatus=response.status;return response;
             }) });

@@ -22,8 +22,7 @@ import { makeApplication } from '../../../packages/core/src/application.ts';
 import { SessionService } from '../../../packages/core/src/sessions/service.ts';
 import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 import { createToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
-import type { RunRepository } from '../../../packages/core/src/storage/repositories.ts';
-import { RuntimeService } from '../../../packages/core/src/runtime/service.ts';
+import { RuntimeService, type RuntimeDependencies } from '../../../packages/core/src/runtime/service.ts';
 import { openTestDatabase } from '../../support/database.ts';
 import type { ProviderPort } from '@flowmate/contracts';
 import { createAgentHistoryFixture } from '../application/agent-history-fixture.ts';
@@ -102,11 +101,9 @@ function fixture() {
     leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts }));
   if (!watched.ok) throw new Error(watched.error.code);
   const deps = {
-    memory: opened.data.memory,
+    database: opened.data,
     fixtureHistory,
-    runs: opened.data.runs,
-    sessions: opened.data.sessions,
-    sessionInputs: opened.data.sessionInputs,
+
     provider: {
       async prepare() { throw new Error('provider must not be called'); },
       async close() { return { stopped: true, closed: true, errors: [] as const }; },
@@ -140,9 +137,9 @@ function makeAgent(history: ReturnType<typeof createAgentHistoryFixture>, option
       const prepared = await prepare(signal);
       if (!prepared.ok) return prepared;
       return ok({ ...prepared.data, execute: async (input, runSignal, observe) => {
-        history.saveUser(nativeSessionId, input);
+        await history.saveUser(nativeSessionId, input);
         const outcome = await prepared.data.execute(input, runSignal, observe);
-        try { history.saveResult(nativeSessionId, input, outcome, !runSignal.aborted); }
+        try { await history.saveResult(nativeSessionId, input, outcome, !runSignal.aborted); }
         catch (error) {
           // The already observed late outcome still carries usage even when the
           // old writer cannot acknowledge history after a sticky terminal commit.
@@ -157,6 +154,27 @@ function makeAgent(history: ReturnType<typeof createAgentHistoryFixture>, option
 }
 
 describe('RuntimeService Agent lifecycle', () => {
+  it('stops only the original accepted foreground execution when its client disconnects', async () => {
+    const { db, deps } = fixture(), entered = deferred<void>(), stopped = deferred<void>();
+    const controller = new AbortController(), finished = finishSignal();
+    const agent = makeAgent(deps.fixtureHistory, { execute: async (_input, signal) => {
+      signal.addEventListener('abort', () => stopped.resolve(), { once: true }); entered.resolve();
+      await stopped.promise;
+      return nativeOutcome;
+    } });
+    const runtime = new RuntimeService({ ...deps, agent });
+    try {
+      const accepted = await runtime.start(request, { signal: controller.signal, onEvent: finished.onEvent });
+      expect(accepted.ok).toBe(true); if (!accepted.ok) throw Error(accepted.error.code);
+      await entered.promise; controller.abort('shutdown');
+      const end = await finished.done.promise;
+      expect(end).toMatchObject({ type: 'run_finished', result: { ok: true, data: { status: 'failed', stopped: true, error: { code: 'runtime_shutdown' } } } });
+      expect(await db.read(store => store.runs.get(accepted.data.runId)))
+        .toMatchObject({ ok: true, data: { status: 'failed', cancelRequestedAt: null, cleanup: { stopReason: 'shutdown', stopped: true } } });
+      expect(runtime.state().active).toBeNull();
+    } finally { stopped.resolve(); await runtime.close(); await db.close(); }
+  });
+
   it('rejects a new Workspace Run with missing verification before storing or preparing it', async () => {
     const { db, deps } = fixture();
     let preparations = 0;
@@ -167,7 +185,7 @@ describe('RuntimeService Agent lifecycle', () => {
     expect(preparations).toBe(0);
     expect(db.db.query('SELECT count(*) AS count FROM runs').get()).toEqual({ count: 0 });
     expect(db.db.query('SELECT count(*) AS count FROM session_inputs').get()).toEqual({ count: 0 });
-    await runtime.close(); db.close();
+    await runtime.close(); await db.close();
   });
 
   it.each([false, true])('keeps pure Chat input use available and requires verification for consistent empty Workspace (verifier=%s)', async hasVerifier => {
@@ -187,7 +205,7 @@ describe('RuntimeService Agent lifecycle', () => {
           db.db.query('UPDATE session_inputs SET content_json=? WHERE id=?').run(JSON.stringify({ ...saved.data.content,
             workspaceContext, workspaceInput }), input.inputId!);
         }
-        checked = input.verifyInputUse!(input.inputId!);
+        checked = await input.verifyInputUse!([input.inputId!]);
         return { ...nativeOutcome, error: checked.ok ? null : checked.error, stopReason: checked.ok ? 'stop' : 'error' };
       } });
       const runtime = new RuntimeService({ ...deps, agent,
@@ -197,7 +215,7 @@ describe('RuntimeService Agent lifecycle', () => {
       await finished.done.promise;
       expect(checked).toMatchObject(scopeVersion === 1 || hasVerifier ? { ok: true }
         : { ok: false, error: { code: 'workspace_unavailable' } });
-      await runtime.close(); db.close();
+      await runtime.close(); await db.close();
     }
   });
 
@@ -219,7 +237,7 @@ describe('RuntimeService Agent lifecycle', () => {
             db.db.query('UPDATE runs SET scope_json=? WHERE id=?').run(JSON.stringify({ version: 2,
               allowedTools: [], allowedDocumentIds: [], allowedArtifactIds: [], allowedResourcePaths: [] }), input.runId);
           }
-          checked = input.verifyInputUse!(input.inputId!);
+          checked = await input.verifyInputUse!([input.inputId!]);
           if (checked.ok) delivered++;
           return { ...nativeOutcome, error: checked.ok ? null : checked.error, stopReason: checked.ok ? 'stop' : 'error' };
         } }) } satisfies AgentPort;
@@ -230,7 +248,7 @@ describe('RuntimeService Agent lifecycle', () => {
       await finished.done.promise;
       expect(checked).toMatchObject({ ok: false, error: { code: 'storage_corrupt' } });
       expect(delivered).toBe(0);
-      await runtime.close(); db.close();
+      await runtime.close(); await db.close();
     }
   });
   it('keeps admitted Run limits when prepared Agent facts report different limits', async () => {
@@ -248,7 +266,7 @@ describe('RuntimeService Agent lifecycle', () => {
     expect(remainingMs).toBeGreaterThan(80_000);
     expect(db.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: { config: {
       limits: { timeoutMs: 90_000, stopGraceMs: 200 } } } });
-    await runtime.close(); db.close();
+    await runtime.close(); await db.close();
   });
   it('freezes Settings then explicit budget and looks up the original input before reading changed defaults', async () => {
     const { db, deps } = fixture();
@@ -265,7 +283,7 @@ describe('RuntimeService Agent lifecycle', () => {
         agent: { ...snapshot.agent, policyVersion: 'runtime-v1', taskPolicyVersion: 'p5-session-inputs-v1', ...budget } } });
     } };
     const runtime = new RuntimeService({ ...deps, agent, runtimeDefaults: () => { settingsReads++; return ok(defaults); } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
+    const sessions = new SessionService(agent, () => runtime.state(), deps.now, db,
       (runRequest, input, control) => runtime.start(runRequest, control, input), input => runtime.appendInput(input));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
     const input = { sessionId: 1, mode: 'prompt' as const, clientSequence: 1, text: 'Budgeted invoice', config,
@@ -300,20 +318,14 @@ describe('RuntimeService Agent lifecycle', () => {
     expect(await app.queryRun(next.data.runId)).toMatchObject({ ok: true, data: { config: {
       limits: { timeoutMs: 100, stopGraceMs: 100 }, runtimeBudget: { maxModelCalls: 1, maxToolCalls: 0, toolTimeoutMs: 100 } } } });
     expect(await app.queryRun(first.data.runId)).toEqual(run);
-    await app.close(); db.close();
+    await app.close(); await db.close();
   });
   it('never prepares or executes an Agent when the initial Agent Run insert fails', async () => {
     const { db, deps } = fixture();
-    const runs = new Proxy(db.runs as RunRepository, {
-      get(target, key, receiver) {
-        if (key === 'createAgent') return () => ({ ok: false, error: appError('storage_write_failed', 'storage', 'fixture insert failure', true) });
-        const value = Reflect.get(target, key, receiver) as unknown;
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
+    db.db.exec("CREATE TRIGGER reject_agent_insert BEFORE INSERT ON runs WHEN NEW.kind='agent' BEGIN SELECT RAISE(ABORT,'controlled Agent insert failure'); END;");
     let prepared = false;
     let events = 0;
-    const service = new RuntimeService({ ...deps, runs, agent: makeAgent(deps.fixtureHistory, { prepare: async () => {
+    const service = new RuntimeService({ ...deps, agent: makeAgent(deps.fixtureHistory, { prepare: async () => {
       prepared = true;
       return ok({ snapshot, execute: async () => nativeOutcome });
     } }) });
@@ -345,8 +357,8 @@ describe('RuntimeService Agent lifecycle', () => {
     const row = db.runs.get(runId);
     expect(row).toMatchObject({ ok: true, data: { kind: 'agent', sessionId: 1, status: 'completed', output: { text: nativeOutcome.text } } });
     expect(service.state()).toMatchObject({ active: null, blocked: false });
-    expect(service.cancel(runId)).toMatchObject({ ok: true, data: { accepted: false } });
-    expect(service.cancel(999)).toMatchObject({ ok: false, error: { code: 'run_not_found' } });
+    expect(await service.cancel(runId)).toMatchObject({ ok: true, data: { accepted: false } });
+    expect(await service.cancel(999)).toMatchObject({ ok: false, error: { code: 'run_not_found' } });
     const secondFinished = finishSignal();
     const second = await service.start({ ...request, text: '上面这张发票还缺少什么？' }, secondFinished);
     expect(second).toMatchObject({ ok: true, data: { runId: 2, sessionId: 1 } });
@@ -370,9 +382,9 @@ describe('RuntimeService Agent lifecycle', () => {
     if (!accepted.ok) return;
     await entered.promise;
     expect(await service.start({ ...request, sessionId: 2 })).toMatchObject({ ok: false, error: { code: 'runtime_busy' } });
-    const cancelled = service.cancel(accepted.data.runId);
+    const cancelled = await service.cancel(accepted.data.runId);
     expect(cancelled).toMatchObject({ ok: true, data: { accepted: true } });
-    expect(service.cancel(accepted.data.runId)).toMatchObject({ ok: true, data: { accepted: false } });
+    expect(await service.cancel(accepted.data.runId)).toMatchObject({ ok: true, data: { accepted: false } });
     work.resolve(nativeOutcome);
     await finished.done.promise;
     expect(db.runs.get(accepted.data.runId)).toMatchObject({ ok: true, data: { status: 'cancelled', stoppedAt: '2026-09-24T00:00:00.000Z', output: { text: nativeOutcome.text }, error: { code: 'agent_cancelled' } } });
@@ -388,7 +400,7 @@ describe('RuntimeService Agent lifecycle', () => {
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
     await entered.promise;
-    expect(service.cancel(accepted.data.runId)).toMatchObject({ ok: true, data: { accepted: true } });
+    expect(await service.cancel(accepted.data.runId)).toMatchObject({ ok: true, data: { accepted: true } });
     await finished.done.promise;
     const before = db.runs.get(accepted.data.runId);
     expect(before).toMatchObject({ ok: true, data: { status: 'failed', output: null, stoppedAt: null } });
@@ -416,17 +428,49 @@ describe('RuntimeService Agent lifecycle', () => {
     expect(db.db.query('SELECT COUNT(*) AS count FROM runs').get()).toEqual({ count: 1 });
   });
 
+  it('waits for late Agent usage to commit before confirming resource closure', async () => {
+    const { db, deps } = fixture(), entered = deferred<void>(), work = deferred<AgentNativeOutcome>(), finished = finishSignal();
+    const lateOutcome: AgentNativeOutcome = { ...nativeOutcome,
+      usage: { ...nativeOutcome.usage, source: 'sdk', reason: null,
+        sdkValues: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3,
+          costInput: 0, costOutput: 0, costCacheRead: 0, costCacheWrite: 0, costTotal: 0 }, attempts: 1 },
+      tokens: { inputTokens: 1, outputTokens: 2, totalTokens: 3, cost: '0', usageComplete: true } };
+    const service = new RuntimeService({ ...deps, agent: makeAgent(deps.fixtureHistory,
+      { execute: () => { entered.resolve(); return work.promise; } }) });
+    const accepted = await service.start(request, finished);
+    if (!accepted.ok) throw new Error(accepted.error.code);
+    await entered.promise;
+    expect(await service.cancel(accepted.data.runId)).toMatchObject({ ok: true, data: { accepted: true } });
+    await finished.done.promise;
+    const transaction = db.transaction, usageWriting = deferred<void>(), releaseCommit = deferred<void>();
+    db.transaction = operation => transaction(async scope => {
+      let lateUsage = false;
+      const supplement = scope.runs.supplementUsage;
+      scope.runs.supplementUsage = (...args) => { lateUsage = true; return supplement(...args); };
+      const value = await operation(scope);
+      if (lateUsage) { usageWriting.resolve(); await releaseCommit.promise; }
+      return value;
+    });
+    let settled = false;
+    const closing = service.close().then(report => { settled = true; return report; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      work.resolve(lateOutcome);
+      await usageWriting.promise;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(db.db.inTransaction).toBe(true); expect(settled).toBe(false);
+      releaseCommit.resolve();
+      expect(await closing).toMatchObject({ stopped: true, closed: true });
+      expect(await db.read(scope => scope.runs.get(accepted.data.runId)))
+        .toMatchObject({ ok: true, data: { status: 'failed', stoppedAt: null, usage: { source: 'sdk' }, tokens: { totalTokens: 3 } } });
+    } finally { work.resolve(lateOutcome); releaseCommit.resolve(); await closing; }
+  });
   it('poisons the runtime when a stopped Agent outcome cannot be persisted', async () => {
     const { db, deps } = fixture();
     const finished = finishSignal();
-    const failedRuns = new Proxy(db.runs as RunRepository, {
-      get(target, key, receiver) {
-        if (key === 'finish') return () => ({ ok: false, error: appError('storage_write_failed', 'storage', 'fixture write failure', true) });
-        const value = Reflect.get(target, key, receiver) as unknown;
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
-    const service = new RuntimeService({ ...deps, runs: failedRuns, agent: makeAgent(deps.fixtureHistory, ) });
+    db.db.exec("CREATE TRIGGER reject_agent_terminal BEFORE UPDATE OF status ON runs WHEN NEW.status IN ('completed','failed','cancelled') BEGIN SELECT RAISE(ABORT,'controlled Agent terminal failure'); END;");
+    const service = new RuntimeService({ ...deps, agent: makeAgent(deps.fixtureHistory) });
     const accepted = await service.start(request, finished);
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
@@ -460,15 +504,9 @@ describe('RuntimeService Agent lifecycle', () => {
   it('does not run the prompt when saving the running snapshot fails', async () => {
     const { db, deps } = fixture();
     const finished = finishSignal();
-    const runs = new Proxy(db.runs as RunRepository, {
-      get(target, key, receiver) {
-        if (key === 'start') return () => ({ ok: false, error: appError('storage_write_failed', 'storage', 'fixture write failure', true) });
-        const value = Reflect.get(target, key, receiver) as unknown;
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
+    db.db.exec("CREATE TRIGGER reject_agent_start BEFORE UPDATE OF status ON runs WHEN NEW.status='running' BEGIN SELECT RAISE(ABORT,'controlled Agent start failure'); END;");
     let prompted = false;
-    const service = new RuntimeService({ ...deps, runs, agent: makeAgent(deps.fixtureHistory, { execute: async () => { prompted = true; return nativeOutcome; } }) });
+    const service = new RuntimeService({ ...deps, agent: makeAgent(deps.fixtureHistory, { execute: async () => { prompted = true; return nativeOutcome; } }) });
     const accepted = await service.start(request, finished);
     expect(accepted.ok).toBe(true);
     const end = await finished.done.promise;
@@ -546,19 +584,13 @@ describe('RuntimeService Agent lifecycle', () => {
     const entered = deferred<void>();
     const finished = finishSignal();
     const { db, deps } = fixture();
-    const runs = new Proxy(db.runs as RunRepository, {
-      get(target, key, receiver) {
-        if (key === 'recordCancel') return () => ({ ok: false, error: appError('storage_write_failed', 'storage', 'fixture cancel write failure', true) });
-        const value = Reflect.get(target, key, receiver) as unknown;
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
-    const service = new RuntimeService({ ...deps, runs, agent: makeAgent(deps.fixtureHistory, { execute: () => { entered.resolve(); return work.promise; } }) });
+    db.db.exec("CREATE TRIGGER reject_initial_agent_cancel BEFORE UPDATE OF cancel_requested_at ON runs WHEN NEW.status=OLD.status AND OLD.cancel_requested_at IS NULL BEGIN SELECT RAISE(ABORT,'controlled initial cancellation failure'); END;");
+    const service = new RuntimeService({ ...deps, agent: makeAgent(deps.fixtureHistory, { execute: () => { entered.resolve(); return work.promise; } }) });
     const accepted = await service.start(request, finished);
     expect(accepted.ok).toBe(true);
     if (!accepted.ok) return;
     await entered.promise;
-    const cancellation = service.cancel(accepted.data.runId);
+    const cancellation = await service.cancel(accepted.data.runId);
     work.resolve(nativeOutcome);
     const end = await finished.done.promise;
     expect(cancellation).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
@@ -666,13 +698,17 @@ describe('P5 public input stopping and admission barriers', () => {
     let executions = 0;
     let auditReads = 0;
     const agent = makeAgent(deps.fixtureHistory, { execute: async () => { executions++; return nativeOutcome; } });
-    const runtime = new RuntimeService({ ...deps, agent, sessionInputs: { ...db.sessionInputs, forRun(runId) {
-      if (++auditReads === 2) return fail(appError('storage_read_failed', 'storage', 'Final input audit unavailable.', true));
-      return db.sessionInputs.forRun(runId);
-    } } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
+    const database: RuntimeDependencies['database'] = { read: db.read,
+      transaction: operation => db.transaction(scope => operation({ ...scope, sessionInputs: { ...scope.sessionInputs,
+        forRun(runId, inputIds) {
+          if (inputIds !== undefined) return scope.sessionInputs.forRun(runId, inputIds);
+          if (++auditReads === 2) return fail(appError('storage_read_failed', 'storage', 'Final input audit unavailable.', true));
+          return scope.sessionInputs.forRun(runId);
+        } } })) };
+    const runtime = new RuntimeService({ ...deps, database, agent });
+    const sessions = new SessionService(agent, () => runtime.state(), deps.now, db,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
-      id => runtime.verifySessionMutation(id));
+      (id, intent, repository) => runtime.verifySessionMutation(id, intent, repository));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
     const finished = finishSignal();
     const submitted = await app.submitInput({ ...request, clientSequence: 1, mode: 'prompt' }, finished);
@@ -707,9 +743,9 @@ describe('P5 public input stopping and admission barriers', () => {
         return ok({ snapshot, async execute(input, _signal, observe) {
           streaming = true;
           observe({ type: 'agent_event', at: deps.now(), monotonicMs: performance.now(), data: { eventName: 'agent_start' } });
-          deps.fixtureHistory.saveUser(nativeId, input);
+          await deps.fixtureHistory.saveUser(nativeId, input);
           entered.resolve(); await release.promise;
-          deps.fixtureHistory.saveResult(nativeId, { ...input, completeInputResult: () => ok(undefined) }, nativeOutcome);
+          await deps.fixtureHistory.saveResult(nativeId, { ...input, completeInputResult: () => ok(undefined) }, nativeOutcome);
           if (scenario === 'failed-result') {
             const failed = db.sessionInputs.failResult(input.runId, [input.inputId!], `assistant-${input.inputId}`,
               appError('agent_goal_not_met', 'runtime', 'The first input did not meet its goal.', false, input.runId), deps.now());
@@ -721,13 +757,17 @@ describe('P5 public input stopping and admission barriers', () => {
       },
     };
     let rejectRead = scenario === 'ledger-read-failure';
-    const runtime = new RuntimeService({ ...deps, agent, sessionInputs: { ...db.sessionInputs, forRun(runId) {
-      if (rejectRead) { rejectRead = false; return fail(appError('storage_read_failed', 'storage', 'Transient input audit failure.', true)); }
-      return db.sessionInputs.forRun(runId);
-    } } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
+    const database: RuntimeDependencies['database'] = { read: db.read,
+      transaction: operation => db.transaction(scope => operation({ ...scope, sessionInputs: { ...scope.sessionInputs,
+        forRun(runId, inputIds) {
+          if (inputIds !== undefined) return scope.sessionInputs.forRun(runId, inputIds);
+          if (rejectRead) { rejectRead = false; return fail(appError('storage_read_failed', 'storage', 'Transient input audit failure.', true)); }
+          return scope.sessionInputs.forRun(runId);
+        } } })) };
+    const runtime = new RuntimeService({ ...deps, database, agent });
+    const sessions = new SessionService(agent, () => runtime.state(), deps.now, db,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
-      id => runtime.verifySessionMutation(id));
+      (id, intent, repository) => runtime.verifySessionMutation(id, intent, repository));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
     const finished = finishSignal();
     const initial = await app.submitInput({ ...request, clientSequence: 1, mode: 'prompt', timeoutMs: 5000 }, finished);
@@ -736,7 +776,12 @@ describe('P5 public input stopping and admission barriers', () => {
     const queued = await app.submitInput({ sessionId: 1, clientSequence: 2, mode: 'followUp', runId: initial.data.runId, text: 'Unconfirmed input' });
     if (!queued.ok) throw new Error(queued.error.code);
     release.resolve();
-    expect(await finished.done.promise).toMatchObject({ type: 'run_finished', result: { ok: true, data: { status: 'failed', stopped: true } } });
+    const terminal = await finished.done.promise;
+    expect(terminal).toMatchObject({ type: 'run_finished', result: { ok: true, data: { status: 'failed', stopped: true } } });
+    if (scenario === 'ledger-read-failure') {
+      expect(rejectRead).toBe(false);
+      expect(terminal).toMatchObject({ result: { data: { error: { code: 'storage_read_failed' } } } });
+    }
     expect(await app.querySessionInput({ sessionId: 1, inputId: queued.data.inputId })).toMatchObject({ ok: true, data: { input: {
       status: 'delivery_unknown', processingStatus: 'failed', nativeEntryId: null } } });
     expect(db.sessions.get(1)).toMatchObject({ ok: true, data: { nativeUnusable: true } });
@@ -775,13 +820,13 @@ describe('P5 public input stopping and admission barriers', () => {
         async execute(input, signal, observe) {
           executeCount += 1; streaming = true; executionInput = input;
           observe({ type: 'agent_event', at: deps.now(), monotonicMs: performance.now(), data: { eventName: 'agent_start' } });
-          deps.fixtureHistory.saveUser(nativeId, input);
+          await deps.fixtureHistory.saveUser(nativeId, input);
           entered.resolve();
           await finishFirst.promise;
           const { onInputAdmissionClosed: _firstAgentEnd, ...firstTurn } = input;
-          deps.fixtureHistory.saveResult(nativeId, firstTurn, nativeOutcome);
+          await deps.fixtureHistory.saveResult(nativeId, firstTurn, nativeOutcome);
           const consumed = queued[0]!;
-          deps.fixtureHistory.saveUser(nativeId, { ...input, inputId: consumed.inputId, text: consumed.text, promptText: consumed.promptText });
+          await deps.fixtureHistory.saveUser(nativeId, { ...input, inputId: consumed.inputId, text: consumed.text, promptText: consumed.promptText });
           if (!input.toolBinding) throw new Error('The public material Run must bind the real tool executor.');
           await input.toolBinding.execute('powershell', {}, { nativeToolCallId: 'p5-stop-process', signal });
           const outcome = await settled.promise;
@@ -796,9 +841,9 @@ describe('P5 public input stopping and admission barriers', () => {
     const runtime = new RuntimeService({ ...deps, agent, tools, workspaceVerifier: verify, nativeTools: {
       runtimeDir: nativeHeader.cwd,
       availability: [{ name: 'powershell', available: true, reason: null }] } });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
+    const sessions = new SessionService(agent, () => runtime.state(), deps.now, db,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
-      id => runtime.verifySessionMutation(id));
+      (id, intent, repository) => runtime.verifySessionMutation(id, intent, repository));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
     const current = db.workspace.update({ expectedRevision: 0, change: { kind: 'session', sessionId: 1 }, at: deps.now() }, verify);
     if (!current.ok) throw new Error(current.error.code);
@@ -826,7 +871,7 @@ describe('P5 public input stopping and admission barriers', () => {
     expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { active: { runId: initial.data.runId } } });
     expect(await app.submitInput({ sessionId: 1, clientSequence: 5, mode: 'steer', runId: initial.data.runId, text: 'After Stop', workspace }))
       .toMatchObject({ ok: false, error: { code: 'input_admission_closed' } });
-    expect(executionInput.completeInputResult?.([initial.data.inputId], firstResultId))
+    expect(await executionInput.completeInputResult?.([initial.data.inputId], firstResultId))
       .toMatchObject({ ok: false, error: { code: 'input_admission_closed' } });
     expect(db.db.query('SELECT COUNT(*) AS count FROM session_inputs').get()).toEqual({ count: 4 });
     expect(queued).toHaveLength(3);
@@ -872,24 +917,24 @@ describe('P5 public input stopping and admission barriers', () => {
         return ok({ snapshot, async execute(input, _signal, observe) {
           executeCount += 1; streaming = true;
           observe({ type: 'agent_event', at: deps.now(), monotonicMs: performance.now(), data: { eventName: 'agent_start' } });
-          deps.fixtureHistory.saveUser(nativeId, input);
+          await deps.fixtureHistory.saveUser(nativeId, input);
           if (executeCount === 1) {
             entered.resolve(); await beginClosing.promise;
-            deps.fixtureHistory.saveResult(nativeId, input, nativeOutcome);
+            await deps.fixtureHistory.saveResult(nativeId, input, nativeOutcome);
             observe({ type: 'agent_event', at: deps.now(), monotonicMs: performance.now(), data: { eventName: 'agent_end' } });
             closedAdmission.resolve(); await releaseSettled.promise;
             streaming = false;
             return { ...nativeOutcome, agent: { ...nativeOutcome.agent, confirmedUnconsumedInputIds: queued.map(item => item.inputId) } };
           }
-          deps.fixtureHistory.saveResult(nativeId, input, nativeOutcome);
+          await deps.fixtureHistory.saveResult(nativeId, input, nativeOutcome);
           streaming = false; return nativeOutcome;
         } });
       },
     };
     const runtime = new RuntimeService({ ...deps, agent });
-    const sessions = new SessionService(db.sessions, agent, () => runtime.state(), deps.now, db.runs, db.memory, db.sessionInputs,
+    const sessions = new SessionService(agent, () => runtime.state(), deps.now, db,
       (runRequest, submission, control) => runtime.start(runRequest, control, submission), input => runtime.appendInput(input),
-      id => runtime.verifySessionMutation(id));
+      (id, intent, repository) => runtime.verifySessionMutation(id, intent, repository));
     const app = makeApplication(runtime, db.runs, async () => ({ stopped: true, closed: true, errors: [] }), sessions);
     const finished = finishSignal();
     const initial = await app.submitInput({ ...request, clientSequence: 1, mode: 'prompt', timeoutMs: 5000 }, finished);

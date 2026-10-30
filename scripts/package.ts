@@ -5,12 +5,13 @@ import { builtinModules } from 'node:module';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getToolPath } from '@earendil-works/pi-coding-agent';
-import { PACKAGED_MIGRATIONS, PACKAGED_NATIVE_TOOLS, PackagedReleaseSchema, resolveRuntimeLayout, type PackagedRelease } from '../packages/shared/src/runtime-layout.ts';
+import { PACKAGED_BUN_VERSION, PACKAGED_MIGRATIONS, PACKAGED_NATIVE_TOOLS, PackagedReleaseSchema, resolveRuntimeLayout, type PackagedRelease } from '../packages/shared/src/runtime-layout.ts';
+import { validateWinSwExecutable } from '../packages/shared/src/service-layout.ts';
 
 const entries = [['apps/host/main.ts', 'host.js'], ['agent-eval/src/desktop/worker.ts', 'evaluation-worker.js'],
-  ['apps/maintenance/main.ts', 'maintenance.js']] as const;
-const versions = { '@earendil-works/pi-ai': '0.85.1', '@earendil-works/pi-coding-agent': '0.85.1',
-  '@earendil-works/pi-tui': '0.85.1', '@tintinweb/pi-subagents': '0.19.0', zod: '3.25.76',
+  ['apps/maintenance/main.ts', 'maintenance.js'], ['apps/service/main.ts', 'service.js'], ['scripts/service.ts', 'service-manager.js']] as const;
+const versions = { '@earendil-works/pi-ai': '1.4.0', '@earendil-works/pi-coding-agent': '1.4.0',
+  '@earendil-works/pi-tui': '1.4.0', '@tintinweb/pi-subagents': '0.19.0', zod: '3.25.76',
   electron: '44.4.5', 'electron-builder': '26.15.3' };
 
 function copyTree(source: string, destination: string, allowed: (path: string) => boolean = () => true): void {
@@ -33,8 +34,12 @@ function files(root: string, directory = root): string[] {
   }).sort();
 }
 
-function requireEntries(repository: string): void {
+async function requireEntries(repository: string): Promise<void> {
   if (entries.some(([entry]) => !existsSync(join(repository, entry)))) throw Error('packaging_entry_missing');
+  if (['resources/service/WinSW.NET461.exe', 'resources/service/FlowmateRuntime.xml', 'licenses/winsw-2.12.0.LICENSE.txt']
+    .some(file => !existsSync(join(repository, file)))) throw Error('packaging_service_asset_missing');
+  if (!(await validateWinSwExecutable(join(repository, 'resources/service/WinSW.NET461.exe'))).ok)
+    throw Error('packaging_service_wrapper_version_invalid');
 }
 
 function launcher(worker: boolean): string {
@@ -61,8 +66,8 @@ try {
 /** Build-time only. A caller supplies a new owned destination; no product data is read. */
 export async function buildRuntime(repository: string, destination: string): Promise<PackagedRelease> {
   repository = realpathSync(repository);
-  requireEntries(repository);
-  if (process.platform !== 'win32' || process.arch !== 'x64' || Bun.version !== '1.4.0') throw Error('packaging_runtime_version_invalid');
+  await requireEntries(repository);
+  if (process.platform !== 'win32' || process.arch !== 'x64' || Bun.version !== PACKAGED_BUN_VERSION) throw Error('packaging_runtime_version_invalid');
   if (!isAbsolute(destination) || basename(destination) !== 'flowmate-runtime' || existsSync(destination)) throw Error('packaging_destination_invalid');
   const metadata = JSON.parse(readFileSync(join(repository, 'package.json'), 'utf8'));
   for (const [name, version] of Object.entries(versions)) {
@@ -99,7 +104,7 @@ export async function buildRuntime(repository: string, destination: string): Pro
   }
   copyTree(join(repository, 'agent-eval/src/adapters/fill-controls/index.html'), join(destination, 'apps/fill-controls/index.html'));
   copyTree(process.execPath, join(destination, 'bin/bun.exe'));
-  copyTree(join(repository, 'licenses/bun-1.4.0.LICENSE.md'), join(destination, 'licenses/bun@1.4.0/LICENSE.md'));
+  copyTree(join(repository, `licenses/bun-${PACKAGED_BUN_VERSION}.LICENSE.md`), join(destination, `licenses/bun@${PACKAGED_BUN_VERSION}/LICENSE.md`));
   for (const [name, path] of nativeTools) {
     const tool = PACKAGED_NATIVE_TOOLS[name as keyof typeof PACKAGED_NATIVE_TOOLS];
     copyTree(path, join(destination, 'bin', name + '.exe'));
@@ -112,6 +117,9 @@ export async function buildRuntime(repository: string, destination: string): Pro
     join(destination, 'native/win32/prebuilds/win32-x64'));
   copyTree(migrations, join(destination, 'apps/migrations'));
   copyTree(join(repository, 'resources'), join(destination, 'resources'), path => /\.(md|json)$/.test(path));
+  copyTree(join(repository, 'resources/service/WinSW.NET461.exe'), join(destination, 'service/FlowmateRuntime.exe'));
+  copyTree(join(repository, 'resources/service/FlowmateRuntime.xml'), join(destination, 'resources/service/FlowmateRuntime.xml'));
+  copyTree(join(repository, 'licenses/winsw-2.12.0.LICENSE.txt'), join(destination, 'licenses/winsw@2.12.0/LICENSE.txt'));
   copyTree(join(sdk, 'package.json'), join(destination, 'sdk/package.json'));
   copyTree(join(sdk, 'README.md'), join(destination, 'sdk/README.md'));
   copyTree(join(sdk, 'docs'), join(destination, 'sdk/docs'));
@@ -142,19 +150,19 @@ export async function buildRuntime(repository: string, destination: string): Pro
         if (!readFileSync(source).equals(readFileSync(copy))) throw Error('packaging_license_conflict');
       } else copyTree(source, copy);
     }
-    if (['@earendil-works/pi-ai', '@earendil-works/pi-agent-core', '@earendil-works/pi-coding-agent',
-      '@earendil-works/pi-tui', '@earendil-works/pi-telemetry'].includes(data.name)
-      && data.version === '0.85.1' && !existsSync(join(target, 'LICENSE')))
-      copyTree(join(repository, 'licenses/pi-0.85.1.LICENSE'), join(target, 'LICENSE'));
+    if (data.name.startsWith('@earendil-works/pi-')
+      && data.version === '1.4.0' && !existsSync(join(target, 'LICENSE')))
+      copyTree(join(repository, 'licenses/pi-1.4.0.LICENSE'), join(target, 'LICENSE'));
   }
   mkdirSync(join(destination, 'licenses'), { recursive: true });
   writeFileSync(join(destination, 'licenses/third-party.json'), JSON.stringify([...packages.values(),
     { name: 'bun', version: Bun.version, license: 'MIT; bundled dependencies have separate notices in LICENSE.md' },
+    { name: 'winsw', version: '2.12.0', license: 'MIT', source: 'https://github.com/winsw/winsw/releases/tag/v2.12.0', framework: 'net461' },
     ...Object.values(PACKAGED_NATIVE_TOOLS).map(tool => ({ ...tool, license: 'MIT' }))], null, 2), { flag: 'wx' });
   const release = PackagedReleaseSchema.parse({ version: 1, releaseId: randomUUID(), productVersion: metadata.version,
     platform: 'win32', arch: 'x64', bunVersion: Bun.version, electronVersion: versions.electron,
     sdkVersion: versions['@earendil-works/pi-coding-agent'], pluginVersion: versions['@tintinweb/pi-subagents'],
-    schemaVersion: 20, settingsVersion: 7, files: files(destination) });
+    schemaVersion: 21, settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files: files(destination) });
   writeFileSync(join(destination, 'release.json'), JSON.stringify(release, null, 2), { flag: 'wx' });
   const layout = resolveRuntimeLayout({ isPackaged: true, appPath: join(dirname(destination), 'app/app.asar'),
     resourcesPath: dirname(destination), userDataRoot: join(dirname(dirname(destination)), 'package-validation-data') });
@@ -164,7 +172,7 @@ export async function buildRuntime(repository: string, destination: string): Pro
 
 async function packageDesktop(mode: 'dir' | 'nsis'): Promise<void> {
   const repository = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
-  requireEntries(repository);
+  await requireEntries(repository);
   const stage = join(repository, 'out/package-stage');
   const output = join(repository, 'out');
   if (existsSync(output) && realpathSync(output) !== output) throw Error('packaging_destination_invalid');

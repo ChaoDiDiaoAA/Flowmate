@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { ResourceExpansionEvidenceSchema, ResourceReadEvidenceSchema } from './resources.ts';
-import { SessionSnapshotSchema } from './runtime.ts';
+import { AgentSessionSnapshotSchema } from './runtime.ts';
 import type { DbId, NativeHistoryAppendContext, NativeSessionHistory, Result } from './runtime.ts';
 import { ContextErrorSchema, NativeInputContextBindingSchema } from './context.ts';
 import { normalizeSessionTitle } from './session-title.ts';
@@ -14,7 +14,7 @@ const jsonBytes = (value: unknown) => bytes(JSON.stringify(value));
 const issue = (context: z.RefinementCtx, message: string) => context.addIssue({ code: 'custom', message });
 
 export const NativeEntryTypeSchema = z.enum(['message', 'model_change', 'thinking_level_change', 'compaction',
-  'branch_summary', 'custom', 'custom_message', 'label', 'session_info']);
+  'branch_summary', 'custom', 'custom_message', 'context_edit', 'usage', 'label', 'session_info']);
 export type NativeEntryType = z.infer<typeof NativeEntryTypeSchema>;
 export const HistorySelectionReasonSchema = z.enum(['empty-context', 'incomplete-tool-pair', 'history-invalid',
   'source-unavailable', 'context-unsupported', 'session-unavailable', 'busy']);
@@ -77,6 +77,11 @@ const nativeUsage = z.object({ input: z.number().finite(), output: z.number().fi
 const nativeContent = z.union([z.string(), z.array(z.discriminatedUnion('type', [nativeText, nativeImage]))]);
 const stopReason = z.enum(['pending', 'stop', 'length', 'toolUse', 'error', 'aborted', 'deferred']);
 const nativeMessages = z.discriminatedUnion('role', [
+  z.object({ role: z.literal('system'), content: z.union([z.string(), z.array(nativeText)]),
+    sections: z.record(z.string().nullable()).optional(),
+    toolsAdded: z.array(z.object({ name: z.string().min(1), description: z.string(), parameters: z.record(z.unknown()) }).passthrough()).optional(),
+    toolsRemoved: z.array(z.object({ name: z.string().min(1) }).passthrough()).optional(),
+    timestamp: z.number().finite() }).passthrough(),
   z.object({ role: z.literal('user'), content: nativeContent, timestamp: z.number().finite() }).passthrough(),
   z.object({ role: z.literal('assistant'), content: z.array(z.discriminatedUnion('type', [nativeText, nativeThinking, nativeToolCall])),
     api: z.string().min(1), provider: z.string().min(1), model: z.string().min(1), usage: nativeUsage,
@@ -110,6 +115,11 @@ const nativeEntries = z.discriminatedUnion('type', [
   z.object({ ...entryBase, type: z.literal('custom'), customType: z.string(), data: z.unknown().optional() }).passthrough(),
   z.object({ ...entryBase, type: z.literal('custom_message'), customType: z.string(), content: nativeContent,
     display: z.boolean(), details: z.unknown().optional() }).passthrough(),
+  z.object({ ...entryBase, type: z.literal('context_edit'), targetId: NativeEntryIdSchema,
+    replacement: z.object({ content: z.union([z.string(), z.array(z.discriminatedUnion('type',
+      [nativeText, nativeImage, nativeThinking, nativeToolCall]))]) }).passthrough().nullable() }).passthrough(),
+  z.object({ ...entryBase, type: z.literal('usage'), kind: z.string(), provider: z.string(), model: z.string(),
+    usage: nativeUsage, note: z.string().optional() }).passthrough(),
   z.object({ ...entryBase, type: z.literal('label'), targetId: NativeEntryIdSchema, label: z.string().optional() }).passthrough(),
   z.object({ ...entryBase, type: z.literal('session_info'), name: z.string().optional() }).passthrough(),
 ]);
@@ -126,7 +136,7 @@ export const NativeSessionHistorySchema = nativeJson.pipe(z.object({ storageVers
     if (seen.has(entry.id) || entry.parentId !== null && !seen.has(entry.parentId)) issue(context, 'Entry IDs and parent order must be valid.');
     seen.add(entry.id);
     let reference: string | null = null;
-    if (entry.type === 'label') reference = entry.targetId;
+    if (entry.type === 'label' || entry.type === 'context_edit') reference = entry.targetId;
     if (entry.type === 'compaction') reference = entry.firstKeptEntryId;
     if (entry.type === 'branch_summary') reference = entry.fromId === 'root' ? null : entry.fromId;
     if (entry.type === 'message' && entry.message.role === 'branchSummary')
@@ -157,6 +167,7 @@ export type HistoryCommitInput = { sessionId: DbId; expected: HistoryCommitState
 export const NativeHistoryWriteSchema = z.object({ expected: HistoryCommitStateSchema, history: NativeSessionHistorySchema,
   contexts: z.array(appendContext).readonly() }).strict();
 export type NativeHistoryWrite = { expected: HistoryCommitState; history: NativeSessionHistory; contexts: readonly NativeHistoryAppendContext[] };
+export type NativeHistoryWriter = (write: NativeHistoryWrite) => Result<HistoryCommitReceipt> | Promise<Result<HistoryCommitReceipt>>;
 export const NativeHistoryOriginSeedSchema = z.object({ nativeEntryId: NativeEntryIdSchema, originSessionId: id,
   originRunId: id.nullable() }).strict().readonly();
 export type NativeHistoryOriginSeed = z.infer<typeof NativeHistoryOriginSeedSchema>;
@@ -222,7 +233,7 @@ export const HistoryEntrySummarySchema = z.object({ sequence: HistorySafeInteger
 export type HistoryEntrySummary = z.infer<typeof HistoryEntrySummarySchema>;
 const images = { hasImages: z.boolean(), imageMimeTypes: z.array(z.string().min(1).max(256)).readonly() };
 export const HistoryEntryDisplayFieldsSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('message'), role: z.enum(['user', 'assistant', 'toolResult', 'bashExecution', 'custom', 'branchSummary', 'compactionSummary']),
+  z.object({ type: z.literal('message'), role: z.enum(['system', 'user', 'assistant', 'toolResult', 'bashExecution', 'custom', 'branchSummary', 'compactionSummary']),
     toolName: HistoryTextPreviewSchema.nullable(), callId: NativeEntryIdSchema.nullable(), stopReason: stopReason.nullable(),
     isError: z.boolean().nullable(), ...images }).strict(),
   z.object({ type: z.literal('model_change'), provider: HistoryTextPreviewSchema, modelId: HistoryTextPreviewSchema }).strict(),
@@ -231,6 +242,9 @@ export const HistoryEntryDisplayFieldsSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('branch_summary'), fromId: NativeEntryIdSchema }).strict(),
   z.object({ type: z.literal('custom'), customType: HistoryTextPreviewSchema, hasOpaqueData: z.boolean() }).strict(),
   z.object({ type: z.literal('custom_message'), customType: HistoryTextPreviewSchema, display: z.boolean(), hasOpaqueData: z.boolean(), ...images }).strict(),
+  z.object({ type: z.literal('context_edit'), targetId: NativeEntryIdSchema, omitted: z.boolean() }).strict(),
+  z.object({ type: z.literal('usage'), kind: HistoryTextPreviewSchema, provider: HistoryTextPreviewSchema,
+    model: HistoryTextPreviewSchema, usage: nativeUsage }).strict(),
   z.object({ type: z.literal('label'), targetId: NativeEntryIdSchema, label: HistoryTextPreviewSchema.nullable() }).strict(),
   z.object({ type: z.literal('session_info'), name: HistoryTextPreviewSchema.nullable() }).strict(),
 ]).superRefine((fields, context) => {
@@ -244,7 +258,7 @@ export const HistoryEntryDisplayFieldsSchema = z.discriminatedUnion('type', [
   }
 }).readonly();
 export type HistoryEntryDisplayFields = z.infer<typeof HistoryEntryDisplayFieldsSchema>;
-export const NativeHistoryPageSchema = z.object({ session: SessionSnapshotSchema, commit: HistoryCommitStateSchema,
+export const NativeHistoryPageSchema = z.object({ session: AgentSessionSnapshotSchema, commit: HistoryCommitStateSchema,
   items: z.array(HistoryEntrySummarySchema).max(100).readonly(), nextAfterSequence: HistorySafeIntegerSchema.nullable() }).strict()
   .superRefine((page, context) => {
     if (new Set(page.items.map(item => item.entryId)).size !== page.items.length) issue(context, 'History page entry identities must be unique.');
@@ -276,7 +290,7 @@ export const ForkSessionRequestSchema = z.object({ sourceSessionId: id, expected
   targetEntryId: NativeEntryIdSchema, title: normalizedTitle, clientOperationId: z.string().uuid().transform(value => value.toLowerCase()) }).strict();
 export type ForkSessionRequest = z.infer<typeof ForkSessionRequestSchema>;
 // selectedEntryId records creation intent; idempotent lookup reports the target's current commit.
-export const ForkSessionResultSchema = z.object({ session: SessionSnapshotSchema, commit: HistoryCommitStateSchema,
+export const ForkSessionResultSchema = z.object({ session: AgentSessionSnapshotSchema, commit: HistoryCommitStateSchema,
   sourceSessionId: id, selectedEntryId: NativeEntryIdSchema }).strict().refine(value => value.session.sessionId !== value.sourceSessionId
     && value.commit.entryCount > 0, 'Fork must identify an independent committed Session.').readonly();
 export type ForkSessionResult = z.infer<typeof ForkSessionResultSchema>;
@@ -300,7 +314,7 @@ function resultSchema<T extends z.ZodTypeAny>(data: T, maximumBytes: number) {
 export const NativeHistoryPageResultSchema = resultSchema(NativeHistoryPageSchema, 1048576);
 export const SessionHistoryEntryResultSchema = resultSchema(SessionHistoryEntryDetailSchema, 131072);
 export const ForkSessionResponseSchema = resultSchema(ForkSessionResultSchema, 131072);
-export const BranchSessionResponseSchema = resultSchema(z.object({ session: SessionSnapshotSchema,
+export const BranchSessionResponseSchema = resultSchema(z.object({ session: AgentSessionSnapshotSchema,
   leafId: NativeEntryIdSchema, entryCount: HistorySafeIntegerSchema }).strict(), 131072);
 export interface MemoryStore {
   load(sessionId: DbId): Result<StoredNativeHistory | null>;

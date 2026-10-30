@@ -136,7 +136,7 @@ for (const isolation of [undefined] as const) test
         const result = await session.execute(new AbortController().signal);
         expect(result).toMatchObject({ status: 'completed', endpointReached: true,
             evidence: { 'history-operations': { present: true }, history: { present: true }, 'interaction-history': { present: true } } });
-        const operations = result.evidence['history-operations']!.actual as Array<{ action: string; after: { operation: { generated: boolean; saved: { leafId: string }; stopped: boolean; nativeOutcome: string } } }>;
+        const operations = result.evidence['history-operations']!.actual as Array<{ action: string; after: { operation: { operationId: string; sessionId: number; generated: boolean; saved: { leafId: string }; stopped: boolean; nativeOutcome: string } } }>;
         expect(operations).toHaveLength(1);
         expect(operations[0]!.action).toBe('compact-history');
         expect(operations[0]!.after.operation.generated).toBe(true);
@@ -145,6 +145,12 @@ for (const isolation of [undefined] as const) test
         expect(typeof operations[0]!.after.operation.saved.leafId).toBe('string');
         expect(JSON.stringify(result.evidence.history!.actual)).toContain('SUMMARY_MARKER');
         expect(requests).toHaveLength(6);
+        expect(result.evidence['trace-capture']?.present, JSON.stringify(result.evidence['trace-capture']?.actual)).toBe(true);
+        const manual = result.observations.find(value => value.kind === 'span' && value.parameters?.purpose === 'native-maintenance');
+        const summaries = result.observations.filter(value => value.kind === 'generation' && value.parameters?.purpose === 'summary-history');
+        expect(manual?.parameters).toMatchObject({ operationId: operations[0]!.after.operation.operationId, sessionId: operations[0]!.after.operation.sessionId });
+        expect(summaries).toHaveLength(1); expect(summaries[0]?.parentId).toBe(manual?.id);
+        expect(summaries[0]?.input).toEqual(requests[4]); expect(JSON.stringify(summaries[0]?.output)).toContain('SUMMARY_MARKER');
         expect(JSON.stringify(requests[5])).toContain('SUMMARY_MARKER');
         expect((result.evidence.runs!.actual as unknown[])).toHaveLength(5);
         expect(result.usage).toMatchObject({ inputTokens: 60, outputTokens: 12, totalTokens: 72, cost: null });

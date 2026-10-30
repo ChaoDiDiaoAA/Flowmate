@@ -1,21 +1,21 @@
 import { isDeepStrictEqual } from 'node:util';
 import { appError, fail, ok, HistoryCommitReceiptSchema } from '@flowmate/contracts';
-import type { HistoryCommitState, HistoryCommitReceipt, NativeHistoryRecoverySeed, NativeHistoryWrite, NativeSessionHistory, NativeHistoryAppendContext, Result } from '@flowmate/contracts';
+import type { HistoryCommitState, HistoryCommitReceipt, NativeHistoryRecoverySeed, NativeHistoryWriter, NativeSessionHistory, NativeHistoryAppendContext, Result } from '@flowmate/contracts';
 import { validateNativeHistory, validateRecovery } from './history.ts';
 
 const json = (value: unknown) => JSON.parse(JSON.stringify(value));
-/** Fixed SDK 0.85.1 synchronous _persist acknowledgement state. The writer owns SQL and any lost-receipt lookup. */
+/** Confirmed history only. The Session owns append ordering; the writer owns SQL and lost-receipt lookup. */
 export class PiMemoryAdapter {
   public lastSavedHistory: NativeSessionHistory;
   public commit: HistoryCommitState;
   public seed: NativeHistoryRecoverySeed;
   public failure?: ReturnType<typeof appError>;
   constructor(history: NativeSessionHistory, commit: HistoryCommitState, seed: NativeHistoryRecoverySeed,
-    public writer: (write: NativeHistoryWrite) => Result<HistoryCommitReceipt>) {
+    public writer: NativeHistoryWriter) {
     if (!validateRecovery(history, seed, commit).ok) throw new Error('invalid_recovery');
     this.lastSavedHistory = structuredClone(history); this.commit = structuredClone(commit); this.seed = structuredClone(seed);
   }
-  public save(history: NativeSessionHistory, contexts: readonly NativeHistoryAppendContext[], inputs: NativeHistoryRecoverySeed['inputs'] = []): Result<HistoryCommitReceipt> {
+  public save(history: NativeSessionHistory, contexts: readonly NativeHistoryAppendContext[], inputs: NativeHistoryRecoverySeed['inputs'] = []): ReturnType<NativeHistoryWriter> {
     if (this.failure) return fail(this.failure);
     const reject = (error = appError('storage_write_failed', 'storage', 'Native conversation save was not confirmed.', true)) => {
       this.failure = error; return fail(error);
@@ -39,12 +39,15 @@ export class PiMemoryAdapter {
       if (!validateRecovery(history, nextSeed, expected).ok) return reject(appError('session_history_invalid', 'session', 'New conversation provenance is incomplete.'));
       if (!changed) return ok(structuredClone(this.commit));
       // Detached target/associations are captured before calling a writer, which may synchronously publish events.
-      const target = structuredClone(history), frozenContexts = structuredClone(contexts);
+      const target = structuredClone(history), frozenContexts = structuredClone(contexts), frozenSeed = structuredClone(nextSeed);
       const result = this.writer({ expected: structuredClone(this.commit), history: structuredClone(target), contexts: frozenContexts });
-      if (!result.ok) return reject(result.error);
-      if (!HistoryCommitReceiptSchema.safeParse(result.data).success || !isDeepStrictEqual(result.data, expected)) return reject();
-      this.lastSavedHistory = target; this.commit = structuredClone(result.data); this.seed = nextSeed;
-      return ok(structuredClone(result.data));
+      const confirm = (saved: Result<HistoryCommitReceipt>): Result<HistoryCommitReceipt> => {
+        if (!saved.ok) return reject(saved.error);
+        if (!HistoryCommitReceiptSchema.safeParse(saved.data).success || !isDeepStrictEqual(saved.data, expected)) return reject();
+        this.lastSavedHistory = target; this.commit = structuredClone(saved.data); this.seed = frozenSeed;
+        return ok(structuredClone(saved.data));
+      };
+      return 'ok' in result ? confirm(result) : Promise.resolve(result).then(confirm).catch(() => reject());
     } catch { return reject(); }
   }
 }

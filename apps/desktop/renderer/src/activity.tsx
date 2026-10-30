@@ -23,6 +23,7 @@ type Props = {
   onObserve(runId: number, sessionId: number | null): void; onRefresh(): void;
   onSegment(after: number): void; onRetryPrefix(): void;
   onOpenInvoice(documentId: number): void; onOpenProcessing(jobId: number): void;
+  onOpenEvaluationTrace(runId: number, sessionId: number | null): void;
   onOpenContextBasis(input: { sessionId: number; runId: number; context: ContextReference }): void;
 };
 
@@ -154,6 +155,10 @@ export function ActivityPage(props: Props) {
           {new Date(r.createdAt).toLocaleString()} · {r.status} · {r.input.text.slice(0, 120)}</option>)}</select></label>
       {props.currentRun && <button className="secondary-button" onClick={() => { setSessionId(props.currentRun!.sessionId); setParentRunId(props.currentRun!.kind === 'agent' ? props.currentRun!.runId : null); props.onObserve(props.currentRun!.runId, props.currentRun!.sessionId); }}>View latest request</button>}
       {nextRunId !== null && <button className="secondary-button" disabled={loading} onClick={() => void loadMoreRequests()}>Load earlier requests</button>}
+      <button className="secondary-button" disabled={parentRunId === null && !props.view} onClick={() => {
+        const runId = parentRunId ?? props.view?.runId;
+        if (runId !== undefined && runId !== null) props.onOpenEvaluationTrace(runId, sessionId);
+      }}>Open evaluation trace</button>
     </div>{loading && <p className="activity-note" role="status">Loading processing requests…</p>}</section>
     {parentRunId !== null && sessionId !== null && <Subagents key={`${props.hostEpoch}:${sessionId}:${parentRunId}`} parentRunId={parentRunId}
       parentSessionId={sessionId} hostEpoch={props.hostEpoch} ready={props.ready} refreshToken={`${props.view?.runId}:${props.view?.events.size}:${snapshot?.status}`}

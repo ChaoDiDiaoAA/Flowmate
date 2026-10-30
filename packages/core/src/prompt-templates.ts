@@ -10,7 +10,7 @@ type Template = { name: string; description: string; content: string; filePath: 
 export function createInputDefinitions(options: { resourceRoot: string; runtimeRoot: string;
   tools: readonly { name: string; effect: string }[];
   parseFrontmatter(content: string): { frontmatter: Record<string, unknown>; body: string };
-  loadPromptTemplates(options: { cwd: string; agentDir: string; promptPaths: string[]; includeDefaults: boolean }): Template[];
+  loadPromptTemplates(options: { cwd: string; agentDir: string; promptPaths: string[]; includeDefaults: boolean }): { templates: Template[]; diagnostics: readonly unknown[] };
   expandPromptTemplate(text: string, templates: any[]): string }) {
   const builtinRoot = join(options.resourceRoot, 'subagents'), userRoot = join(options.runtimeRoot, 'subagents');
   const templateRoot = join(options.resourceRoot, 'prompt-templates');
@@ -51,7 +51,9 @@ export function createInputDefinitions(options: { resourceRoot: string; runtimeR
     for (const file of files) { InputDefinitionIdSchema.parse(file.slice(0, -3));
       if (!file.endsWith('.md')) throw new Error('Template directory must contain Markdown definitions.');
       decoder.decode(bytes(safePath(templateRoot, file), 65536)); }
-    const loaded = options.loadPromptTemplates({ cwd: options.runtimeRoot, agentDir: options.runtimeRoot, promptPaths: [templateRoot], includeDefaults: false });
+    const result = options.loadPromptTemplates({ cwd: options.runtimeRoot, agentDir: options.runtimeRoot, promptPaths: [templateRoot], includeDefaults: false });
+    if (result.diagnostics.length) throw new Error('Explicit prompt templates could not be loaded without diagnostics.');
+    const loaded = result.templates;
     if (loaded.length !== files.length || new Set(loaded.map(item => item.name)).size !== loaded.length
       || loaded.some(item => ['subagent', 'skill', 'invoice-assist'].includes(item.name))) throw new Error('Template names conflict or could not be loaded.');
     return loaded;

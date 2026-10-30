@@ -1,20 +1,41 @@
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { describe, expect, it, mock } from 'bun:test';
+import { InMemoryCredentialStore, createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
+import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { describe, expect, it, mock, spyOn } from 'bun:test';
 import { PiProviderAdapter, type FetchLike } from '../../packages/runtime-pi/src/provider.ts';
 import { prepareModelRuntime } from '../../packages/runtime-pi/src/model-runtime.ts';
 import type { ProviderConfig } from '../../packages/contracts/src/runtime.ts';
 import type { NativeObservation, NativeOutcome } from '../../packages/contracts/src/ports.ts';
+import { waitFor } from '../support/resources.ts';
 
 const config: ProviderConfig = {
   version: 1,
   name: 'fixture',
   revision: 1,
-  modelRef: { provider: 'deepseek', model: 'deepseek-v4-flash' },
+  modelRef: { provider: 'deepseek', model: 'deepseek-flash' },
   native: { authPath: 'C:\\Users\\test\\.pi\\auth.json', modelsPath: null },
   parameters: { maxRetries: 0, maxRetryDelayMs: 2000 },
 };
 
 const input = { goal: '返回一句话', text: '合成文本', messageTimestamp: 1789948800000 };
+
+// This fixture stalls the SDK producer itself; current HTTP decoders actively cancel their readers.
+function stalledNativeOutput(text: string, onAbort: () => void = () => {}) {
+  let signal: AbortSignal | undefined, release = () => {};
+  const native = spyOn(ModelRuntime.prototype, 'streamSimple').mockImplementation((model, _context, options) => {
+    signal = options?.signal;
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const stream = createAssistantMessageEventStream();
+    const partial: AssistantMessage = { role: 'assistant', api: model.api, provider: model.provider, model: model.id,
+      content: [{ type: 'text', text }], timestamp: Date.now(), stopReason: 'pending',
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    queueMicrotask(() => stream.push({ type: 'text_delta', contentIndex: 0, delta: text, partial }));
+    release = () => { partial.stopReason = 'aborted'; stream.push({ type: 'error', reason: 'aborted', error: partial }); stream.end(); };
+    return stream;
+  });
+  return { get signal() { return signal; }, release: () => release(), restore: () => native.mockRestore() };
+}
+
 
 describe('PiProviderAdapter', () => {
   it('requires a real output limit for an unknown custom model', async () => {
@@ -191,37 +212,28 @@ describe('PiProviderAdapter', () => {
     expect(outcome.usage.source).toBe('unknown');
   });
 
-  it('[F-output-limit-stop-unconfirmed] preserves bounded partial text when the transport ignores abort', async () => {
-    const credentials = new InMemoryCredentialStore();
-    await credentials.modify('deepseek', async () => ({ type: 'api_key', key: 'FLOWMATE_SYNTHETIC_KEY' }));
-    const oversized = 'x'.repeat(256 * 1024 + 1);
-    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
-    let requestSignal: AbortSignal | undefined;
+  it('[F-output-limit-stop-unconfirmed] preserves bounded partial text while the native producer ignores abort', async () => {
+    const producer = stalledNativeOutput('x'.repeat(256 * 1024 + 1));
     const witnesses: Readonly<Record<string, unknown>>[] = [];
-    const fetch = mock<FetchLike>(async (_request, init) => {
-      requestSignal = init?.signal as AbortSignal | undefined;
-      const encoded = new TextEncoder().encode(`data: ${JSON.stringify({ id: 'fixture-limit-hang', choices: [{ index: 0, delta: { content: oversized }, finish_reason: null }] })}\n\n`);
-      return new Response(new ReadableStream<Uint8Array>({
-        start(controller) {
-          bodyController = controller;
-          controller.enqueue(encoded);
-        },
-      }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    });
-    const adapter = new PiProviderAdapter({ credentials, fetch, witness: (entry) => witnesses.push(entry) });
-    const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 25 }, new AbortController().signal);
-    expect(prepared.ok).toBe(true);
-    if (!prepared.ok) return;
-
-    const outcome = await prepared.data.execute(input, new AbortController().signal, () => undefined);
-
-    expect(outcome.error?.code).toBe('provider_output_limit');
-    expect(new TextEncoder().encode(outcome.text).byteLength).toBeLessThanOrEqual(256 * 1024);
-    expect(requestSignal?.aborted).toBe(true);
-    expect(outcome.stopped).toBe(false);
-    expect(outcome.cleanupErrors.map((entry) => entry.code)).toContain('stop_unconfirmed');
-    expect(witnesses).toContainEqual({ type: 'output_limit_stop', stopped: false, streamFailed: false, aborted: true });
-    bodyController?.close();
+    const adapter = new PiProviderAdapter({ credentials: new InMemoryCredentialStore(),
+      runtimeApiKey: 'SYNTHETIC_ONLY', witness: entry => witnesses.push(entry) });
+    try {
+      const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 25 }, new AbortController().signal);
+      expect(prepared.ok).toBe(true);
+      if (!prepared.ok) return;
+      const outcome = await prepared.data.execute(input, new AbortController().signal, () => undefined);
+      expect(outcome.error?.code).toBe('provider_output_limit');
+      expect(new TextEncoder().encode(outcome.text).byteLength).toBeLessThanOrEqual(256 * 1024);
+      expect(producer.signal?.aborted).toBe(true);
+      expect(outcome.stopped).toBe(false);
+      expect(outcome.cleanupErrors.map(entry => entry.code)).toContain('stop_unconfirmed');
+      expect(witnesses).toContainEqual({ type: 'output_limit_stop', stopped: false, streamFailed: false, aborted: true });
+      expect((await adapter.close()).closed).toBe(false);
+    } finally {
+      producer.release();
+      await waitFor(async () => (await adapter.close()).closed);
+      producer.restore();
+    }
   });
 
   it('[F-network-failure] classifies a transport failure before any response as a network error', async () => {
@@ -244,26 +256,19 @@ describe('PiProviderAdapter', () => {
   it('[F-output-limit-clock] keeps the stop grace bounded when the wall clock moves backward', async () => {
     const originalDateNow = Date.now;
     let wallClockShift = 0;
-    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
     let guard: ReturnType<typeof setTimeout> | undefined;
     let pending: Promise<NativeOutcome> | undefined;
-    const adapter = new PiProviderAdapter({ runtimeApiKey: 'SYNTHETIC_ONLY', fetch: async (_request, init) => {
-      const encoded = new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ index: 0,
-        delta: { content: 'x'.repeat(256 * 1024 + 1) }, finish_reason: null }] })}\n\n`);
-      return new Response(new ReadableStream<Uint8Array>({ start(controller) {
-        bodyController = controller;
-        controller.enqueue(encoded);
-        init?.signal?.addEventListener('abort', () => { wallClockShift = -60_000; }, { once: true });
-      } }), { headers: { 'content-type': 'text/event-stream' } });
-    } });
+    const producer = stalledNativeOutput('x'.repeat(256 * 1024 + 1), () => { wallClockShift = -60_000; });
+    const adapter = new PiProviderAdapter({ runtimeApiKey: 'SYNTHETIC_ONLY' });
+    const control = new AbortController();
     try {
       Date.now = () => originalDateNow() + wallClockShift;
       const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 25 }, new AbortController().signal);
       if (!prepared.ok) throw new Error(prepared.error.code);
-      pending = prepared.data.execute(input, new AbortController().signal, () => undefined);
+      pending = prepared.data.execute(input, control.signal, () => undefined);
       const result = await Promise.race([
-        pending.then((outcome) => ({ kind: 'outcome' as const, outcome })),
-        new Promise<{ kind: 'guard' }>((resolve) => { guard = setTimeout(() => resolve({ kind: 'guard' }), 1_000); }),
+        pending.then(outcome => ({ kind: 'outcome' as const, outcome })),
+        new Promise<{ kind: 'guard' }>(resolve => { guard = setTimeout(() => resolve({ kind: 'guard' }), 1_000); }),
       ]);
       expect(wallClockShift).toBe(-60_000);
       expect(result.kind).toBe('outcome');
@@ -275,26 +280,34 @@ describe('PiProviderAdapter', () => {
     } finally {
       if (guard !== undefined) clearTimeout(guard);
       Date.now = originalDateNow;
-      bodyController?.close();
+      control.abort(); producer.release();
       await pending;
-      await adapter.close();
+      await waitFor(async () => (await adapter.close()).closed);
+      producer.restore();
     }
   });
 
   it('[F-auth-source-change] does not turn credentials removed after prepare into success', async () => {
+    const previous = process.env.DEEPSEEK_API_KEY;
     const credentials = new InMemoryCredentialStore();
     await credentials.modify('deepseek', async () => ({ type: 'api_key', key: 'FLOWMATE_SYNTHETIC_KEY' }));
     const fetch = mock<FetchLike>(async () => new Response('unexpected', { status: 200 }));
     const adapter = new PiProviderAdapter({ credentials, fetch });
-    const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 5_000 }, new AbortController().signal);
-    expect(prepared.ok).toBe(true);
-    if (!prepared.ok) return;
-
-    await credentials.delete('deepseek');
-    const outcome = await prepared.data.execute(input, new AbortController().signal, () => undefined);
-
-    expect(outcome.error).not.toBeNull();
-    expect(outcome.text).not.toContain('FLOWMATE_SYNTHETIC_KEY');
-    expect(outcome.stopReason).not.toBe('stop');
+    try {
+      const prepared = await adapter.prepare(config, { timeoutMs: 10_000, stopGraceMs: 5_000 }, new AbortController().signal);
+      expect(prepared.ok).toBe(true);
+      if (!prepared.ok) return;
+      await credentials.delete('deepseek');
+      process.env.DEEPSEEK_API_KEY = 'SYNTHETIC_AMBIENT_NOT_AUTHORIZED';
+      const outcome = await prepared.data.execute(input, new AbortController().signal, () => undefined);
+      expect(outcome.error).not.toBeNull();
+      expect(outcome.text).not.toContain('FLOWMATE_SYNTHETIC_KEY');
+      expect(outcome.stopReason).not.toBe('stop');
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = previous;
+      await adapter.close();
+    }
   });
 });

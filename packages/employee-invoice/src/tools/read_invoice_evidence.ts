@@ -1,11 +1,10 @@
 import { invoiceToolSchemas } from '@flowmate/contracts';
 import type { InvoiceToolInput, InvoiceToolOutput, ToolDefinition } from '@flowmate/contracts';
-import type { DocumentService } from '@flowmate/data';
 import { appError } from '@flowmate/contracts';
-import { unwrap } from './definition.ts';
+import { unwrap, type InvoiceDocumentReader } from './definition.ts';
 import { sourceFor } from './source.ts';
 
-export const readInvoiceEvidence = (documents: DocumentService) => ({
+export const readInvoiceEvidence = (documents: InvoiceDocumentReader) => ({
   name: 'read_invoice_evidence',
   version: '1',
   label: 'Read evidence',
@@ -20,7 +19,7 @@ export const readInvoiceEvidence = (documents: DocumentService) => ({
     if (input.kind !== 'parsed' || typeof input.blockId !== 'string') {
       throw appError('tool_invalid_input', 'input', 'An evidence block is required.');
     }
-    const loaded = unwrap(documents.readParsedForRun(input.documentId, context));
+    const loaded = unwrap(await documents.readParsedForRun(input.documentId, context));
     const page = loaded.parsed.pages.find((item) => item.page === input.page);
     const block = page?.blocks.find((item) => item.id === input.blockId);
     if (!page || !block) throw appError('tool_invalid_input', 'input', 'The parsed evidence reference does not exist.');

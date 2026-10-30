@@ -8,8 +8,8 @@ it('lists installed Pi providers and their model limits without network access',
   const catalog = await createPiModelCatalog();
   const providers = await catalog.list();
   const deepseek = providers.find((provider) => provider.id === 'deepseek');
-  expect(deepseek?.models.some((model) => model.id === 'deepseek-v4-flash' && model.maxTokens > 0)).toBe(true);
-  expect(deepseek?.models.find((model) => model.id === 'deepseek-v4-flash')?.endpoint).toBe('https://api.deepseek.com/');
+  expect(deepseek?.models.some((model) => model.id === 'deepseek-flash' && model.maxTokens > 0)).toBe(true);
+  expect(deepseek?.models.find((model) => model.id === 'deepseek-flash')?.endpoint).toBe('https://api.deepseek.com/');
   expect(safeUrl('https://user:secret@example.com/v1?token=secret#private')).toBe('https://example.com/v1');
   expect(safeUrl('not-a-url')).toBeNull();
   expect(deepseek?.authMethods).toContain('api_key');

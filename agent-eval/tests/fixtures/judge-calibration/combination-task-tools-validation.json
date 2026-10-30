@@ -1,0 +1,102 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "parsePolicy": "metric-json-fence-strict-counts/v1",
+  "id": "combination-task-tools-validation",
+  "instanceId": "combination-task-tools-validation-instance",
+  "sourceGroup": "combination-task-tools-validation",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic combined-metric engineering reference; labels derive from the declared goal, contract and original observations. No evaluated Agent output or human approval is claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "clarification-decision",
+        "version": "v1",
+        "unit": "决策点",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one clarification-decision opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      },
+      {
+        "metricId": "tool-arguments",
+        "version": "v1",
+        "unit": "请求",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one tool-arguments opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      },
+      {
+        "metricId": "diagnostic-partial-failure-explanation",
+        "version": "v1",
+        "unit": "披露机会",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one diagnostic-partial-failure-explanation opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "independentScenario": "combination-task-tools-validation",
+    "userGoal": "Read supplied invoice 77 and disclose any unresolved extraction failure.",
+    "providedDocuments": [
+      77
+    ],
+    "observedRequest": {
+      "documentId": 77
+    },
+    "toolResult": "read failed: unsupported document format",
+    "observedAnswer": "I attempted to read invoice 77, but its unsupported format prevented extraction. Please provide a readable copy; extraction is incomplete."
+  },
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"clarification-decision\",\"counts\":{\"numerator\":1,\"denominator\":1,\"unassessable\":0},\"failures\":[]},{\"metricId\":\"tool-arguments\",\"counts\":{\"numerator\":1,\"denominator\":1,\"unassessable\":0},\"failures\":[]},{\"metricId\":\"diagnostic-partial-failure-explanation\",\"counts\":{\"numerator\":1,\"denominator\":1,\"unassessable\":0},\"failures\":[]}]}",
+  "references": [
+    {
+      "metricId": "clarification-decision",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "Original observations satisfy the independent criterion."
+    },
+    {
+      "metricId": "tool-arguments",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "Original observations satisfy the independent criterion."
+    },
+    {
+      "metricId": "diagnostic-partial-failure-explanation",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "Original observations satisfy the independent criterion."
+    }
+  ]
+}

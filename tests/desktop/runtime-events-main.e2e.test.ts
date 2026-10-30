@@ -120,7 +120,9 @@ async function fixture() {
     if (!paths.ok) throw new Error(paths.error.code);
     const opened = openDatabase(paths.data); if (!opened.ok) throw new Error(opened.error.code);
     const at = '2026-10-03T00:00:00.000Z';
-    const created = opened.data.runs.create({ goal: 'Main observation fixture',
+    try {
+    const runId = await opened.data.transaction(scope => {
+    const created = scope.runs.create({ goal: 'Main observation fixture',
       input: { version: 1, goal: 'Main observation fixture', text: 'No model execution', messageTimestamp: Date.parse(at) },
       config: { version: 1, name: 'Offline fixture', revision: 1,
         requestedModel: { provider: 'fixture', model: 'offline' }, resolvedModel: { provider: 'fixture', model: 'offline' },
@@ -131,16 +133,18 @@ async function fixture() {
         attemptsComplete: false, costSource: null, updatedAt: at },
       cleanup: { version: 1, stopped: false, stopReason: null, lateObservationRequired: false, errors: [] }, createdAt: at });
     if (!created.ok) throw new Error(created.error.code);
-    const saved = opened.data.runs.get(created.data); if (!saved.ok) throw new Error(saved.error.code);
+    const saved = scope.runs.get(created.data); if (!saved.ok) throw new Error(saved.error.code);
     const endedAt = '2026-10-03T00:00:01.000Z';
-    const finished = opened.data.runs.finish(created.data, { status: 'failed', output: null,
+    const finished = scope.runs.finish(created.data, { status: 'failed', output: null,
       error: { code: 'fixture_not_executed', category: 'provider', message: 'Offline observation fixture.', retryable: false },
       usage: saved.data.usage, tokens: saved.data.tokens,
       cleanup: { version: 1, stopped: true, stopReason: 'not-executed', lateObservationRequired: false, errors: [] },
       endedAt, stoppedAt: endedAt, durationMs: null });
     if (!finished.ok || !finished.data) throw new Error('Offline fixture terminal was not committed.');
-    opened.data.close();
-    console.log(JSON.stringify({ runId: created.data }));
+    return created.data;
+    });
+    console.log(JSON.stringify({ runId }));
+    } finally { await opened.data.close(); }
   `], { cwd: repository, env: cleanEnvironment(), windowsHide: true, encoding: 'utf8' });
   expect(seeded.status, seeded.stderr).toBe(0);
   const { runId } = JSON.parse(seeded.stdout.trim()) as { runId: number };

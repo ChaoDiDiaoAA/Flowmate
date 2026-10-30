@@ -4,7 +4,7 @@
 
 ## 准备开发环境
 
-使用 Windows x64、Bun **1.4.0**、Node.js **24** 与 Git。依赖版本由 [package.json](../../package.json) 和 [bun.lock](../../bun.lock) 固定，保留两份[必要补丁](development.zh-CN.md#dependency-patches)。模型操作需要服务地址与凭据，浏览界面和运行工程夹具不需要真实模型。
+使用 Windows x64、Bun **1.4.4**、Node.js **24** 与 Git。当前工程基线为 Pi SDK **1.4.0**、数据 schema **21**。依赖版本由 [package.json](../../package.json) 和 [bun.lock](../../bun.lock) 固定，保留[必要补丁](development.zh-CN.md#dependency-patches)。模型操作需要服务地址与凭据，浏览界面和运行工程夹具不需要真实模型。
 
 在仓库根目录执行：
 
@@ -37,9 +37,18 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 3. 在对话主区点击 **Send**，观察 Run 和回复；需要时点击 **Stop**，等待实际停止事实。
 4. 从左侧最近会话或 **Chats** 打开已有会话，回到对话主区查看保存历史；查看不会再次请求模型。
 
-在业务和设置页面，对话显示为右侧 Assistant。切换布局、收起并重新展开侧栏，会在当前窗口内保留当前 Session 草稿。发票和研究流程分别从 **Invoices**、**Deep Research** 进入，布局规则见 [UI 系统](UI-SYSTEM.zh-CN.md)。
+在原有发票、研究和设置页面，对话显示为右侧 Assistant。切换布局、收起并重新展开侧栏，会在当前窗口内保留当前 Session 草稿。**Chats**、**Invoices**、**Deep Research** 保持 AgentSession 流程，布局规则见 [UI 系统](UI-SYSTEM.zh-CN.md)；独立 **Personal Agent** 入口使用 Pi Durable 处理持续发票事项。
 
 处理本地文件前，选择预期工作目录或授权资料，并在请求中说明范围。可用原生工具可能包含写文件和执行 Shell；目录选择只确定工作位置，不是文件系统沙箱。
+
+## 在 Personal Agent 创建持续发票事项
+
+1. 从左侧导航打开 **Personal Agent**，先确认并保存其模型、工具与资源配置，再固定选择一组已有解析的发票，填写目标并明确提交，创建持久发票事项。创建入口仅在 Personal Agent；**Invoices** 保持单票选择与编辑。
+2. 查看事项概览、逐票 Todo、候选和来源证据，为对应票据补料，或沿复核动作回到 **Invoices**。
+3. 阅读操作回执，区分资料保存、执行授权受理、原尝试或新尝试、排队与受阻。原尝试正常完成后的有效补料可以自动继续符合条件的工作；用户停止或失败后的补料仅保存，须明确继续。
+4. 逐票明确最终处置为 `accepted`、`rejected` 或 `excluded`。普通 **Reject** 只拒绝候选，不结束该票处理；有候选或 Run 成功均不单独代表事项完成。
+
+查看页面/历史与桌面重连仅纯读，不发起模型或工具调用，也不触发后端恢复。后端启动恢复另行加载原持久事实和原生记录，核已保存授权及当前资格后恢复符合条件的原尝试；不因事项仍 `open` 产生新意图，不复活已停止或失败的尝试。本次工程交付覆盖应用运行期间已验证的行为；关闭桌面后执行、Windows 服务重启恢复与开机恢复仍属系统服务目标，真实 SCM 验收延期。继续和复核的细节见 [Personal Agent 流程](workflows.zh-CN.md#personal-agent)。
 
 ## 按需启用能力
 
@@ -55,7 +64,7 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 
 ## 后续流程与常见问题
 
-研究与发票操作见[业务流程](workflows.zh-CN.md)。研究读取选定本地文本、Markdown 或已登记解析资料；发票流程需要原件与外部准备的解析材料，应用不生成解析。
+研究、单票复核与 Personal Agent 持续事项见[业务流程](workflows.zh-CN.md)。研究读取选定本地文本、Markdown 或已登记解析资料；发票流程需要原件与外部准备的解析材料，应用不生成解析。
 
 | 现象 | 优先检查 |
 |---|---|
@@ -65,4 +74,4 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 | 没有子任务 | 扩展启用、角色可用、实际 Agent 调用及剩余预算 |
 | 历史会话不能继续 | 保存历史或资料权限可能不可用；新 Run 前查看诊断 |
 
-默认 Windows 数据根为 `%APPDATA%\Flowmate`，SQLite 位于 `data\app.sqlite`。模型请求会向选定服务发送相应内容，可能收费。Test connection、Optimize、Send、Fill with Agent、研究规划与执行可能请求模型；打开页面、保存设置不会自动请求。
+默认 Windows 数据根为 `%APPDATA%\Flowmate`，SQLite 位于 `data\app.sqlite`。模型请求会向选定服务发送相应内容，可能收费。Test connection、Optimize、Send、Fill with Agent、研究规划与执行、获准的 Personal Agent 执行可能请求模型；打开页面、保存设置不会自动请求。

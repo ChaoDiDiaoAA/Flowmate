@@ -31,11 +31,11 @@ export async function createSdkProbe(): Promise<SdkProbe> {
 
   return {
     runtime,
-    model: runtime.getModel('deepseek', 'deepseek-v4-flash'),
+    model: runtime.getModel('deepseek', 'deepseek-flash'),
     missingModel: runtime.getModel('deepseek', 'flowmate-p1-intentionally-absent-model'),
     error: runtime.getError(),
     networkEnabled: false,
-    // ModelRuntime 0.85.1 has no public dispose method. The probe owns no
+    // ModelRuntime 1.4.0 has no public dispose method. The probe owns no
     // socket or file store, so this is an explicit no-op rather than a fake
     // native close operation.
     close: async () => undefined,

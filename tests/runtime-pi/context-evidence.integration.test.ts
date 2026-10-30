@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
-import type { AssistantMessage, Context, Model } from '@earendil-works/pi-ai';
+import { Type, type AssistantMessage, type Context, type Model } from '@earendil-works/pi-ai';
 import { streamSimple } from '@earendil-works/pi-ai/api/anthropic-messages';
+import { normalizeContext } from '@earendil-works/pi-ai/utils/transcript';
 import { checkPayload, checkResourcePayload, checkResourceWire, checkWire, preparePayloadCodec,
   type ResourcePayloadText } from '../../packages/runtime-pi/src/context-evidence.ts';
 import type { Result } from '@flowmate/contracts';
@@ -14,17 +15,17 @@ const assistant = (ids: string[]): AssistantMessage => ({ role: 'assistant', api
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
 
-async function sample(context: Context, resources: ResourcePayloadText[] = []) {
-  const codec = need(preparePayloadCodec(model.api, context, true));
+async function sample(context: Context, resources: ResourcePayloadText[] = [], requestModel = model) {
+  const codec = need(preparePayloadCodec(requestModel.api, context, true));
   let payload: unknown, wire: Awaited<ReturnType<typeof checkWire>> | undefined;
   let resourceWire: Awaited<ReturnType<typeof checkResourceWire>> | undefined;
-  const result = await streamSimple(model, context, { apiKey: 'synthetic-codec-key', maxRetries: 0,
+  const result = await streamSimple(requestModel, normalizeContext(context), { apiKey: 'synthetic-codec-key', maxRetries: 0,
     onPayload: outgoing => { payload = structuredClone(outgoing); },
     fetch: Object.assign(async (request: RequestInfo | URL, init?: RequestInit) => {
       wire = await checkWire(codec, request, init);
-      resourceWire = await checkResourceWire(model.api, request, init, resources);
+      resourceWire = await checkResourceWire(requestModel.api, request, init, resources);
       const events = [{ type: 'message_start', message: { id: 'offline-response', type: 'message', role: 'assistant', content: [],
-        model: model.id, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } },
+        model: requestModel.id, stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } },
       { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } },
       { type: 'message_stop' }];
       return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),
@@ -33,6 +34,24 @@ async function sample(context: Context, resources: ResourcePayloadText[] = []) {
   expect(result.stopReason).toBe('stop');
   return { codec, payload: payload as { messages: Array<{ role: string; content: any }> }, wire, resourceWire };
 }
+
+test('Anthropic native system updates retain resource proof beside tool additions and removals', async () => {
+  const context: Context = { messages: [
+    { role: 'system', content: 'Initial policy.', toolsAdded: [{ name: 'read_a', description: 'Old scoped reader.', parameters: Type.Object({}) }], timestamp: 0 },
+    { role: 'user', content: 'Review this invoice.', timestamp: 1 },
+    { role: 'system', content: 'REVISED_SCOPED_POLICY', toolsRemoved: [{ name: 'read_a' }],
+      toolsAdded: [{ name: 'read_b', description: 'Current scoped reader.', parameters: Type.Object({}) }], timestamp: 2 },
+  ] };
+  const resources: ResourcePayloadText[] = [{ role: 'system', text: 'REVISED_SCOPED_POLICY' }];
+  const { codec, payload, wire, resourceWire } = await sample(context, resources, { ...model,
+    compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true } });
+  expect(payload.messages.some(message => message.role === 'system' && Array.isArray(message.content)
+    && message.content.some(block => block.type === 'tool_addition'))).toBe(true);
+  expect(need(checkPayload(codec, payload)).inclusion).toBe('confirmed');
+  expect(need(wire!).inclusion).toBe('confirmed');
+  expect(checkResourcePayload(model.api, payload, resources)).toEqual([{ inclusion: 'confirmed', reason: null }]);
+  expect(resourceWire).toEqual([{ inclusion: 'confirmed', reason: null }]);
+});
 
 test('Anthropic SDK payload and wire preserve user text blocks, order and surrogate normalization', async () => {
   const context: Context = { messages: [{ role: 'user', timestamp: 1,
@@ -123,8 +142,9 @@ test('unobservable Anthropic resource blocks and opaque wire bodies remain unkno
 });
 
 test('unsupported deferred tool references stay unavailable and cannot bypass image checks', () => {
-  const context: Context = { messages: [assistant(['read-call']), { role: 'toolResult', toolCallId: 'read-call', toolName: 'read',
-    timestamp: 3, isError: false, addedToolNames: ['read'], content: [{ type: 'text', text: 'Deferred result' }] }] };
+  const legacyResult = { role: 'toolResult' as const, toolCallId: 'read-call', toolName: 'read',
+    timestamp: 3, isError: false, addedToolNames: ['read'], content: [{ type: 'text' as const, text: 'Deferred result' }] };
+  const context: Context = { messages: [assistant(['read-call']), legacyResult] };
   const codec = need(preparePayloadCodec(model.api, context, true));
   expect(need(checkPayload(codec, {}))).toEqual({ inclusion: 'unavailable', reason: 'payload_codec_unavailable' });
   context.messages.push({ role: 'user', timestamp: 4, content: [{ type: 'image', mimeType: 'image/png', data: 'IMAGE' }] });

@@ -1,0 +1,85 @@
+{
+  "contract": "flowmate-judge-reference/v1",
+  "parsePolicy": "metric-json-fence-strict-counts/v1",
+  "id": "combination-memory-validation",
+  "instanceId": "combination-memory-validation-instance",
+  "sourceGroup": "combination-memory-validation",
+  "partition": "validation",
+  "authority": {
+    "kind": "agent-authored",
+    "author": "Codex",
+    "basis": "Independent synthetic combined-metric engineering reference; labels derive from the declared goal, contract and original observations. No evaluated Agent output or human approval is claimed."
+  },
+  "plan": {
+    "contract": "flowmate-semantic-plan/v1",
+    "criteria": [
+      {
+        "metricId": "history-use",
+        "version": "v1",
+        "unit": "要求点",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one history-use opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      },
+      {
+        "metricId": "compaction-retention",
+        "version": "v1",
+        "unit": "事实与来源点",
+        "denominator": 1,
+        "required": true,
+        "rule": "Use the independent goal, contract, original observations and outcome to judge this one compaction-retention opportunity.",
+        "evidence": [
+          "independentScenario"
+        ],
+        "trigger": "started"
+      }
+    ]
+  },
+  "evidence": {
+    "independentScenario": "combination-memory-validation",
+    "history": [
+      {
+        "user": "Use the revised account S-17 for this invoice."
+      }
+    ],
+    "independentRequiredFacts": [
+      "account S-17"
+    ],
+    "nativeCompaction": {
+      "observed": true,
+      "retained": "Use revised account S-17."
+    },
+    "postCompactionAction": {
+      "account": "S-17"
+    }
+  },
+  "referenceWire": "{\"v\":1,\"results\":[{\"metricId\":\"history-use\",\"counts\":{\"numerator\":1,\"denominator\":1,\"unassessable\":0},\"failures\":[]},{\"metricId\":\"compaction-retention\",\"counts\":{\"numerator\":1,\"denominator\":1,\"unassessable\":0},\"failures\":[]}]}",
+  "references": [
+    {
+      "metricId": "history-use",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "Original observations satisfy the independent criterion."
+    },
+    {
+      "metricId": "compaction-retention",
+      "counts": [
+        1,
+        1,
+        0
+      ],
+      "severeError": false,
+      "citationSupport": null,
+      "reason": "Original observations satisfy the independent criterion."
+    }
+  ]
+}

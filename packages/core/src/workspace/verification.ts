@@ -1,5 +1,6 @@
 import { appError, fail, ok, invoiceHeaderFields, invoiceLineFields } from '@flowmate/contracts';
 import type { DocumentRef, Result, WorkspaceInput, WorkspaceMaterialInspection, WorkspaceSelection } from '@flowmate/contracts';
+import type { SqlDatabaseStore } from '../storage/database.ts';
 
 export type WorkspaceVerificationInput = {
   documentRef: DocumentRef | null;
@@ -9,16 +10,16 @@ export type WorkspaceVerificationInput = {
   selection: WorkspaceSelection | null;
 };
 export type WorkspaceVerification = { invalidReferences: readonly string[]; material: WorkspaceMaterialInspection | null };
-export type WorkspaceVerifier = (input: WorkspaceVerificationInput) => Result<WorkspaceVerification>;
+export type WorkspaceVerifier = (input: WorkspaceVerificationInput, store?: Pick<SqlDatabaseStore, 'documents' | 'contents'>) => Result<WorkspaceVerification>;
 
 export function createWorkspaceVerifier(options: {
-  inspectMaterial(ref: DocumentRef): Result<WorkspaceMaterialInspection>;
+  inspectMaterial(ref: DocumentRef, store?: Pick<SqlDatabaseStore, 'documents' | 'contents'>): Result<WorkspaceMaterialInspection>;
 }): WorkspaceVerifier {
-  return input => {
+  return (input, store) => {
     let material: WorkspaceMaterialInspection | null = null;
     const invalidReferences: string[] = [];
     if (input.documentRef !== null) {
-      const inspected = options.inspectMaterial(input.documentRef);
+      const inspected = options.inspectMaterial(input.documentRef, store);
       if (!inspected.ok) return inspected;
       material = inspected.data;
       if (material.kind === 'invalid') invalidReferences.push(material.reason);

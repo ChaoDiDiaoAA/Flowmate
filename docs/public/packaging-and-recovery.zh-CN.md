@@ -4,7 +4,7 @@
 
 ## 构建 Windows 安装包
 
-安装目标为 **Windows x64**，使用 Bun **1.4.0** 与锁定依赖。脚本检查 Pi 0.85.1、pi-subagents 0.19.0、Electron 44.4.5、迁移、原生工具及必需资源。
+安装目标为 **Windows x64**，使用 Bun **1.4.4** 与锁定依赖。脚本检查 Pi SDK 1.4.0、pi-subagents 0.19.0、Electron 44.4.5、schema 21 迁移、原生工具及必需资源。
 
 ```powershell
 bun install --frozen-lockfile
@@ -15,7 +15,9 @@ bun --no-env-file run package:win
 
 脚本构建桌面，在 `out/package-stage/` 准备运行资源，electron-builder 输出至 `out/package/` 并关闭发布。NSIS 按用户安装，允许选择目录，安装后不自动运行，卸载不删除应用数据。
 
-运行资源包含 Bun、Host/评测/维护入口、Pi 资源、迁移、作者资源、必需原生文件和许可。`release.json` 保存显式版本与文件清单，安装验证核对实际清单和版本，不回退开发源码或 PATH Bun。必要补丁和许可继续保留，见[开发指南](development.zh-CN.md#dependency-patches)。
+运行资源包含 Bun、Host/评测/维护入口、ServiceOwner/服务管理入口、WinSW、两套 Pi 运行路径、迁移、作者资源、必需原生文件和许可。`release.json` 保存显式版本与文件清单，安装验证核对实际清单和版本，不回退开发源码或 PATH Bun。必要补丁和许可继续保留，见[开发指南](development.zh-CN.md#dependency-patches)。
+
+当前工程交付保留已有 `out/package/win-unpacked` 目录包及其 `resources/flowmate-runtime/release.json`，本次文稿收口不重新构建。当前交付边界为应用运行期间的执行、已提交事实和合法恢复；真实 SCM 安装/启动、开机、升级/回退及关闭桌面后持续运行统一延期验收。
 
 ## 数据与诊断
 
@@ -23,11 +25,13 @@ bun --no-env-file run package:win
 
 | 相对位置 | 用途 |
 |---|---|
-| `data/app.sqlite` | Session、Run、输入、Context 和业务事实 |
+| `data/app.sqlite` | 同一协调 owner 下的 Session、Run、输入、Context、发票事项与 Durable 原生记录 |
 | `data/settings.json`、`data/installed-release.json` | 设置与安装发行记录 |
+| `service-installation.json` | 服务安装与明确启用选择 |
 | `artifacts/`、`outputs/` | 受管资料和交付文件 |
 | `runtime/resource-bundles/`、`runtime/subagents/` | 原 Run 资源与用户角色 |
 | `security/credentials/`、`Local State` | 加密凭据封装与 Electron 密钥材料 |
+| `security/service-credentials/` | CurrentUser DPAPI 服务凭据与分阶段操作收据 |
 | `imports/invoices/` | 安装版发票导入来源 |
 | `evaluation/agent-eval/runs/` | 安装版本地评测结果 |
 | `logs/` | 运行诊断 |
@@ -38,7 +42,7 @@ Models/Settings 诊断检查 Provider/Runtime，Activity 查看实际事件和�
 
 ## 离线备份
 
-关闭 Flowmate 和目标根的其他控制者。维护工具取得控制者租约，检查存储、Checkpoint 数据库并验证复制文件。目标是绝对新目录且父目录已存在，只复制活跃 SQLite 文件不能保证 WAL 和关联文件一致。
+关闭 Flowmate，并确认目标根上的 ServiceOwner 或其他控制者已停止；不能只凭桌面窗口关闭判断控制者已退出。维护工具取得控制者租约，检查存储、Checkpoint 数据库并验证复制文件。目标是绝对新目录且父目录已存在，只复制活跃 SQLite 文件不能保证 WAL 和关联文件一致。
 
 以下为**安装版运行环境**模板，占位符需替换为实际绝对位置，不使用开发源码入口：
 
@@ -49,7 +53,7 @@ $backup = '<absolute new backup directory>'
 & (Join-Path $runtime 'bin\bun.exe') --no-env-file (Join-Path $runtime 'apps\maintenance.js') backup --user-data-root $userData --destination $backup
 ```
 
-检查 JSON `result`、`leaseRelease`、退出状态与 `gaps`。Manifest 列出复制路径和字节数，保留选定持久数据、加密凭据与 Local State，不镜像整个根。日志、`.env` 密钥、外部来源目录和外部评测数据集不在完整备份承诺内，必要外部材料另存。
+检查 JSON `result`、`leaseRelease`、退出状态与 `gaps`。Manifest 列出复制路径和字节数，保留选定持久数据、服务安装选择、加密凭据、分阶段服务凭据收据与 Local State，不镜像整个根。日志、`.env` 密钥、外部来源目录和外部评测数据集不在完整备份承诺内，必要外部材料另存。
 
 凭据仍依赖 Windows 账户和系统加密环境，加密封装与 Local State 不保证跨账户、跨机器恢复。
 
@@ -68,7 +72,7 @@ $restoredRoot = '<absolute restored user-data directory>'
 
 4. 核对可读性、兼容性及缺口。`runtimeValidation: pending` 表示文件和引用检查尚未验证实时执行；目标账户检查凭据访问，恢复存储获准使用后再显式启动一个安全新 Run。
 
-校验器将恢复持久文件集合、内容、引用与 Manifest 核对，并检查 Schema/设置兼容；不复制文件、重放旧调用、修复历史缺口、证明模型连接或认证业务质量。安装发行变化时，在打开、迁移状态前先备份；失败保留原数据，不宣称恢复成功。
+校验器将恢复持久文件集合、内容、引用与 Manifest 核对，并检查 Schema/设置兼容。已启用的服务选择必须具有原 SQLite，缺失时拒绝而非新建空库。校验不复制文件、重放旧调用、修复历史缺口、证明模型连接或认证业务质量。安装发行变化时，在打开、迁移状态前先备份；失败保留原数据，不宣称恢复成功。
 
 ## 源码与验证
 

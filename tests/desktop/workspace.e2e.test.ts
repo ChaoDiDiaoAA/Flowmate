@@ -21,7 +21,7 @@ it('P7 Workspace remains in shared navigation and preserves a null saved chat', 
     app = await electron.launch({ args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
     const page = await app.firstWindow();
     await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
-    await expect(page.locator('.rail .nav-item')).toHaveCount(12, { timeout: 3000 });
+    await expect(page.locator('.rail .nav-item')).toHaveCount(13, { timeout: 3000 });
     await page.getByRole('navigation', { name: 'Workspace navigation' }).getByRole('button', { name: 'Workspace', exact: true }).click();
     await expect(page.getByTestId('workspace-page')).toBeVisible();
     await expect(page.getByTestId('workspace-summary')).toContainText('No invoice selected');
@@ -170,21 +170,21 @@ async function fixture(sparse = false, failCleanup = false, secondDocument = fal
     { page: sparse ? 5 : 2, blocks: [{ id: 'b53', kind: 'text', text: 'Second page source', sourceIndex: 0, sourceType: 'controlled', bbox: null }] }],
     completeness: { status: 'complete', checks: [], warnings: [] } };
   const seed = spawnSync(process.env.FLOWMATE_BUN_EXECUTABLE || 'bun', ['--no-env-file', '-e', `
-    import { openDatabase, createFileStore } from '@flowmate/core';
+    import { createFileStore, openDatabase } from '@flowmate/core';
     import { resolveProductPaths } from '@flowmate/shared';
     const input = JSON.parse(await Bun.stdin.text()); const paths = resolveProductPaths(input.root);
     if (!paths.ok) throw new Error(paths.error.code);
     const opened = openDatabase(paths.data); if (!opened.ok) throw new Error(opened.error.code);
     try {
       const at = '2026-10-03T00:00:00.000Z';
-      const files = createFileStore(paths.data, opened.data.documents);
+      const files = createFileStore(paths.data, opened.data);
       const published = await files.publish({ sourceKey:'voxel51-hq-invoice-ocr',sourceRecordId:'p7-controlled',sourceVersion:input.version,at,
         original:{kind:'original',primaryName:'original.png',files:[{name:'original.png',bytes:Buffer.from(input.png,'base64'),mimeType:'image/png'}]},
         parsed:{kind:'parsed',primaryName:'parsed.json',files:[{name:'parsed.json',bytes:Buffer.from(JSON.stringify(input.parsed)),mimeType:'application/json'}]} });
       if (!published.ok) throw new Error(published.error.code);
-      const result = opened.data.documents.register({documentId:published.data.documentId,sourceKey:'voxel51-hq-invoice-ocr',sourceRecordId:'p7-controlled',version:input.version,
+      const result = await opened.data.transaction(scope => scope.documents.register({documentId:published.data.documentId,sourceKey:'voxel51-hq-invoice-ocr',sourceRecordId:'p7-controlled',version:input.version,
         originalArtifact:published.data.original,parsedArtifact:published.data.parsed,status:'available',
-        metadata:{version:2,sampleId:'000001',pageCount:input.parsed.pages.length,warnings:[],allowedUsesClaim:['local review'],licenseVerification:'not_verified',unavailableReason:null},createdAt:at,updatedAt:at});
+        metadata:{version:2,sampleId:'000001',pageCount:input.parsed.pages.length,warnings:[],allowedUsesClaim:['local review'],licenseVerification:'not_verified',unavailableReason:null},createdAt:at,updatedAt:at}));
       if (!result.ok) throw new Error(result.error.code);
       if (input.secondDocument) {
         const secondParsed = {formatVersion:2,pages:[{page:1,blocks:[{id:'b1',kind:'text',text:'Hidden invoice B source',sourceIndex:0,sourceType:'controlled',bbox:null}]}],completeness:{status:'complete',checks:[],warnings:[]}};
@@ -192,12 +192,12 @@ async function fixture(sparse = false, failCleanup = false, secondDocument = fal
           original:{kind:'original',primaryName:'original.png',files:[{name:'original.png',bytes:Buffer.from(input.png,'base64'),mimeType:'image/png'}]},
           parsed:{kind:'parsed',primaryName:'parsed.json',files:[{name:'parsed.json',bytes:Buffer.from(JSON.stringify(secondParsed)),mimeType:'application/json'}]} });
         if (!second.ok) throw new Error(second.error.code);
-        const registered = opened.data.documents.register({documentId:second.data.documentId,sourceKey:'voxel51-hq-invoice-ocr',sourceRecordId:'p7-controlled-B',version:'p7-legacy-B',
-          originalArtifact:second.data.original,parsedArtifact:second.data.parsed,status:'available',metadata:{version:2,sampleId:'000002',pageCount:1,warnings:[],allowedUsesClaim:['local review'],licenseVerification:'not_verified',unavailableReason:null},createdAt:at,updatedAt:at});
+        const registered = await opened.data.transaction(scope => scope.documents.register({documentId:second.data.documentId,sourceKey:'voxel51-hq-invoice-ocr',sourceRecordId:'p7-controlled-B',version:'p7-legacy-B',
+          originalArtifact:second.data.original,parsedArtifact:second.data.parsed,status:'available',metadata:{version:2,sampleId:'000002',pageCount:1,warnings:[],allowedUsesClaim:['local review'],licenseVerification:'not_verified',unavailableReason:null},createdAt:at,updatedAt:at}));
         if (!registered.ok) throw new Error(registered.error.code);
       }
-      if (input.failCleanup) opened.data.db.exec("CREATE TRIGGER p7_fail_workspace BEFORE UPDATE ON workspace WHEN NEW.active_document_id IS NULL AND OLD.active_document_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'p7 controlled cleanup failure'); END");
-    } finally { opened.data.close(); }
+      if (input.failCleanup) await opened.data.transaction(scope => scope.db.exec("CREATE TRIGGER p7_fail_workspace BEFORE UPDATE ON workspace WHEN NEW.active_document_id IS NULL AND OLD.active_document_id IS NOT NULL BEGIN SELECT RAISE(ABORT,'p7 controlled cleanup failure'); END"));
+    } finally { await opened.data.close(); }
   `], { cwd: resolve(import.meta.dirname, '../..'), input: JSON.stringify({ root: userData, version, parsed, png: png.toString('base64'), failCleanup, secondDocument }),
     encoding: 'utf8', windowsHide: true });
   if (seed.status !== 0) throw new Error(`Managed fixture seed failed: ${seed.stderr}`);

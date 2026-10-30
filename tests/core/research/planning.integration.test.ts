@@ -31,7 +31,7 @@ it('plans through real SDK tools, releases occupancy, and confirms the exact ver
   } });
   deferCleanup(() => server.stop(true));
   const app = need(await createApplication({ paths, logger: { write: () => undefined, close: async () => undefined },
-    agentFactory: (tools, resourceContents) => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools, resourceContents,
+    agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }) }));
   deferCleanup(() => app.close());
   const session = need(await app.createSession({ title: 'Research planning' }));

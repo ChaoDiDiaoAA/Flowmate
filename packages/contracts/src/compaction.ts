@@ -136,7 +136,7 @@ export type RunCompactionEvidence = Readonly<Omit<z.infer<typeof RunCompactionEv
 
 export type NativeCompactionControl = {
   sessionId: DbId; operationId: string; signal: AbortSignal; remainingMs: () => number; maxModelCalls: number;
-  verifyUse: () => Result<void>; observe: (value: CompactionObservation) => void;
+  verifyUse: () => Result<void> | Promise<Result<void>>; observe: (value: CompactionObservation) => void;
 };
 export type NativeCompactionOutcome = {
   observation: CompactionObservation; stopped: boolean; cleanupErrors: readonly AppError[];

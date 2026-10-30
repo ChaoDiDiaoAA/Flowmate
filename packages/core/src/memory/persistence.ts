@@ -1,4 +1,5 @@
-import { SQLiteError, type Database } from 'bun:sqlite';
+import { SQLiteError } from 'bun:sqlite';
+import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import { appError, fail, ok, HistoryCommitInputSchema, HistoryCommitStateSchema, NativeSessionHistorySchema } from '@flowmate/contracts';
 import type { AppError, DbId, HistoryCommitInput, HistoryCommitReceipt, MemoryStore, StoredNativeHistory } from '@flowmate/contracts';
 import type { RuntimeEventStore } from '../events/store.ts';

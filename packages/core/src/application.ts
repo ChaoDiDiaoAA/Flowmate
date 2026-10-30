@@ -1,5 +1,9 @@
 import type { InputDefinitions } from './prompt-templates.ts';
-import { ResearchSessionRequestSchema, ResearchSessionResultSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema } from '@flowmate/contracts';
+import { parsePersonalAgentCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse,
+  personalAgentHostFailure, type PersonalAgentCommandType } from '../../contracts/src/personal-agent-commands.ts';
+import { PersonalTaskIdentitySchema, type PersonalAgentApi, type InvoiceWorksApi, type PersonalTasksApi } from '../../contracts/src/personal-agent.ts';
+import { ResearchSessionRequestSchema, ResearchSessionResultSchema, ResearchPageRequestSchema, ResearchEvidenceRequestSchema,
+  PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import {
   appError,
@@ -90,43 +94,83 @@ export interface RuntimeServicePort {
   ): Promise<Result<ProviderOutcome>>;
   start(request: NormalizedAgentRunRequest, control?: AgentControl): Promise<Result<RunAccepted>>;
   queryNativeTools?(): Result<readonly NativeToolAvailability[]>;
-  cancel(runId: DbId): Result<{ runId: DbId; accepted: boolean }>;
-  cancelSubagent?(request: import('@flowmate/contracts').CancelSubagentRequest): Result<import('@flowmate/contracts').SubagentCancelReceipt>;
+  cancel(runId: DbId): Result<{ runId: DbId; accepted: boolean }> | Promise<Result<{ runId: DbId; accepted: boolean }>>;
+  cancelSubagent?(request: import('@flowmate/contracts').CancelSubagentRequest): Result<import('@flowmate/contracts').SubagentCancelReceipt>
+    | Promise<Result<import('@flowmate/contracts').SubagentCancelReceipt>>;
   revokeDocumentUse(documentId: DbId): Promise<Result<{ affectedSessionIds: DbId[]; stopRequested: boolean }>>;
   state(): RuntimeState;
   close(): Promise<CloseReport>;
 }
 
-export type RunQueryPort = Pick<RunRepository, 'get'> & Partial<Pick<RunRepository, 'listBySession' | 'listSubagents' | 'querySubagent'>>;
+export type RunQueryPort = {
+  get(...input: Parameters<RunRepository['get']>): ReturnType<RunRepository['get']> | Promise<ReturnType<RunRepository['get']>>;
+  listBySession?: (...input: Parameters<RunRepository['listBySession']>) => ReturnType<RunRepository['listBySession']> | Promise<ReturnType<RunRepository['listBySession']>>;
+  listSubagents?: (...input: Parameters<RunRepository['listSubagents']>) => ReturnType<RunRepository['listSubagents']> | Promise<ReturnType<RunRepository['listSubagents']>>;
+  querySubagent?: (...input: Parameters<RunRepository['querySubagent']>) => ReturnType<RunRepository['querySubagent']> | Promise<ReturnType<RunRepository['querySubagent']>>;
+};
 
 export type DisposeResources = () => Promise<CloseReport>;
-type ProductApplicationOptions = {
-  research?: ResearchRepository;
-  queryResearchEvidence?: (input: import('zod').z.input<typeof import('@flowmate/contracts').ResearchEvidenceRequestSchema>) => Result<import('zod').z.infer<typeof import('@flowmate/contracts').ResearchEvidenceSchema>>;
-  exportResearchReport?: (input: import('zod').z.infer<typeof import('@flowmate/contracts').ResearchReportRequestSchema>) => Result<import('@flowmate/contracts').ResearchExport>;
-  importResearchMaterial?: (input: import('@flowmate/contracts').ImportResearchMaterialRequest) => Result<import('@flowmate/contracts').ResearchMaterial>;
+type ResourceService = ReturnType<typeof createResourceService>;
+type ResourceQueryPort = { [K in 'catalog' | 'readFile' | 'verifyFrozen' | 'readFrozenFile' | 'validateSelection']:
+  (...input: Parameters<ResourceService[K]>) => ReturnType<ResourceService[K]> | Promise<ReturnType<ResourceService[K]>> };
+export type ProductApplicationOptions = {
+  personal?: { agent: PersonalAgentApi; works: InvoiceWorksApi; tasks: PersonalTasksApi; close?: () => Promise<Result<void>> };
+  research?: {
+    listMaterials(...input: Parameters<ResearchRepository['listMaterials']>): ReturnType<ResearchRepository['listMaterials']> | Promise<ReturnType<ResearchRepository['listMaterials']>>;
+    create(...input: Parameters<ResearchRepository['create']>): ReturnType<ResearchRepository['create']> | Promise<ReturnType<ResearchRepository['create']>>;
+    get(...input: Parameters<ResearchRepository['get']>): ReturnType<ResearchRepository['get']> | Promise<ReturnType<ResearchRepository['get']>>;
+    forSession(...input: Parameters<ResearchRepository['forSession']>): ReturnType<ResearchRepository['forSession']> | Promise<ReturnType<ResearchRepository['forSession']>>;
+    list(...input: Parameters<ResearchRepository['list']>): ReturnType<ResearchRepository['list']> | Promise<ReturnType<ResearchRepository['list']>>;
+    getPlan(...input: Parameters<ResearchRepository['getPlan']>): ReturnType<ResearchRepository['getPlan']> | Promise<ReturnType<ResearchRepository['getPlan']>>;
+    getSource(...input: Parameters<ResearchRepository['getSource']>): ReturnType<ResearchRepository['getSource']> | Promise<ReturnType<ResearchRepository['getSource']>>;
+    getClaim(...input: Parameters<ResearchRepository['getClaim']>): ReturnType<ResearchRepository['getClaim']> | Promise<ReturnType<ResearchRepository['getClaim']>>;
+    getReport(...input: Parameters<ResearchRepository['getReport']>): ReturnType<ResearchRepository['getReport']> | Promise<ReturnType<ResearchRepository['getReport']>>;
+    listSources(...input: Parameters<ResearchRepository['listSources']>): ReturnType<ResearchRepository['listSources']> | Promise<ReturnType<ResearchRepository['listSources']>>;
+    listClaims(...input: Parameters<ResearchRepository['listClaims']>): ReturnType<ResearchRepository['listClaims']> | Promise<ReturnType<ResearchRepository['listClaims']>>;
+    listReports(...input: Parameters<ResearchRepository['listReports']>): ReturnType<ResearchRepository['listReports']> | Promise<ReturnType<ResearchRepository['listReports']>>;
+  };
+  queryResearchEvidence?: (input: import('zod').z.input<typeof import('@flowmate/contracts').ResearchEvidenceRequestSchema>) => Result<import('zod').z.infer<typeof import('@flowmate/contracts').ResearchEvidenceSchema>> | Promise<Result<import('zod').z.infer<typeof import('@flowmate/contracts').ResearchEvidenceSchema>>>;
+  exportResearchReport?: (input: import('zod').z.infer<typeof import('@flowmate/contracts').ResearchReportRequestSchema>) => Result<import('@flowmate/contracts').ResearchExport> | Promise<Result<import('@flowmate/contracts').ResearchExport>>;
+  importResearchMaterial?: (input: import('@flowmate/contracts').ImportResearchMaterialRequest) => Result<import('@flowmate/contracts').ResearchMaterial> | Promise<Result<import('@flowmate/contracts').ResearchMaterial>>;
   inputDefinitions?: InputDefinitions;
-  resources?: ReturnType<typeof createResourceService>;
+  resources?: ResourceQueryPort;
   extensions?: ExtensionService;
   resourceDefaults?: () => Result<AssemblySelectionSnapshot | ResourceSelectionResult>;
   saveExtensionSelection?: (input: ExtensionSelectionRequest) => Promise<Result<ExtensionSelectionResult>>;
   saveResourceSelection?: (input: ResourceSelectionRequest) => Promise<Result<ResourceSelectionResult>>;
-  documents: DocumentRepository;
-  jobs: JobRepository;
-  candidates: CandidateRepository;
-  events: BusinessEventRepository;
+  documents: {
+    list(...input: Parameters<DocumentRepository['list']>): ReturnType<DocumentRepository['list']> | Promise<ReturnType<DocumentRepository['list']>>;
+    get(...input: Parameters<DocumentRepository['get']>): ReturnType<DocumentRepository['get']> | Promise<ReturnType<DocumentRepository['get']>>;
+  };
+  jobs: {
+    list(...input: Parameters<JobRepository['list']>): ReturnType<JobRepository['list']> | Promise<ReturnType<JobRepository['list']>>;
+    get(...input: Parameters<JobRepository['get']>): ReturnType<JobRepository['get']> | Promise<ReturnType<JobRepository['get']>>;
+  };
+  candidates: {
+    listByJob(...input: Parameters<CandidateRepository['listByJob']>): ReturnType<CandidateRepository['listByJob']> | Promise<ReturnType<CandidateRepository['listByJob']>>;
+    readByJob(...input: Parameters<CandidateRepository['readByJob']>): ReturnType<CandidateRepository['readByJob']> | Promise<ReturnType<CandidateRepository['readByJob']>>;
+  };
+  events: { list(...input: Parameters<BusinessEventRepository['list']>):
+    ReturnType<BusinessEventRepository['list']> | Promise<ReturnType<BusinessEventRepository['list']>> };
   runtimeEvents?: EventService;
-  toolCalls?: Pick<ToolCallRepository, 'list' | 'getById'> & Partial<Pick<ToolCallRepository, 'request' | 'fixArguments'>>;
+  toolCalls?: {
+    list(...input: Parameters<ToolCallRepository['list']>): ReturnType<ToolCallRepository['list']> | Promise<ReturnType<ToolCallRepository['list']>>;
+    getById(...input: Parameters<ToolCallRepository['getById']>): ReturnType<ToolCallRepository['getById']> | Promise<ReturnType<ToolCallRepository['getById']>>;
+  } & Partial<{
+    request(...input: Parameters<ToolCallRepository['request']>): ReturnType<ToolCallRepository['request']> | Promise<ReturnType<ToolCallRepository['request']>>;
+    fixArguments(...input: Parameters<ToolCallRepository['fixArguments']>): ReturnType<ToolCallRepository['fixArguments']> | Promise<ReturnType<ToolCallRepository['fixArguments']>>;
+  }>;
   contextService?: Pick<ContextService, 'listContextSnapshots' | 'queryContextSnapshot' | 'listContextRequests'>;
-  contextRepository?: Pick<ContextRepository, 'readResourceEvidence'>;
+  contextRepository?: { readResourceEvidence(...input: Parameters<ContextRepository['readResourceEvidence']>):
+    ReturnType<ContextRepository['readResourceEvidence']> | Promise<ReturnType<ContextRepository['readResourceEvidence']>> };
   invoiceForms?: Pick<InvoiceFormService, 'query'>;
   invoiceEdits?: Pick<InvoiceEditService, 'save' | 'accept' | 'reject' | 'export' | 'readExport' | 'queryOperation'>;
   importInvoiceMaterial: (sourceDirectory: string) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
   importPreparedInvoiceMaterial: (input: import('@flowmate/contracts').PreparedInvoiceMaterial) => Promise<Result<import('@flowmate/contracts').DocumentSnapshot>>;
-  hideDocument?: (documentId: DbId) => Result<{ documentId: DbId; affectedChatCount: number }>;
-  readDocumentPage: (input: import('@flowmate/contracts').InvoiceToolInput<'read_invoice_document'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'read_invoice_document'>>;
-  listDocumentPages: (input: import('@flowmate/contracts').InvoiceToolInput<'list_invoice_pages'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'list_invoice_pages'>>;
-  readDocumentOriginal: (documentId: DbId, page: number) => Result<import('@flowmate/contracts').DocumentOriginalImage>;
+  hideDocument?: (documentId: DbId) => Result<{ documentId: DbId; affectedChatCount: number }> | Promise<Result<{ documentId: DbId; affectedChatCount: number }>>;
+  readDocumentPage: (input: import('@flowmate/contracts').InvoiceToolInput<'read_invoice_document'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'read_invoice_document'>> | Promise<Result<import('@flowmate/contracts').InvoiceToolOutput<'read_invoice_document'>>>;
+  listDocumentPages: (input: import('@flowmate/contracts').InvoiceToolInput<'list_invoice_pages'>) => Result<import('@flowmate/contracts').InvoiceToolOutput<'list_invoice_pages'>> | Promise<Result<import('@flowmate/contracts').InvoiceToolOutput<'list_invoice_pages'>>>;
+  readDocumentOriginal: (documentId: DbId, page: number) => Result<import('@flowmate/contracts').DocumentOriginalImage> | Promise<Result<import('@flowmate/contracts').DocumentOriginalImage>>;
 };
 
 /**
@@ -147,7 +191,22 @@ export function makeApplication(
 ): Application {
   let closeInFlight: Promise<Result<CloseReport>> | null = null;
   let finalCloseResult: Result<CloseReport> | null = null;
+  let closing = false;
   const closeErrors = new Map<string, ReturnType<typeof appError>>();
+  const personalUnavailable = () => fail(appError('personal_agent_unavailable', 'runtime', 'Personal Agent is unavailable.'));
+  const personalCommand = async <I, T>(type: PersonalAgentCommandType, raw: I,
+    invoke: (input: I) => Promise<Result<T>> | undefined): Promise<Result<T>> => {
+    const command = parsePersonalAgentCommand({ type, input: raw });
+    if (!command) return fail(appError('input_invalid', 'input', 'The Personal Agent request is invalid.'));
+    if (!products?.personal) return personalUnavailable();
+    if (closing && ['personal_agent_update', 'invoice_work_create', 'invoice_work_supplement', 'invoice_work_dispose_item',
+      'invoice_work_continue', 'invoice_work_cancel', 'personal_task_stop'].includes(type))
+      return fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.'));
+    try {
+      const result = parsePersonalAgentHostResult(type, await invoke(command.input as I));
+      return result && matchesPersonalAgentResponse(command, result) ? result as Result<T> : personalAgentHostFailure(type);
+    } catch { return personalAgentHostFailure(type); }
+  };
   const resourceDefaults = (): Result<AssemblySelectionSnapshot> => {
     try {
       const value = products?.resourceDefaults?.() ?? ok({ revision: 0, selection: EMPTY_RESOURCE_SELECTION });
@@ -156,22 +215,53 @@ export function makeApplication(
       return parsed.success ? ok(parsed.data) : fail(appError('config_settings_invalid', 'input', 'Resource configuration is invalid.'));
     } catch { return fail(appError('config_settings_invalid', 'input', 'Resource configuration is unavailable.')); }
   };
-  const readRunTool = ({ runId, sessionId, toolCallId }: import('@flowmate/contracts').RunToolCallRequest): Result<ToolCallSnapshot> => {
+  const readRunTool = async ({ runId, sessionId, toolCallId }: import('@flowmate/contracts').RunToolCallRequest): Promise<Result<ToolCallSnapshot>> => {
     if (!products?.toolCalls) return fail(appError('tool_calls_unavailable', 'storage', 'Run 工具查询尚未组装。', true));
-    const run = runs.get(runId);
+    const run = await runs.get(runId);
     if (!run.ok) return run;
     if (run.data.kind === 'provider' || run.data.sessionId !== sessionId)
       return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.', false, runId));
-    const call = products.toolCalls.getById(toolCallId);
+    const call = await products.toolCalls.getById(toolCallId);
     if (!call.ok) return call;
     return call.data.runId === runId && call.data.sessionId === sessionId ? call
       : fail(appError('state_conflict', 'runtime', 'Tool call does not belong to this Run.', false, runId));
   };
   return {
+    personalAgent: {
+      get: () => personalCommand('personal_agent_get', {}, () => products?.personal?.agent.get()),
+      update: raw => personalCommand('personal_agent_update', raw, input => products?.personal?.agent.update(input)),
+      openConversation: raw => personalCommand('personal_agent_open_conversation', raw, input => products?.personal?.agent.openConversation(input)),
+    },
+    invoiceWorks: {
+      create: raw => personalCommand('invoice_work_create', raw, input => products?.personal?.works.create(input)),
+      list: raw => personalCommand('invoice_work_list', raw, input => products?.personal?.works.list(input)),
+      get: raw => personalCommand('invoice_work_get', raw, input => products?.personal?.works.get(input)),
+      supplement: raw => personalCommand('invoice_work_supplement', raw, input => products?.personal?.works.supplement(input)),
+      disposeItem: raw => personalCommand('invoice_work_dispose_item', raw, input => products?.personal?.works.disposeItem(input)),
+      continueWork: raw => personalCommand('invoice_work_continue', raw, input => products?.personal?.works.continueWork(input)),
+      cancelWork: raw => personalCommand('invoice_work_cancel', raw, input => products?.personal?.works.cancelWork(input)),
+      queryOperation: raw => personalCommand('invoice_work_query_operation', raw, input => products?.personal?.works.queryOperation(input)),
+      timeline: raw => personalCommand('invoice_work_timeline', raw, input => products?.personal?.works.timeline(input)),
+    },
+    personalTasks: {
+      list: raw => personalCommand('personal_task_list', raw, input => products?.personal?.tasks.list(input)),
+      get: raw => personalCommand('personal_task_get', raw, input => products?.personal?.tasks.get(input)),
+      stop: raw => personalCommand('personal_task_stop', raw, input => products?.personal?.tasks.stop(input)),
+      history: raw => personalCommand('personal_task_history', raw, input => products?.personal?.tasks.history(input)),
+      historyEntry: raw => personalCommand('personal_task_history_entry', raw, input => products?.personal?.tasks.historyEntry(input)),
+      resume: async raw => {
+        const input = PersonalTaskIdentitySchema.safeParse(raw);
+        if (!input.success) return fail(appError('input_invalid', 'input', 'The personal task identity is invalid.'));
+        if (!products?.personal) return personalUnavailable();
+        if (closing) return fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.'));
+        try { return await products.personal.tasks.resume(input.data); }
+        catch { return fail(appError('durable_resume_failed', 'runtime', 'The original personal task could not be resumed.', true)); }
+      },
+    },
     replayInvoiceSave: async raw => {
       const parsed = InvoiceSaveReplayRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Original save identity is invalid.'));
-      const input = parsed.data, original = readRunTool(input), repository = products?.toolCalls;
+      const input = parsed.data, original = await readRunTool(input), repository = products?.toolCalls;
       if (!original.ok) return original;
       const call = original.data;
       const receipt = invoiceToolSchemas.save_invoice_candidate.output.safeParse(call.result?.data);
@@ -180,70 +270,89 @@ export function makeApplication(
         return fail(appError('state_conflict', 'runtime', 'Original successful save could not be verified.'));
       if (!repository?.request || !repository.fixArguments) return fail(appError('tool_calls_unavailable', 'storage', 'Original save replay is unavailable.'));
       // Re-enter the same idempotency checks as ToolExecutor, without admitting a new logical save.
-      const requested = repository.request({ runId: input.runId, sessionId: input.sessionId, nativeToolCallId: input.nativeToolCallId,
+      const requested = await repository.request({ runId: input.runId, sessionId: input.sessionId, nativeToolCallId: input.nativeToolCallId,
         toolName: call.toolName, toolVersion: call.toolVersion, effect: call.effect, context: call.context,
         rawArguments: input.rawArguments, requestedAt: call.requestedAt });
       if (!requested.ok) return requested;
-      const fixed = repository.fixArguments({ toolCallId: call.toolCallId, finalArguments: input.arguments });
+      const fixed = await repository.fixArguments({ toolCallId: call.toolCallId, finalArguments: input.arguments });
       if (!fixed.ok) return fixed;
       return ok({ runId: input.runId, sessionId: input.sessionId, toolCallId: call.toolCallId,
         nativeToolCallId: input.nativeToolCallId, receipt: receipt.data, created: false as const });
     },
     importResearchMaterial: async raw => {
       const parsed = ImportResearchMaterialSchema.safeParse(raw);
-      return parsed.success ? contextRead(ResearchMaterialResultSchema, () => products?.importResearchMaterial?.(parsed.data))
+      return parsed.success ? contextRead(ResearchMaterialResultSchema, async () => await products?.importResearchMaterial?.(parsed.data))
         : fail(appError('input_invalid', 'input', 'Selected research material is invalid.'));
     },
-    listResearchMaterials: async (input = {}) => contextRead(ResearchMaterialsResultSchema, () => products?.research?.listMaterials(input)),
+    listResearchMaterials: async (input = {}) => {
+      const parsed = ResearchPageRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchMaterialsResultSchema, async () => await products?.research?.listMaterials(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research material list is invalid.'));
+    },
     createResearchTask: async raw => {
       const parsed = CreateResearchTaskSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Research task parameters are invalid.'));
-      return contextRead(ResearchTaskResultSchema, () => products?.research?.create({ ...parsed.data, at: new Date().toISOString() }));
+      const request = { ...parsed.data, at: new Date().toISOString() };
+      return contextRead(ResearchTaskResultSchema, async () => await products?.research?.create(request));
     },
-    listResearchTasks: async (input = {}) => contextRead(ResearchTasksResultSchema, () => products?.research?.list(input)),
-    queryResearchTask: async id => contextRead(ResearchTaskResultSchema, () => products?.research?.get(id)),
+    listResearchTasks: async (input = {}) => {
+      const parsed = ResearchPageRequestSchema.safeParse(input);
+      return parsed.success ? contextRead(ResearchTasksResultSchema, async () => await products?.research?.list(parsed.data))
+        : fail(appError('input_invalid', 'input', 'Research task list is invalid.'));
+    },
+    queryResearchTask: async id => isDbId(id)
+      ? contextRead(ResearchTaskResultSchema, async () => await products?.research?.get(id))
+      : fail(appError('input_invalid', 'input', 'Research task ID is invalid.')),
     queryResearchForSession: async input => {
       const parsed = ResearchSessionRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchSessionResultSchema, () => products?.research?.forSession(parsed.data.sessionId))
+      return parsed.success ? contextRead(ResearchSessionResultSchema, async () => await products?.research?.forSession(parsed.data.sessionId))
         : fail(appError('input_invalid', 'input', 'Research Session query is invalid.'));
     },
     queryResearchPlan: async input => {
       const parsed = ResearchPlanRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchPlanResultSchema, () => products?.research?.getPlan(parsed.data))
+      return parsed.success ? contextRead(ResearchPlanResultSchema, async () => await products?.research?.getPlan(parsed.data))
         : fail(appError('input_invalid', 'input', 'Research plan query is invalid.'));
     },
     queryResearchSource: async input => {
       const parsed = ResearchSourceRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchSourceResultSchema, () => products?.research?.getSource(parsed.data))
+      return parsed.success ? contextRead(ResearchSourceResultSchema, async () => await products?.research?.getSource(parsed.data))
         : fail(appError('input_invalid', 'input', 'Research source query is invalid.'));
     },
     queryResearchClaim: async input => {
       const parsed = ResearchClaimRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchClaimResultSchema, () => products?.research?.getClaim(parsed.data))
+      return parsed.success ? contextRead(ResearchClaimResultSchema, async () => await products?.research?.getClaim(parsed.data))
         : fail(appError('input_invalid', 'input', 'Research Claim query is invalid.'));
     },
     queryResearchReport: async input => {
       const parsed = ResearchReportRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchReportResultSchema, () => products?.research?.getReport(parsed.data))
+      return parsed.success ? contextRead(ResearchReportResultSchema, async () => await products?.research?.getReport(parsed.data))
         : fail(appError('input_invalid', 'input', 'Research report query is invalid.'));
     },
     listResearchSources: async input => {
       const parsed = ResearchSourcesRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchSourcesResultSchema, () => products?.research?.listSources(parsed.data))
+      return parsed.success ? contextRead(ResearchSourcesResultSchema, async () => await products?.research?.listSources(parsed.data))
         : fail(appError('input_invalid', 'input', 'Research source list is invalid.'));
     },
     listResearchClaims: async input => {
       const parsed = ResearchClaimsRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchClaimsResultSchema, () => products?.research?.listClaims(parsed.data))
+      return parsed.success ? contextRead(ResearchClaimsResultSchema, async () => await products?.research?.listClaims(parsed.data))
         : fail(appError('input_invalid', 'input', 'Research Claim list is invalid.'));
     },
     listResearchReports: async input => {
       const parsed = ResearchSourcesRequestSchema.safeParse(input);
-      return parsed.success ? contextRead(ResearchReportsResultSchema, () => products?.research?.listReports(parsed.data))
+      return parsed.success ? contextRead(ResearchReportsResultSchema, async () => await products?.research?.listReports(parsed.data))
         : fail(appError('input_invalid', 'input', 'Research report list is invalid.'));
     },
-    queryResearchEvidence: async input => products?.queryResearchEvidence?.(input) ?? fail(appError('research_unavailable', 'storage', 'Research evidence is unavailable.')),
-    exportResearchReport: async input => products?.exportResearchReport?.(input) ?? fail(appError('research_unavailable', 'storage', 'Research export is unavailable.')),
+    queryResearchEvidence: async input => {
+      const parsed = ResearchEvidenceRequestSchema.safeParse(input);
+      return parsed.success ? await products?.queryResearchEvidence?.(parsed.data) ?? fail(appError('research_unavailable', 'storage', 'Research evidence is unavailable.'))
+        : fail(appError('input_invalid', 'input', 'Evidence request is invalid.'));
+    },
+    exportResearchReport: async input => {
+      const parsed = ResearchReportRequestSchema.safeParse(input);
+      return parsed.success ? await products?.exportResearchReport?.(parsed.data) ?? fail(appError('research_unavailable', 'storage', 'Research export is unavailable.'))
+        : fail(appError('input_invalid', 'input', 'Report export request is invalid.'));
+    },
     listSubagentDefinitions: async () => products?.inputDefinitions?.listSubagentDefinitions() ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
     getSubagentDefinition: async raw => products?.inputDefinitions?.getSubagentDefinition(raw) ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
     saveSubagentDefinition: async raw => products?.inputDefinitions?.saveSubagentDefinition(raw) ?? fail(appError('input_invalid', 'input', 'Role directory is unavailable.')),
@@ -269,7 +378,7 @@ export function makeApplication(
     listSubagents: async raw => {
       const parsed = ListSubagentsRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Child list parameters are invalid.'));
-      const parent = runs.get(parsed.data.parentRunId); if (!parent.ok) return parent;
+      const parent = await runs.get(parsed.data.parentRunId); if (!parent.ok) return parent;
       if (parent.data.kind !== 'agent' || parent.data.sessionId !== parsed.data.parentSessionId)
         return fail(appError('subagent_identity_conflict', 'runtime', 'The parent does not belong to this Session.'));
       return contextRead(SubagentPageResultSchema, () => runs.listSubagents?.({ parentRunId: parsed.data.parentRunId,
@@ -278,21 +387,22 @@ export function makeApplication(
     querySubagent: async raw => {
       const parsed = QuerySubagentRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Child detail parameters are invalid.'));
-      const parent = runs.get(parsed.data.parentRunId); if (!parent.ok) return parent;
+      const parent = await runs.get(parsed.data.parentRunId); if (!parent.ok) return parent;
       if (parent.data.kind !== 'agent' || parent.data.sessionId !== parsed.data.parentSessionId)
         return fail(appError('subagent_identity_conflict', 'runtime', 'The parent does not belong to this Session.'));
       return contextRead(SubagentDetailResultSchema, () => runs.querySubagent?.(parsed.data));
     },
     querySessionExtensions: async raw => {
       const parsed = SessionExtensionQuerySchema.safeParse(raw);
-      return parsed.success ? contextRead(SessionExtensionResultSchema, () => sessions?.queryExtensions(parsed.data))
-        : fail(appError('input_invalid', 'input', 'Session extension query is invalid.'));
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Session extension query is invalid.'));
+      const result = await sessions?.queryExtensions(parsed.data);
+      return contextRead(SessionExtensionResultSchema, () => result);
     },
     queryRunExtensions: async raw => {
       const parsed = RunExtensionQuerySchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run extension query is invalid.'));
-      return contextRead(RunExtensionResultSchema, () => {
-        const saved = runs.get(parsed.data.runId); if (!saved.ok) return saved;
+      return contextRead(RunExtensionResultSchema, async () => {
+        const saved = await runs.get(parsed.data.runId); if (!saved.ok) return saved;
         if (saved.data.kind === 'provider' || saved.data.sessionId !== parsed.data.sessionId)
           return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
         const config = saved.data.config;
@@ -331,16 +441,16 @@ export function makeApplication(
     queryRunResources: async raw => {
       const parsed = RunResourceQuerySchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run resource query is invalid.'));
-      return contextRead(RunResourceResultSchema, () => {
-        const request = parsed.data, saved = runs.get(request.runId);
+      return contextRead(RunResourceResultSchema, async () => {
+        const request = parsed.data, saved = await runs.get(request.runId);
         if (!saved.ok) return saved;
         if (saved.data.kind === 'provider' || saved.data.sessionId !== request.sessionId)
           return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
         const frozen = saved.data.config.resources === undefined ? null : FrozenResourcesSchema.parse(saved.data.config.resources);
-        const evidence = products?.contextRepository?.readResourceEvidence(request);
+        const evidence = await products?.contextRepository?.readResourceEvidence(request);
         if (!evidence) return fail(appError('resource_evidence_write_failed', 'storage', 'Resource journal query is unavailable.', true));
         if (!evidence.ok) return evidence;
-        const verified = frozen ? products?.resources?.verifyFrozen(frozen) : ok(undefined);
+        const verified = frozen ? await products?.resources?.verifyFrozen(frozen) : ok(undefined);
         return ok({ ...request, frozen, evidence: evidence.data, gap: frozen && (!verified || !verified.ok)
           ? 'bundle-unavailable' as const : evidence.data === null ? 'legacy-not-collected' as const : null });
       });
@@ -348,8 +458,8 @@ export function makeApplication(
     readRunResourceFile: async raw => {
       const parsed = RunResourceFileRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run resource file query is invalid.'));
-      return contextRead(ResourceFileResultSchema, () => {
-        const { sessionId, runId, ...file } = parsed.data, saved = runs.get(runId);
+      return contextRead(ResourceFileResultSchema, async () => {
+        const { sessionId, runId, ...file } = parsed.data, saved = await runs.get(runId);
         if (!saved.ok) return saved;
         if (saved.data.kind === 'provider' || saved.data.sessionId !== sessionId)
           return fail(appError('state_conflict', 'input', 'Run does not belong to this Session.'));
@@ -378,11 +488,11 @@ export function makeApplication(
         return saved.success ? saved.data : fail(appError('config_settings_write_failed', 'storage', 'Resource save result could not be verified.', true));
       } catch { return fail(appError('config_settings_write_failed', 'storage', 'Resource selection save could not be confirmed.', true)); }
     },
-    validateResourceSelection: (selection, extensions = EMPTY_EXTENSION_SELECTION) => products?.resources?.validateSelection(selection, extensions.enabledExtensions)
+    validateResourceSelection: async (selection, extensions = EMPTY_EXTENSION_SELECTION) => await products?.resources?.validateSelection(selection, extensions.enabledExtensions)
       ?? fail(appError('resource_required_unavailable', 'input', 'Resource service is unavailable.')),
-    compactSession: async raw => {
+    compactSession: async (raw, control) => {
       const request = normalizeSessionCompactionRequest(raw);
-      return request.ok ? runtime.compactSession(request.data) : request;
+      return request.ok ? runtime.compactSession(request.data, control) : request;
     },
     querySessionCompaction: async raw => {
       const request = normalizeSessionCompactionQuery(raw);
@@ -396,7 +506,7 @@ export function makeApplication(
       const normalized = normalizeProviderRequest(raw);
       return normalized.ok ? runtime.callProvider(normalized.data, control) : normalized;
     },
-    queryRun: async (runId) => isDbId(runId) ? runs.get(runId) : fail(appError('input_invalid', 'input', 'Run ID 无效。')),
+    queryRun: async (runId) => isDbId(runId) ? await runs.get(runId) : fail(appError('input_invalid', 'input', 'Run ID 无效。')),
     listContextSnapshots: async input => contextRead(ContextSnapshotsResultSchema, () => products?.contextService?.listContextSnapshots(input)),
     queryContextSnapshot: async input => contextRead(ContextSnapshotResultSchema, () => products?.contextService?.queryContextSnapshot(input)),
     listContextRequests: async input => contextRead(ContextRequestsResultSchema, () => products?.contextService?.listContextRequests(input)),
@@ -409,12 +519,12 @@ export function makeApplication(
       const parsed = RunToolCallsRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run tool query is invalid.'));
       const { runId, sessionId, beforeId, limit } = parsed.data;
-      const run = runs.get(runId);
+      const run = await runs.get(runId);
       if (!run.ok) return run;
       if ((run.data.kind === 'provider' ? null : run.data.sessionId) !== sessionId)
         return fail(appError('state_conflict', 'runtime', 'Run and Session do not match.', false, runId));
       if (run.data.kind === 'provider') return ok({ items: [], nextBeforeId: null });
-      const calls = products.toolCalls.list({ runId, ...(beforeId === undefined ? {} : { beforeId }), limit });
+      const calls = await products.toolCalls.list({ runId, ...(beforeId === undefined ? {} : { beforeId }), limit });
       if (!calls.ok) return calls;
       try {
         if (calls.data.items.some(call => call.runId !== runId || call.sessionId !== sessionId)) throw new Error('ownership');
@@ -425,7 +535,7 @@ export function makeApplication(
       if (!products?.toolCalls) return fail(appError('tool_calls_unavailable', 'storage', 'Run 工具查询尚未组装。', true));
       const parsed = RunToolCallRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Run tool query is invalid.'));
-      const call = readRunTool(parsed.data);
+      const call = await readRunTool(parsed.data);
       if (!call.ok) return call;
       try { return ok(toolView(call.data)); }
       catch { return fail(appError('storage_corrupt', 'storage', 'Run tool could not be projected.')); }
@@ -435,7 +545,7 @@ export function makeApplication(
       const parsed = ToolEvidenceRequestSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Tool evidence query is invalid.'));
       try {
-        const input = parsed.data, call = readRunTool(input);
+        const input = parsed.data, call = await readRunTool(input);
         if (!call.ok) return call;
         const bytes = Buffer.from(JSON.stringify(ToolCallSnapshotSchema.parse(call.data)));
         const evidenceRevision = call.data.evidenceRevision ?? 0;
@@ -481,7 +591,7 @@ export function makeApplication(
       const normalized = normalizeSessionRunsRequest(raw);
       if (!normalized.ok) return normalized;
       if (!runs.listBySession) return fail(appError('session_runs_unavailable', 'storage', 'Session Run 仓储尚未组装。'));
-      return runs.listBySession(normalized.data);
+      return await runs.listBySession(normalized.data);
     },
     listSessionMessages: async (raw) => {
       const normalized = normalizeSessionMessagesRequest(raw);
@@ -491,7 +601,7 @@ export function makeApplication(
       if (!isDbId(runId) || (callSequence !== undefined && !isDbId(callSequence))) {
         return fail(appError('input_invalid', 'input', 'Prompt Trace 查询参数无效。'));
       }
-      const run = runs.get(runId);
+      const run = await runs.get(runId);
       if (!run.ok) return run;
       if (run.data.kind === 'provider') return ok({ availability: 'not-collected', calls: [], droppedCalls: null });
       if (!promptTrace) return ok({ availability: 'not-collected', calls: [], droppedCalls: null });
@@ -562,10 +672,10 @@ export function makeApplication(
       if ('documentId' in request && request.documentId !== undefined && (!Number.isSafeInteger(request.documentId) || request.documentId < 1)) {
         return fail(appError('input_invalid', 'input', 'Document ID 无效。'));
       }
-      return products?.jobs.list(request) ?? fail(appError('job_service_unavailable', 'storage', 'Job 查询尚未组装。', true));
+      return await products?.jobs.list(request) ?? fail(appError('job_service_unavailable', 'storage', 'Job 查询尚未组装。', true));
     },
     queryJob: async (jobId) => Number.isSafeInteger(jobId) && jobId > 0
-      ? products?.jobs.get(jobId) ?? fail(appError('job_service_unavailable', 'storage', 'Job 查询尚未组装。', true))
+      ? await products?.jobs.get(jobId) ?? fail(appError('job_service_unavailable', 'storage', 'Job 查询尚未组装。', true))
       : fail(appError('input_invalid', 'input', 'Job ID 无效。')),
     hideJob: async (jobId) => jobs?.hide(jobId)
       ?? fail(appError('job_service_unavailable', 'storage', 'Processing service is unavailable.', true)),
@@ -576,7 +686,7 @@ export function makeApplication(
         || Object.keys(raw).some((key) => !['jobId', 'beforeSequence', 'limit'].includes(key))) {
         return fail(appError('input_invalid', 'input', 'Candidate 分页参数无效。'));
       }
-      return products?.candidates.listByJob({ jobId: raw.jobId, beforeSequence: raw.beforeSequence ?? null, limit: raw.limit ?? 50 })
+      return await products?.candidates.listByJob({ jobId: raw.jobId, beforeSequence: raw.beforeSequence ?? null, limit: raw.limit ?? 50 })
         ?? fail(appError('candidate_service_unavailable', 'storage', 'Candidate 查询尚未组装。', true));
     },
     queryJobCandidate: async (raw) => {
@@ -585,7 +695,7 @@ export function makeApplication(
         || Object.keys(raw).some((key) => !['jobId', 'candidateId'].includes(key))) {
         return fail(appError('input_invalid', 'input', 'Candidate 查询参数无效。'));
       }
-      return products?.candidates.readByJob({ jobId: raw.jobId, candidateId: raw.candidateId })
+      return await products?.candidates.readByJob({ jobId: raw.jobId, candidateId: raw.candidateId })
         ?? fail(appError('candidate_service_unavailable', 'storage', 'Candidate 查询尚未组装。', true));
     },
     listActivity: async (raw) => {
@@ -599,7 +709,7 @@ export function makeApplication(
       const id = hasJob ? record.jobId : record.documentId;
       if (typeof id !== 'number' || !Number.isSafeInteger(id) || id < 1) return fail(appError('input_invalid', 'input', 'Activity 所属 ID 无效。'));
       const filter = hasJob ? { jobId: id } : { documentId: id };
-      return products?.events.list({ ...page.data, ...filter })
+      return await products?.events.list({ ...page.data, ...filter })
         ?? fail(appError('activity_service_unavailable', 'storage', 'Activity 查询尚未组装。', true));
     },
     importInvoiceMaterial: async (sourceDirectory) => {
@@ -640,7 +750,7 @@ export function makeApplication(
     cancelSubagent: async (request) => {
       const input = CancelSubagentRequestSchema.safeParse(request);
       if (!input.success) return fail(appError('input_invalid', 'input', 'Child cancellation parameters are invalid.'));
-      const result = runtime.cancelSubagent?.(input.data)
+      const result = await runtime.cancelSubagent?.(input.data)
         ?? fail(appError('subagent_origin_invalid', 'runtime', 'Child execution management is unavailable.'));
       if (!result.ok) return result;
       const receipt = SubagentCancelReceiptSchema.safeParse(result.data);
@@ -668,15 +778,24 @@ export function makeApplication(
   };
 
   async function closeOnce(): Promise<Result<CloseReport>> {
+    closing = true;
+    // Quiesce background admission before foreground release can notify its saved queue.
+    const personalClosing = (async (): Promise<Result<void>> => {
+      try { return await products?.personal?.close?.() ?? ok(undefined); }
+      catch { return fail(appError('personal_agent_close_failed', 'runtime', 'Personal Agent stop could not be confirmed.', true)); }
+    })();
     let runtimeReport: CloseReport;
     try {
       runtimeReport = await runtime.close();
     } catch {
-      return ok({ stopped: false, closed: false, errors: [appError('runtime_close_failed', 'runtime', '运行资源关闭失败。', true)] });
+      runtimeReport = { stopped: false, closed: false, errors: [appError('runtime_close_failed', 'runtime', '运行资源关闭失败。', true)] };
     }
+    const personalReport = await personalClosing;
 
     let resourceReport: CloseReport;
-    if (!runtimeReport.stopped) {
+    if (!personalReport.ok) {
+      resourceReport = { stopped: false, closed: false, errors: [personalReport.error] };
+    } else if (!runtimeReport.stopped) {
       resourceReport = { stopped: false, closed: false, errors: [] };
     } else {
       try {
@@ -705,9 +824,9 @@ function toolView(call: ToolCallSnapshot): RuntimeToolView {
     context: call.context === null ? null : { snapshotId: call.context.snapshotId, requestSequence: call.context.requestSequence } });
 }
 
-function contextRead<T>(schema: z.ZodType<Result<T>>, read: () => Result<T> | undefined): Result<T> {
+async function contextRead<T>(schema: z.ZodType<Result<T>>, read: () => Result<T> | Promise<Result<T> | undefined> | undefined): Promise<Result<T>> {
   try {
-    const parsed = schema.safeParse(read());
+    const parsed = schema.safeParse(await read());
     if (parsed.success) return parsed.data;
   } catch { /* Only the fixed public failure crosses this boundary. */ }
   return fail(appError('internal_error', 'internal', 'Context query could not be completed.'));

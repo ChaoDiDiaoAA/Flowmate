@@ -9,7 +9,7 @@ import { appError, fail, ok, evaluationRequests, EvaluationExecutionListSchema, 
     type EvaluationTrialView, type EvaluationScoreView, type EvaluationReadPageSchema } from '@flowmate/contracts';
 import { inside } from '../dataset-loader/local.ts';
 import { discoverSavedExecutions, reportPath } from '../reports/paths.ts';
-import { comparison, inspectReport, readReport, readReportMetadata, judgeCallSchema, sdkJudgeConfigurationSchema, legacyJudgeConfigurationSchema, type ReportInspection, type LocalReport } from '../reports/store.ts';
+import { comparison, inspectReport, readReport, readReportMetadata, judgeCallSchema, sdkJudgeConfigurationSchema, nativeJudgeConfigurationSchema, legacyJudgeConfigurationSchema, type ReportInspection, type LocalReport } from '../reports/store.ts';
 import { agentModelCapabilitiesSchema } from '../configuration.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
 import { metricCatalog } from '../scoring/catalog.ts';
@@ -32,10 +32,13 @@ function conditions(inspection: ReportInspection): Pick<EvaluationExecutionSumma
         const source = originalSource === null ? null : { runtime: originalSource.runtime, dependencies: originalSource.dependencies,
             fileCount: originalSource.files.length, paths: originalSource.files.slice(0, 200).map(file => file.path), pathsTruncated: originalSource.files.length > 200 };
         const judge = raw.judge === undefined ? undefined : raw.judge === null ? null
-            : z.union([sdkJudgeConfigurationSchema, legacyJudgeConfigurationSchema]).parse(raw.judge);
+            : z.union([sdkJudgeConfigurationSchema, nativeJudgeConfigurationSchema, legacyJudgeConfigurationSchema]).parse(raw.judge);
         return { conditions: schema.parse(scanEvidence({ agent, run, source, scoring: { version: inspection.metadata.scoringConfiguration.version,
+            ...(inspection.metadata.scoringConfiguration.scoringVersion?{scoringVersion:inspection.metadata.scoringConfiguration.scoringVersion}:{}),
             judgeMode: inspection.metadata.scoringConfiguration.judgeMode }, ...(judge === undefined ? {} : { judge: judge === null ? null : {
-                api: 'api' in judge ? judge.api : null, model: judge.model, baseUrl: judge.baseUrl, timeoutMs: judge.timeoutMs } }) }).value), conditionsIssue: null };
+                api: 'api' in judge ? judge.api : null, model: judge.model, baseUrl: 'baseUrl' in judge ? judge.baseUrl : null, timeoutMs: judge.timeoutMs,
+                ...('reasoningEffort' in judge ? {reasoningEffort:judge.reasoningEffort} : {}),
+                ...('transport' in judge ? { transport: judge.transport } : {}) } }) }).value), conditionsIssue: null };
     } catch { return { conditions: null, conditionsIssue: 'invalid' }; }
 }
 export function exportView(value: LocalReport['export'] | null): EvaluationExportView | null {
@@ -79,6 +82,7 @@ function scoreViews(inspection: ReportInspection, trialId?: string): EvaluationS
             metricId: score.metricId, name: clipped(score.name), version: score.version, method: score.method, required: score.required,
             status: score.status, value: score.value, reason: clipped(score.reason), reasonTruncated: score.reason.length > 2000,
             evidence: score.evidence.map(clipped), evaluatorId: score.evaluatorId ?? null, evaluatorVersion: score.evaluatorVersion ?? null,
+            judge:score.judge??null,calibration:score.calibration??null,
             category: score.category ?? (metricCatalog.some(metric => metric.id === score.metricId) ? 'formal' : null),
             applicabilityReason: score.applicabilityReason === undefined ? null : clipped(score.applicabilityReason), statistics: score.statistics ?? null,
         }).value)));

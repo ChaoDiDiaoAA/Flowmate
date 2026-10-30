@@ -7,6 +7,16 @@ import { randomUUID } from 'node:crypto';
 import type { IpcMainInvokeEvent } from 'electron';
 import { cleanupResources, closeDesktopFixture, createHttpProvider, Database, mkdtemp } from '../support/resources.ts';
 import { manifest, tasks, material } from '../../agent-eval/tests/fixtures/minimal-dataset.ts';
+import { observationRowsFromOtlp } from '../../agent-eval/tests/langfuse/otlp-fixture.ts';
+import { require as loadTypeScript } from 'tsx/cjs/api';
+import type { LocalReport } from '../../agent-eval/src/reports/store.ts';
+
+// Match the Worker's TypeScript/JSON loader when fixtures call its source services from Node.
+const { createCurationService } = loadTypeScript('../../agent-eval/src/curation/index.ts', import.meta.url) as typeof import('../../agent-eval/src/curation/index.ts');
+const { candidateFile, readTraceState, traceFile, updateTraceState } = loadTypeScript('../../agent-eval/src/curation/store.ts', import.meta.url) as typeof import('../../agent-eval/src/curation/store.ts');
+const { readFeedbackRecords } = loadTypeScript('../../agent-eval/src/review/local.ts', import.meta.url) as typeof import('../../agent-eval/src/review/local.ts');
+const { createArchive, archiveReference, writeArchivePart } = loadTypeScript('../../agent-eval/src/reports/archive.ts', import.meta.url) as typeof import('../../agent-eval/src/reports/archive.ts');
+const { readReport, reportPath, saveReport } = loadTypeScript('../../agent-eval/src/reports/store.ts', import.meta.url) as typeof import('../../agent-eval/src/reports/store.ts');
 
 test.afterEach(cleanupResources);
 const repository = resolve(import.meta.dirname, '../..');
@@ -25,6 +35,158 @@ function desktopEnvironment(userData: string) {
     if (process.env[key]) env[key] = process.env[key]!;
   return { ...env, FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData };
 }
+function savedEvaluationTrace(root: string, traceId: string) {
+  const archive = createArchive(root, { selection: 'case' }), executionId = 'controlled-execution';
+  const report: LocalReport = { contract: 'flowmate-agent-run/v1', executionId, dataset: { id: 'facility-test', version: 1, subject: 'agent' },
+    selection: 'case', environment: 'controlled-ui', startedAt: '2026-10-28T00:00:00.000Z', endedAt: null, repeat: 1,
+    executionComplete: false, scoring: 'pending', manualReview: 'none', formalAcceptance: 'not-assessed', scoringConfiguration: { version: 1, judgeMode: 'off' },
+    export: { backend: 'local', status: 'disabled' }, trials: [{ caseId: 'test-lines', caseVersion: 1, caseName: 'Small controlled copy', category: 'task',
+      partition: 'full', repetition: 1, trialId: 'controlled-trial', traceId: traceId.replaceAll('-', ''), status: 'NOT_RUN', reason: 'Controlled original fixture',
+      counts: {}, execution: null, scores: [], judgeCalls: [], feedback: 'none' }] };
+  saveReport(archiveReference(archive.file, 'executions', executionId), report);
+  writeArchivePart(archiveReference(archive.file, 'snapshots', executionId), { dataset: 'facility-test', version: 1,
+    cases: [{ id: 'test-lines', version: 1 }], materials: [] });
+}
+
+test('Evaluation loop persists opt-in switches and saves Trace feedback without running models', async () => {
+  test.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-evaluation-loop-')), root = evaluationFixture(userData);
+  const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
+    args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Evaluation loop', exact: true })).toBeVisible();
+    const capture = page.getByLabel('Capture product traces', { exact: true });
+    await expect(capture).not.toBeChecked();
+    await expect(page.getByLabel('Upload captured traces', { exact: true })).not.toBeChecked();
+    await expect(page.getByLabel('Automatically mine candidates', { exact: true })).not.toBeChecked();
+    await capture.check(); await page.getByRole('button', { name: 'Save trace switches', exact: true }).click();
+    await page.getByRole('button', { name: 'Refresh loop configuration', exact: true }).click();
+    await expect(capture).toBeChecked();
+    await expect(page.getByLabel('Upload captured traces', { exact: true })).not.toBeChecked();
+    await expect(page.getByRole('button', { name: 'Mine selected trace', exact: true })).toBeDisabled();
+    const traceId = '00000000-0000-4000-8000-000000000005', curation = createCurationService(root);
+    curation.saveTrace({ id: traceId, revision: 1, source: { kind: 'product', runId: 'synthetic-ui-run' }, entry: 'chats',
+      startedAt: '2026-10-28T00:00:00.000Z', endedAt: '2026-10-28T00:00:01.000Z', input: { prompt: 'Synthetic original input' }, output: 'Synthetic original answer',
+      status: 'completed', complete: true, gaps: [], configuration: {}, events: [], facts: {}, materials: [] });
+    await page.getByRole('button', { name: 'Refresh traces', exact: true }).click();
+    await page.getByRole('button', { name: traceId, exact: true }).click();
+    await page.getByLabel('Loop reviewer', { exact: true }).fill('synthetic-trace-reviewer');
+    await page.getByLabel('Loop feedback note', { exact: true }).fill('Synthetic successful answer review.');
+    await page.getByLabel('Trace feedback verdict', { exact: true }).selectOption('good');
+    await page.getByRole('button', { name: 'Save trace feedback', exact: true }).click();
+    const target = { kind: 'trace-feedback', id: traceId, revision: 1 };
+    await expect.poll(() => curation.listFeedback(target).length).toBe(1);
+    expect(curation.listFeedback(target)[0])
+      .toMatchObject({ target: { kind: 'trace-feedback', id: traceId, revision: 1 }, source: 'human', verdict: 'good', reviewer: 'synthetic-trace-reviewer' });
+    await page.getByRole('button', { name: 'Candidates', exact: true }).click();
+    await page.getByRole('button', { name: 'Refresh candidates', exact: true }).click();
+    await expect(page.getByText('No candidate drafts.', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Experiments', exact: true }).click();
+    expect(JSON.parse(await page.getByLabel('Experiment plan JSON').inputValue()).repeats).toBe(1);
+    await expect(page.getByRole('button', { name: 'Run declared experiment', exact: true })).toBeDisabled();
+    expect(existsSync(join(root, 'agent-eval/runs'))).toBe(false);
+    expect(existsSync(join(root, 'agent-eval/src/datasets/gold-candidates'))).toBe(false);
+  } catch (error) { failure = error as Error; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+  if (failure) throw failure;
+});
+
+test('Loop exposes the installed repository restriction and disables writes while retaining saved reads', async () => {
+  test.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-loop-unavailable-')), root = evaluationFixture(userData);
+  const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
+    args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Evaluation', exact: true }).waitFor({ timeout: 20_000 });
+    // Controlled IPC fixture presents the installed service's availability contract; no DOM or saved data is changed.
+    await app.evaluate(({ ipcMain }) => {
+      const channel = 'flowmate:evaluation-workflow';
+      const handlers = Reflect.get(ipcMain, '_invokeHandlers') as Map<string, (event: IpcMainInvokeEvent, input: unknown) => Promise<any>>;
+      const original = handlers.get(channel); if (!original) throw Error('Workflow handler unavailable');
+      ipcMain.removeHandler(channel);
+      ipcMain.handle(channel, async (event, input) => {
+        const reply = await original(event, input);
+        if ((input as { action: string }).action === 'settings.get' && reply.ok)
+          reply.data.data.workspace = { available: false, reason: 'Controlled installed boundary: explicit repository workspace is unavailable.' };
+        return reply;
+      });
+    });
+    await page.getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await expect(page.getByRole('alert')).toContainText('explicit repository workspace is unavailable');
+    for (const label of ['Capture product traces', 'Upload captured traces', 'Automatically mine candidates'])
+      await expect(page.getByLabel(label, { exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Save trace switches', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Mine selected trace', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Refresh traces', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Candidates', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Publish approved candidate snapshot', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Refresh candidates', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Experiments', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Run declared experiment', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'List Baselines', exact: true })).toBeEnabled();
+    expect(existsSync(join(root, 'agent-eval/configs/observability.json'))).toBe(false);
+    expect(existsSync(join(root, 'agent-eval/src/datasets/gold-candidates'))).toBe(false);
+  } catch (error) { failure = error as Error; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+  if (failure) throw failure;
+});
+
+test('large candidate originals must fully load before editing and saved platform evidence stays separate', async () => {
+  test.setTimeout(90_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-large-record-ui-')), root = evaluationFixture(userData);
+  const traceId = '00000000-0000-4000-8000-000000000041', candidateId = '00000000-0000-4000-8000-000000000042';
+  const curation = createCurationService(root);
+  const originalMaterial = '原始资料\n' + 'x'.repeat(5 * 1024 * 1024) + '\n资料结尾';
+  const trace = curation.saveTrace({ id: traceId, revision: 1, source: { kind: 'product', runId: 'controlled-run' }, entry: 'chats',
+    startedAt: '2026-10-28T00:00:00.000Z', endedAt: '2026-10-28T00:00:01.000Z', input: { prompt: originalMaterial }, output: 'Local original answer',
+    status: 'completed', complete: true, gaps: [], configuration: {}, events: [], facts: {}, materials: [] });
+  const evaluationTraceId = '00000000-0000-4000-8000-000000000043', importedTraceId = '00000000-0000-4000-8000-000000000044';
+  savedEvaluationTrace(root, evaluationTraceId);
+  curation.saveTrace({ ...trace, id: importedTraceId, source: { kind: 'product' }, facts: { langfuseObservations: [] }, input: { prompt: 'Small controlled copy' } });
+  updateTraceState(root, traceId, state => { state.platformSnapshot = { readAt: '2026-10-28T00:00:02.000Z', trace: { ...trace, output: 'Separate platform answer' } }; });
+  const platformSnapshot = readTraceState(root, traceId).platformSnapshot!, platformText = JSON.stringify(platformSnapshot, null, 2) + '\n';
+  const originalTrace = readFileSync(traceFile(root, traceId), 'utf8');
+  curation.saveCandidate({ contract: 'flowmate-evaluation-candidate/v1', id: candidateId, revision: 1,
+    kind: 'bad', status: 'draft', traceRef: { id: traceId, revision: 1 }, sourceLabels: ['controlled-ui-proof'], reason: 'Original controlled reason',
+    review: { originalMaterial }, bindings: [], controlBindings: [] });
+  const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
+    args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow(); await page.getByRole('button', { name: 'Evaluation', exact: true }).click();
+    await page.getByRole('button', { name: evaluationTraceId, exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Upload selected trace', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Open saved Benchmark Execution', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: importedTraceId, exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Upload selected trace', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: traceId, exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Saved platform snapshot', exact: true })).toContainText('2026-10-28T00:00:02.000Z');
+    await page.getByRole('button', { name: 'Read saved platform snapshot JSON', exact: true }).click();
+    await expect(page.getByLabel('Original JSON chunk', { exact: true })).toContainText('"readAt"');
+    await page.getByLabel('Original character offset', { exact: true }).fill(String(platformText.indexOf('Separate platform answer') - 20));
+    await page.getByRole('button', { name: 'Read original offset', exact: true }).click();
+    await expect(page.getByLabel('Original JSON chunk', { exact: true })).toContainText('Separate platform answer');
+    await page.getByRole('button', { name: 'Candidates', exact: true }).click();
+    await page.getByRole('button', { name: 'Refresh candidates', exact: true }).click();
+    await page.getByRole('button', { name: candidateId, exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Save candidate revision', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: 'Load complete candidate for editing', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Save candidate revision', exact: true })).toBeEnabled({ timeout: 45_000 });
+    await page.getByLabel('Candidate edit JSON', { exact: true }).fill('{"reason":"Updated controlled reason"}');
+    await page.getByRole('button', { name: 'Save candidate revision', exact: true }).click();
+    await expect(page.getByRole('heading', { name: `${candidateId} · revision 2 · draft`, exact: true })).toBeVisible();
+    const saved = curation.readCandidate(candidateId);
+    expect(saved.reason).toBe('Updated controlled reason'); expect(saved.review?.originalMaterial).toBe(originalMaterial);
+    expect(readFileSync(traceFile(root, traceId), 'utf8')).toBe(originalTrace);
+    expect(readTraceState(root, traceId).platformSnapshot).toEqual(platformSnapshot);
+    expect(existsSync(candidateFile(root, candidateId))).toBe(true);
+  } catch (error) { failure = error as Error; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+  if (failure) throw failure;
+});
 
 async function failNextDesktopRead(app: ElectronApplication, channel: 'flowmate:get-state' | 'flowmate:query-evaluation-result', message: string) {
   await app.evaluate(({ ipcMain }, fault) => {
@@ -71,13 +233,16 @@ test('Evaluation opens the registered catalog and reviews a Case without running
     await expect(page.getByText('Feedback saved.', { exact: true })).toBeVisible();
     await page.getByLabel('Environment', { exact: true }).fill('synthetic-local');
     await page.getByRole('button', { name: 'Preview evaluation', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Evaluation preview', exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole('button', { name: 'Preview evaluation', exact: true })).toBeEnabled();
+    await expect(page.getByText('Members, scoring and run conditions', { exact: true })).toBeVisible();
     await expect(page.getByText('评测Agent未配置或凭据不可用。', { exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Start evaluation', exact: true })).toBeDisabled();
     await page.getByText('Members, scoring and run conditions', { exact: true }).click();
     await expect(page.getByText(/"environment": "synthetic-local"/)).toBeVisible();
-    expect(JSON.parse(readFileSync(join(root, 'agent-eval/runs/case-reviews/review.json'), 'utf8')).records[0])
+    expect(readFeedbackRecords(root)[0])
       .toMatchObject({ reviewer: 'synthetic-page-reviewer', caseId: 'test-lines' });
-    expect(existsSync(join(root, 'agent-eval/runs/business'))).toBe(false);
+    expect(existsSync(join(root, 'agent-eval/runs'))).toBe(false);
     await page.setViewportSize({ width: 980, height: 760 });
     const size = await page.locator('.workspace').evaluate(element => ({ width: element.clientWidth, content: element.scrollWidth }));
     expect(size.content).toBeLessThanOrEqual(size.width + 1);
@@ -111,21 +276,34 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
   });
   let partial = true, projectQueries = 0, uploadExecution = '', releaseUpload!: () => void;
   const uploadHeld = new Promise<void>(done => { releaseUpload = done; });
-  const batches: string[][] = [], acceptedFirst = new Set<string>();
+  const batches: string[][] = [], observations: Array<{ id: string; traceId: string; parentObservationId?: string | null; metadata: { localObservationId: string } }> = [];
+  const scores: Array<{ id: string; traceId: string; name: string; value: number; source: string }> = [];
+  let observationReads = 0;
   const platform = await createHttpProvider(async request => {
-    if (new URL(request.url).pathname.endsWith('/projects')) {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith('/projects')) {
       projectQueries++;
       return Response.json({ data: [{ id: 'synthetic-ui-project', name: 'Synthetic', organization: { id: 'synthetic-org', name: 'Synthetic' }, metadata: {} }] });
     }
-    if (!new URL(request.url).pathname.endsWith('/ingestion')) return new Response(null, { status: 404 });
-    const body = await request.json() as { batch: Array<{ id: string }> };
-    const target = JSON.parse(readFileSync(join(root, 'agent-eval/runs/business', uploadExecution, 'export.json'), 'utf8')).target;
+    if (url.pathname.endsWith('/v2/observations')) {
+      observationReads++; return Response.json({ data: partial ? observations.filter(row => !row.parentObservationId) : observations, meta: {} });
+    }
+    if (url.pathname.endsWith('/v3/scores')) return Response.json({ data: partial ? [] : scores.map(score => ({ ...score, subject: { kind: 'trace', id: score.traceId } })), meta: {} });
+    if (url.pathname.endsWith('/scores') && request.method === 'POST') {
+      const score = await request.json() as typeof scores[number]; scores.push(score); return Response.json({ id: score.id });
+    }
+    if (!url.pathname.endsWith('/otel/v1/traces')) return new Response(null, { status: 404 });
+    expect(request.headers.get('x-langfuse-ingestion-version')).toBe('4');
+    const body = await request.json() as { resourceSpans: Array<{ scopeSpans: Array<{ spans: Array<{ spanId: string; traceId: string;
+      attributes: Array<{ key: string; value: { stringValue: string } }> }> }> }> };
+    const target = readReport(reportPath(root, uploadExecution)).export.target;
     expect(target).toMatchObject({ projectId: 'synthetic-ui-project' });
-    batches.push(body.batch.map(event => event.id));
+    const rows = observationRowsFromOtlp(body);
+    const ids = rows.map(row => { expect(row.metadata.executionId).toBe(uploadExecution); return row.metadata.localObservationId as string; });
+    observations.push(...rows);
+    batches.push(ids);
     if (batches.length === 1) await uploadHeld;
-    const successes = body.batch.filter((_, index) => !partial || index === 0).map(event => ({ id: event.id, status: 201 }));
-    if (partial) successes.forEach(event => acceptedFirst.add(event.id));
-    return Response.json({ successes, errors: partial ? body.batch.slice(1).map(event => ({ id: event.id, status: 500, message: 'Synthetic partial receipt' })) : [] });
+    return Response.json({});
   });
   mkdirSync(join(root, 'agent-eval/configs'), { recursive: true });
   writeFileSync(join(root, 'agent-eval/configs/.env'), [`LANGFUSE_BASE_URL=http://127.0.0.1:${platform.port}`,
@@ -147,7 +325,8 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
     await page.getByLabel('Selection', { exact: true }).selectOption('case');
     await page.getByLabel('Case', { exact: true }).selectOption('test-lines');
     await page.getByRole('button', { name: 'Preview evaluation', exact: true }).click();
-    await expect(page.getByText('1 Cases · 1 Trials · Judge calls: at most 0', { exact: true })).toBeVisible();
+    await expect(page.getByText('1 Cases · 1 Trials · Judge calls: at most 0', { exact: true })).toBeVisible({ timeout: 30_000 });
+    await page.getByRole('button', { name: 'Start evaluation', exact: true }).click({ trial: true });
     const updated = await page.evaluate(async () => {
       const state = await window.flowmate.getState(); if (!state.ok || !state.data.settings.evaluation?.agent) throw Error('Synthetic Agent config unavailable');
       const { credentialRef, ...connection } = state.data.settings.evaluation.agent;
@@ -209,23 +388,34 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
     expect(projectQueries).toBe(0); expect(batches).toEqual([]);
     uploadExecution = executionId;
     await result.getByText('Platform receipt', { exact: true }).click();
+    await app.evaluate(() => {
+      const schedule = globalThis.setTimeout; let remaining = 1;
+      Reflect.set(globalThis, 'restoreEvaluationUploadTimer', () => { globalThis.setTimeout = schedule; });
+      globalThis.setTimeout = new Proxy(schedule, { apply(target, receiver, args) {
+        return Reflect.apply(target, receiver, args[1] === 10_000 && remaining-- > 0 ? [args[0], 100, ...args.slice(2)] : args);
+      } });
+    });
     await result.getByRole('button', { name: 'Upload / resend saved report', exact: true }).click();
     await expect(result.getByText(/评测响应未知/)).toBeVisible({ timeout: 15_000 });
+    await app.evaluate(() => Reflect.get(globalThis, 'restoreEvaluationUploadTimer')());
     await expect(result.getByRole('button', { name: 'Upload / resend saved report', exact: true })).toBeDisabled();
-    expect(batches).toHaveLength(1); expect(requests).toBe(1);
+    await expect.poll(() => batches.length).toBe(1); expect(requests).toBe(1);
     releaseUpload();
-    await expect.poll(() => JSON.parse(readFileSync(join(root, 'agent-eval/runs/business', executionId, 'export.json'), 'utf8')).status).toBe('partial');
+    await expect.poll(() => readReport(reportPath(root, executionId)).export.status).toBe('partial');
     await result.getByRole('button', { name: 'Refresh saved result', exact: true }).click();
     await expect(result.getByText('Export: partial', { exact: true })).toBeVisible();
-    const firstBatches = batches.length, originalIds = new Set(batches.flat()); partial = false;
+    const firstBatches = batches.length, originalIds = new Set(batches.flat()), firstReads = observationReads; partial = false;
     await failNextDesktopRead(app, 'flowmate:query-evaluation-result', 'Synthetic saved receipt refresh failed.');
     await result.getByRole('button', { name: 'Upload / resend saved report', exact: true }).click();
     await expect(result.getByText('Synthetic saved receipt refresh failed.', { exact: true })).toBeVisible();
     await expect(result.getByRole('button', { name: 'Upload / resend saved report', exact: true })).toBeDisabled();
     await result.getByRole('button', { name: 'Refresh saved result', exact: true }).click();
     await expect(result.getByText('Export: complete', { exact: true })).toBeVisible();
-    const resent = batches.slice(firstBatches).flat(); expect(resent.length).toBeGreaterThan(0);
-    expect(resent.every(eventId => originalIds.has(eventId) && !acceptedFirst.has(eventId))).toBe(true);
+    expect(batches.slice(firstBatches)).toEqual([]);
+    expect(observationReads).toBeGreaterThan(firstReads);
+    expect(observations.every(row => originalIds.has(row.metadata.localObservationId))).toBe(true);
+    expect(scores.length).toBeGreaterThan(0);
+    expect(scores.every(score => score.source === 'API' && observations.some(row => row.traceId === score.traceId) && Number.isFinite(score.value))).toBe(true);
     const completedBatches = batches.length;
     await result.getByRole('button', { name: 'Upload / resend saved report', exact: true }).click();
     await expect.poll(() => projectQueries).toBe(3); expect(batches).toHaveLength(completedBatches); expect(requests).toBe(1);
@@ -262,12 +452,14 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
     await page.getByRole('button', { name: 'Compare conditions and results', exact: true }).click();
     await expect(page.getByText(/Different conditions can be viewed side by side/)).toBeVisible();
     expect(requests).toBe(2); expect(batches).toHaveLength(completedBatches);
-    const originalReport = readFileSync(join(root, 'agent-eval/runs/business', executionId, 'report.json'), 'utf8');
+    const originalReport = JSON.stringify(readReport(reportPath(root, executionId)));
     await killOwnedEvaluationWorker(app, root);
     await page.getByLabel('Dataset', { exact: true }).selectOption('facility-test');
     await page.getByLabel('Selection', { exact: true }).selectOption('case');
     await page.getByLabel('Case', { exact: true }).selectOption('test-lines');
     await page.getByRole('button', { name: 'Preview evaluation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Start evaluation', exact: true })).toBeEnabled({ timeout: 30_000 });
+    await expect(page.getByText('Members, scoring and run conditions', { exact: true })).toBeVisible();
     await expect(page.getByRole('region', { name: 'Global evaluation control' })).toHaveCount(0);
     await page.getByRole('button', { name: 'Start evaluation', exact: true }).click();
     await expect.poll(() => requests, { timeout: 30_000 }).toBe(3);
@@ -275,10 +467,9 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
     if (!quitting.ok) throw Error('Synthetic active control unavailable');
     const quitExecution = quitting.data.executionIds[0]!;
     await closeDesktopFixture(app, userData); closed = true;
-    const quitReport = JSON.parse(readFileSync(join(root, 'agent-eval/runs/business', quitExecution, 'report.json'), 'utf8'));
+    const quitReport = readReport(reportPath(root, quitExecution));
     expect(quitReport.endedAt).not.toBeNull();
-    const observation = JSON.parse(readFileSync(join(root, 'agent-eval/runs/business', quitExecution, quitReport.trials[0].evidence.observation), 'utf8'));
-    expect(observation.evidence.cleanup).toMatchObject({ present: true, actual: { closed: true, stopped: true } });
+    expect(quitReport.trials[0]!.execution?.evidence.cleanup).toMatchObject({ present: true, actual: { closed: true, stopped: true } });
     app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
       args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 }); closed = false;
     const reopened = await app.firstWindow(); await reopened.getByRole('button', { name: 'Invoices', exact: true }).click(); await reopened.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
@@ -287,10 +478,15 @@ test('Evaluation runs the real isolated Agent with zero Judge and keeps global c
     expect(restored).toMatchObject({ ok: true, data: { summary: { executionComplete: false } } });
     expect(await reopened.evaluate(() => window.flowmate.queryEvaluationControl())).toMatchObject({ ok: true, data: { state: 'idle', executionIds: [] } });
     expect(requests).toBe(3); expect(batches).toHaveLength(completedBatches);
-    expect(readFileSync(join(root, 'agent-eval/runs/business', executionId, 'report.json'), 'utf8')).toBe(originalReport);
+    expect(JSON.stringify(readReport(reportPath(root, executionId)))).toBe(originalReport);
   } catch (error) {
     failure = error as Error;
     if (!closed) console.log('Synthetic evaluation control:', await (await app.firstWindow()).evaluate(() => window.flowmate.queryEvaluationControl()));
+    if (!closed) console.log('Synthetic visible status:', await (await app.firstWindow()).getByRole('status').allTextContents());
+    if (uploadExecution) {
+      const saved = readReport(reportPath(root, uploadExecution)).export;
+      console.log('Synthetic export progress:', { observationReads, postedScores: scores.length, batches: batches.length, status: saved.status, error: saved.error });
+    }
   }
   finally { release(); releaseSecond(); releaseUpload(); if (!closed) await closeDesktopFixture(app, userData, failure); await server.stop(); await platform.stop(); }
   if (failure) throw failure;
@@ -330,16 +526,16 @@ test('an active Worker crash preserves partial evidence and stopping uncertainty
     await expect(page.getByRole('button', { name: 'Evaluation: interrupted', exact: true })).toBeVisible();
     const interrupted = await page.evaluate(() => window.flowmate.queryEvaluationControl());
     expect(interrupted).toMatchObject({ ok: true, data: { batchId: active.data.batchId, state: 'interrupted', stop: 'unconfirmed' } });
-    const file = join(root, 'agent-eval/runs/business', executionId, 'report.json'), original = readFileSync(file, 'utf8');
+    const original = JSON.stringify(readReport(reportPath(root, executionId)));
     const result = await page.evaluate(executionId => window.flowmate.queryEvaluationResult({ executionId, view: 'summary' }), executionId);
     expect(result).toMatchObject({ ok: true, data: { summary: { executionComplete: false, scoring: 'pending' } } });
     expect(await page.evaluate(() => window.flowmate.queryEvaluationControl())).toEqual(interrupted);
     expect(await page.evaluate(() => window.flowmate.startEvaluation({ previewId: 'synthetic-unaccepted-preview', requestId: 'synthetic-after-crash' })))
       .toMatchObject({ ok: false, error: { code: 'evaluation_busy' } });
-    expect(requests).toBe(1); expect(readFileSync(file, 'utf8')).toBe(original);
+    expect(requests).toBe(1); expect(JSON.stringify(readReport(reportPath(root, executionId)))).toBe(original);
     // The fixture forces only its own process out after verifying that normal product quit remains unconfirmed.
     await expect(closeDesktopFixture(app, userData)).rejects.toThrow('Desktop fixture normal close'); closed = true;
-    expect(readFileSync(file, 'utf8')).toBe(original);
+    expect(JSON.stringify(readReport(reportPath(root, executionId)))).toBe(original);
   } catch (error) { failure = error as Error; throw error; }
   finally { release(); if (!closed) await closeDesktopFixture(app, userData, failure); await server.stop(); }
 });
@@ -421,7 +617,7 @@ test('P16 public desktop operations inspect and review an isolated Case while mi
       feedback: { ok: true, data: { operation: { id: 'synthetic-electron-feedback', validity: 'current' }, formalAcceptance: 'pending' } },
       uploaded: { ok: false, error: { code: 'evaluation_export_failed' } }, control: { ok: true, data: { state: 'idle', executionIds: [] } } });
     expect(requests).toBe(0); expect(JSON.stringify(result)).not.toContain('synthetic-electron-platform-secret');
-    expect(JSON.parse(readFileSync(join(root, 'agent-eval/runs/case-reviews/review.json'), 'utf8')).records).toHaveLength(1);
+    expect(readFeedbackRecords(root)).toHaveLength(1);
   } catch (error) { failure = error as Error; throw error; }
   finally { await closeDesktopFixture(app, userData, failure); await server.stop(); }
   const db = new Database(join(userData, 'data/app.sqlite'), { readonly: true });
@@ -462,7 +658,12 @@ test('Models configures independent Evaluation Agent and Judge credentials witho
     expect(saved).toMatchObject({ ok: true, data: { settings: { defaultModelId: null, models: [], evaluation: {
       agent: { model: 'gpt-4o-mini' }, judge: { model: 'gpt-4o-mini', timeoutMs: 180000 } } },
       evaluationCredentials: { agent: 'configured', judge: 'configured' } } });
-    if (saved.ok) expect(saved.data.settings.evaluation?.agent?.credentialRef).not.toBe(saved.data.settings.evaluation?.judge?.credentialRef);
+    if (saved.ok) {
+      const judgeProfile = saved.data.settings.evaluation?.judge;
+      expect(judgeProfile && 'credentialRef' in judgeProfile).toBe(true);
+      if (judgeProfile && 'credentialRef' in judgeProfile)
+        expect(saved.data.settings.evaluation?.agent?.credentialRef).not.toBe(judgeProfile.credentialRef);
+    }
     expect(JSON.stringify(saved)).not.toContain('synthetic-p16-agent-ui-key');
     expect(JSON.stringify(saved)).not.toContain('synthetic-p16-judge-ui-key');
     await expect(judge.getByRole('button', { name: 'Save evaluation Judge', exact: true })).toBeEnabled();

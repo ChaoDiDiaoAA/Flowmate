@@ -20,6 +20,7 @@ function fixture() {
 
 test('local Host launches with its own runtime and product data without copying evaluation sources',()=>{
     const f=fixture(),local=prepareLocalHost(f.repo,f.trial);
+    expect(local.launch.args[local.launch.args.indexOf('--evaluation-trial-root') + 1]).toBe(f.trial);
     expect(local.launch.executable.toLowerCase()).not.toContain('docker');
     expect(local.manifest).toMatchObject({kind:'local-process',filesystemSandbox:false});
     expect(existsSync(join(local.runtimeRoot,'agent-eval'))).toBe(false);
@@ -44,3 +45,12 @@ test('evaluation Host does not inherit unrelated provider, cloud or evaluation c
     const actual=JSON.parse(execFileSync(local.launch.executable,local.launch.args,{cwd:local.runtimeRoot,env,encoding:'utf8',windowsHide:true}));
     expect(actual).toEqual(names.map(()=>false));
 },15000);
+
+test('trusted evaluation overrides arrive at the actual Host startup as a separate validated argument', () => {
+    const f = fixture(), overrides = { systemPrompt: 'Trusted experiment prompt', reasoning: 'max' as const,
+        strategy: { budgetAwareness: false, statistics: false, experience: true } };
+    writeFileSync(join(f.repo, 'apps/host/main.ts'), 'const i=process.argv.indexOf("--eval-agent-overrides");console.log(process.argv[i+1]);');
+    const local = prepareLocalHost(f.repo, f.trial, [], undefined, undefined, [], undefined, overrides);
+    const actual = JSON.parse(execFileSync(local.launch.executable, local.launch.args, { cwd: local.runtimeRoot, encoding: 'utf8', windowsHide: true }));
+    expect(actual).toEqual(overrides);
+}, 15000);

@@ -32,7 +32,7 @@ it('routes native Command and Markdown Template inputs through bound receipts an
   let extensions: ExtensionRef[] = [];
   const app = need(await createApplication({paths,resourceRoot,
     resourceDefaults:()=>ok({revision:1,selection:{prompt:null,enabledSkills:[]},extensions:{enabledExtensions:extensions}}),
-    agentFactory:(tools,resourceContents)=>new PiAgentAdapter({cwd:paths.runtimeDir,agentDir:paths.runtimeDir,tools,resourceContents,credentials:new InMemoryCredentialStore(),runtimeApiKey:'controlled-only'})}));
+    agentFactory:tools=>new PiAgentAdapter({cwd:paths.runtimeDir,agentDir:paths.runtimeDir,tools,credentials:new InMemoryCredentialStore(),runtimeApiKey:'controlled-only'})}));
   deferCleanup(()=>app.close()); extensions=need(await app.listExtensions()).items.filter(item=>item.ref.id==='subagents').map(item=>item.ref);
   const session=need(await app.createSession());
   const config: ProviderConfig={version:1,name:'trigger',revision:1,modelRef:{provider:'trigger',model:'trigger'},native:{authPath:join(root,'auth.json'),modelsPath:null},

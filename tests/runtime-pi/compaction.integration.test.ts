@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createAssistantMessageEventStream, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { getCurrentSystemPrompt } from '@earendil-works/pi-ai/utils/transcript';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import { SessionManager, type AgentSession, type AgentSessionEvent, type CompactionResult } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok, RUNTIME_CONFIG } from '@flowmate/contracts';
@@ -29,6 +30,34 @@ describe('P10 readonly adapter compaction inspection', () => {
     f.session.model!.contextWindow = 0;
     const invalid = need(f.adapter.inspectSessionCompaction({ history: bundle.history!, seed: bundle.seed, commit: bundle.commit! }));
     expect(invalid.capacity).toMatchObject({ contextWindow: null, thresholdTokens: null, fitsEstimate: null });
+  });
+  it('replacing a native system section preserves its effective context estimate and saved update history', async () => {
+    const f = await fixture(); await f.session.compact();
+    const note = 'Invoice note: ' + 'x'.repeat(12000);
+    f.session.sessionManager.appendMessage({ role: 'system', content: '', sections: { invoiceNote: note }, timestamp: 10 });
+    const before = need(f.store.sessions.loadHistoryForContext(f.row.sessionId));
+    const first = need(f.adapter.inspectSessionCompaction({ history: before.history!, seed: before.seed, commit: before.commit! }));
+    const replacement = note.replace('Invoice note', 'Current note');
+    f.session.sessionManager.appendMessage({ role: 'system', content: '', sections: { invoiceNote: replacement }, timestamp: 11 });
+    const after = need(f.store.sessions.loadHistoryForContext(f.row.sessionId));
+    const second = need(f.adapter.inspectSessionCompaction({ history: after.history!, seed: after.seed, commit: after.commit! }));
+    const prompt = getCurrentSystemPrompt(f.session.sessionManager.buildSessionContext().messages);
+    expect(prompt).toContain(replacement); expect(prompt).not.toContain(note);
+    expect(after.history!.entries).toHaveLength(before.history!.entries.length + 1);
+    expect(first.capacity.tokens).not.toBeNull();
+    expect(second.capacity.tokens).toBe(first.capacity.tokens);
+  });
+  it('native zero-usage compaction does not count replaced system sections as additional model context', async () => {
+    const f = await fixture('system-updates'); f.session.setAutoCompactionEnabled(true);
+    const before = need(f.store.memory.load(f.row.sessionId))!.commit;
+    expect(f.session.getContextUsage()?.tokens ?? Infinity).toBeLessThan(64000 - RUNTIME_CONFIG.compaction.reserveTokens);
+    const check = Reflect.get(f.session, '_checkCompaction');
+    if (typeof check !== 'function') throw new Error('Missing fixed SDK check');
+    const assistant = [...f.session.messages].reverse().find(message => message.role === 'assistant');
+    if (!assistant || assistant.role !== 'assistant') throw new Error('Missing original zero-usage response');
+    await check.call(f.session, assistant);
+    expect(f.calls).toHaveLength(0); expect(f.events).toEqual([]);
+    expect(need(f.store.memory.load(f.row.sessionId))!.commit).toEqual(before);
   });
   it('fixed SDK skips other-model overflow, aborted callbacks and stale pre-compaction usage', async () => {
     const f = await fixture(); f.session.setAutoCompactionEnabled(true);
@@ -58,7 +87,7 @@ describe('P10 readonly adapter compaction inspection', () => {
 import type { NativeSessionHistory, Result, CompactionObservation } from '@flowmate/contracts';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
 import { ensureNativeSession } from '../../packages/core/src/sessions/service.ts';
-import { openTestDatabase } from '../support/database.ts';
+import { openTestDatabase, withNativeHistoryFaults } from '../support/database.ts';
 import { deferCleanup, mkdtempSync, createHttpProvider } from '../support/resources.ts';
 import { installNativeCompactionBridge, type NativeSummaryScope } from '../../packages/runtime-pi/src/memory/compaction.ts';
 
@@ -70,12 +99,13 @@ const reply = (text: string, timestamp = 2, stopReason: AssistantMessage['stopRe
   role: 'assistant', content: [{ type: 'text', text }], api: 'openai-completions', provider: 'p10-native',
   model: 'offline', timestamp, stopReason, usage,
 });
-async function fixture(kind: 'long' | 'empty' | 'split' = 'long', product = false, transport: 'native' | 'http' = 'native') {
+async function fixture(kind: 'long' | 'empty' | 'split' | 'system-updates' = 'long', product = false, transport: 'native' | 'http' = 'native') {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-p10-native-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), runtimeDir: join(root, 'runtime'),
     artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs'), logsDir: join(root, 'logs') };
-  const store = need(openTestDatabase(paths));
+  const store = withNativeHistoryFaults(need(openTestDatabase(paths)));
   const payloads: unknown[] = [];
+  const modelObservations: import('@flowmate/contracts').ModelTraceObservation[] = [];
   const server = transport === 'http' ? await createHttpProvider(async request => {
     payloads.push(await request.json());
     const chunk = (delta: unknown, reason: string | null) => 'data: ' + JSON.stringify({ id: 'controlled-summary',
@@ -97,13 +127,28 @@ async function fixture(kind: 'long' | 'empty' | 'split' = 'long', product = fals
     manager.appendMessage({ role: 'user', content: 'one large invoice turn ' + 'y'.repeat(90000), timestamp: 3 });
     manager.appendMessage(reply('retained end ' + 'z'.repeat(100000), 4));
   }
+  if (kind === 'system-updates') {
+    manager.appendMessage({ role: 'user', content: 'Review the authorized invoice.', timestamp: 1 });
+    manager.appendMessage({ ...reply('No reported usage.'), usage: { ...usage, input: 0, output: 0, totalTokens: 0 } });
+    for (let update = 0; update < 4; update++) manager.appendMessage({ role: 'system', content: '', timestamp: update + 3,
+      sections: { invoiceNote: String.fromCharCode(65 + update).repeat(60000) } });
+  }
   const history: NativeSessionHistory = { storageVersion: 1, header: manager.getHeader()!,
     entries: manager.getEntries().map(entry => ({ ...entry })), leafId: manager.getLeafId(), unusable: false };
   const row = need(store.sessions.create({ nativeSessionId: history.header.id, title: 'Native compaction', at, nativeHistory: history }));
   let session!: AgentSession;
   const adapter = new PiAgentAdapter({ cwd: root, agentDir: root, credentials: new InMemoryCredentialStore(),
+    observeModel: value => modelObservations.push(value),
     runtimeApiKey: 'synthetic-native-compaction', sessionSetup: value => { session = value; } });
-  need(ensureNativeSession(store.sessions, adapter, row, store.memory));
+  if (product) need(await ensureNativeSession(store, adapter, row));
+  else {
+    // Bare SDK bridge characterization retains its real synchronous SQL writer; public product cases use the owner above.
+    const bundle = need(store.sessions.loadHistoryForContext(row.sessionId));
+    need(adapter.restoreSession(row.nativeSessionId, bundle.history!, bundle.seed, bundle.commit!));
+    need(adapter.watchSession(row.nativeSessionId, bundle.commit!, bundle.seed, write => store.memory.commit({
+      sessionId: row.sessionId, expected: write.expected, header: write.history.header, appendEntries: write.history.entries,
+      leafId: write.history.leafId, unusable: write.history.unusable, contexts: write.contexts })));
+  }
   const config = { version: 1 as const, name: 'Native fixture', revision: 1,
     modelRef: { provider: 'p10-native', model: 'offline' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
     connection: { baseUrl: server ? `http://127.0.0.1:${server.port}/v1` : 'http://127.0.0.1:1/v1', api: 'openai-completions' as const, contextWindow: 64000, maxTokens: 16384 },
@@ -143,11 +188,71 @@ async function fixture(kind: 'long' | 'empty' | 'split' = 'long', product = fals
   };
   const bridge = product ? { dispose() {} } : need(installNativeCompactionBridge(session, hook));
   deferCleanup(async () => { bridge.dispose(); await adapter.close(); });
-  return { store, row, adapter, session, bridge, hook, scopes, generated, appended, events, calls, payloads,
+  return { store, row, adapter, session, bridge, hook, scopes, generated, appended, events, calls, payloads, modelObservations,
     denyGenerated: () => { denyGenerated = true; }, response: (value: AssistantMessage) => { response = value; } };
 }
 
 describe('P10 fixed native compaction bridge and real SQLite commit', () => {
+  it.each(['allow', 'deny', 'cancel'] as const)('awaits owner-backed summary permission and rechecks stop before HTTP: %s', async decision => {
+    const f = await fixture('long', true, 'http');
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const held = f.store.transaction(async () => { entered.resolve(); await release.promise; });
+    await entered.promise;
+    const controller = new AbortController();
+    let settled = false;
+    const compacting = f.adapter.compactSession(f.row.nativeSessionId, { sessionId: f.row.sessionId,
+      operationId: crypto.randomUUID(), signal: controller.signal, maxModelCalls: 2, remainingMs: () => 60000,
+      verifyUse: async () => {
+        const current = await f.store.read(scope => scope.sessions.get(f.row.sessionId));
+        if (!current.ok) return current;
+        return decision === 'deny' ? fail(appError('session_scope_revoked', 'session', 'Controlled permission rejection.')) : ok(undefined);
+      }, observe: () => {} }).then(result => { settled = true; return result; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false); expect(f.payloads).toHaveLength(0);
+      if (decision === 'cancel') controller.abort('user');
+    } finally { release.resolve(); await held; }
+    const outcome = await compacting;
+    expect(outcome.observation).toMatchObject(decision === 'allow'
+      ? { generated: true, stopped: true, nativeOutcome: 'succeeded', mayContinue: true }
+      : { generated: false, saved: null, stopped: true, mayContinue: false,
+        error: { code: decision === 'deny' ? 'session_scope_revoked' : 'compaction_cancelled' } });
+    expect(f.payloads).toHaveLength(decision === 'allow' ? 1 : 0);
+  });
+
+  it('waits for asynchronous SQLite compaction acknowledgement before reporting a reusable checkpoint', async () => {
+    const f = await fixture('long', true, 'http');
+    const bundle = need(await f.store.read(scope => scope.sessions.loadHistoryForContext(f.row.sessionId)));
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let holding: Promise<void> | undefined;
+    need(f.adapter.watchSession(f.row.nativeSessionId, bundle.commit!, bundle.seed, write => {
+      if (write.history.entries.at(-1)?.type === 'compaction' && !holding)
+        holding = f.store.transaction(async () => { entered.resolve(); await release.promise; });
+      return f.store.transaction(scope => scope.memory.commit({ sessionId: f.row.sessionId, expected: write.expected,
+        header: write.history.header, appendEntries: write.history.entries, leafId: write.history.leafId,
+        unusable: write.history.unusable, contexts: write.contexts }));
+    }));
+    let finished = false;
+    const compacting = f.adapter.compactSession(f.row.nativeSessionId, { sessionId: f.row.sessionId,
+      operationId: crypto.randomUUID(), signal: new AbortController().signal, maxModelCalls: 2,
+      remainingMs: () => 60000, verifyUse: () => ok(undefined), observe: () => {} })
+      .then(result => { finished = true; return result; });
+    try {
+      await Promise.race([entered.promise, compacting.then(result => { throw Error(`Compaction ended before its append: ${result.observation.error?.code}`); })]);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(finished).toBe(false);
+      expect(f.adapter.inspect(f.row.nativeSessionId).availability).toBe('busy');
+      release.resolve(); await holding;
+      const outcome = await compacting;
+      expect(outcome).toMatchObject({ stopped: true, observation: { generated: true,
+        nativeOutcome: 'succeeded', mayContinue: true, error: null, saved: { entryCount: bundle.commit!.entryCount + 1 } } });
+      const saved = need(await f.store.read(scope => scope.sessions.loadHistoryForContext(f.row.sessionId)));
+      expect(saved.history?.entries.at(-1)?.type).toBe('compaction');
+      if (!outcome.observation.saved) throw Error('Missing confirmed compaction receipt');
+      expect(saved.commit!.leafId).toBe(outcome.observation.saved.leafId);
+    } finally { release.resolve(); await holding; await compacting; }
+  });
+
   it.each(['no-work', 'expired', 'small-window', 'unknown-window'] as const)('public manual %s sends no summary HTTP and does not invent a save', async kind => {
     const f = await fixture(kind === 'no-work' ? 'empty' : 'long', true, 'http');
     if (kind === 'small-window' || kind === 'unknown-window') f.session.model!.contextWindow = kind === 'small-window' ? RUNTIME_CONFIG.compaction.reserveTokens : 0;
@@ -177,14 +282,15 @@ describe('P10 fixed native compaction bridge and real SQLite commit', () => {
     expect(outcome.observation.generated).toBe(true);
     expect(outcome.observation.saved !== null).toBe(kind === 'lost-receipt');
     expect(outcome.observation.mayContinue).toBe(kind === 'lost-receipt');
-    expect(outcome.observation.nativeOutcome).toBe(kind === 'lost-receipt' ? 'succeeded' : 'failed');
+    expect(outcome.observation.nativeOutcome).toBe('succeeded');
+    if (kind === 'cas-conflict') expect(outcome.observation.error).not.toBeNull();
     expect(f.store.db.query("SELECT COUNT(*) AS n FROM session_native_entries WHERE json_extract(entry_json,'$.type')='compaction'").get())
       .toEqual({ n: kind === 'lost-receipt' ? 1 : 0 });
   });
   it('refuses a revision-exhausted checkpoint before its first summary HTTP', async () => {
     const f = await fixture('long', true, 'http');
     f.store.db.query('UPDATE session_native_history SET commit_revision=? WHERE session_id=?').run(Number.MAX_SAFE_INTEGER, f.row.sessionId);
-    need(ensureNativeSession(f.store.sessions, f.adapter, need(f.store.sessions.get(f.row.sessionId)), f.store.memory));
+    need(await ensureNativeSession(f.store, f.adapter, need(f.store.sessions.get(f.row.sessionId))));
     const outcome = await f.adapter.compactSession(f.row.nativeSessionId, { sessionId: f.row.sessionId,
       operationId: crypto.randomUUID(), signal: new AbortController().signal, maxModelCalls: 2,
       remainingMs: () => 5000, verifyUse: () => ok(undefined), observe: () => {} });
@@ -200,6 +306,10 @@ describe('P10 fixed native compaction bridge and real SQLite commit', () => {
       remainingMs: () => 5000, verifyUse: () => ok(undefined), observe: () => {} });
     expect(outcome.observation).toMatchObject({ generated: true, nativeOutcome: 'succeeded', stopped: true, mayContinue: true });
     expect(f.payloads).toHaveLength(kind === 'split' ? 2 : 1);
+    const captured = f.modelObservations.filter(value => value.runId === null && value.operationId === outcome.observation.operationId);
+    expect(captured.filter(value => value.phase === 'request').map(value => value.data)).toEqual(f.payloads);
+    expect(captured.filter(value => value.phase === 'response')).toHaveLength(kind === 'split' ? 2 : 1);
+    expect(captured.every(value => value.sessionId === f.row.sessionId && value.purpose?.startsWith('summary-'))).toBe(true);
     expect(outcome.observation.usage.attempts).toBe(kind === 'split' ? 2 : 1);
     expect(outcome.observation.tokens.totalTokens).toBe(kind === 'split' ? 30 : 15);
     expect(outcome.observation.tokens.cost).toBeNull();
@@ -226,7 +336,7 @@ describe('P10 fixed native compaction bridge and real SQLite commit', () => {
       remainingMs: () => 5000, verifyUse: () => ok(undefined), observe: value => { observations.push(value); } });
     expect(outcome.stopped).toBe(true);
     expect(outcome.observation).toMatchObject({ generated: true, stopped: true, phase: 'ended',
-      nativeOutcome: kind === 'saved' ? 'succeeded' : 'failed', mayContinue: kind === 'saved' });
+      nativeOutcome: 'succeeded', mayContinue: kind === 'saved' });
     const bundle = need(f.store.sessions.loadHistoryForContext(f.row.sessionId));
     if (kind === 'saved') {
       expect(outcome.observation.saved).toEqual(bundle.commit);

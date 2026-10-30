@@ -7,3 +7,4 @@ export * from './sdk-probe.ts';
 export * from './native-tools.ts';
 export * from './resources/loader.ts';
 export { validateNativeHistory, validateAgentContext, validateLlmMessages, inspectSessionHistory, buildForkSessionHistory } from './memory/history.ts';
+export { toPiParameters } from './schema.ts';

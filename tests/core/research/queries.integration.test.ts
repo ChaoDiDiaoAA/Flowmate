@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Database } from 'bun:sqlite';
 import { createApplication } from '../../../apps/composition.ts';
-import { openDatabase } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 
 it('restores research facts through public queries without admitting model, tool or Session inputs', async () => {
@@ -19,7 +19,7 @@ it('restores research facts through public queries without admitting model, tool
   if (!task.ok) throw new Error(task.error.code);
   const before = { runs: store.db.query('SELECT * FROM runs').all(), inputs: store.db.query('SELECT * FROM session_inputs').all(),
     tasks: store.db.query('SELECT * FROM research_tasks').all() };
-  store.close();
+  await store.close();
   let modelRequests = 0;
   const app = await createApplication({ paths, logger: { write: () => undefined, close: async () => undefined },
     provider: { prepare: async () => { modelRequests++; throw new Error('Queries must not execute.'); }, close: async () => ({ stopped: true, closed: true, errors: [] }) } });

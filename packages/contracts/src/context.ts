@@ -331,12 +331,12 @@ export const ContextEvidenceUpdateSchema = z.discriminatedUnion('kind', [
 ]).superRefine((value, context) => { if (value.kind === 'sdk-payload') checkInclusion(value, context); }).readonly();
 export type ContextEvidenceUpdate = z.infer<typeof ContextEvidenceUpdateSchema>;
 export type ContextHooks = {
-  compaction?: (value: RunCompactionEvidence) => Result<void>;
-  recordResourceRead?: (value: ResourceReadEvidence) => Result<void>;
-  recordResourceRequest?: (value: ResourceRequestEvidence) => Result<void>;
-  resolveToolResult(input: Readonly<{ sessionId: number; nativeToolCallId: string }>): Result<NativeToolResultContextBinding>;
-  bind(input: Readonly<{ binding: RequestContextBinding; api: string; transport: ContextRequestEvidence['transport']; at: string }>): Result<void>;
-  record(binding: RequestContextBinding, update: ContextEvidenceUpdate): Result<void>;
+  compaction?: (value: RunCompactionEvidence) => Result<void> | Promise<Result<void>>;
+  recordResourceRead?: (value: ResourceReadEvidence) => Result<void> | Promise<Result<void>>;
+  recordResourceRequest?: (value: ResourceRequestEvidence) => Result<void> | Promise<Result<void>>;
+  resolveToolResult(input: Readonly<{ sessionId: number; nativeToolCallId: string }>): Result<NativeToolResultContextBinding> | Promise<Result<NativeToolResultContextBinding>>;
+  bind(input: Readonly<{ binding: RequestContextBinding; api: string; transport: ContextRequestEvidence['transport']; at: string }>): Result<void> | Promise<Result<void>>;
+  record(binding: RequestContextBinding, update: ContextEvidenceUpdate): Result<void> | Promise<Result<void>>;
 };
 
 const limit = z.number().int().min(1).max(20).default(20);

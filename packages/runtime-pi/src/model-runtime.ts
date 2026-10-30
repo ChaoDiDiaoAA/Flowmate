@@ -6,7 +6,7 @@ import {
   type Model,
   ModelsError,
 } from '@earendil-works/pi-ai';
-import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, VERSION } from '@earendil-works/pi-coding-agent';
 import { appError, fail, ok } from '@flowmate/contracts';
 import type { ProviderConfig, Result } from '@flowmate/contracts';
 import type { SafeConfigSnapshot, SdkUsageValues, TokenColumns, UsageRecord } from '@flowmate/contracts';
@@ -101,8 +101,9 @@ export function normalizeUsage(
   };
 }
 
-const codingAgentVersion = '0.85.1';
-const aiVersion = '0.85.1';
+const codingAgentVersion = VERSION;
+const aiVersion = '1.4.0';
+const guardedRuntimes = new WeakSet<ModelRuntime>();
 
 export function safeUrl(value: string): string | null {
   try {
@@ -139,6 +140,11 @@ export async function refreshModelRuntimeAuth(
     else if (runtime.getProviderAuthStatus(config.modelRef.provider).source === 'runtime') {
       await runtime.removeRuntimeApiKey(config.modelRef.provider, { signal });
     }
+    const status = runtime.getProviderAuthStatus(config.modelRef.provider);
+    // Pi merges env overrides with ambient values; they cannot disable its fallback.
+    if (!apiKey && (!status.configured || status.source === 'environment' || status.source === 'fallback')) {
+      return fail(appError('provider_auth_failed', 'provider', 'Provider 认证未配置。'));
+    }
     const auth = await runtime.getAuth(model, { signal });
     if (!auth) return fail(appError('provider_auth_failed', 'provider', 'Provider 认证未配置。'));
     return ok({ authSource: apiKey ? 'pi-runtime-api-key' : 'pi-native' });
@@ -166,6 +172,24 @@ export async function prepareModelRuntime(
       refreshOnCreate: false,
       signal,
     });
+    if (!guardedRuntimes.has(runtime)) {
+      const guarded = runtime, readAuth = runtime.getAuth.bind(runtime);
+      runtime.getAuth = async (providerOrModel, overrides) => {
+        const provider = typeof providerOrModel === 'string' ? providerOrModel : providerOrModel.provider;
+        const refreshed = await guarded.refresh({ providers: [provider], allowNetwork: false, signal: overrides?.signal });
+        const status = guarded.getProviderAuthStatus(provider);
+        if (refreshed.aborted || !status.configured || status.source === 'environment' || status.source === 'fallback') return undefined;
+        return typeof providerOrModel === 'string' ? readAuth(providerOrModel, overrides) : readAuth(providerOrModel, overrides);
+      };
+      const streamSimple = runtime.streamSimple.bind(runtime);
+      runtime.streamSimple = (model, context, options) => {
+        const compat = model.compat;
+        // Native catalog fallbacks cannot authorize a different product model.
+        return streamSimple(compat && 'allowedFallbackModels' in compat
+          ? { ...model, compat: { ...compat, allowedFallbackModels: [] } } : model, context, options);
+      };
+      guardedRuntimes.add(runtime);
+    }
   } catch {
     return fail(appError('provider_runtime_init_failed', 'provider', 'Provider Runtime 初始化失败.', true));
   }
@@ -196,6 +220,7 @@ export async function prepareModelRuntime(
           name: config.modelRef.model,
           input: ['text'],
           reasoning: config.connection.reasoning ?? catalogModel?.reasoning ?? false,
+          ...(catalogModel?.thinkingLevelMap ? { thinkingLevelMap: { ...catalogModel.thinkingLevelMap } } : {}),
           contextWindow: config.connection.contextWindow ?? catalogModel!.contextWindow,
           maxTokens: config.connection.maxTokens ?? modelMaxTokens!,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

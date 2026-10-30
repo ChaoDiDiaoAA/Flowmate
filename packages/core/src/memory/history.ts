@@ -2,8 +2,8 @@ import { appError, fail, ok, normalizeNativeHistoryPageRequest, normalizeSession
   NativeHistoryInspectionSchema, NativeHistoryPageResultSchema, SessionHistoryEntryResultSchema, NativeSessionEntrySchema } from '@flowmate/contracts';
 import type { AgentPort, HistoryEntryDisplayFields, HistoryEntrySummary, HistorySelectionReason, NativeHistoryPage,
   NativeHistoryPageRequest, NativeHistoryRecoveryBundle, NativeSessionEntry, Result, SessionHistoryEntryDetail,
-  SessionHistoryEntryRequest, SessionSnapshot } from '@flowmate/contracts';
-import type { SessionRepository, SessionRow } from '../storage/repositories.ts';
+  SessionHistoryEntryRequest, AgentSessionSnapshot } from '@flowmate/contracts';
+import type { SessionRepository, AgentSessionRow } from '../storage/repositories.ts';
 
 type TextPart = { kind: NonNullable<SessionHistoryEntryDetail['part']>['kind']; text: string };
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
@@ -44,16 +44,20 @@ function display(entry: NativeSessionEntry): { fields: HistoryEntryDisplayFields
     case 'custom': return { fields: { type: entry.type, customType: preview(entry.customType), hasOpaqueData: entry.data !== undefined }, parts: [] };
     case 'custom_message': return { fields: { type: entry.type, customType: preview(entry.customType), display: entry.display,
       hasOpaqueData: entry.details !== undefined, ...imageFacts(entry.content) }, parts: contentParts(entry.content) };
+    case 'context_edit': return { fields: { type: entry.type, targetId: entry.targetId, omitted: entry.replacement === null },
+      parts: entry.replacement === null ? [] : contentParts(entry.replacement.content) };
+    case 'usage': return { fields: { type: entry.type, kind: preview(entry.kind), provider: preview(entry.provider),
+      model: preview(entry.model), usage: entry.usage }, parts: entry.note === undefined ? [] : [{ kind: 'text', text: entry.note }] };
     case 'label': return { fields: { type: entry.type, targetId: entry.targetId, label: entry.label === undefined ? null : preview(entry.label) },
       parts: entry.label === undefined ? [] : [{ kind: 'text', text: entry.label }] };
     case 'session_info': return { fields: { type: entry.type, name: entry.name === undefined ? null : preview(entry.name) },
       parts: entry.name === undefined ? [] : [{ kind: 'text', text: entry.name }] };
   }
 }
-type Loaded = { row: SessionRow; bundle: NativeHistoryRecoveryBundle; blocked: boolean };
+type Loaded = { row: AgentSessionRow; bundle: NativeHistoryRecoveryBundle; blocked: boolean };
 export function createHistoryReader(deps: { repository: SessionRepository; agent: AgentPort;
-  project: (row: SessionRow) => SessionSnapshot; managementReason: (row: SessionRow) => HistorySelectionReason | null }) {
-  function summarize(loaded: Loaded): Result<{ session: SessionSnapshot; summaries: HistoryEntrySummary[] }> {
+  project: (row: AgentSessionRow) => AgentSessionSnapshot; managementReason: (row: AgentSessionRow) => HistorySelectionReason | null }) {
+  function summarize(loaded: Loaded): Result<{ session: AgentSessionSnapshot; summaries: HistoryEntrySummary[] }> {
     const { history, commit, seed } = loaded.bundle;
     if (!history || !commit || !deps.agent.inspectSessionHistory)
       return fail(appError('session_history_unavailable', 'session', 'Saved native history is unavailable.'));
@@ -78,7 +82,7 @@ export function createHistoryReader(deps: { repository: SessionRepository; agent
     });
     return ok({ session: deps.project({ ...loaded.row, modelUseBlocked: loaded.blocked }), summaries });
   }
-  function read<T>(sessionId: number, revision: number | undefined, project: (loaded: Loaded, summaries: HistoryEntrySummary[], session: SessionSnapshot) => Result<T>): Result<T> {
+  function read<T>(sessionId: number, revision: number | undefined, project: (loaded: Loaded, summaries: HistoryEntrySummary[], session: AgentSessionSnapshot) => Result<T>): Result<T> {
     return deps.repository.readHistorySnapshot(sessionId, loaded => {
       if (!loaded.bundle.history || !loaded.bundle.commit) return fail(appError('session_history_unavailable', 'session', 'Saved native history is unavailable.'));
       if (revision !== undefined && revision !== loaded.bundle.commit.commitRevision)

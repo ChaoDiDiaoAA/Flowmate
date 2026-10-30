@@ -5,7 +5,8 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { resolveProductPaths } from '@flowmate/shared';
-import { openDatabase, createFileStore } from '../../../packages/core/src/index.ts';
+import { createFileStore } from '../../../packages/core/src/index.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { createApplication } from '../../../apps/composition.ts';
 import { mkdtempSync } from '../../support/resources.ts';
 import { defaultProductSettings } from '../../../packages/core/src/configuration/settings.ts';
@@ -29,14 +30,14 @@ function legacyStore() {
   return { root, paths, db };
 }
 
-it('creates the direct-content schema and preserves immutable original bytes across reads and restarts', () => {
+it('creates the direct-content schema and preserves immutable original bytes across reads and restarts', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-direct-content-'));
   const resolved = resolveProductPaths(root); if (!resolved.ok) throw new Error(resolved.error.code);
   const opened = openDatabase(resolved.data); expect(opened.ok).toBe(true); if (!opened.ok) throw new Error(opened.error.code);
   const owner = { ownerKind: 'artifact', ownerId: '1', relativePath: 'original.txt' };
   const original = Uint8Array.from([1, 2, 3]);
   try {
-    expect(opened.data.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 20 });
+    expect(opened.data.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 21 });
     expect(opened.data.db.query("SELECT name FROM pragma_table_info('session_inputs') WHERE name='request_hash'").get()).toBeNull();
     expect(opened.data.db.query("SELECT name FROM pragma_table_info('tool_calls') WHERE name='evidence_revision'").get()).toEqual({ name: 'evidence_revision' });
     opened.data.contents.remember(owner, original);
@@ -49,13 +50,13 @@ it('creates the direct-content schema and preserves immutable original bytes acr
     expect(() => opened.data.contents.remember(owner, Uint8Array.from([3, 2, 1]))).toThrow('managed_file_content_conflict');
     expect(() => opened.data.db.query('UPDATE managed_file_contents SET content=? WHERE owner_kind=? AND owner_id=? AND relative_path=?')
       .run(Uint8Array.from([3, 2, 1]), owner.ownerKind, owner.ownerId, owner.relativePath)).toThrow();
-  } finally { opened.data.close(); }
+  } finally { await opened.data.close(); }
   const restarted = openDatabase(resolved.data); expect(restarted.ok).toBe(true); if (!restarted.ok) throw new Error(restarted.error.code);
   try { expect(restarted.data.contents.read(owner)).toEqual(Uint8Array.from([1, 2, 3])); }
-  finally { restarted.data.close(); }
+  finally { await restarted.data.close(); }
 });
 
-it('backs up a v19 store and preserves IDs and native text while exposing unverified legacy files as unavailable', () => {
+it('backs up a v19 store and preserves IDs and native text while exposing unverified legacy files as unavailable', async () => {
   const f = legacyStore(), at = '2026-10-01T00:00:00.000Z';
   const original = Buffer.from('ORIGINAL'), parsed = Buffer.from('{}');
   const legacyDigest = 'a'.repeat(64);
@@ -93,7 +94,7 @@ it('backs up a v19 store and preserves IDs and native text while exposing unveri
     expect(opened.data.db.query('SELECT unusable FROM session_native_history').get()).toEqual({ unusable: 0 });
     expect(opened.data.db.query('SELECT count(*) AS count FROM managed_file_contents').get()).toEqual({ count: 0 });
     const artifact = opened.data.documents.getArtifact(1); if (!artifact.ok) throw new Error(artifact.error.code);
-    expect(createFileStore(f.paths, opened.data.documents).read(artifact.data)).toMatchObject({ ok: false });
+    expect(createFileStore(f.paths, opened.data).read(artifact.data, undefined, opened.data.contents)).toMatchObject({ ok: false });
     expect(readFileSync(join(f.root, 'artifacts', '1', 'original.png'))).toEqual(original);
     expect(readFileSync(join(f.root, 'artifacts', '1', 'publish.json'), 'utf8')).not.toContain('sha256');
     const backups = readdirSync(join(f.root, 'data')).filter(name => name.startsWith('pre-v20-'));
@@ -105,8 +106,8 @@ it('backs up a v19 store and preserves IDs and native text while exposing unveri
     const old = new Database(join(backupRoot, 'app.sqlite'), { readonly: true });
     try { expect(old.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 19 }); }
     finally { old.close(); }
-  } finally { opened.data.close(); }
-  const restarted = openDatabase(f.paths); expect(restarted.ok).toBe(true); if (restarted.ok) restarted.data.close();
+  } finally { await opened.data.close(); }
+  const restarted = openDatabase(f.paths); expect(restarted.ok).toBe(true); if (restarted.ok) await restarted.data.close();
   expect(readdirSync(join(f.root, 'data')).filter(name => name.startsWith('pre-v20-'))).toHaveLength(1);
 });
 
@@ -167,7 +168,7 @@ it('retains original Run resource facts under an opaque bundle ID and exposes a 
     const backupName = readdirSync(join(f.root, 'data')).find(name => name.startsWith('pre-v20-')); if (!backupName) throw new Error('Missing legacy backup');
     expect(readFileSync(join(f.root, 'data', backupName, oldSourcePath), 'utf8')).toBe(sourceText);
     expect(reopened.data.db.query('SELECT count(*) AS count FROM managed_file_contents').get()).toEqual({ count: 0 }); }
-  finally { reopened.data.close(); }
+  finally { await reopened.data.close(); }
 });
 
 it('reimports a legacy research material with the same title and text while preserving its visible verification gap', async () => {
@@ -188,10 +189,10 @@ it('reimports a legacy research material with the same title and text while pres
   try {
     expect(reopened.data.research.listMaterials({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ artifactId }, { artifactId: 1, verificationGap: 'legacy-original-unavailable' }] } });
     const current = reopened.data.documents.getArtifact(artifactId); if (!current.ok) throw new Error(current.error.code);
-    expect(createFileStore(f.paths, reopened.data.documents).read(current.data)).toEqual({ ok: true, data: new Uint8Array(Buffer.from(text)) });
+    expect(createFileStore(f.paths, reopened.data).read(current.data, undefined, reopened.data.contents)).toEqual({ ok: true, data: new Uint8Array(Buffer.from(text)) });
     const old = reopened.data.documents.getArtifact(1); if (!old.ok) throw new Error(old.error.code);
-    expect(createFileStore(f.paths, reopened.data.documents).read(old.data)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
-  } finally { reopened.data.close(); }
+    expect(createFileStore(f.paths, reopened.data).read(old.data, undefined, reopened.data.contents)).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } });
+  } finally { await reopened.data.close(); }
 });
 
 it('reimports a prepared invoice as a new verified version while retaining the unavailable legacy document', async () => {
@@ -219,8 +220,8 @@ it('reimports a prepared invoice as a new verified version while retaining the u
     expect(reopened.data.documents.get(1)).toMatchObject({ ok: true, data: { documentRef: { id: 1, version: 'legacy-version' }, status: 'unavailable', unavailableReason: expect.stringContaining('Re-import') } });
     const current = reopened.data.documents.get(documentId); if (!current.ok) throw new Error(current.error.code);
     const artifact = reopened.data.documents.getArtifact(current.data.originalArtifactId); if (!artifact.ok) throw new Error(artifact.error.code);
-    expect(createFileStore(f.paths, reopened.data.documents).read(artifact.data)).toEqual({ ok: true, data: new Uint8Array(Buffer.from(sourceText)) });
-  } finally { reopened.data.close(); }
+    expect(createFileStore(f.paths, reopened.data).read(artifact.data, undefined, reopened.data.contents)).toEqual({ ok: true, data: new Uint8Array(Buffer.from(sourceText)) });
+  } finally { await reopened.data.close(); }
 });
 
 it('rolls back SQL and restores earlier file rewrites when a later legacy manifest is invalid', () => {

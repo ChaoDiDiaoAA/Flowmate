@@ -5,10 +5,10 @@ import { join } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { appError, fail, ok, CandidateDraftSchema, invoiceHeaderFields, NativeSessionHistorySchema } from '@flowmate/contracts';
-import type { AgentRunEvent, Application, CandidateRepository, ProviderConfig, Result, WorkspaceSnapshot } from '@flowmate/contracts';
-import { ContextService, createFileStore, createToolExecutor, createToolRecorder, JobService, makeApplication, openDatabase,
-  RuntimeService, SessionService, WorkspaceService } from '@flowmate/core';
-import type { DbHandle } from '@flowmate/core';
+import type { AgentRunEvent, Application, CandidateRepository, ProviderConfig, Result, ToolCallContext, WorkspaceSnapshot } from '@flowmate/contracts';
+import { ContextService, createFileStore, createToolExecutor, createToolRecorder, JobService, makeApplication, RuntimeService, SessionService, WorkspaceService } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../support/database.ts';
+import type { TestDbHandle } from '../support/database.ts';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools } from '@flowmate/employee-invoice';
 import { PiAgentAdapter } from '../../packages/runtime-pi/src/session.ts';
@@ -32,7 +32,7 @@ type Payload = { messages: Array<{ role: string; content: unknown; tool_call_id?
 function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<Response>, setup?: (session: AgentSession) => void,
   options: { maxResultBytes?: number; p8?: boolean;
     candidateSave?: (save: CandidateRepository['save'], input: Parameters<CandidateRepository['save']>[0],
-      store: DbHandle, app: Application) => ReturnType<CandidateRepository['save']> } = {}) {
+      store: TestDbHandle, app: Application) => ReturnType<CandidateRepository['save']> | Promise<ReturnType<CandidateRepository['save']>> } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-admission-'));
   const paths = { root, databaseFile: join(root, 'data/app.sqlite'), runtimeDir: join(root, 'runtime'),
     logsDir: join(root, 'logs'), artifactsDir: join(root, 'artifacts'), outputsDir: join(root, 'outputs') };
@@ -59,18 +59,32 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
       metadata: { version: 2, pageCount: 1, warnings: [], allowedUsesClaim: ['synthetic test'],
         licenseVerification: 'not_verified', unavailableReason: null }, createdAt: now(), updatedAt: now() }));
   }
-  const files = createFileStore(paths, store.documents);
-  const documents = createDocumentService({ paths, repository: store.documents, files, allowedSourceRoot: root, now });
+  const files = createFileStore(paths, store);
+  const documents = createDocumentService({ paths, files, allowedSourceRoot: root, now,
+    transaction: operation => store.transaction(scope => operation({ repository: scope.documents,
+      files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })) });
   const verify = createTestWorkspaceVerifier(store, root);
   let business = 0, clockOffset = 0;
   let app!: Application;
   const originalSave = store.candidates.save.bind(store.candidates);
-  const candidates: CandidateRepository = { ...store.candidates, save: input => options.candidateSave
-    ? options.candidateSave(originalSave, input, store, app) : originalSave(input) };
-  const definitions = createInvoiceTools({ documents, documentRepository: store.documents, candidates, now })
+  const candidates = {
+    save: (input: Parameters<CandidateRepository['save']>[0], call: ToolCallContext) => options.candidateSave
+      ? options.candidateSave(originalSave, input, store, app) : store.transaction(scope => {
+        if (call.signal.aborted) return fail(appError('agent_cancelled', 'runtime', 'The run was cancelled; no candidate was saved.', false));
+        if (call.deadlineAt !== undefined && performance.now() >= call.deadlineAt)
+          return fail(appError('tool_timeout', 'tool', 'The tool deadline elapsed; no candidate was saved.', true));
+        return scope.candidates.save(input);
+      }),
+    listForRun: (input: Parameters<CandidateRepository['listForRun']>[0]) => store.read(scope => scope.candidates.listForRun(input)),
+    readForRun: (input: Parameters<CandidateRepository['readForRun']>[0]) => store.read(scope => scope.candidates.readForRun(input)),
+  };
+  const definitions = createInvoiceTools({
+    documents: { readParsedForRun: (id, context) => store.transaction(scope => documents.readParsedForRun(id, context, {
+      repository: scope.documents, files: { read: (artifact, name) => files.read(artifact, name, scope.contents) },
+    })) }, documentRepository: { get: id => store.read(scope => scope.documents.get(id)) }, candidates, now })
     .map(tool => ({ ...tool, execute: (...args: Parameters<typeof tool.execute>) => { business++; return tool.execute(...args); } }));
-  const tools = createToolExecutor({ definitions, recorder: createToolRecorder(store.toolCalls, now), now,
-    isSessionModelUseBlocked: id => store.sessions.isModelUseBlocked(id), monotonicNow: () => performance.now() + clockOffset,
+  const tools = createToolExecutor({ definitions,  database: store, now,
+     monotonicNow: () => performance.now() + clockOffset,
     maxResultBytes: options.maxResultBytes });
   const payloads: Payload[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
@@ -79,17 +93,18 @@ function fixture(fetch: (body: Payload, ordinal: number) => Response | Promise<R
   deferCleanup(() => server.stop(true));
   const agent = new PiAgentAdapter({ cwd: root, agentDir: paths.runtimeDir, tools: definitions,
     credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-runtime-key', sessionSetup: setup });
-  const runtime = new RuntimeService({ memory: store.memory, runs: store.runs, sessions: store.sessions, sessionInputs: store.sessionInputs, tools, agent, workspaceVerifier: verify,
+  const runtime = new RuntimeService({ database: store,  tools, agent, workspaceVerifier: verify,
     ...(options.p8 ? { contextService: new ContextService({ store, materials: {
-      inspectParsed: input => documents.inspectParsedForContext(input) } }), contextRepository: store.context } : {}),
+      inspectParsed: (input, scope) => documents.inspectParsedForContext(input, { repository: scope.documents,
+        files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }) } }) } : {}),
     provider: { async prepare() { throw new Error('No direct Provider request is authorized.'); },
       async close() { return { stopped: true, closed: true, errors: [] }; } }, log: { write() {}, async close() {} },
     now, monotonicNow: () => performance.now() + clockOffset });
-  const sessions = new SessionService(store.sessions, agent, () => runtime.state(), now, store.runs, store.memory, store.sessionInputs,
+  const sessions = new SessionService(agent, () => runtime.state(), now, store,
     (request, input, control) => runtime.start(request, control, input), request => runtime.appendInput(request),
-    id => runtime.verifySessionMutation(id));
-  app = makeApplication(runtime, store.runs, async () => { store.close(); return { stopped: true, closed: true, errors: [] }; },
-    sessions, undefined, new WorkspaceService(store.workspace, now, verify), new JobService(store.jobs, now));
+    (id, intent, repository) => runtime.verifySessionMutation(id, intent, repository));
+  app = makeApplication(runtime, store.runs, async () => { await store.close(); return { stopped: true, closed: true, errors: [] }; },
+    sessions, undefined, new WorkspaceService(store, now, verify), new JobService(store, now));
   deferCleanup(() => app.close());
   const config: ProviderConfig = { version: 1, name: 'Controlled runtime admission', revision: 1,
     modelRef: { provider: 'runtime-admission-fixture', model: 'runtime-model' }, native: { authPath: join(root, 'unused.json'), modelsPath: null },
@@ -134,9 +149,13 @@ describe('Runtime final admission after the real SDK before hook awaits', () => 
     expect(bundle.history!.entries).toEqual(JSON.parse(JSON.stringify(nativeSession.sessionManager.getEntries())));
     expect(bundle.commit).toMatchObject({ entryCount: nativeSession.sessionManager.getEntries().length,
       leafId: nativeSession.sessionManager.getLeafId() });
-    expect(bundle.seed.origins.filter(origin => bundle.history!.entries.find(entry => entry.id === origin.nativeEntryId)?.type === 'message')
+    const nativeEntries = NativeSessionHistorySchema.parse(bundle.history).entries;
+    expect(bundle.seed.origins.filter(origin => {
+      const entry = nativeEntries.find(entry => entry.id === origin.nativeEntryId);
+      return entry?.type === 'message' && entry.message.role !== 'system';
+    })
       .every(origin => origin.originRunId === accepted.runId && origin.originSessionId === session.sessionId)).toBe(true);
-    const messages = NativeSessionHistorySchema.parse(bundle.history).entries.flatMap(entry => entry.type === 'message' ? [entry.message] : []);
+    const messages = nativeEntries.flatMap(entry => entry.type === 'message' ? [entry.message] : []);
     expect(messages.at(-1)).toMatchObject({ role: 'assistant', stopReason: 'aborted', errorMessage: 'tool_budget_exceeded',
       content: [{ type: 'text', text: '' }] });
     expect(messages.filter(message => message.role === 'toolResult').map(message => message.toolCallId)).toEqual(['budget-owner-1']);
@@ -162,7 +181,7 @@ describe('Runtime final admission after the real SDK before hook awaits', () => 
       expect(await cold.close()).toMatchObject({ stopped: true, closed: true });
       expect(reopened.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
       expect(f.payloads).toHaveLength(2);
-    } finally { reopened.close(); }
+    } finally { await reopened.close(); }
   }, 15_000);
 
   it('T10 F8-18 rejects original synchronous candidate save after public revocation inside its real handler', async () => {
@@ -172,7 +191,7 @@ describe('Runtime final admission after the real SDK before hook awaits', () => 
       result?: ReturnType<CandidateRepository['save']>; snapshot?: unknown; input?: unknown; journal?: unknown } = { calls: 0 };
     const f = fixture((_body, ordinal) => ordinal === 1 ? response('', {
       name: 'save_invoice_candidate', args: { documentId: 1, candidate }, id: 't10-revoked-candidate' }) : response('Unexpected later request'),
-    undefined, { p8: true, candidateSave(save, input, store, app) {
+    undefined, { p8: true, async candidateSave(_save, input, store, app) {
       observed.calls++;
       const tool = store.db.query<{ context_snapshot_id: number; request_sequence: number; status: string }, [number, string]>
         ('SELECT context_snapshot_id,request_sequence,status FROM tool_calls WHERE run_id=? AND native_tool_call_id=?')
@@ -183,9 +202,10 @@ describe('Runtime final admission after the real SDK before hook awaits', () => 
       observed.input = store.db.query('SELECT id,content_json,context_snapshot_id FROM session_inputs WHERE run_id=?').get(input.runId);
       observed.journal = store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(input.runId);
       observed.revoke = app.revokeDocumentUse(input.documentId);
-      expect(need(store.sessions.isModelUseBlocked(input.sessionId))).toBe(true);
-      // No await: the unchanged synchronous repository must itself enter the revoked transaction.
-      const result = save(input); observed.result = result;
+      await observed.revoke;
+      expect(need(await store.read(scope => scope.sessions.isModelUseBlocked(input.sessionId)))).toBe(true);
+      // Await public revocation outside SQL, then exercise the unchanged synchronous save guard in its owner.
+      const result = await store.transaction(scope => scope.candidates.save(input)); observed.result = result;
       expect(result).toMatchObject({ ok: false, error: { code: 'session_scope_revoked', category: 'session', retryable: false } });
       expect(store.db.query('SELECT * FROM context_snapshots WHERE id=?').get(tool.context_snapshot_id)).toEqual(observed.snapshot);
       expect(store.db.query('SELECT context_observations_json FROM runs WHERE id=?').get(input.runId)).toEqual(observed.journal);
@@ -287,10 +307,16 @@ describe('Runtime final admission after the real SDK before hook awaits', () => 
       if (fault === 'transaction') f.store.db.exec(`CREATE TRIGGER reject_runtime_observation BEFORE UPDATE OF runtime_observation_json ON tool_calls
         WHEN NEW.runtime_observation_json IS NOT NULL BEGIN SELECT RAISE(ABORT,'controlled observation write failure'); END;`);
       else {
-        const original = f.store.toolCalls.reject;
-        f.store.toolCalls.reject = input => { fixed = original(input);
-          if (fixed.ok && fault === 'response-throw') throw new Error('Controlled rejection response loss.');
-          return fixed.ok ? fail(appError('storage_write_failed', 'storage', 'Controlled rejection response loss.')) : fixed; };
+        const transaction = f.store.transaction;
+        f.store.transaction = operation => transaction(scope => {
+          const original = scope.toolCalls.reject;
+          scope.toolCalls.reject = input => {
+            fixed = original(input);
+            if (fixed.ok && fault === 'response-throw') throw new Error('Controlled rejection response loss.');
+            return fixed.ok ? fail(appError('storage_write_failed', 'storage', 'Controlled rejection response loss.')) : fixed;
+          };
+          return operation(scope);
+        });
       }
       release.release(); const end = await terminal.ready;
       expect(after).toBe(route === 'sdk' ? 0 : 1); expect(f.business()).toBe(0);

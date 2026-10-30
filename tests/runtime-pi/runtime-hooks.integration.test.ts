@@ -14,6 +14,7 @@ for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-id-mutate', 'sdk-na
     const paths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
       outputsDir: join(root, 'outputs'), logsDir: join(root, 'logs'), runtimeDir: join(root, 'runtime') };
     let before = 0, after = 0, business = 0, requests = 0;
+    let cacheWarmingStatus: unknown;
     let fixedFacts: Pick<ToolCallSnapshot, 'result' | 'runtimeObservation' | 'endedAt' | 'stoppedAt'> | undefined;
     let queryCall: AgentToolBinding['queryCall'];
     const payloads: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
@@ -36,9 +37,10 @@ for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-id-mutate', 'sdk-na
     const opened = await createApplication({ paths, logger: { write() {}, close: async () => undefined },
       toolDefinitions: definitions => definitions.map(tool => tool.name === 'calculate_invoice_amounts'
         ? { ...tool, execute: (...call: Parameters<typeof tool.execute>) => { business += 1; return tool.execute(...call); } } : tool),
-      agentFactory: (definitions, resourceContents) => {
-      const adapter = new PiAgentAdapter({ resourceContents, cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools: definitions,
+      agentFactory: definitions => {
+      const adapter = new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools: definitions,
         credentials: new InMemoryCredentialStore(), runtimeApiKey: 'controlled-key', sessionSetup(session) {
+          cacheWarmingStatus = session.cacheWarmingStatus;
           const originalBefore = session.agent.beforeToolCall, originalAfter = session.agent.afterToolCall;
           session.agent.beforeToolCall = async (...call) => {
             before += 1;
@@ -56,7 +58,7 @@ for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-id-mutate', 'sdk-na
           };
           session.agent.afterToolCall = async (...call) => {
             after += 1;
-            const saved = queryCall?.(call[0].toolCall.id);
+            const saved = await queryCall?.(call[0].toolCall.id);
             if (!saved?.ok) throw new Error('Expected a saved ToolCall before SDK after.');
             fixedFacts = { result: saved.data.result, runtimeObservation: saved.data.runtimeObservation,
               endedAt: saved.data.endedAt, stoppedAt: saved.data.stoppedAt };
@@ -113,6 +115,7 @@ for (const mode of ['schema', 'sdk-block', 'sdk-throw', 'sdk-id-mutate', 'sdk-na
       { onEvent: event => { if (event.type === 'run_finished') finish(event); } });
       if (!accepted.ok) throw new Error(accepted.error.code);
       const terminal = await completion;
+      if (mode === 'schema') expect(cacheWarmingStatus).toEqual({ state: 'inactive', reason: 'cache warming disabled' });
       expect(terminal.result.ok).toBe(true);
       expect(await app.close()).toMatchObject({ ok: true, data: { stopped: true, closed: true } });
       closed = true;

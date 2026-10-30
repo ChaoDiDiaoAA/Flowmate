@@ -2,9 +2,12 @@ import { platformClient } from './export.ts';
 import { readReport, reportPath } from '../reports/store.ts';
 import { addFeedback, feedbackStatus } from '../review/local.ts';
 import type { LangfuseClient } from '@langfuse/client';
+import { langfuseConfig, langfuseConnection, type LangfuseConnection } from '../configuration.ts';
 const NAME = 'Flowmate local run feedback';
-export async function platformReview(repo: string, action: string, executionId?: string, providedClient?: LangfuseClient) {
-    const client = providedClient ?? await platformClient(repo);
+export async function platformReview(repo: string, action: string, executionId?: string, providedClient?: LangfuseClient,
+    providedConnection?: LangfuseConnection) {
+    const connection = providedConnection ? langfuseConnection(providedConnection) : langfuseConfig(repo);
+    const client = providedClient ?? await platformClient(repo, connection);
     try {
         const queues = [] as Awaited<ReturnType<typeof client.api.annotationQueues.listQueues>>['data'];
         for (let page = 1;; page++) {
@@ -27,6 +30,9 @@ export async function platformReview(repo: string, action: string, executionId?:
         if (report.executionId !== executionId) throw new Error('Execution identity mismatch');
         if (report.export.status !== 'complete')
             throw new Error('Export this execution successfully before platform review');
+        const projects = await client.api.projects.get({ maxRetries: 0 });
+        if (!report.export.target || report.export.target.baseUrl !== connection.baseUrl || projects.data.length !== 1 ||
+            projects.data[0]!.id !== report.export.target.projectId) throw Error('Platform review target differs from the original export target');
         if (action === 'sync') {
             const feedback = feedbackStatus(repo, executionId);
             if (feedback.stale) throw new Error('Feedback version mismatch');
@@ -34,8 +40,8 @@ export async function platformReview(repo: string, action: string, executionId?:
                 const trial = report.trials.find(t => t.caseId === record.caseId && t.trialId === record.trialId && t.caseVersion===record.caseVersion);
                 if (!trial)
                     throw new Error('Feedback version mismatch');
-                client.score.create({ id: ['human', report.executionId, record.id].join(':'), traceId: trial.traceId, name: '人工反馈 · 运行结果', dataType: 'CATEGORICAL', value: record.verdict, comment: record.note,
-                    metadata: { feedbackId: record.id, executionId: report.executionId, trialId: trial.trialId, caseId: trial.caseId, caseVersion: 'v1',
+                await client.api.scores.create({ id: ['human', report.executionId, record.id].join(':'), traceId: trial.traceId, name: '人工反馈 · 运行结果', dataType: 'CATEGORICAL', value: record.verdict, comment: record.note,
+                    metadata: { feedbackId: record.id, executionId: report.executionId, trialId: trial.trialId, caseId: trial.caseId, caseVersion: trial.caseVersion,
                         reviewer: record.reviewer, at: record.at, method: 'human', source: 'local-feedback' } });
             }
             await client.flush();
@@ -66,28 +72,13 @@ export async function platformReview(repo: string, action: string, executionId?:
         const cursors = new Set<string>();
         do {
             const response = await client.api.scoresV3.getManyV3({ limit: 100, cursor, fields: 'details,subject,annotation', source: 'ANNOTATION', queueId: queue.id });
-            for (const raw of response.data) {
-                const score = raw as unknown as {
-                    id: string;
-                    name: string;
-                    value: unknown;
-                    stringValue?: string;
-                    source: string;
-                    queueId?: string;
-                    authorUserId?: string;
-                    timestamp: string;
-                    comment?: string;
-                    subject?: {
-                        kind: string;
-                        id: string;
-                    };
-                };
+            for (const score of response.data) {
                 if (score.name !== NAME || score.source !== 'ANNOTATION' || score.queueId !== queue.id || !score.authorUserId || score.subject?.kind !== 'trace')
                     continue;
                 const trial = report.trials.find(t => t.traceId === score.subject!.id);
                 if (!trial || !items.some(i => i.objectId === trial.traceId && i.status === 'COMPLETED'))
                     continue;
-                const verdict = score.stringValue ?? score.value;
+                const verdict = score.value;
                 if (verdict !== 'good' && verdict !== 'bad')
                     continue;
                 imported.push(addFeedback(repo, { executionId, caseId: trial.caseId, trialId: trial.trialId, reviewer: `langfuse:${score.authorUserId}`, verdict, note: score.comment || `Platform annotation ${score.id}`, source: `langfuse:${score.id}`, id: `langfuse:${score.id}`, at: score.timestamp }));

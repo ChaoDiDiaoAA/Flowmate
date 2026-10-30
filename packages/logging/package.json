@@ -2,6 +2,6 @@
   "name": "@flowmate/logging",
   "private": true,
   "type": "module",
-  "dependencies": { "@flowmate/contracts": "workspace:*" },
+  "dependencies": { "@flowmate/contracts": "workspace:*", "@flowmate/shared": "workspace:*" },
   "exports": { ".": "./src/index.ts" }
 }

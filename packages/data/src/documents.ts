@@ -70,6 +70,10 @@ export interface DocumentRepository {
 }
 export interface FileStore {
   publish(input: PublishArtifactInput): Promise<Result<PublishedArtifactPair>>;
+  publish<T>(input: PublishArtifactInput, workflow: {
+    findExisting(): Promise<Result<T | null>>;
+    register(published: PublishedArtifactPair): Promise<Result<T>>;
+  }): Promise<Result<T>>;
   read(artifact: StoredArtifact, fileName?: string): Result<Uint8Array>;
 }
 
@@ -118,17 +122,40 @@ function scopeAllows(scope: RunScope, document: DocumentSnapshot): boolean {
 export type DocumentServiceOptions = {
   paths: ProductPaths;
   allowedSourceRoot: string;
-  repository: DocumentRepository;
-  files: FileStore;
+  files: Pick<FileStore, 'publish'>;
   now: () => string;
+  transaction: <T>(operation: (current: MaterialInspectionOptions) => Result<T>) => Promise<Result<T>>;
 };
+export type MaterialInspectionOptions = { repository: DocumentRepository; files: Pick<FileStore, 'read'> };
 
 export class DocumentService {
   private tail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly options: DocumentServiceOptions) {}
 
+  private async transaction<T>(operation: (current: MaterialInspectionOptions) => Result<T>): Promise<Result<T>> {
+    try { return await this.options.transaction(operation); }
+    catch { return fail(appError('storage_write_failed', 'storage', 'Document facts could not be saved or confirmed.', true)); }
+  }
+
+  private async registerPublished(input: NewDocumentRegistration, signal?: AbortSignal): Promise<Result<DocumentSnapshot>> {
+    const saved = await this.transaction(current => cancelled(signal)
+      ? fail(appError('operation_cancelled', 'runtime', '材料导入已取消；已发布文件保留为待核对孤儿。'))
+      : current.repository.register(input));
+    if (saved.ok || saved.error.code === 'operation_cancelled') return saved;
+    const found = await this.transaction(current => current.repository.findBySource({
+      sourceKey: input.sourceKey, sourceRecordId: input.sourceRecordId, version: input.version,
+    }));
+    if (found.ok && found.data && found.data.documentRef.id === input.documentId
+      && found.data.originalArtifactId === input.originalArtifact.artifactId && found.data.parsedArtifactId === input.parsedArtifact.artifactId
+      && found.data.status === input.status && found.data.pageCount === input.metadata.pageCount
+      && found.data.createdAt === input.createdAt && found.data.updatedAt === input.updatedAt) return ok(found.data);
+    return saved;
+  }
+
   public importPrepared(raw: unknown, signal?: AbortSignal): Promise<Result<DocumentSnapshot>> {
+    try { raw = structuredClone(raw); }
+    catch { return Promise.resolve(fail(appError('input_invalid', 'input', 'Prepared invoice source is invalid.'))); }
     const previous = this.tail;
     let release!: () => void;
     this.tail = new Promise<void>(resolve => { release = resolve; });
@@ -150,18 +177,9 @@ export class DocumentService {
     const parsedBytes = Buffer.from(JSON.stringify(parsed)), contentBytes = Buffer.from(JSON.stringify(input.sourceText));
     const pagesBytes = Buffer.from(JSON.stringify(input.pages)), sourceBytes = Buffer.from(JSON.stringify({
       contract: input.contract, sample: input.sample, original: { name: input.original.name } }));
-    const versions = this.options.repository.findVersions?.({ sourceKey, sourceRecordId });
-    if (versions && !versions.ok) return versions;
-    for (const prior of versions?.ok ? versions.data : []) {
-      const same = this.sameVersion(prior, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, input.original.name);
-      if (same.ok || same.error.code !== 'document_version_conflict') return same;
-    }
     const version = newDocumentVersion();
-    const existing = this.options.repository.findBySource({ sourceKey, sourceRecordId, version });
-    if (!existing.ok) return existing;
-    if (existing.data) return this.sameVersion(existing.data, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, input.original.name);
     const now = this.options.now();
-    const published = await this.options.files.publish({ sourceKey, sourceRecordId, sourceVersion: version, at: now,
+    return this.options.files.publish({ sourceKey, sourceRecordId, sourceVersion: version, at: now,
       original: { kind: 'original', primaryName: input.original.name, files: [{ name: input.original.name, bytes: originalBytes,
         mimeType: input.original.name === 'original.pdf' ? 'application/pdf' : 'text/markdown' }] },
       parsed: { kind: 'parsed', primaryName: 'parsed.json', files: [
@@ -169,16 +187,28 @@ export class DocumentService {
         { name: 'raw-content.json', bytes: contentBytes, mimeType: 'application/json' },
         { name: 'raw-pages.json', bytes: pagesBytes, mimeType: 'application/json' },
         { name: 'source.json', bytes: sourceBytes, mimeType: 'application/json' }
-      ] } });
-    if (!published.ok) return published;
-    if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消；已发布文件保留为待核对孤儿。'));
-    return this.options.repository.register({ documentId: published.data.documentId, sourceKey, sourceRecordId, version: published.data.original.metadata.sourceVersion,
-      originalArtifact: published.data.original, parsedArtifact: published.data.parsed, status: 'available',
-      metadata: { version: 2, pageCount: input.pages.length, warnings: [], allowedUsesClaim: ['frozen-prepared-material'],
-        licenseVerification: 'caller-supplied', unavailableReason: null }, createdAt: now, updatedAt: now });
+      ] } }, {
+      findExisting: () => this.transaction(current => {
+        if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
+        const versions = current.repository.findVersions?.({ sourceKey, sourceRecordId });
+        if (versions && !versions.ok) return versions;
+        for (const prior of versions?.ok ? versions.data : []) {
+          const same = this.sameVersion(prior, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, input.original.name, current);
+          if (same.ok || same.error.code !== 'document_version_conflict') return same;
+        }
+        const existing = current.repository.findBySource({ sourceKey, sourceRecordId, version });
+        if (!existing.ok) return existing;
+        return existing.data ? this.sameVersion(existing.data, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, input.original.name, current) : ok(null);
+      }),
+      register: published => this.registerPublished({ documentId: published.documentId, sourceKey, sourceRecordId, version: published.original.metadata.sourceVersion,
+        originalArtifact: published.original, parsedArtifact: published.parsed, status: 'available',
+        metadata: { version: 2, pageCount: input.pages.length, warnings: [], allowedUsesClaim: ['frozen-prepared-material'],
+          licenseVerification: 'caller-supplied', unavailableReason: null }, createdAt: now, updatedAt: now }, signal),
+    });
   }
 
   public importVoxel51(input: { sourceDirectory: string }, signal?: AbortSignal): Promise<Result<DocumentSnapshot>> {
+    input = { ...input };
     const previous = this.tail;
     let release!: () => void;
     this.tail = new Promise<void>((resolveLock) => { release = resolveLock; });
@@ -196,9 +226,6 @@ export class DocumentService {
     if (!parsed.ok) return parsed;
     const version = newDocumentVersion();
     if (version.length > MAX_INVOICE_VERSION_CHARS) return fail(appError('source_invalid', 'input', '来源版本超过支持范围。'));
-    const existing = this.options.repository.findBySource({ sourceKey: parsed.data.sourceKey,
-      sourceRecordId: parsed.data.sourceRecordId, version });
-    if (!existing.ok) return existing;
     const sourceRecord = {
       version: 2,
       sourceKey: parsed.data.sourceKey,
@@ -216,15 +243,6 @@ export class DocumentService {
     };
     const parsedBytes = Buffer.from(JSON.stringify(parsed.data.parsed), 'utf8');
     const sourceBytes = Buffer.from(JSON.stringify(sourceRecord), 'utf8');
-    const versions = this.options.repository.findVersions?.({ sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId });
-    if (versions && !versions.ok) return versions;
-    for (const prior of versions?.ok ? versions.data : []) {
-      const same = this.sameVersion(prior, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, originalFileName);
-      if (same.ok || same.error.code !== 'document_version_conflict') return same;
-    }
-    if (existing.data) {
-      return this.sameVersion(existing.data, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, originalFileName);
-    }
     if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
     const now = this.options.now();
     const publish: PublishArtifactInput = {
@@ -238,13 +256,23 @@ export class DocumentService {
         { name: 'source.json', bytes: sourceBytes, mimeType: 'application/json' },
       ] },
     };
-    const published = await this.options.files.publish(publish);
-    if (!published.ok) return published;
-    if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消；已发布文件保留为待核对孤儿。'));
-    const result = this.options.repository.register({
-      documentId: published.data.documentId,
-      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, version: published.data.original.metadata.sourceVersion,
-      originalArtifact: published.data.original, parsedArtifact: published.data.parsed,
+    return this.options.files.publish(publish, {
+      findExisting: () => this.transaction(current => {
+        if (cancelled(signal)) return fail(appError('operation_cancelled', 'runtime', '材料导入已取消。'));
+        const existing = current.repository.findBySource({ sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, version });
+        if (!existing.ok) return existing;
+        const versions = current.repository.findVersions?.({ sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId });
+        if (versions && !versions.ok) return versions;
+        for (const prior of versions?.ok ? versions.data : []) {
+          const same = this.sameVersion(prior, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, originalFileName, current);
+          if (same.ok || same.error.code !== 'document_version_conflict') return same;
+        }
+        return existing.data ? this.sameVersion(existing.data, originalBytes, contentBytes, pagesBytes, parsedBytes, sourceBytes, originalFileName, current) : ok(null);
+      }),
+      register: published => this.registerPublished({
+      documentId: published.documentId,
+      sourceKey: parsed.data.sourceKey, sourceRecordId: parsed.data.sourceRecordId, version: published.original.metadata.sourceVersion,
+      originalArtifact: published.original, parsedArtifact: published.parsed,
       status: 'available', metadata: {
         version: 2, sampleId: parsed.data.sampleId, pageCount: parsed.data.parsed.pages.length,
         warnings: parsed.data.parsed.completeness.warnings,
@@ -253,126 +281,133 @@ export class DocumentService {
         unavailableReason: null,
       },
       createdAt: now, updatedAt: now,
+      }, signal),
     });
-    return result;
   }
 
-  public readOriginalForWorkspace(documentId: number, page: number): Result<{ documentRef: DocumentSnapshot['documentRef']; mimeType: 'image/jpeg' | 'image/png'; bytes: Uint8Array }> {
+  public readOriginalForWorkspace(documentId: number, page: number): Promise<Result<{ documentRef: DocumentSnapshot['documentRef']; mimeType: 'image/jpeg' | 'image/png'; bytes: Uint8Array }>> {
+    return this.transaction(options => {
     if (!Number.isSafeInteger(documentId) || documentId < 1 || page !== 1) return fail(appError('input_invalid', 'input', '原图引用无效。'));
-    const document = this.options.repository.get(documentId);
+    const document = options.repository.get(documentId);
     if (!document.ok) return document;
     if (document.data.status !== 'available') return fail(appError('input_unavailable', 'input', '材料当前不可读取。', true));
-    const artifact = this.options.repository.getArtifact(document.data.originalArtifactId);
+    const artifact = options.repository.getArtifact(document.data.originalArtifactId);
     if (!artifact.ok) return artifact;
     const fileName = artifact.data.relativePath.slice(artifact.data.relativePath.lastIndexOf('/') + 1);
-    const bytes = this.options.files.read(artifact.data, fileName);
+    const bytes = options.files.read(artifact.data, fileName);
     if (!bytes.ok) return bytes.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt') : bytes;
+      ? this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt', undefined, options.repository) : bytes;
     if (bytes.data.byteLength > MAX_WORKSPACE_ORIGINAL_BYTES) return fail(appError('tool_result_too_large', 'runtime', '原图超过桌面读取大小限制。'));
     const mimeType = artifact.data.mimeType;
     if (artifact.data.metadata.sourceKey === 'prepared-invoice' && preparedOriginal(bytes.data, fileName))
       return fail(appError('input_unavailable', 'input', 'This prepared original has no image preview; its parsed pages remain available.'));
     if ((mimeType !== 'image/jpeg' && mimeType !== 'image/png') || !isSupportedOriginal(bytes.data, fileName)) {
-      return this.unavailableDocument(documentId, 'original_artifact_invalid');
+      return this.unavailableDocument(documentId, 'original_artifact_invalid', undefined, options.repository);
     }
     return ok({ documentRef: document.data.documentRef, mimeType, bytes: bytes.data });
+    });
   }
 
-  public restoreDocument(documentId: number): Result<DocumentSnapshot> {
-    const document = this.options.repository.get(documentId);
+  public restoreDocument(documentId: number): Promise<Result<DocumentSnapshot>> {
+    return this.transaction(options => {
+    const document = options.repository.get(documentId);
     if (!document.ok) return document;
-    const original = this.options.repository.getArtifact(document.data.originalArtifactId);
-    const parsed = this.options.repository.getArtifact(document.data.parsedArtifactId);
+    const original = options.repository.getArtifact(document.data.originalArtifactId);
+    const parsed = options.repository.getArtifact(document.data.parsedArtifactId);
     if (!original.ok) return original;
     if (!parsed.ok) return parsed;
     const originalName = original.data.relativePath.slice(original.data.relativePath.lastIndexOf('/') + 1);
-    const originalBytes = this.options.files.read(original.data, originalName);
+    const originalBytes = options.files.read(original.data, originalName);
     if (!originalBytes.ok) return originalBytes.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt') : originalBytes;
+      ? this.unavailableDocument(documentId, 'original_artifact_missing_or_corrupt', undefined, options.repository) : originalBytes;
     if (!(original.data.metadata.sourceKey === 'prepared-invoice' ? preparedOriginal(originalBytes.data, originalName)
-      : isSupportedOriginal(originalBytes.data, originalName))) return this.unavailableDocument(documentId, 'original_artifact_invalid');
-    const decoded = this.readStoredParsed(document.data, parsed.data);
+      : isSupportedOriginal(originalBytes.data, originalName))) return this.unavailableDocument(documentId, 'original_artifact_invalid', undefined, options.repository);
+    const decoded = this.readStoredParsed(document.data, parsed.data, undefined, options);
     if (!decoded.ok) return decoded;
     try {
       if (decoded.data.pages.length !== document.data.pageCount) {
-        return this.unavailableDocument(documentId, 'parsed_document_mismatch');
+        return this.unavailableDocument(documentId, 'parsed_document_mismatch', undefined, options.repository);
       }
       for (const file of parsed.data.metadata.files) {
         if (file.relativePath === 'parsed.json') continue;
-        const sidecar = this.options.files.read(parsed.data, file.relativePath);
+        const sidecar = options.files.read(parsed.data, file.relativePath);
         if (!sidecar.ok) return sidecar.error.code === 'artifact_unavailable'
-          ? this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt') : sidecar;
+          ? this.unavailableDocument(documentId, 'parsed_sidecar_missing_or_corrupt', undefined, options.repository) : sidecar;
       }
-      return this.options.repository.setAvailability({ documentId, status: 'available', reason: null, at: this.options.now() });
+      return options.repository.setAvailability({ documentId, status: 'available', reason: null, at: this.options.now() });
     } catch {
-      return this.unavailableDocument(documentId, 'parsed_document_invalid');
+      return this.unavailableDocument(documentId, 'parsed_document_invalid', undefined, options.repository);
     }
+    });
   }
 
-  public readParsedForRun(documentId: number, context: ProductToolContext): Result<{ document: DocumentSnapshot; parsed: StoredParsedDocument }> {
+  public readParsedForRun(documentId: number, context: ProductToolContext,
+    options: MaterialInspectionOptions): Result<{ document: DocumentSnapshot; parsed: StoredParsedDocument }> {
     if (!Number.isSafeInteger(documentId) || documentId < 1 || !context.scope.allowedDocumentIds.includes(documentId)) {
       return fail(appError('tool_access_denied', 'runtime', '当前 Run 无权读取该材料。', false, context.runId, context.sessionId));
     }
-    const document = this.options.repository.get(documentId);
+    const document = options.repository.get(documentId);
     if (!document.ok) return document.error.code === 'document_not_found'
       ? fail(appError('tool_access_denied', 'runtime', '当前 Run 无权读取该材料。', false, context.runId, context.sessionId))
       : document;
     if (!scopeAllows(context.scope, document.data)) return fail(appError('tool_access_denied', 'runtime', '当前 Run 无权读取该材料。', false, context.runId, context.sessionId));
     if (document.data.status !== 'available' || document.data.isHidden) return fail(appError('input_unavailable', 'input', '材料当前不可读取。', true, context.runId, context.sessionId));
-    const artifact = this.options.repository.getArtifact(document.data.parsedArtifactId);
+    const artifact = options.repository.getArtifact(document.data.parsedArtifactId);
     if (!artifact.ok) return artifact;
-    const parsed = this.readStoredParsed(document.data, artifact.data, context);
+    const parsed = this.readStoredParsed(document.data, artifact.data, context, options);
     return parsed.ok ? ok({ document: document.data, parsed: parsed.data }) : parsed;
   }
 
-  public readParsedForWorkspace(documentId: number): Result<{ document: DocumentSnapshot; parsed: StoredParsedDocument }> {
+  public readParsedForWorkspace(documentId: number,
+    options: MaterialInspectionOptions): Result<{ document: DocumentSnapshot; parsed: StoredParsedDocument }> {
     if (!Number.isSafeInteger(documentId) || documentId < 1) return fail(appError('input_invalid', 'input', 'Document ID 无效。'));
-    const document = this.options.repository.get(documentId);
+    const document = options.repository.get(documentId);
     if (!document.ok) return document;
     if (document.data.status !== 'available') return fail(appError('input_unavailable', 'input', '材料当前不可读取。', true));
-    const artifact = this.options.repository.getArtifact(document.data.parsedArtifactId);
+    const artifact = options.repository.getArtifact(document.data.parsedArtifactId);
     if (!artifact.ok) return artifact;
-    const parsed = this.readStoredParsed(document.data, artifact.data);
+    const parsed = this.readStoredParsed(document.data, artifact.data, undefined, options);
     return parsed.ok ? ok({ document: document.data, parsed: parsed.data }) : parsed;
   }
 
-  public inspectForWorkspace(ref: DocumentRef): Result<WorkspaceMaterialInspection> {
-    const inspected = this.inspectMaterial(ref);
+  public inspectForWorkspace(ref: DocumentRef, options: MaterialInspectionOptions): Result<WorkspaceMaterialInspection> {
+    const inspected = this.inspectMaterial(ref, options);
     if (!inspected.ok) return inspected;
     if (inspected.data.kind === 'invalid') return ok(inspected.data);
     return ok({ kind: 'valid', document: inspected.data.document,
       pages: inspected.data.parsed.pages.map(page => ({ page: page.page, blockIds: page.blocks.map(block => block.id) })) });
   }
 
-  public inspectParsedForContext(input: Parameters<ContextMaterialPort['inspectParsed']>[0]): Result<ContextParsedMaterial> {
+  public inspectParsedForContext(input: Parameters<ContextMaterialPort['inspectParsed']>[0],
+    options: MaterialInspectionOptions): Result<ContextParsedMaterial> {
     const parsed = ContextMaterialRequestSchema.safeParse(input);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'Context material reference is invalid.'));
     const request = parsed.data;
     if (!request.allowedDocumentIds.includes(request.documentRef.id)) return fail(appError('tool_access_denied', 'runtime', 'Context material is outside the Run scope.'));
     try {
-      const document = this.options.repository.get(request.documentRef.id);
+      const document = options.repository.get(request.documentRef.id);
       if (!document.ok) return document;
       if (document.data.documentRef.version !== request.documentRef.version) return fail(appError('state_conflict', 'input', 'Context material version changed.'));
       if (document.data.isHidden || document.data.status !== 'available') return fail(appError('input_unavailable', 'input', 'Context material is unavailable.', true));
       if (!request.allowedArtifactIds.includes(document.data.parsedArtifactId)) return fail(appError('tool_access_denied', 'runtime', 'Context Artifact is outside the Run scope.'));
-      const inspected = this.inspectMaterial(request.documentRef);
+      const inspected = this.inspectMaterial(request.documentRef, options);
       if (!inspected.ok) return inspected;
       if (inspected.data.kind === 'invalid') return fail(appError('artifact_unavailable', 'storage', 'Context managed material could not be verified.'));
       return ok({ document: inspected.data.document, parsed: inspected.data.parsed });
     } catch { return fail(appError('storage_read_failed', 'storage', 'Context material inspection could not be completed.', true)); }
   }
 
-  private inspectMaterial(ref: DocumentRef): Result<{ kind: 'invalid'; reason: string }
+  private inspectMaterial(ref: DocumentRef, options: MaterialInspectionOptions): Result<{ kind: 'invalid'; reason: string }
     | { kind: 'valid'; document: DocumentSnapshot; parsed: StoredParsedDocument }> {
     if (!DocumentRefSchema.safeParse(ref).success) return fail(appError('input_invalid', 'input', '材料引用无效。'));
     const invalid = (reason: string): Result<{ kind: 'invalid'; reason: string }> => ok({ kind: 'invalid', reason });
     try {
-      const document = this.options.repository.get(ref.id);
+      const document = options.repository.get(ref.id);
       if (!document.ok) return document.error.code === 'document_not_found' ? invalid('document_missing') : document;
       if (document.data.documentRef.version !== ref.version) return invalid('document_version_mismatch');
       if (document.data.isHidden) return invalid('document_hidden');
-      const original = this.options.repository.getArtifact(document.data.originalArtifactId);
-      const parsed = this.options.repository.getArtifact(document.data.parsedArtifactId);
+      const original = options.repository.getArtifact(document.data.originalArtifactId);
+      const parsed = options.repository.getArtifact(document.data.parsedArtifactId);
       if (!original.ok) return original.error.code === 'artifact_not_found' ? invalid('artifact_missing_or_invalid') : original;
       if (!parsed.ok) return parsed.error.code === 'artifact_not_found' ? invalid('artifact_missing_or_invalid') : parsed;
       if (original.data.kind !== 'original' || parsed.data.kind !== 'parsed'
@@ -380,13 +415,13 @@ export class DocumentService {
         || original.data.metadata.sourceVersion !== ref.version || parsed.data.metadata.sourceVersion !== ref.version
         || original.data.metadata.sourceKey !== parsed.data.metadata.sourceKey
         || original.data.metadata.sourceRecordId !== parsed.data.metadata.sourceRecordId) return invalid('artifact_missing_or_invalid');
-      const owner = this.options.repository.findBySource({ sourceKey: original.data.metadata.sourceKey,
+      const owner = options.repository.findBySource({ sourceKey: original.data.metadata.sourceKey,
         sourceRecordId: original.data.metadata.sourceRecordId, version: original.data.metadata.sourceVersion });
       if (!owner.ok) return owner;
       if (owner.data?.documentRef.id !== ref.id || owner.data.documentRef.version !== ref.version)
         return invalid('artifact_missing_or_invalid');
       const originalName = original.data.relativePath.slice(original.data.relativePath.lastIndexOf('/') + 1);
-      const originalBytes = this.options.files.read(original.data, originalName);
+      const originalBytes = options.files.read(original.data, originalName);
       if (!originalBytes.ok) return originalBytes.error.code === 'artifact_unavailable' ? invalid('artifact_missing_or_invalid') : originalBytes;
       if (original.data.metadata.sourceKey === 'prepared-invoice'
         ? !preparedOriginal(originalBytes.data, originalName) || original.data.mimeType !== (originalName === 'original.pdf' ? 'application/pdf' : 'text/markdown')
@@ -396,11 +431,11 @@ export class DocumentService {
       // Check every registered file, including sidecars, without altering availability.
       for (const artifact of [original.data, parsed.data]) {
         for (const file of artifact.metadata.files) {
-          const bytes = this.options.files.read(artifact, file.relativePath);
+          const bytes = options.files.read(artifact, file.relativePath);
           if (!bytes.ok) return bytes.error.code === 'artifact_unavailable' ? invalid('artifact_missing_or_invalid') : bytes;
         }
       }
-      const decoded = this.inspectStoredParsed(document.data, parsed.data);
+      const decoded = this.inspectStoredParsed(document.data, parsed.data, options);
       if (!decoded.ok) return decoded.error.code === 'artifact_unavailable' ? invalid('artifact_missing_or_invalid') : decoded;
       if (decoded.data.pages.length !== document.data.pageCount) return invalid('artifact_missing_or_invalid');
       const seenPages = new Set<number>();
@@ -416,25 +451,26 @@ export class DocumentService {
   }
 
   private readStoredParsed(document: DocumentSnapshot, artifact: StoredArtifact,
-    context?: ProductToolContext): Result<StoredParsedDocument> {
-    const inspected = this.inspectStoredParsed(document, artifact);
+    context: ProductToolContext | undefined, options: MaterialInspectionOptions): Result<StoredParsedDocument> {
+    const inspected = this.inspectStoredParsed(document, artifact, options);
     return !inspected.ok && inspected.error.code === 'artifact_unavailable'
-      ? this.unavailableDocument(document.documentRef.id, inspected.error.message, context) : inspected;
+      ? this.unavailableDocument(document.documentRef.id, inspected.error.message, context, options.repository) : inspected;
   }
 
-  private inspectStoredParsed(document: DocumentSnapshot, artifact: StoredArtifact): Result<StoredParsedDocument> {
+  private inspectStoredParsed(document: DocumentSnapshot, artifact: StoredArtifact,
+    options: MaterialInspectionOptions): Result<StoredParsedDocument> {
     const invalid = (reason: string) => fail<StoredParsedDocument>(appError('artifact_unavailable', 'storage', reason));
-    const bytes = this.options.files.read(artifact, 'parsed.json');
+    const bytes = options.files.read(artifact, 'parsed.json');
     if (!bytes.ok) return bytes.error.code === 'artifact_unavailable' ? invalid('parsed_artifact_missing_or_corrupt') : bytes;
     let decoded: StoredParsedDocument;
     try { decoded = decodeParsed(parseJson(bytes.data)); }
     catch { return invalid('parsed_document_invalid'); }
     if (artifact.metadata.sourceKey === 'prepared-invoice') {
-      const original = this.options.repository.getArtifact(document.originalArtifactId);
+      const original = options.repository.getArtifact(document.originalArtifactId);
       if (!original.ok) return original;
       const originalName = original.data.relativePath.slice(original.data.relativePath.lastIndexOf('/') + 1);
-      const originalBytes = this.options.files.read(original.data, originalName), source = this.options.files.read(artifact, 'source.json');
-      const content = this.options.files.read(artifact, 'raw-content.json'), pages = this.options.files.read(artifact, 'raw-pages.json');
+      const originalBytes = options.files.read(original.data, originalName), source = options.files.read(artifact, 'source.json');
+      const content = options.files.read(artifact, 'raw-content.json'), pages = options.files.read(artifact, 'raw-pages.json');
       if (!originalBytes.ok || !source.ok || !content.ok || !pages.ok) return invalid('prepared_sidecar_missing_or_corrupt');
       try {
         const input = PreparedInvoiceMaterialSchema.safeParse({ ...parseJson(source.data) as object,
@@ -448,9 +484,9 @@ export class DocumentService {
     }
     if (!/:parsed-v3:[a-f0-9]{64}$/.test(document.documentRef.version)) return ok(decoded);
 
-    const content = this.options.files.read(artifact, 'raw-content.json');
+    const content = options.files.read(artifact, 'raw-content.json');
     if (!content.ok) return content.error.code === 'artifact_unavailable' ? invalid('parsed_sidecar_missing_or_corrupt') : content;
-    const pages = this.options.files.read(artifact, 'raw-pages.json');
+    const pages = options.files.read(artifact, 'raw-pages.json');
     if (!pages.ok) return pages.error.code === 'artifact_unavailable' ? invalid('parsed_sidecar_missing_or_corrupt') : pages;
     try {
       const mapped = mapVoxel51ParsedDocument({ content: parseJson(content.data), pages: parseJson(pages.data) });
@@ -464,26 +500,28 @@ export class DocumentService {
     return ok(decoded);
   }
 
-  private unavailableDocument(documentId: number, reason: string, context?: ProductToolContext): Result<never> {
-    const changed = this.options.repository.setAvailability({ documentId, status: 'unavailable', reason, at: this.options.now() });
+  private unavailableDocument(documentId: number, reason: string, context: ProductToolContext | undefined,
+    repository: DocumentRepository): Result<never> {
+    const changed = repository.setAvailability({ documentId, status: 'unavailable', reason, at: this.options.now() });
     if (!changed.ok) return changed;
     return fail(appError('input_unavailable', 'input', '材料缺失或损坏，需先恢复后再读取。', true,
       context?.runId, context?.sessionId));
   }
 
   private sameVersion(document: DocumentSnapshot, original: Uint8Array, content: Uint8Array, pages: Uint8Array,
-    parsed: Uint8Array, source: Uint8Array, originalName: 'original.jpg' | 'original.png' | 'original.pdf' | 'source.md'): Result<DocumentSnapshot> {
+    parsed: Uint8Array, source: Uint8Array, originalName: 'original.jpg' | 'original.png' | 'original.pdf' | 'source.md',
+    options: MaterialInspectionOptions): Result<DocumentSnapshot> {
     if (document.status === 'unavailable' && document.unavailableReason === 'Legacy file content has no preserved original bytes. Re-import this document to use it again.')
       return fail(appError('document_version_conflict', 'input', 'Legacy source bytes cannot prove equivalence; import a new version.'));
-    const originalArtifact = this.options.repository.getArtifact(document.originalArtifactId);
-    const parsedArtifact = this.options.repository.getArtifact(document.parsedArtifactId);
+    const originalArtifact = options.repository.getArtifact(document.originalArtifactId);
+    const parsedArtifact = options.repository.getArtifact(document.parsedArtifactId);
     if (!originalArtifact.ok) return originalArtifact;
     if (!parsedArtifact.ok) return parsedArtifact;
-    const savedOriginal = this.options.files.read(originalArtifact.data, originalName);
-    const savedParsed = this.options.files.read(parsedArtifact.data, 'parsed.json');
-    const savedContent = this.options.files.read(parsedArtifact.data, 'raw-content.json');
-    const savedPages = this.options.files.read(parsedArtifact.data, 'raw-pages.json');
-    const savedSource = this.options.files.read(parsedArtifact.data, 'source.json');
+    const savedOriginal = options.files.read(originalArtifact.data, originalName);
+    const savedParsed = options.files.read(parsedArtifact.data, 'parsed.json');
+    const savedContent = options.files.read(parsedArtifact.data, 'raw-content.json');
+    const savedPages = options.files.read(parsedArtifact.data, 'raw-pages.json');
+    const savedSource = options.files.read(parsedArtifact.data, 'source.json');
     if (!savedOriginal.ok) return savedOriginal;
     if (!savedParsed.ok) return savedParsed;
     if (!savedContent.ok) return savedContent;
@@ -494,7 +532,7 @@ export class DocumentService {
       && Buffer.compare(Buffer.from(savedContent.data), Buffer.from(content)) === 0
       && Buffer.compare(Buffer.from(savedPages.data), Buffer.from(pages)) === 0
       && Buffer.compare(Buffer.from(savedSource.data), Buffer.from(source)) === 0
-      ? document.isHidden ? this.options.repository.unhide(document.documentRef.id, this.options.now()) : ok(document)
+      ? document.isHidden ? options.repository.unhide(document.documentRef.id, this.options.now()) : ok(document)
       : fail(appError('document_version_conflict', 'input', '同一来源版本对应了不同材料内容。'));
   }
 }

@@ -13,11 +13,13 @@ import { EVALUATION_FRAME_LIMIT, parseEvaluationWorkerCommand, parseEvaluationWo
 import { registerSecrets, scanEvidence } from '../../../agent-eval/src/execution/evidence-safety.ts';
 import type { EvaluationStartContext } from '../../../agent-eval/src/desktop/service.ts';
 import { safeChildEnvironment } from './host-client.ts';
-import { langfuseConfig, type LangfuseConnection } from '../../../agent-eval/src/configuration.ts';
+import { langfuseConfig, type LangfuseConnection, type EvaluationAgentCredential } from '../../../agent-eval/src/configuration.ts';
+import { EvaluationWorkflowRequestSchema, isWorkflowReadOnly, type EvaluationWorkflowResult } from '../../../packages/contracts/src/evaluation-workflow.ts';
 
 type Fields<K extends EvaluationWorkerOperation> = Omit<Extract<EvaluationWorkerCommand, { type: K }>, 'version' | 'sessionId' | 'messageId' | 'type'>;
 type Pending = { operation: EvaluationWorkerOperation; command: ReturnType<typeof parseEvaluationCommand>;
-  resolve(value: Result<EvaluationWorkerData<EvaluationWorkerOperation>>): void; timer: ReturnType<typeof setTimeout> };
+  workflowAction?: string;
+  resolve(value: Result<EvaluationWorkerData<EvaluationWorkerOperation>>): void; timer: ReturnType<typeof setTimeout> | undefined };
 type Start = { previewId: string; batchId: string; sent: boolean; cancelled: boolean; control: EvaluationControlState;
   promise: Promise<Result<EvaluationControlState>> };
 type PrepareStart = (preview: EvaluationPreview) => Promise<Result<Omit<EvaluationStartContext, 'batchId'>>>;
@@ -48,11 +50,14 @@ export class EvaluationClient {
   private crashBlocked = false;
   private closeAcknowledged = false;
   private exporting = false;
+  private workflowWriting = false;
+  private readonly capturedTraces = new Set<string>();
+  private processingCapturedTraces = false;
   private readonly exports = new Map<string, { executionId: string; promise: Promise<Result<EvaluationWorkerData<'export_evaluation'>>> }>();
 
   constructor(private readonly repository: string, private readonly evaluationRepository = repository, private readonly launch?: EvaluationWorkerLaunch) {}
   public get state(): EvaluationControlState | null { return this.current ? structuredClone(this.current) : null; }
-  public get canRestartHost(): boolean { return !this.closing && !this.exporting && !this.crashBlocked && !active(this.current); }
+  public get canRestartHost(): boolean { return !this.closing && !this.exporting && !this.workflowWriting && !this.crashBlocked && !active(this.current); }
   public subscribe(listener: (event: EvaluationEvent) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private publish(control: EvaluationControlState, replace = false) {
     const safe = scanEvidence(structuredClone(control)).value;
@@ -61,6 +66,22 @@ export class EvaluationClient {
     this.current = safe;
     const event: EvaluationEvent = { version: 1, sessionId: control.sessionId, sequence: ++this.publicationSequence, control: this.current };
     for (const listener of this.listeners) { try { listener(structuredClone(event)); } catch { /* Display cannot change the controller. */ } }
+    void this.flushCapturedTraces();
+  }
+  public enqueueTrace(traceId: string): void {
+    if (this.closing || !EvaluationWorkflowRequestSchema.safeParse({ action: 'trace.process', traceId }).success) return;
+    this.capturedTraces.add(traceId); void this.flushCapturedTraces();
+  }
+  private async flushCapturedTraces(): Promise<void> {
+    if (this.processingCapturedTraces) return;
+    this.processingCapturedTraces = true;
+    try {
+      while (this.capturedTraces.size && this.canRestartHost) {
+        const traceId = this.capturedTraces.values().next().value!; this.capturedTraces.delete(traceId);
+        const result = await this.workflow({ action: 'trace.process', traceId });
+        if (!result.ok && result.error.code === 'evaluation_busy') { this.capturedTraces.add(traceId); break; }
+      }
+    } finally { this.processingCapturedTraces = false; }
   }
   private interrupted() {
     if (active(this.current)) this.publish({ ...this.current!, state: 'interrupted', stop: 'unconfirmed',
@@ -97,7 +118,7 @@ export class EvaluationClient {
     const timer = setTimeout(() => finish(failure('evaluation_worker_timeout', '评测进程尚未就绪；保留原连接，不自动重启。')), 20_000);
     this.exited = new Promise<void>(done => child.once('exit', () => {
       if (this.child === child) {
-        if (!this.closeAcknowledged && active(this.current)) { this.crashBlocked = true; this.interrupted(); }
+        if (!this.closeAcknowledged && (active(this.current) || this.workflowWriting)) { this.crashBlocked = true; this.interrupted(); }
         this.child = null; this.startup = null; this.latestPreview = null;
         finish(failure('evaluation_worker_exited', '评测进程已退出。')); this.failPending('evaluation_worker_exited', '评测进程已退出，原请求结果未知。');
       }
@@ -121,7 +142,8 @@ export class EvaluationClient {
         this.workerSequence = output.event.sequence; this.publish(control); return;
       }
       const pending = this.pending.get(output.messageId); if (!pending) return;
-      if (pending.operation !== output.operation || pending.command && !matchesEvaluationResponse(pending.command, output.result as Result<EvaluationControlState | EvaluationPreview>)) {
+      if (pending.operation !== output.operation || pending.command && !matchesEvaluationResponse(pending.command, output.result as Result<EvaluationControlState | EvaluationPreview>)
+        || pending.workflowAction && output.result.ok && (!('action' in output.result.data) || output.result.data.action !== pending.workflowAction)) {
         clearTimeout(pending.timer); this.pending.delete(output.messageId); pending.resolve(failure('evaluation_protocol_invalid', '评测回复不属于原请求。')); this.interrupted(); return;
       }
       if (output.operation === 'shutdown' && output.result.ok && output.result.data.closed && output.result.data.stopped) this.closeAcknowledged = true;
@@ -139,7 +161,7 @@ export class EvaluationClient {
     child.once('close', () => lines.close());
     return ready;
   }
-  private request<K extends EvaluationWorkerOperation>(operation: K, fields: Fields<K>, timeoutMs = 10_000): Promise<Result<EvaluationWorkerData<K>>> {
+  private request<K extends EvaluationWorkerOperation>(operation: K, fields: Fields<K>, timeoutMs: number | null = 10_000): Promise<Result<EvaluationWorkerData<K>>> {
     const child = this.child, messageId = randomUUID();
     if (!child || !child.stdin.writable || child.stdin.destroyed) return Promise.resolve(failure('evaluation_worker_unavailable', '评测通道不可写。'));
     const command = parseEvaluationWorkerCommand({ ...fields, type: operation, version: 1, sessionId: this.sessionId, messageId });
@@ -147,8 +169,9 @@ export class EvaluationClient {
     const line = JSON.stringify(command) + '\n';
     if (Buffer.byteLength(line) > EVALUATION_FRAME_LIMIT) return Promise.resolve(failure('input_invalid', '评测请求超过传输容量。'));
     return new Promise(resolve => {
-      const timer = setTimeout(() => { this.pending.delete(messageId); resolve(failure('evaluation_response_unknown', '评测响应未知，请查询原请求。')); }, timeoutMs);
-      this.pending.set(messageId, { operation, command: operation === 'shutdown' ? null : parseEvaluationCommand({ type: operation, input: command.input }),
+      const timer = timeoutMs === null ? undefined : setTimeout(() => { this.pending.delete(messageId); resolve(failure('evaluation_response_unknown', '评测响应未知，请查询原请求。')); }, timeoutMs);
+      this.pending.set(messageId, { operation, command: operation === 'shutdown' || operation === 'evaluation_workflow' ? null : parseEvaluationCommand({ type: operation, input: command.input }),
+        ...(command.type === 'evaluation_workflow' ? { workflowAction: command.input.action } : {}),
         resolve: value => resolve(value as Result<EvaluationWorkerData<K>>), timer });
       child.stdin.write(line, error => { if (!error) return; clearTimeout(timer); this.pending.delete(messageId); resolve(failure('evaluation_write_failed', '评测请求写入结果未知。')); });
     });
@@ -165,12 +188,31 @@ export class EvaluationClient {
   public compare(input: unknown) { return this.read('compare_evaluation', input); }
   public catalog(input: unknown) { return this.read('query_evaluation_catalog', input); }
   public feedback(input: unknown) { return this.read('query_evaluation_feedback', input); }
+  public async workflow(input: unknown, agentCredentials?: EvaluationAgentCredential[]): Promise<Result<EvaluationWorkflowResult>> {
+    const parsed = EvaluationWorkflowRequestSchema.safeParse(input);
+    if (!parsed.success) return failure('input_invalid', '评测闭环请求无效。');
+    if (agentCredentials && parsed.data.action !== 'experiment.run') return failure('input_invalid', '只有实验执行可接收私有模型凭据。');
+    const readOnly = isWorkflowReadOnly(parsed.data.action);
+    if (this.closing || !readOnly && (this.workflowWriting || this.exporting || this.crashBlocked || active(this.current)))
+      return failure('evaluation_busy', '评测正在运行、写入、关闭或停止未确认。');
+    if (!readOnly) this.workflowWriting = true;
+    try {
+      const ready = await this.ensureReady(); if (!ready.ok) return ready;
+      if (this.closing) return failure('evaluation_busy', '评测正在关闭。');
+      registerSecrets(agentCredentials?.map(item => item.apiKey) ?? []);
+      const result = await this.request('evaluation_workflow', { input: parsed.data,
+        ...(agentCredentials ? { context: { agentCredentials } } : {}) }, readOnly ? 10_000 : null);
+      if (result.ok && (result.data.action === 'mine' && result.data.data.operation.stopConfirmed === false
+        || result.data.action === 'trace.process' && result.data.data.mining.stopConfirmed === false)) this.crashBlocked = true;
+      return result;
+    } finally { if (!readOnly) { this.workflowWriting = false; void this.flushCapturedTraces(); } }
+  }
   public async addFeedback(input: unknown): Promise<Result<EvaluationWorkerData<'add_evaluation_feedback'>>> {
     const parsed = evaluationRequests.add_evaluation_feedback.safeParse(input);
     if (!parsed.success) return failure('input_invalid', '评测反馈请求无效。');
-    if (this.closing || this.exporting || this.crashBlocked || active(this.current)) return failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。');
+    if (this.closing || this.workflowWriting || this.exporting || this.crashBlocked || active(this.current)) return failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。');
     const ready = await this.ensureReady(); if (!ready.ok) return ready;
-    if (this.closing || this.exporting || this.crashBlocked || active(this.current)) return failure('evaluation_busy', '评测状态已变化，请在空闲后提交反馈。');
+    if (this.closing || this.workflowWriting || this.exporting || this.crashBlocked || active(this.current)) return failure('evaluation_busy', '评测状态已变化，请在空闲后提交反馈。');
     return this.request('add_evaluation_feedback', { input: parsed.data });
   }
   public export(input: unknown, prepare?: PrepareExport): Promise<Result<EvaluationWorkerData<'export_evaluation'>>> {
@@ -179,7 +221,7 @@ export class EvaluationClient {
     const request = parsed.data, prior = this.exports.get(request.operationId);
     if (prior) return prior.executionId === request.executionId ? prior.promise
       : Promise.resolve(failure('evaluation_request_conflict', '原导出操作ID不能改绑其他Execution。'));
-    if (this.closing || this.exporting || this.crashBlocked || active(this.current))
+    if (this.closing || this.workflowWriting || this.exporting || this.crashBlocked || active(this.current))
       return Promise.resolve(failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。'));
     this.exporting = true;
     const work = (async (): Promise<Result<EvaluationWorkerData<'export_evaluation'>>> => {
@@ -194,14 +236,14 @@ export class EvaluationClient {
       } catch { return failure('evaluation_export_prepare_failed', '平台配置准备失败，未发送上传请求。'); }
     })();
     this.exports.set(request.operationId, { executionId: request.executionId, promise: work });
-    void work.finally(() => { this.exporting = false; });
+    void work.finally(() => { this.exporting = false; void this.flushCapturedTraces(); });
     return work;
   }
   public async preview(input: unknown, settings: EvaluationConfigurationSnapshot): Promise<Result<EvaluationPreview>> {
     const parsed = evaluationRequests.preview_evaluation.safeParse(input);
     if (!parsed.success) return failure('input_invalid', '评测选集无效。');
     const ready = await this.ensureReady(); if (!ready.ok) return ready;
-    const result = await this.request('preview_evaluation', { input: parsed.data, settings });
+    const result = await this.request('preview_evaluation', { input: parsed.data, settings }, 30_000);
     if (result.ok) this.latestPreview = result.data;
     return result;
   }
@@ -210,7 +252,7 @@ export class EvaluationClient {
     if (!parsed.success) return Promise.resolve(failure('input_invalid', '评测启动请求无效。'));
     const prior = this.starts.get(parsed.data.requestId);
     if (prior) return prior.previewId === parsed.data.previewId ? prior.promise : Promise.resolve(failure('evaluation_request_conflict', '原请求不能改绑其他预览。'));
-    if (this.closing || this.exporting || this.crashBlocked || active(this.current)) return Promise.resolve(failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。'));
+    if (this.closing || this.workflowWriting || this.exporting || this.crashBlocked || active(this.current)) return Promise.resolve(failure('evaluation_busy', '评测正在运行、导出、关闭或停止未确认。'));
     const preview = this.latestPreview;
     if (!preview || preview.previewId !== parsed.data.previewId) return Promise.resolve(failure('evaluation_preview_unknown', '预览已失效，请刷新。'));
     if ([...this.starts.values()].some(start => start.previewId === preview.previewId)) return Promise.resolve(failure('evaluation_preview_consumed', '该预览已受理，请重新预览。'));
@@ -280,6 +322,7 @@ export class EvaluationClient {
   }
   public async close(): Promise<Result<{ closed: boolean; stopped: boolean; errors: string[] }>> {
     this.closing = true;
+    this.capturedTraces.clear();
     const current = this.current?.requestId ? this.starts.get(this.current.requestId) : null;
     if (current && active(current.control) && !current.sent) {
       current.cancelled = true;

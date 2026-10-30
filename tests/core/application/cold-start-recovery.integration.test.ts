@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { Database } from 'bun:sqlite';
 import { appError, ok, INVOICE_TOOLS_SYSTEM_PROMPT } from '@flowmate/contracts';
 import type { AgentPort, ProductPaths, ProviderPort, ProviderRequest, SafeConfigSnapshot, NativeSessionHistory } from '@flowmate/contracts';
-import { openDatabase } from '@flowmate/core';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { createAgentHistoryFixture } from './agent-history-fixture.ts';
 import { PiAgentAdapter } from '../../../packages/runtime-pi/src/session.ts';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
@@ -40,7 +40,7 @@ it('P9 T05 preserves unknown input gaps and independent Workspace when complete 
   store.db.query("UPDATE session_native_entries SET entry_json=json_set(entry_json,'$.parentId','missing-parent') WHERE entry_id='legacy-60'").run();
   const facts = (db: Database) => ({ header: db.query('SELECT * FROM session_native_history').all(), entries: db.query('SELECT * FROM session_native_entries').all(),
     inputs: db.query('SELECT * FROM session_inputs').all(), runs: db.query('SELECT * FROM runs').all() });
-  const before = facts(store.db); store.close();
+  const before = facts(store.db); await store.close();
   let requests = 0, prepares = 0;
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() { requests++; return new Response('unexpected', { status: 500 }); } });
   deferCleanup(() => server.stop(true));
@@ -137,7 +137,7 @@ it('cold-start blocks an unconfirmed terminal Provider while preserving read-onl
   const runId = providerRun(store);
   expect(finish(store, runId, { stopped: false }).ok).toBe(true);
   const before = store.runs.get(runId);
-  store.close();
+  await store.close();
   const { app, providerCalls } = await application(paths);
   expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { active: null, blocked: true,
     error: { code: 'runtime_recovery_blocked', runId } } });
@@ -153,7 +153,7 @@ it('cold-start blocks an unconfirmed terminal Provider while preserving read-onl
 it('cold-start does not clear process-exit uncertainty merely because it acquired a database controller lease', async () => {
   const { store, paths } = fixture();
   const runId = providerRun(store);
-  store.close();
+  await store.close();
   const { app, providerCalls } = await application(paths);
   expect(await app.queryRun(runId)).toMatchObject({ ok: true, data: { status: 'failed', error: { code: 'runtime_interrupted' },
     stoppedAt: null, cleanup: { stopped: false, lateObservationRequired: true } } });
@@ -172,7 +172,7 @@ it.each(['powershell', 'bash'])('cold-start retains actual stop uncertainty for 
   expect(store.toolCalls.start({ toolCallId: call.data.toolCallId, startedAt: stamp }).ok).toBe(true);
   expect(finish(store, runId).ok).toBe(true);
   const before = store.runs.get(runId);
-  store.close();
+  await store.close();
   const { app, providerCalls, agentCalls } = await application(paths);
   expect(await app.queryRun(runId)).toEqual(before);
   expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: true,
@@ -185,7 +185,7 @@ it.each(['powershell', 'bash'])('cold-start retains actual stop uncertainty for 
   deferCleanup(() => reopened.data.close());
   expect(reopened.data.toolCalls.getById(call.data.toolCallId)).toMatchObject({ ok: true, data: {
     status: 'failed', startedAt: stamp, stoppedAt: null, result: { error: { code: 'runtime_interrupted' } }, cleanup: { stopped: false } } });
-  reopened.data.close();
+  await reopened.data.close();
 });
 
 it('cold-start closes a provably unstarted requested tool without claiming a historical stopped timestamp', async () => {
@@ -195,7 +195,7 @@ it('cold-start closes a provably unstarted requested tool without claiming a his
     toolVersion: '0.85.1', effect: 'LOCAL_WRITE', rawArguments: {}, requestedAt: stamp });
   if (!call.ok) throw new Error(call.error.code);
   expect(finish(store, runId).ok).toBe(true);
-  store.close();
+  await store.close();
   const { app } = await application(paths);
   expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: false } });
   await app.close();
@@ -204,7 +204,7 @@ it('cold-start closes a provably unstarted requested tool without claiming a his
   deferCleanup(() => reopened.data.close());
   expect(reopened.data.toolCalls.getById(call.data.toolCallId)).toMatchObject({ ok: true, data: {
     status: 'failed', startedAt: null, stoppedAt: null, cleanup: { stopped: true } } });
-  reopened.data.close();
+  await reopened.data.close();
 });
 
 it('cold-start keeps history unusable local to its Session and does not treat diagnostic errors or delivery failure as global stop uncertainty', async () => {
@@ -223,7 +223,7 @@ it('cold-start keeps history unusable local to its Session and does not treat di
     error: appError('tool_result_delivery_failed', 'runtime', 'Synthetic delivery failure.', true) } }).ok).toBe(true);
   expect(finish(store, runId, { diagnostic: true }).ok).toBe(true);
   const before = store.runs.get(runId);
-  store.close();
+  await store.close();
   const { app, providerCalls, agentCalls } = await application(paths);
   expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: false } });
   expect(await app.queryRun(runId)).toEqual(before);
@@ -239,7 +239,7 @@ it('cold-start preserves readable records while blocking an unreadable required 
   const runId = providerRun(store);
   expect(finish(store, runId).ok).toBe(true);
   store.db.query('UPDATE runs SET cleanup_json=? WHERE id=?').run(JSON.stringify({ ...cleanup, version: 999 }), runId);
-  store.close();
+  await store.close();
   const { app, providerCalls } = await application(paths);
   expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: true,
     error: { code: 'runtime_recovery_blocked', runId } } });
@@ -258,7 +258,7 @@ it.each([
   store.db.query('UPDATE runs SET cleanup_json=? WHERE id=?').run(JSON.stringify({ ...cleanup, ...gap }), runId);
   const before = store.runs.get(runId);
   expect(before.ok).toBe(true);
-  store.close();
+  await store.close();
   const { app, providerCalls } = await application(paths);
   expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: true,
     error: { code: 'runtime_recovery_blocked', runId } } });
@@ -289,7 +289,7 @@ it('cold-start blocks only the original Session when a stopped completed tool la
   const { runId, sessionId, toolCallId } = finishedToolWithMissingResult(store);
   const before = store.runs.get(runId);
   expect(before.ok).toBe(true);
-  store.close();
+  await store.close();
   const { app, providerCalls, agentCalls } = await application(paths);
   expect(await app.queryRuntimeState()).toMatchObject({ ok: true, data: { blocked: false } });
   expect(await app.queryRun(runId)).toEqual(before);
@@ -325,7 +325,7 @@ it('cold-start blocks only the original Session when a stopped completed tool la
     .toEqual({ status: 'succeeded', stopped_at: stamp, result_json: '{"version":999}' });
 });
 
-it('cold-start rolls back all recovery if a necessary Session history block cannot be saved', () => {
+it('cold-start rolls back all recovery if a necessary Session history block cannot be saved', async () => {
   const { store, paths } = fixture();
   const { sessionId, toolCallId } = finishedToolWithMissingResult(store);
   const runId = providerRun(store);
@@ -333,7 +333,7 @@ it('cold-start rolls back all recovery if a necessary Session history block cann
   const beforeEntries = store.db.query('SELECT * FROM session_native_entries ORDER BY session_id,sequence').all();
   store.db.exec(`CREATE TRIGGER reject_history_block BEFORE UPDATE ON session_native_history
     BEGIN SELECT RAISE(ABORT,'synthetic necessary save failure'); END;`);
-  store.close();
+  await store.close();
   expect(openDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
   const saved = new Database(paths.databaseFile);
   deferCleanup(() => saved.close());

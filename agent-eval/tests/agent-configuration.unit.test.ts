@@ -28,14 +28,49 @@ test('evaluation env accepts dedicated Agent variables without changing process 
     } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('CLI overrides system overrides the dedicated env; key stays outside public Agent configuration', () => {
+test('CLI model overrides preserve the selected endpoint credential and endpoint changes require an explicit connection credential', () => {
     const root = envRepo();
     try {
         const result = configuration.agentConfig?.(root, { FLOWMATE_EVAL_AGENT_MODEL: 'system-agent', FLOWMATE_EVAL_AGENT_API_KEY: 'synthetic-eval-system-key' },
-            { model: 'cli-agent', baseUrl: 'https://cli.invalid/v1', api: 'openai-responses' });
-        expect(result).toEqual({ configuration: { model: 'cli-agent', baseUrl: 'https://cli.invalid/v1', api: 'openai-responses' }, apiKey: 'synthetic-eval-system-key' });
+            { model: 'cli-agent' });
+        expect(result).toEqual({ configuration: { ...connection, model: 'cli-agent' }, apiKey: 'synthetic-eval-system-key' });
+        expect(() => configuration.agentConfig(root, {}, { model: 'cli-agent', baseUrl: 'https://cli.invalid/v1', api: 'openai-responses' })).toThrow('credential');
         expect(configuration.agentConfig?.(root, {}).configuration).toEqual(connection);
         expect(scanEvidence('synthetic-eval-system-key').value).toBe('[REDACTED]');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the verified unauthenticated local Luna connection never inherits the default provider secret', () => {
+    const root = envRepo();
+    try {
+        const result = configuration.agentConfig(root, {}, { model: 'gpt-6-luna', api: 'openai-completions', baseUrl: 'http://127.0.0.1:8767/v1' });
+        expect(result.apiKey).toBe('flowmate-local-no-auth'); expect(result.apiKey).not.toBe('synthetic-eval-file-key');
+        expect(() => configuration.agentConfig(root, {}, { model: 'gpt-6-luna', api: 'openai-completions', baseUrl: 'https://unverified.invalid/v1' })).toThrow('credential');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the default Luna role carries configured max reasoning through preparation without using the experiment control credential', async () => {
+    const root = envRepo();
+    try {
+        writeFileSync(join(root, 'agent-eval/configs/.env'), [
+            'FLOWMATE_EVAL_AGENT_BASE_URL=http://127.0.0.1:8767/v1',
+            'FLOWMATE_EVAL_AGENT_API=openai-completions', 'FLOWMATE_EVAL_AGENT_MODEL=gpt-6-luna',
+            'FLOWMATE_EVAL_AGENT_REASONING_EFFORT=max', 'FLOWMATE_EVAL_DEEPSEEK_API_KEY=synthetic-experiment-control-key',
+        ].join('\n'));
+        const catalog: ModelCatalogProvider[] = [{ id: 'luna', name: 'Luna', authMethods: ['api_key'], models: [{
+            id: 'gpt-6-luna', name: 'Luna', api: 'openai-completions', endpoint: 'http://127.0.0.1:8767/v1',
+            contextWindow: 272000, maxTokens: 128000, reasoning: true,
+        }] }];
+        const prepared = await configuration.prepareAgentConfig(root, {}, {}, catalog);
+        expect(prepared.configuration).toMatchObject({ model: 'gpt-6-luna', reasoning: 'max',
+            api: 'openai-completions', baseUrl: 'http://127.0.0.1:8767/v1' });
+        expect(prepared.apiKey).toBe('flowmate-local-no-auth');
+        const { reasoning: _, modelCapabilities: __, ...localConnection } = prepared.configuration;
+        expect((await configuration.prepareAgentConnection(localConnection, prepared.apiKey, catalog)).configuration.reasoning).toBe('max');
+        expect((await configuration.prepareAgentConnection({ ...localConnection, reasoning: undefined }, prepared.apiKey, catalog)).configuration.reasoning).toBe('max');
+        expect((await configuration.prepareAgentConfig(root, {}, { reasoning: 'off' }, catalog)).configuration.reasoning).toBe('off');
+        expect(() => configuration.agentConfig(root, { FLOWMATE_EVAL_AGENT_REASONING_EFFORT: 'invalid' })).toThrow();
+        expect(scanEvidence('synthetic-experiment-control-key').value).toBe('[REDACTED]');
     } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -78,6 +113,31 @@ test('preparing the Agent records catalog capabilities without a generation requ
         expect(result?.configuration).toEqual({ ...connection, modelCapabilities: { contextWindow: 131072, maxTokens: 32768, reasoning: true,
             source: 'pi-sdk-model-catalog', providers: ['native'] } });
         expect(JSON.stringify(result?.configuration)).not.toContain('synthetic-eval-file-key');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('verified local Luna uses its unique native cached context and the official model output limit', () => {
+    const root = envRepo(), cache = join(root, 'models_cache.json');
+    try {
+        writeFileSync(cache, JSON.stringify({ models: [{ slug: 'gpt-6-luna', context_window: 272000,
+            supported_reasoning_levels: [{ effort: 'medium' }, { effort: 'max' }] }] }));
+        expect(configuration.readLocalCodexModelCapabilities({ model: 'gpt-6-luna', api: 'openai-completions', baseUrl: 'http://127.0.0.1:8767/v1' }, cache))
+            .toEqual({ contextWindow: 272000, maxTokens: 128000, reasoning: true,
+                transport: { maxTokens: 32768, source: 'local-codex-gateway-source' },
+                source: 'codex-cli-cache-and-openai-model-reference', providers: ['codex-cli-local-gateway'] });
+        expect(() => configuration.readLocalCodexModelCapabilities({ model: 'gpt-6-luna', api: 'openai-completions', baseUrl: 'https://other.invalid/v1' }, cache)).toThrow();
+        writeFileSync(cache, JSON.stringify({ models: [{ slug: 'gpt-6-luna', context_window: 1000, supported_reasoning_levels: [] }] }));
+        expect(() => configuration.readLocalCodexModelCapabilities({ model: 'gpt-6-luna', api: 'openai-completions', baseUrl: 'http://127.0.0.1:8767/v1' }, cache)).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the local gateway transport ceiling applies without replacing supplied catalog native limits or provenance', async () => {
+    const root = envRepo();
+    try {
+        const result = await configuration.prepareAgentConfig(root, {}, { model: 'gpt-6-luna', api: 'openai-completions', baseUrl: 'http://127.0.0.1:8767/v1' },
+            [{ ...provider(), models: [{ ...provider().models[0]!, id: 'gpt-6-luna', endpoint: 'http://127.0.0.1:8767/v1', maxTokens: 128000 }] }]);
+        expect(result.configuration.modelCapabilities).toMatchObject({ maxTokens: 128000, source: 'pi-sdk-model-catalog',
+            transport: { maxTokens: 32768, source: 'local-codex-gateway-source' } });
     } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

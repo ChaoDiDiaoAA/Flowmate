@@ -22,9 +22,9 @@ export function find<T extends Pick<Package, 'ref'> & { item?: Package['item'] }
   return pack;
 }
 
-export function createResourceLoader(options: { resourceRoot: string; contents: ManagedFileContents; inspectNativeResources: InspectNativeResources }) {
+export function createResourceLoader(options: { resourceRoot: string; contents?: ManagedFileContents; inspectNativeResources: InspectNativeResources }) {
   const authorRoot = resolve(options.resourceRoot);
-  function load(kind: 'prompt' | 'skill', id: string): Package {
+  function load(kind: 'prompt' | 'skill', id: string, store: ManagedFileContents): Package {
     const relativeRoot = `${kind === 'prompt' ? 'prompts' : 'skills'}/${id}`;
     const root = join(authorRoot, relativeRoot);
     const manifest = ResourceManifestSchema.parse(JSON.parse(decoder.decode(bytes(safePath(authorRoot,
@@ -34,7 +34,7 @@ export function createResourceLoader(options: { resourceRoot: string; contents: 
     const ref = ResourceRefSchema.parse({ kind, id, version: manifest.version });
     const contents = new Map<string, Buffer>();
     const owner = { ownerKind: 'resource-author', ownerId: resourceRefKey(ref) };
-    try { options.contents.remember({ ...owner, relativePath: 'resource.json' }, Buffer.from(canonicalResourceManifest(manifest))); }
+    try { store.remember({ ...owner, relativePath: 'resource.json' }, Buffer.from(canonicalResourceManifest(manifest))); }
     catch { reject('resource_version_changed', 'The registered author manifest changed without a new version.'); }
     let name = id, description = '', disableModelInvocation = false;
     const diagnostics: Array<{ code: string; message: string }> = [];
@@ -43,7 +43,7 @@ export function createResourceLoader(options: { resourceRoot: string; contents: 
         const content = bytes(safePath(root, file.path), RESOURCE_LIMITS.fileBytes);
         if (file.bytes !== content.length)
           reject('resource_version_changed', 'Resource file content differs from its fixed manifest.');
-        try { options.contents.remember({ ...owner, relativePath: file.path }, content); }
+        try { store.remember({ ...owner, relativePath: file.path }, content); }
         catch { reject('resource_version_changed', 'The registered author content changed without a new version.'); }
         contents.set(file.path, content);
       }
@@ -64,7 +64,8 @@ export function createResourceLoader(options: { resourceRoot: string; contents: 
     return { ref, manifest, directory: root, contents, item: { ref, name, description, keywords: manifest.keywords,
       enabled: false, available: diagnostics.length === 0, disableModelInvocation, bodyFile: manifest.bodyFile, files: manifest.files, dependencies: manifest.requires, dependencyChecks: [], diagnostics } };
   }
-  function discover() {
+  function discover(contents: ManagedFileContents | undefined = options.contents) {
+    if (!contents) reject('resource_bundle_unavailable', 'Original resource contents are required.');
     const packages: Package[] = [], diagnostics: ResourceCatalog['diagnostics'][number][] = [];
     if (!existsSync(authorRoot)) return { packages, diagnostics };
     directory(authorRoot);
@@ -78,7 +79,7 @@ export function createResourceLoader(options: { resourceRoot: string; contents: 
         if (!ResourceIdSchema.safeParse(id).success) { diagnostics.push({ resourceId: null, version: null,
           code: 'resource_manifest_invalid', message: 'Invalid resource directory ID.' }); continue; }
         if (++count > RESOURCE_LIMITS.packages) reject('resource_content_too_large', 'Resource discovery exceeds 64 registered packages.');
-        const loaded = checked(() => { directory(join(group, id)); return load(kind, id); });
+        const loaded = checked(() => { directory(join(group, id)); return load(kind, id, contents); });
         if (loaded.ok) packages.push(loaded.data);
         else diagnostics.push({ resourceId: id, version: null, code: loaded.error.code, message: loaded.error.message });
       }

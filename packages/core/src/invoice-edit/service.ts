@@ -1,74 +1,119 @@
-import { appError, fail, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandidateRequestSchema,
-  RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields } from '@flowmate/contracts';
+import { appError, fail, ok, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandidateRequestSchema,
+  RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields, invoiceExportName } from '@flowmate/contracts';
 import type { CandidateSnapshot, DocumentRef, ExportInvoiceCandidateRequest, InvoiceExportReference, Result,
   SaveInvoiceCandidateResponse, InvoiceCandidateDecisionResponse } from '@flowmate/contracts';
 import { InvoiceCandidateOperationQuerySchema, InvoiceExportReadRequestSchema } from '@flowmate/contracts';
 import type { InvoiceExportPage } from '@flowmate/contracts';
 import type { InvoiceCandidateOperationResult } from '@flowmate/contracts';
-import type { InvoiceEditRepository, ValidateHumanInvoice } from '../storage/repositories.ts';
+import { isDeepStrictEqual } from 'node:util';
+import type { ValidateHumanInvoice } from '../storage/repositories.ts';
+import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { FileStore } from '../storage/file-store.ts';
+import { MAX_INVOICE_EXPORT_BYTES } from '../storage/file-store.ts';
 
-export type InvoiceEditServiceOptions = { candidates: InvoiceEditRepository; validate: ValidateHumanInvoice;
-  files: Pick<FileStore, 'publishInvoiceExport' | 'readInvoiceExport'>; now: () => string };
+export type InvoiceEditServiceOptions = {
+  database: Pick<DbHandle, 'read' | 'transaction'>;
+  validate: (draft: Parameters<ValidateHumanInvoice>[0], ref: DocumentRef, store: SqlDatabaseStore) => ReturnType<ValidateHumanInvoice>;
+  files: Pick<FileStore, 'publishInvoiceExport' | 'readInvoiceExport'>;
+  now: () => string;
+};
 
 export class InvoiceEditService {
   public constructor(private readonly options: InvoiceEditServiceOptions) {}
-  public save(raw: unknown): Result<SaveInvoiceCandidateResponse> {
+
+  private async read<T>(operation: (store: SqlDatabaseStore) => Result<T>): Promise<Result<T>> {
+    try { return await this.options.database.read(operation); }
+    catch { return fail(appError('storage_read_failed', 'storage', 'Invoice operation could not be read.', true)); }
+  }
+
+  private async write<T>(operation: (store: SqlDatabaseStore) => Result<T>): Promise<Result<T>> {
+    try { return await this.options.database.transaction(operation); }
+    catch { return fail(appError('storage_write_failed', 'storage', 'Invoice operation could not be saved.', true)); }
+  }
+
+  private async readExportBytes(reference: InvoiceExportReference): Promise<Result<Uint8Array>> {
+    const expected = await this.read(store => {
+      const bytes = store.contents.read({ ownerKind: 'invoice-export', ownerId: String(reference.candidateId), relativePath: reference.relativePath });
+      return bytes ? ok(bytes) : fail(appError('artifact_unavailable', 'storage', 'Original export bytes are unavailable.'));
+    });
+    return expected.ok ? this.options.files.readInvoiceExport(reference, expected.data) : expected;
+  }
+
+  public async save(raw: unknown): Promise<Result<SaveInvoiceCandidateResponse>> {
     const parsed = SaveInvoiceCandidateRequestSchema.safeParse(raw);
-    return parsed.success ? this.options.candidates.saveHuman({ ...parsed.data, at: this.options.now(), validate: this.options.validate })
+    return parsed.success ? this.write(store => store.candidates.saveHuman({ ...parsed.data, at: this.options.now(),
+      validate: (draft, ref) => this.options.validate(draft, ref, store) }))
       : fail(appError('input_invalid', 'input', '人工表单参数无效。'));
   }
-  public accept(raw: unknown): Result<InvoiceCandidateDecisionResponse> {
+
+  public async accept(raw: unknown): Promise<Result<InvoiceCandidateDecisionResponse>> {
     const parsed = AcceptInvoiceCandidateRequestSchema.safeParse(raw);
-    return parsed.success ? this.options.candidates.accept({ ...parsed.data, at: this.options.now(), validate: this.options.validate })
+    return parsed.success ? this.write(store => store.candidates.accept({ ...parsed.data, at: this.options.now(),
+      validate: (draft, ref) => this.options.validate(draft, ref, store) }))
       : fail(appError('input_invalid', 'input', '接受参数无效。'));
   }
-  public queryOperation(raw: unknown): Result<InvoiceCandidateOperationResult> {
+
+  public async queryOperation(raw: unknown): Promise<Result<InvoiceCandidateOperationResult>> {
     const parsed = InvoiceCandidateOperationQuerySchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', '操作查询参数无效。'));
-    const result = this.options.candidates.queryOperation({ ...parsed.data, at: this.options.now() });
+    const result = await this.read(store => store.candidates.queryOperation({ ...parsed.data, at: this.options.now() }));
     if (!result.ok || parsed.data.kind !== 'export' || result.data === null) return result;
-    const read = this.options.files.readInvoiceExport(result.data as InvoiceExportReference);
+    if (!('artifactId' in result.data)) return fail(appError('storage_corrupt', 'storage', 'Export operation has no original reference.'));
+    const read = await this.readExportBytes(result.data);
     return read.ok ? result : read;
   }
-  public reject(raw: unknown): Result<InvoiceCandidateDecisionResponse> {
+
+  public async reject(raw: unknown): Promise<Result<InvoiceCandidateDecisionResponse>> {
     const parsed = RejectInvoiceCandidateRequestSchema.safeParse(raw);
-    return parsed.success ? this.options.candidates.reject({ ...parsed.data, at: this.options.now() })
+    return parsed.success ? this.write(store => store.candidates.reject({ ...parsed.data, at: this.options.now() }))
       : fail(appError('input_invalid', 'input', '拒绝参数无效。'));
   }
-  public export(raw: unknown): Result<InvoiceExportReference> {
+
+  public async export(raw: unknown): Promise<Result<InvoiceExportReference>> {
     const parsed = ExportInvoiceCandidateRequestSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', '导出参数无效。'));
     const input = parsed.data;
-    const prior = this.options.candidates.findExport(input);
+    const prior = await this.read(store => store.candidates.findExport(input));
     if (!prior.ok) return prior;
     if (prior.data) {
-      const read = this.options.files.readInvoiceExport(prior.data);
-      return read.ok ? { ok: true, data: prior.data } : read;
+      const read = await this.readExportBytes(prior.data);
+      return read.ok ? ok(prior.data) : read;
     }
-    const saved = this.options.candidates.readAccepted(input.candidateId);
+    const saved = await this.read(store => store.candidates.readAccepted(input.candidateId));
     if (!saved.ok) return saved;
     const bytes = Buffer.from(formatInvoiceExport(saved.data.candidate, saved.data.documentRef, input.format), 'utf8');
+    if (bytes.byteLength < 1 || bytes.byteLength > MAX_INVOICE_EXPORT_BYTES)
+      return fail(appError('input_invalid', 'input', '导出文件参数无效。'));
+    const relativePath = invoiceExportName(saved.data.candidate, input.format);
+    const remembered = await this.write(store => {
+      const current = store.candidates.readAccepted(input.candidateId);
+      if (!current.ok) return current;
+      if (!isDeepStrictEqual(current.data, saved.data)) return fail(appError('state_conflict', 'input', 'Accepted invoice changed before export.'));
+      store.contents.remember({ ownerKind: 'invoice-export', ownerId: String(input.candidateId), relativePath }, bytes);
+      return ok(undefined);
+    });
+    if (!remembered.ok) return remembered;
     const published = this.options.files.publishInvoiceExport({ candidateId: saved.data.candidate.candidateId,
       jobId: saved.data.candidate.jobId, sequence: saved.data.candidate.sequence, format: input.format, bytes });
     if (!published.ok) return published;
-    return this.options.candidates.registerExport({ ...input, ...published.data, at: this.options.now() });
+    return this.write(store => store.candidates.registerExport({ ...input, ...published.data, at: this.options.now() }));
   }
-  public readExport(raw: unknown): Result<InvoiceExportPage> {
+
+  public async readExport(raw: unknown): Promise<Result<InvoiceExportPage>> {
     const parsed = InvoiceExportReadRequestSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'Export read parameters are invalid.'));
     const { offset, limit, ...request } = parsed.data;
-    const prior = this.options.candidates.findExport(request);
+    const prior = await this.read(store => store.candidates.findExport(request));
     if (!prior.ok) return prior;
     if (!prior.data) return fail(appError('artifact_unavailable', 'storage', 'The original export operation is unavailable.'));
-    const read = this.options.files.readInvoiceExport(prior.data);
+    const read = await this.readExportBytes(prior.data);
     if (!read.ok) return read;
     if (offset >= read.data.byteLength) return fail(appError('input_invalid', 'input', 'Export byte cursor is out of range.'));
     const end = Math.min(offset + limit, read.data.byteLength);
-    return { ok: true, data: { artifactId: prior.data.artifactId, candidateId: prior.data.candidateId,
+    return ok({ artifactId: prior.data.artifactId, candidateId: prior.data.candidateId,
       format: prior.data.format, relativePath: prior.data.relativePath, bytes: read.data.byteLength, offset,
       chunkBase64: Buffer.from(read.data.subarray(offset, end)).toString('base64'),
-      nextOffset: end === read.data.byteLength ? null : end } };
+      nextOffset: end === read.data.byteLength ? null : end });
   }
 }
 export function createInvoiceEditService(options: InvoiceEditServiceOptions): InvoiceEditService { return new InvoiceEditService(options); }

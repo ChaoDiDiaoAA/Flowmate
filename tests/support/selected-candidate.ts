@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { P3AgentConfigFacts, Result, SafeConfigSnapshot, UsageRecord } from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from './resources.ts';
-import { openDatabase } from '../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from './database.ts';
 import { createCandidateRepository, createDocumentRepository, createJobRepository, createRunRepository,
   createSessionRepository, createToolCallRepository, createWorkspaceRepository } from '../../packages/core/src/storage/repositories.ts';
 import { createTestWorkspaceVerifier } from './workspace.ts';
@@ -41,7 +41,8 @@ function legacyStore(input: ReturnType<typeof paths>) {
 }
 export function makeSelectedCandidate(schema9 = false, withSource = false) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-form-call-'));
-  const store = schema9 ? legacyStore(paths(root)) : required(openDatabase(paths(root)));
+  const currentStore = schema9 ? null : required(openDatabase(paths(root)));
+  const store = currentStore ?? legacyStore(paths(root));
   deferCleanup(() => store.close());
   const stamp = '2026-10-01T00:00:00.000Z';
   const originalBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=', 'base64');
@@ -138,5 +139,13 @@ export function makeSelectedCandidate(schema9 = false, withSource = false) {
     cleanup: { ...cleanup, stopped: true, stopReason: 'native-stop' }, endedAt: stamp, stoppedAt: stamp, durationMs: 0 }));
   const selected = required(store.workspace.selectCandidate({ jobId: task.job.jobId, candidateId: saved.receipt.candidateId,
     expectedCandidateId: null, expectedRevision: workspace.revision, at: stamp })).workspace;
-  return { ...store, root, verify, stamp, config, usage, cleanup, session, jobId: task.job.jobId, candidateId: saved.receipt.candidateId, runId: first.runId, toolCallId: saveCall.toolCallId, selectedWorkspace: selected };
+  return { ...store, currentStore, root, verify, stamp, config, usage, cleanup, session, jobId: task.job.jobId, candidateId: saved.receipt.candidateId, runId: first.runId, toolCallId: saveCall.toolCallId, selectedWorkspace: selected };
+}
+
+export async function makeCurrentSelectedCandidate(withSource = false) {
+  const selected = makeSelectedCandidate(false, withSource);
+  await selected.close();
+  const database = required(openDatabase(paths(selected.root)));
+  deferCleanup(() => database.close());
+  return { ...selected, ...database, currentStore: database, verify: createTestWorkspaceVerifier(database, selected.root) };
 }

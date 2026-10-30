@@ -8,7 +8,7 @@ import { appError, CandidateDraftSchema, CandidateReceiptSchema, ToolExecutionFa
 import { z } from 'zod';
 import type { InvoiceFormApplicationReceipt, P3AgentConfigFacts, Result, SafeConfigSnapshot, ToolCallDelivery, UsageRecord, ToolRuntimeObservation } from '@flowmate/contracts';
 import { deferCleanup } from '../../support/resources.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 import { createToolRecorder } from '../../../packages/core/src/tools/recorder.ts';
 import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 
@@ -215,7 +215,7 @@ describe('Runtime fixed observations', () => {
       expect(reopened.ok).toBe(!registrationFails);
       const db = reopened.ok ? reopened.data.db : new Database(paths(root).databaseFile);
       deferCleanup(() => reopened.ok ? reopened.data.close() : db.close());
-      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 20 });
+      expect(db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: registrationFails ? 11 : 21 });
       const columns = db.query('PRAGMA table_info(tool_calls)').all() as Array<{ name: string }>;
       expect(columns.some(column => column.name === 'runtime_observation_json')).toBe(!registrationFails);
       expect(db.query('SELECT id,native_tool_call_id FROM tool_calls WHERE id=?').get(call.toolCallId))
@@ -522,13 +522,13 @@ describe('ToolCall form application facts', () => {
       .toMatchObject({ ok: true, data: { status: 'failed', result: { status: 'failed', formApplication: receipt }, formApplication: receipt } });
   });
 
-  it.each(['pending', 'terminal'] as const)('preserves the %s receipt through interrupted-process recovery', (phase) => {
+  it.each(['pending', 'terminal'] as const)('preserves the %s receipt through interrupted-process recovery', async (phase) => {
     const store = makeFormStore();
     required(store.toolCalls.recordFormApplication({ toolCallId: store.toolCallId, receipt: store.applied }));
     if (phase === 'terminal') required(store.recorder.finish({ toolCallId: store.toolCallId, status: 'succeeded',
       data: { candidateId: store.applied.candidateId, candidateSequence: store.applied.candidateSequence, applied: true },
       committedCandidateId: null, cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] }, stoppedAt: store.stamp }));
-    store.close();
+    await store.close();
     const reopened = required(openDatabase(paths(store.root)));
     deferCleanup(() => reopened.close());
     expect(reopened.toolCalls.getById(store.toolCallId)).toMatchObject({ ok: true, data: {

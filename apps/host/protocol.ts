@@ -2,6 +2,9 @@ export { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesIn
 import { InputDefinitionCommandSchema } from '@flowmate/contracts';
 import { ResearchIntentSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema, InvoiceSaveReplayReceiptSchema } from '@flowmate/contracts';
 import { researchOperations } from '../../packages/contracts/src/research-commands.ts';
+import { personalAgentHostCommandSchemas, isPersonalAgentHostCommand } from '../../packages/contracts/src/personal-agent-commands.ts';
+export { isPersonalAgentHostCommand, parsePersonalAgentCommand, parsePersonalAgentHostResult,
+  matchesPersonalAgentResponse, personalAgentHostFailure } from '../../packages/contracts/src/personal-agent-commands.ts';
 import { z } from 'zod';
 export { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure } from '../../packages/contracts/src/extensions.ts';
 export { isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../packages/contracts/src/resources.ts';
@@ -119,6 +122,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('save_settings'), settings: z.unknown() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_extensions'), input: SessionExtensionQuerySchema }).strict(),
   ...InputDefinitionCommandSchema.options.map(option => option.extend({ version: z.literal(1), requestId })),
+  ...personalAgentHostCommandSchemas({ version: z.literal(1), requestId }),
   ...(Object.keys(researchOperations) as (keyof typeof researchOperations)[]).map(type => z.object({ version: z.literal(1), requestId,
     type: z.literal(type), input: researchOperations[type][1] }).strict()),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_subagents'), input: ListSubagentsRequestSchema }).strict(),
@@ -216,6 +220,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('query_runtime_state') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('close') }).strict(),
 ]).superRefine((command, ctx) => {
+  if (isPersonalAgentHostCommand(command.type) && new TextEncoder().encode(JSON.stringify(command)).byteLength > 262_144)
+    ctx.addIssue({ code: 'custom', message: 'Personal Agent command exceeds its UTF-8 limit.' });
   if (command.type !== 'submit_session_input') return;
   const hasSettings = command.expectedSettingsRevision !== undefined;
   const hasCredential = command.expectedCredentialRef !== undefined;
@@ -250,7 +256,8 @@ export type HostEvent = {
     | z.infer<typeof CompactionNotificationSchema>;
 };
 
-export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest | HostInvoiceFormRequest;
+export type HostEvaluationTraceAvailable = { version: 1; type: 'evaluation_trace_available'; traceId: string; workspaceRoot: string };
+export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest | HostInvoiceFormRequest | HostEvaluationTraceAvailable;
 
 export function parseHostCommand(value: unknown): HostCommand | null {
   const parsed = hostCommandSchema.safeParse(value);

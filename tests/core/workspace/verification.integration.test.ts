@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'bun:test';
 import { createWorkspaceVerifier, requireValidWorkspace } from '../../../packages/core/src/workspace/verification.ts';
 import { appError, fail, invoiceLineFields } from '@flowmate/contracts';
-import { makeSelectedCandidate } from '../../support/selected-candidate.ts';
+import { makeCurrentSelectedCandidate, makeSelectedCandidate } from '../../support/selected-candidate.ts';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createDocumentService } from '../../../packages/data/src/documents.ts';
+import { createFileStore } from '../../../packages/core/src/storage/file-store.ts';
 
 function parsedFixture(f: ReturnType<typeof makeSelectedCandidate>, pages: Array<{ page: number; blocks: Array<{ id: string }> }>) {
   const bytes = Buffer.from(JSON.stringify({ formatVersion: 2, pages: pages.map(page => ({ ...page,
@@ -22,6 +24,26 @@ function parsedFixture(f: ReturnType<typeof makeSelectedCandidate>, pages: Array
 }
 
 describe('Workspace selection verifies actual source and saved candidate', () => {
+  it.each(['inspection', 'parsed'] as const)('reads %s synchronously from the current owner repository when the root alias is unavailable', async mode => {
+    const f = await makeCurrentSelectedCandidate();
+    const paths = { root: f.root, databaseFile: f.db.filename, artifactsDir: join(f.root, 'artifacts'),
+      outputsDir: join(f.root, 'outputs'), runtimeDir: join(f.root, 'runtime'), logsDir: join(f.root, 'logs') };
+    const files = createFileStore(paths, f);
+    const documents = createDocumentService({ paths, files, allowedSourceRoot: f.root, now: () => f.stamp,
+      transaction: operation => f.transaction(scope => operation({ repository: scope.documents,
+        files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })) });
+    f.documents.get = () => fail(appError('storage_read_failed', 'storage', 'Root alias must not inspect the current owner.'));
+    const result = await f.read(scope => {
+      const options: NonNullable<Parameters<typeof documents.readParsedForRun>[2]> = { repository: scope.documents,
+        files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } };
+      return mode === 'inspection' ? documents.inspectForWorkspace({ id: 1, version: 'v1' }, options)
+        : documents.readParsedForWorkspace(1, options);
+    });
+    expect(result).toMatchObject(mode === 'inspection'
+      ? { ok: true, data: { kind: 'valid', document: { documentRef: { id: 1, version: 'v1' } }, pages: [{ page: 1, blockIds: ['b1'] }] } }
+      : { ok: true, data: { document: { documentRef: { id: 1, version: 'v1' } }, parsed: { pages: [{ page: 1 }] } } });
+  });
+
   it('checks a registered missing header field, actual row bounds, and reserved document fields', () => {
     const fixture = makeSelectedCandidate();
     const candidate = fixture.candidates.readByJob({ jobId: fixture.jobId, candidateId: fixture.candidateId });

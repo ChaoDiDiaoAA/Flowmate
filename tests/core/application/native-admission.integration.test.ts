@@ -53,14 +53,14 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
           jobId: null, candidateRef: null, activeView: 'original', selection: null } } : {}),
     }, execute: async (input, signal) => {
       executions.push(input);
-      history.saveUser(nativeSessionId, input);
+      await history.saveUser(nativeSessionId, input);
       if (options.unconfirmedTool) await input.toolBinding?.execute('powershell', {}, { nativeToolCallId: 'unconfirmed-process', signal });
       const outcome = { text: 'Done.', partial: false, stopReason: 'stop', responseId: null, responseModel: null,
         error: null, stopped: true, cleanupErrors: [], usage: { version: 1, source: 'unknown', reason: 'offline',
           sdkValues: null, attempts: 1, attemptsComplete: true, costSource: null, updatedAt: now() } as const,
         tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
         agent: { nativeSessionId, turnCount: 1, modelCallCount: 1 } };
-      history.saveResult(nativeSessionId, input, outcome);
+      await history.saveResult(nativeSessionId, input, outcome);
       return outcome;
     } }); },
     releaseSession: async () => ({ stopped: true, closed: true, errors: [] }),
@@ -74,7 +74,7 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
       return {};
     } })),
     recorder: createToolRecorder(db.toolCalls, now), now });
-  const runtime = new RuntimeService({ memory: db.memory, workspaceVerifier: createTestWorkspaceVerifier(db, root), runs: db.runs, sessions: db.sessions, sessionInputs: db.sessionInputs, agent, tools,
+  const runtime = new RuntimeService({ database: db, workspaceVerifier: createTestWorkspaceVerifier(db, root),  agent, tools,
     provider: { prepare: async () => ({ ok: false, error: appError('unused', 'provider', 'Unused.') }),
       close: async () => ({ stopped: true, closed: true, errors: [] }) },
     log: { write() {}, close: async () => {} }, now, monotonicNow: () => performance.now(),
@@ -82,11 +82,11 @@ function harness(options: { unconfirmedTool?: boolean; conflictingSnapshot?: boo
       { name: 'powershell', available: true, reason: null }, { name: 'bash', available: false, reason: 'Not installed.' }],
  },
   });
-  const sessions = new SessionService(db.sessions, agent, () => runtime.state(), now, db.runs, db.memory,
-    db.sessionInputs, (request, submission, control) => runtime.start(request, control, submission));
+  const sessions = new SessionService(agent, () => runtime.state(), now, db,
+     (request, submission, control) => runtime.start(request, control, submission));
   const app = makeApplication(runtime, db.runs, async () => {
-    db.close(); return { stopped: true, closed: true, errors: [] };
-  }, sessions, undefined, createWorkspaceService(db.workspace, now, createTestWorkspaceVerifier(db, root)));
+    await db.close(); return { stopped: true, closed: true, errors: [] };
+  }, sessions, undefined, createWorkspaceService(db, now, createTestWorkspaceVerifier(db, root)));
   return { app, store: db, db: db.db, executions, preparations, workingDirectory, runtimeDir };
 }
 

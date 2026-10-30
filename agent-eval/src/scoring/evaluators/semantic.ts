@@ -8,13 +8,21 @@ import {unavailableResearchCounts} from '../research-judgment.ts';
 import { z } from 'zod';
 import { isSafetyMetric, localSafetyFailure, safetyEffectsSchema } from '../safety.ts';
 import { metricAppliesTo } from '../formal-rules.ts';
-import {semanticEvaluatorDefinitions} from '../judges/evaluators.ts';
+import {semanticEvaluator} from '../judges/evaluators.ts';
 import {scoringMetric} from '../diagnostic-plans.ts';
+import {calibrationCoverage} from '../judges/calibration-coverage.ts';
+import {publicJudgeConfig} from '../judges/client.ts';
 
 export async function evaluateSemantic(context: EvaluationContext): Promise<{ scores: EvaluationScore[]; judgeCalls: JudgeCall[] }> {
     const { task, result } = context, plan = context.semanticPlan ?? ('contract' in task ? task.expected.semantic : undefined);
     if (!plan) return { scores: [], judgeCalls: [] };
-    const selectedEvaluators=semanticEvaluatorDefinitions.filter(def=>def.appliesTo?.(context,{metric:'answer-relevance',required:false}));
+    const finish=(scores:EvaluationScore[],judgeCalls:JudgeCall[])=>{
+        const call=judgeCalls[0];
+        const calibration=calibrationCoverage(context.calibration,call?.compact?.plan??plan,
+            call?.configuration??(context.judge?publicJudgeConfig(context.judge):undefined));
+        return{scores:scores.map(s=>s.method==='llm-judge'?{...s,calibration}:s),judgeCalls};
+    };
+    const selectedEvaluators=plan.criteria.map(c=>semanticEvaluator(c.metricId)).filter(def=>def.appliesTo(context));
     const ownedCriteria=selectedEvaluators.flatMap(def=>def.prepare!(context));
     if(plan.criteria.some(c=>!ownedCriteria.some(o=>o.metricId===c.metricId)&&metricAppliesTo(task,c.metricId)))
         throw Error('Semantic criterion has no selected independent evaluator');
@@ -78,7 +86,7 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
         } else eligible.push({ ...criterion, required });
         scores.push(base);
     }
-    if (!eligible.length) return { scores, judgeCalls: [] };
+    if (!eligible.length) return finish(scores,[]);
     const selected = [...new Set(eligible.flatMap(c => c.evidence))];
     const selectedPlan:CompactPlan={...plan,criteria:eligible};
     try{
@@ -91,9 +99,9 @@ export async function evaluateSemantic(context: EvaluationContext): Promise<{ sc
             turnRule:'Judge only actual submitted/accepted/consumed turns. Planned future text is not an executed user instruction.' },
         facts: Object.fromEntries(selected.map(key => [key, facts[key]])),...(eligible.some(c=>c.metricId.startsWith('DR'))?{researchFrame}:{})
     }, context.fetcher, context.signal);
-    const measured = selectedEvaluators.flatMap(def=>def.parse!(compactScores(call)));
-    return { scores: scores.map(score => measured.find(m => m.metricId === score.metricId) ?? score), judgeCalls: [call] };
+    const measured = compactScores(call).map(score=>semanticEvaluator(score.metricId).parseResult(score));
+    return finish(scores.map(score => measured.find(m => m.metricId === score.metricId) ?? score),[call]);
     }catch(error){
-        return{scores:scores.map(score=>eligible.some(c=>c.metricId===score.metricId)?{...score,status:'ERROR' as const,reason:error instanceof Error?error.message:String(error)}:score),judgeCalls:[]};
+        return finish(scores.map(score=>eligible.some(c=>c.metricId===score.metricId)?{...score,status:'ERROR' as const,reason:error instanceof Error?error.message:String(error)}:score),[]);
     }
 }

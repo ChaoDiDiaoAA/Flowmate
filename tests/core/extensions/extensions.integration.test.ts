@@ -1,3 +1,4 @@
+import { openTestDatabase } from '../../support/database.ts';
 import { resolveProductPaths } from '@flowmate/shared';
 import { describe, expect, it, spyOn } from 'bun:test';
 import { mkdirSync, writeFileSync, readFileSync, unlinkSync, readdirSync } from 'node:fs';
@@ -10,7 +11,7 @@ import { createResourceService } from '../../../packages/core/src/resources/serv
 import { inspectNativeResources } from '../../../packages/runtime-pi/src/resources/loader.ts';
 import { mkdtempSync, deferCleanup } from '../../support/resources.ts';
 
-const manifest = { schemaVersion: 2, kind: 'extension', id: 'invoice-assist', version: 'v1', sdkVersion: '0.85.1', entryId: 'invoice-assist-v1',
+const manifest = { schemaVersion: 2, kind: 'extension', id: 'invoice-assist', version: 'v1', sdkVersion: '1.4.0', entryId: 'invoice-assist-v1',
   tools: [{ name: 'check_invoice_sources', version: '1' }], commands: ['invoice-assist'], hooks: [
     { event: 'session_start', policy: 'critical' }, { event: 'tool_call', policy: 'critical' },
     { event: 'tool_result', policy: 'observer' }, { event: 'tool_execution_end', policy: 'observer' },
@@ -25,10 +26,10 @@ function fixture() {
   const file = join(resourceRoot, 'extensions', 'invoice-v1.json'); writeFileSync(file, JSON.stringify(manifest));
   writeFileSync(join(resourceRoot, 'extensions', 'subagents-v1.json'), readFileSync(join(import.meta.dir, '../../../resources/extensions/subagents-v1.json')));
   const paths = resolveProductPaths(join(root, 'product')); if (!paths.ok) throw new Error(paths.error.code);
-  const storage = core.openDatabase(paths.data); if (!storage.ok) throw new Error(storage.error.code); deferCleanup(() => storage.data.close());
+  const storage = openTestDatabase(paths.data); if (!storage.ok) throw new Error(storage.error.code); deferCleanup(() => storage.data.close());
   return { root, resourceRoot, file, contents: storage.data.contents };
 }
-function makeCatalog(resourceRoot: string, sdkVersion = '0.85.1') {
+function makeCatalog(resourceRoot: string, sdkVersion = '1.4.0') {
   const create = Reflect.get(core, 'createExtensionService');
   expect(typeof create).toBe('function');
   return create?.({ resourceRoot, sdkVersion, registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }, { name: 'Agent', version: '0.19.0-p13.2', effect: 'READ' }] });
@@ -36,7 +37,7 @@ function makeCatalog(resourceRoot: string, sdkVersion = '0.85.1') {
 
 it('requires actual invoice extension selection and eligibility for an evaluation Hook profile', () => {
   const f = fixture();
-  const service = core.createExtensionService({ resourceRoot: f.resourceRoot, sdkVersion: '0.85.1',
+  const service = core.createExtensionService({ resourceRoot: f.resourceRoot, sdkVersion: '1.4.0',
     registeredTools: [{ name: 'check_invoice_sources', version: '1', effect: 'READ' }],
     evaluationProfile: { id: 'source-quote-trim', version: 1 } });
   const request = { selection, settingsRevision: 7, activeToolNames: ['check_invoice_sources'], policy: 'p3' as const };

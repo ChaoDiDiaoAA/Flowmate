@@ -8,7 +8,7 @@ import { describe, expect, it } from 'bun:test';
 import type { CandidateDraft, InvoiceIssue, P3AgentConfigFacts, Result, SafeConfigSnapshot, UsageRecord, WorkspaceSnapshot } from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from '../../support/resources.ts';
 import { createTestWorkspaceVerifier, prepareTestWorkspaceVerifier } from '../../support/workspace.ts';
-import { openDatabase } from '../../../packages/core/src/storage/database.ts';
+import { openTestDatabase as openDatabase } from '../../support/database.ts';
 
 function makePaths(root: string) {
   return {
@@ -221,7 +221,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -237,7 +237,7 @@ describe('P3 invoice storage migration', () => {
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 
-  it('rolls back migration 004 if a legacy document cannot be updated', () => {
+  it('rolls back migration 004 if a legacy document cannot be updated', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-parser-migration-failure-'));
     const paths = makePaths(root);
     createVersion3InvoiceDatabase(paths);
@@ -248,7 +248,7 @@ describe('P3 invoice storage migration', () => {
     db.close();
     const attempted = openDatabase(paths);
     if (attempted.ok) {
-      attempted.data.close();
+      await attempted.data.close();
     }
     expect(attempted).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
     const after = new Database(paths.databaseFile);
@@ -268,11 +268,15 @@ describe('P3 invoice storage migration', () => {
     const paths = makePaths(root);
     createVersion3InvoiceDatabase(paths);
     const db = new Database(paths.databaseFile);
-    for (const version of ['004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql']) {
-      db.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${version}`, import.meta.url), 'utf8'));
+    try {
+      for (const version of ['004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql']) {
+        db.exec(readFileSync(new URL(`../../../packages/core/src/storage/migrations/${version}`, import.meta.url), 'utf8'));
+        if (db.inTransaction) db.exec('COMMIT');
+      }
+      db.exec('CREATE INDEX sessions_visible_recent ON sessions(id);');
+    } finally {
+      db.close();
     }
-    db.exec('CREATE INDEX sessions_visible_recent ON sessions(id);');
-    db.close();
     expect(openDatabase(paths)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
     const after = new Database(paths.databaseFile);
     expect(after.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
@@ -298,7 +302,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all()).toEqual([
-      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 },
+      { version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 },
     ]);
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
@@ -306,7 +310,7 @@ describe('P3 invoice storage migration', () => {
     expect(db.query('SELECT job_id FROM runs ORDER BY id').all()).toEqual([{ job_id: null }, { job_id: null }]);
     expect(db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all())
-      .toHaveLength(23);
+      .toHaveLength(36);
     expect(db.query('PRAGMA table_info(runs)').all()).toHaveLength(30);
     expect(db.query('SELECT parent_run_id,origin_tool_call_id,plugin_agent_id FROM runs ORDER BY id').all())
       .toEqual([{ parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }, { parent_run_id: null, origin_tool_call_id: null, plugin_agent_id: null }]);
@@ -485,14 +489,14 @@ describe('P3 invoice storage migration', () => {
     expect(opened.data.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   });
 
-  it('repairs interrupted invoice work atomically and preserves business history when deleting Sessions', () => {
+  it('repairs interrupted invoice work atomically and preserves business history when deleting Sessions', async () => {
     const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-recovery-'));
     const paths = makePaths(root);
     createVersion2Database(paths);
     const migrated = openDatabase(paths);
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
-    migrated.data.close();
+    await migrated.data.close();
 
     const seed = new Database(paths.databaseFile);
     seed.exec(`
@@ -538,10 +542,10 @@ describe('P3 invoice storage migration', () => {
     expect(recovered.ok).toBe(true);
     if (!recovered.ok) return;
     let recoveredClosed = false;
-    const closeRecovered = () => {
+    const closeRecovered = async () => {
       if (recoveredClosed) return;
       recoveredClosed = true;
-      recovered.data.close();
+      await recovered.data.close();
     };
     deferCleanup(closeRecovered);
     const db = recovered.data.db;
@@ -574,14 +578,14 @@ describe('P3 invoice storage migration', () => {
     expect(recovered.data.sessions.delete(emptySession.data.sessionId, '2026-09-28T00:04:00.000Z')).toEqual({ ok: true, data: 'permanent' });
     expect(db.query('SELECT active_session_id,revision FROM workspace WHERE id=1').get()).toEqual({ active_session_id: null, revision: 5 });
     const terminalBefore = db.query('SELECT status,ended_at,result_json,stopped_at FROM tool_calls WHERE id=60').get();
-    closeRecovered();
+    await closeRecovered();
     const secondOpen = openDatabase(paths);
     expect(secondOpen.ok).toBe(true);
     let secondOpenClosed = false;
-    const closeSecondOpen = () => {
+    const closeSecondOpen = async () => {
       if (!secondOpen.ok || secondOpenClosed) return;
       secondOpenClosed = true;
-      secondOpen.data.close();
+      await secondOpen.data.close();
     };
     deferCleanup(closeSecondOpen);
     if (secondOpen.ok) {
@@ -589,7 +593,7 @@ describe('P3 invoice storage migration', () => {
       expect(secondOpen.data.sessions.list({ limit: 10 })).toMatchObject({ ok: true, data: { items: [{ sessionId: 8 }] } });
       expect(secondOpen.data.sessions.loadHistory(7)).toEqual({ ok: true, data: nativeHistory });
     }
-    closeSecondOpen();
+    await closeSecondOpen();
 
     const interrupted = new Database(paths.databaseFile);
     interrupted.exec(`

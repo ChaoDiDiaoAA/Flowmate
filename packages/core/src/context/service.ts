@@ -1,17 +1,20 @@
 import { z } from 'zod';
 import { readResearchContext, researchMaterialScope } from '../research/context.ts';
 import { appError, fail, ok, ContextBuildRequestSchema, ContextSnapshotJsonSchema, ContextSnapshotSchema,
-  ContextParsedMaterialSchema, WorkspaceContextSchema, formatExecutionPrompt, FrozenResourcesSchema, matchesResourceBinding } from '@flowmate/contracts';
+  ContextParsedMaterialSchema, WorkspaceContextSchema, formatExecutionPrompt, FrozenResourcesSchema, matchesResourceBinding,
+  ContextSnapshotsRequestSchema, ContextSnapshotRequestSchema, ContextRequestsRequestSchema } from '@flowmate/contracts';
 import type { AppError, CandidateSnapshot, ContextBuildRequest, ContextBuildResult, ContextMaterialPort,
   ContextParsedMaterial, ContextSnapshot, ContextSnapshotJson, Result } from '@flowmate/contracts';
-import type { DbHandle } from '../storage/database.ts';
+import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import { CONTEXT_POLICY, contextJsonBytes, contextTextBytes } from './policy.ts';
 import { selectContextProjection } from './selection.ts';
 import { readContextSnapshotOwner, readRunContextOwner } from './repository.ts';
 import type { RunScope } from '@flowmate/contracts';
 
-export type ContextServiceOptions = { store: Pick<DbHandle, 'db' | 'runs' | 'sessions' | 'jobs' | 'candidates' | 'context'>;
-  materials: ContextMaterialPort };
+type ContextBuildStore = Pick<SqlDatabaseStore, 'db' | 'runs' | 'sessions' | 'jobs' | 'candidates' | 'context' | 'documents' | 'contents'>;
+export type ContextServiceOptions = { store: Pick<DbHandle, 'read'>;
+  materials: { inspectParsed(input: Parameters<ContextMaterialPort['inspectParsed']>[0],
+    store: Pick<SqlDatabaseStore, 'documents' | 'contents'>): Result<ContextParsedMaterial> } };
 class BuildFault extends Error {
   constructor(readonly fact: AppError) { super(fact.code); }
 }
@@ -27,21 +30,27 @@ const buildConfig = z.object({ contextPolicyVersion: z.literal('p8-context-v1'),
 
 export class ContextService {
   constructor(private readonly options: ContextServiceOptions) {}
-  buildSubagentInTransaction(input: SubagentContextInput): Result<ContextBuildResult> {
-    return buildSubagentContextInTransaction(this.options.store, input);
+  async listContextSnapshots(input: import('@flowmate/contracts').ContextSnapshotsRequest): Promise<Result<import('@flowmate/contracts').ContextSnapshotsPage>> {
+    const request = ContextSnapshotsRequestSchema.safeParse(input);
+    if (!request.success) return fail(appError('input_invalid', 'input', 'Context query is invalid.'));
+    return this.options.store.read(scope => scope.context.listContextSnapshots(request.data))
+      .catch(() => fail(appError('storage_read_failed', 'storage', 'Context snapshots could not be read.', true)));
   }
-  listContextSnapshots(input: import('@flowmate/contracts').ContextSnapshotsRequest): Result<import('@flowmate/contracts').ContextSnapshotsPage> {
-    return this.options.store.context.listContextSnapshots(input);
+  async queryContextSnapshot(input: import('@flowmate/contracts').ContextSnapshotRequest): Promise<Result<import('@flowmate/contracts').ContextSnapshotDetail>> {
+    const request = ContextSnapshotRequestSchema.safeParse(input);
+    if (!request.success) return fail(appError('input_invalid', 'input', 'Context query is invalid.'));
+    return this.options.store.read(scope => scope.context.queryContextSnapshot(request.data))
+      .catch(() => fail(appError('storage_read_failed', 'storage', 'Context snapshot could not be read.', true)));
   }
-  queryContextSnapshot(input: import('@flowmate/contracts').ContextSnapshotRequest): Result<import('@flowmate/contracts').ContextSnapshotDetail> {
-    return this.options.store.context.queryContextSnapshot(input);
-  }
-  listContextRequests(input: import('@flowmate/contracts').ContextRequestsRequest): Result<import('@flowmate/contracts').ContextRequestsPage> {
-    return this.options.store.context.listContextRequests(input);
+  async listContextRequests(input: import('@flowmate/contracts').ContextRequestsRequest): Promise<Result<import('@flowmate/contracts').ContextRequestsPage>> {
+    const request = ContextRequestsRequestSchema.safeParse(input);
+    if (!request.success) return fail(appError('input_invalid', 'input', 'Context query is invalid.'));
+    return this.options.store.read(scope => scope.context.listContextRequests(request.data))
+      .catch(() => fail(appError('storage_read_failed', 'storage', 'Context requests could not be read.', true)));
   }
   /** The caller owns admission and its rollback. Material inspection never writes availability. */
-  build(raw: ContextBuildRequest): Result<ContextBuildResult> {
-    const { store, materials } = this.options;
+  build(raw: ContextBuildRequest, store: ContextBuildStore): Result<ContextBuildResult> {
+    const { materials } = this.options;
     if (!store.db.inTransaction) return fail(appError('state_conflict', 'input', 'Context build requires its admission transaction.'));
     try {
       if (typeof raw.text === 'string' && contextTextBytes(raw.text) > 65000) reject('input_too_large');
@@ -50,7 +59,7 @@ export class ContextService {
       if (!parsed.success) reject('input_invalid');
       const request = parsed.data;
       const run = requireResult(store.runs.get(request.runId));
-      if (run.kind !== 'agent' || run.sessionId !== request.sessionId || run.jobId !== request.jobId
+      if (run.kind !== 'agent' || 'runtimeKind' in run || run.sessionId !== request.sessionId || run.jobId !== request.jobId
         || !['created', 'running'].includes(run.status) || run.cancelRequestedAt !== null) reject('run_state_invalid', 'runtime');
       const configResult = buildConfig.safeParse(run.config);
       if (!configResult.success) reject('context_binding_unknown', 'runtime');
@@ -106,7 +115,7 @@ export class ContextService {
         } else if (workspace.candidateRef !== null) reject('state_conflict');
         if (workspace.documentRef !== null) {
           material = ContextParsedMaterialSchema.parse(requireResult(materials.inspectParsed({ documentRef: workspace.documentRef,
-            allowedDocumentIds: originalDocuments, allowedArtifactIds: originalArtifacts })));
+            allowedDocumentIds: originalDocuments, allowedArtifactIds: originalArtifacts }, store)));
           if (!same(material.document.documentRef, workspace.documentRef) || material.document.isHidden || material.document.status !== 'available'
             || !originalDocuments.includes(workspace.documentRef.id) || !originalArtifacts.includes(material.document.parsedArtifactId)) reject('state_conflict');
         } else if (workspace.selection !== null) reject('selection_invalid');
@@ -140,7 +149,7 @@ export class ContextService {
 type SubagentContextInput = { parentSnapshotId: number; childRunId: number; childSessionId: number;
   scope: RunScope; text: string; at: string };
 /** Admission owns the transaction. Copy the generating request's snapshot; never today's Workspace. */
-export function buildSubagentContextInTransaction(store: Pick<DbHandle, 'db' | 'context'>, input: SubagentContextInput): Result<ContextBuildResult> {
+export function buildSubagentContextInTransaction(store: Pick<SqlDatabaseStore, 'db' | 'context'>, input: SubagentContextInput): Result<ContextBuildResult> {
   try {
     if (!store.db.inTransaction) reject('state_conflict');
     const child = z.object({ id: z.literal(input.childRunId), session_id: z.literal(input.childSessionId), kind: z.literal('subagent'),

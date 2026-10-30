@@ -7,6 +7,7 @@ import { createEvaluationService } from '../../src/desktop/service.ts';
 import { saveReport } from '../../src/reports/store.ts';
 import { reportFixture, comparisonFacts } from '../support/fixtures.ts';
 import { registerSecrets } from '../../src/execution/evidence-safety.ts';
+import { createArchive, archiveReference, snapshotReference, writeArchivePart } from '../../src/reports/archive.ts';
 
 function service(root: string) {
     return createEvaluationService(root, { sessionId: 'synthetic-results-session', prepareAgent: async () => { throw Error('Unexpected model preparation'); } });
@@ -17,6 +18,19 @@ function saved(root: string, executionId: string) {
     const file = join(directory, 'report.json'); saveReport(file, report); return { report, file, directory };
 }
 const call = (s: ReturnType<typeof service>, method: string, input: unknown) => Reflect.get(s, method)?.(input);
+
+test('inline native Judge conditions remain readable without an HTTP API or Base URL', () => {
+    const root = mkdtempSync(join(tmpdir(), 'eval-native-conditions-')), archive = createArchive(root, { selection: 'full' });
+    const report = reportFixture(); report.scoringConfiguration.judge = { provider: 'codex-cli', transport: 'codex-cli', model: 'gpt-6.1-terra',
+        reasoningEffort: 'medium', timeoutMs: 180000, protocolVersion: 'flowmate-judge/v2' };
+    const ref = archiveReference(archive.file, 'executions', report.executionId), facts = comparisonFacts();
+    writeArchivePart(snapshotReference(ref), { ...facts, dataset: report.dataset.id, repeat: 1, cases: [{ id: 'sample', version: 1 }],
+        scoring: {}, judge: report.scoringConfiguration.judge });
+    saveReport(ref, report);
+    expect(call(service(root), 'result', { executionId: report.executionId, view: 'summary' })).toMatchObject({ ok: true,
+        data: { summary: { conditionsIssue: null, conditions: { judge: { api: null, baseUrl: null, model: 'gpt-6.1-terra',
+            transport: 'codex-cli', reasoningEffort: 'medium' } } } } });
+});
 
 test('a read-only execution list needs neither Dataset nor model configuration and creates no result directory', () => {
     const root = mkdtempSync(join(tmpdir(), 'eval-result-empty-')), s = service(root);

@@ -174,11 +174,11 @@ export function projectMessageView(message: unknown, context: MessageViewContext
       view = { ...base, ...limited, role: 'assistant', phase: context.phase, stopReason: source.stopReason,
         toolCallId: null, toolName: null, isError: null,
         textOrigin: limited.blocks.some(block => block.type === 'text') ? 'native-content' : null };
-    } else {
+    } else if (source.role === 'toolResult') {
       const summary = resultSummary(source);
       view = { ...base, ...limitedBlocks([{ type: 'text', text: summary }]), role: 'toolResult', phase: 'ended',
         stopReason: null, toolCallId: source.toolCallId, toolName: source.toolName, isError: source.isError, textOrigin: null };
-    }
+    } else return invalid();
     const checked = SessionMessageViewSchema.safeParse(view);
     if (!checked.success || new TextEncoder().encode(JSON.stringify({ items: [checked.data], nextBeforeEntryId: null })).length > pageLimit) return invalid();
     return ok(checked.data);

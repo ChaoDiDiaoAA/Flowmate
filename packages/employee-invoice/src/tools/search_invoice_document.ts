@@ -1,11 +1,10 @@
 import { invoiceToolSchemas, MAX_INVOICE_SEARCH_EXCERPT_CHARS } from '@flowmate/contracts';
 import type { InvoiceToolInput, InvoiceToolOutput, ToolDefinition } from '@flowmate/contracts';
-import type { DocumentService } from '@flowmate/data';
 import { appError } from '@flowmate/contracts';
-import { unwrap } from './definition.ts';
+import { unwrap, type InvoiceDocumentReader } from './definition.ts';
 import { MAX_RESULT_BYTES, sourceFor } from './source.ts';
 
-export const searchInvoiceDocument = (documents: DocumentService) => ({
+export const searchInvoiceDocument = (documents: InvoiceDocumentReader) => ({
   name: 'search_invoice_document',
   version: '1',
   label: 'Search invoice',
@@ -16,7 +15,7 @@ export const searchInvoiceDocument = (documents: DocumentService) => ({
   executionMode: 'parallel',
   execute: async (input, _call, context) => {
     if (!input.query.trim()) throw appError('tool_invalid_input', 'input', 'Search text cannot be empty.');
-    const loaded = unwrap(documents.readParsedForRun(input.documentId, context));
+    const loaded = unwrap(await documents.readParsedForRun(input.documentId, context));
     if (input.page !== null && !loaded.parsed.pages.some((page) => page.page === input.page)) {
       throw appError('tool_invalid_input', 'input', 'The requested page does not exist.');
     }

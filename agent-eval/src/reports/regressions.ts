@@ -1,13 +1,11 @@
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { createRequire } from 'node:module';
 import { z } from 'zod';
 import { atomicText } from './files.ts';
 import { readReport, reportPath, safeId, type LocalReport, type TrialReport } from './store.ts';
 import { scanEvidence } from '../execution/evidence-safety.ts';
-import { regressionOriginSchema, type RegressionOrigin } from '../dataset-loader/regression-origin.ts';
-import { authorDatasetSchema } from '../dataset-loader/authoring.ts';
+import { type RegressionOrigin } from '../dataset-loader/regression-origin.ts';
 
 const state = z.enum(['PASS', 'FAIL', 'ERROR', 'UNJUDGEABLE', 'NOT_RUN']);
 const rowSchema = z.object({ at: z.string().datetime(), batch: z.string(), issueId: z.string(), sourceExecutionId: z.string(), sourceTrialId: z.string(),
@@ -109,16 +107,6 @@ export function recordRegressions(repo: string, file: string): { saved: true; co
 export function regressionView(repo: string, report: LocalReport) {
     const enrolled: Array<{ caseId: string; datasetId: string; origin: RegressionOrigin }> = [];
     const declarationWarnings: string[] = [];
-    const directory = join(repo, 'agent-eval/src/datasets/badcase'), declaration = join(directory, 'cases.ts');
-    try { if (existsSync(declaration)) {
-        const require = createRequire(import.meta.url); delete require.cache[require.resolve(declaration)];
-        const data = authorDatasetSchema.parse(require(declaration).flowmateBadcaseDataset);
-        for (const task of data.cases) for (const input of data.regressionOrigins?.[task.id] ?? []) {
-            const origin = regressionOriginSchema.parse(input);
-            if (origin.sourceExecutionId === report.executionId && report.trials.some(trial => trial.trialId === origin.sourceTrialId && trial.caseId === origin.sourceCaseId && trial.caseVersion === origin.sourceCaseVersion))
-                enrolled.push({ caseId: task.id, datasetId: task.tags.includes('research') ? 'flowmate-badcase-research-v1' : 'flowmate-badcase-business-v1', origin });
-        }
-    } } catch { declarationWarnings.push('专项声明无法读取或校验；原报告仍可查看，收录状态需核验'); }
     for (const trial of report.trials) for (const origin of trial.regressionOrigins ?? []) enrolled.push({ caseId: trial.caseId, datasetId: report.dataset.id, origin });
     const entries = [...new Map(enrolled.map(entry => [JSON.stringify([entry.caseId, entry.datasetId, entry.origin]), entry])).values()].map(entry => {
         const { origin } = entry; const warnings: string[] = [], attempts: Array<Rerun & { metricIds: string[]; matchesCurrentTarget: boolean }> = [];

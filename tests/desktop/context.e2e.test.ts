@@ -328,6 +328,8 @@ it('refreshes selected Context after newly applied real P6 Input and terminal fa
     await expect(panel.getByRole('button', { name: /^Snapshot \d+ ·/ })).toHaveCount(2);
     await expect(panel.getByTestId('context-request')).toHaveCount(2);
     await expect(panel.getByTestId('context-snapshot-detail')).toContainText('Original user context');
+    // A saved Context binding precedes the Provider's actual HTTP reception.
+    await expect.poll(f.requests).toBe(2);
     expect(await f.page.evaluate(() => window.flowmate.readWorkspace())).toEqual(baseline); expect(f.requests()).toBe(2);
   } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
   finally { f.release(); await f.provider.stop(); await closeDesktopFixture(f.app, f.userData, failure); }

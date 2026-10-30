@@ -24,7 +24,7 @@ test('explicit installed executable uses standard data and preserves a session a
     const page = await app.firstWindow();
     await expect.poll(() => page.evaluate(() => window.flowmate.getState().then(value => value.ok && value.data.ready)), { timeout: 25_000 }).toBe(true);
     expect(await page.evaluate(() => window.flowmate.queryDiagnostics())).toMatchObject({ ok: true,
-      data: { host: { availability: 'available' }, runtime: { bunVersion: '1.4.0', sdkVersion: '0.85.1' }, configuration: { credential: 'missing' } } });
+      data: { host: { availability: 'available' }, runtime: { bunVersion: '1.4.4', sdkVersion: '1.4.0' }, configuration: { credential: 'missing' } } });
     expect(await page.evaluate(() => window.flowmate.queryEvaluationCatalog({ view: 'list' })))
       .toMatchObject({ ok: true, data: { items: [] } });
     const session = await page.evaluate(() => window.flowmate.createSession({ title: 'P17 installed acceptance' }));
