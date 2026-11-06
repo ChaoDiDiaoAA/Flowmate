@@ -6,6 +6,7 @@ const tools: readonly string[] = [...INVOICE_REVIEW_TOOL_NAMES, ...SKILL_RESOURC
 const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const label = (ref: ResourceRef) => `${ref.id} ${ref.version}`;
 type Props = { ready: boolean; hostEpoch: number; disabled: boolean; models: readonly ModelProfile[];
+  cloud?: boolean;
   configuration: { revision: number; value: PersonalAgentConfiguration } | null;
   onChange(value: PersonalAgentConfiguration): void; onSave(): void; onReload(): void; onModels(): void };
 
@@ -50,16 +51,17 @@ export function PersonalConfiguration(props: Props) {
   return <details className="panel personal-configuration" onToggle={event => setExpanded(event.currentTarget.open)}><summary>Assistant configuration</summary>
     {value && props.configuration ? <form onSubmit={event => { event.preventDefault(); props.onSave(); }}>
       <p>Changes apply to new work. Accepted work keeps its original configuration and resource versions.</p>
-      <label className="field"><span id="personal-agent-model-label">Personal Agent model</span><select aria-labelledby="personal-agent-model-label" value={value.modelId ?? ''} disabled={props.disabled}
+      <label className="field"><span id="personal-agent-model-label">Personal Agent model</span><select aria-labelledby="personal-agent-model-label" value={value.modelId ?? ''} disabled={props.disabled || props.cloud}
         onChange={event => props.onChange({ ...value, modelId: event.target.value || null })}>
-        <option value="">Choose a saved model</option>{value.modelId && !models.some(model => model.id === value.modelId) && <option value={value.modelId} disabled>Unavailable model {value.modelId}</option>}
+        <option value="">Choose a saved model</option>{!props.cloud && value.modelId && !models.some(model => model.id === value.modelId) && <option value={value.modelId} disabled>Unavailable model {value.modelId}</option>}
+        {props.cloud && value.modelId && !models.some(model => model.id === value.modelId) && <option value={value.modelId}>{value.modelId}</option>}
         {models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label>
       <label className="field"><span id="personal-agent-thinking-label">Personal Agent thinking level</span><select aria-labelledby="personal-agent-thinking-label" value={value.thinkingLevel} disabled={props.disabled}
         onChange={event => { const thinkingLevel = thinkingLevels.find(level => level === event.target.value); if (thinkingLevel) props.onChange({ ...value, thinkingLevel }); }}>
         {thinkingLevels.map(level => <option key={level}>{level}</option>)}</select></label>
       <label className="field"><span id="personal-agent-preferences-label">Assistant preferences</span><textarea aria-labelledby="personal-agent-preferences-label" maxLength={22000} value={value.preferences} disabled={props.disabled}
         onChange={event => props.onChange({ ...value, preferences: event.target.value })} /></label>
-      <label className="field"><span id="personal-agent-directory-label">Personal Agent working directory</span><input aria-labelledby="personal-agent-directory-label" maxLength={4096} value={value.workingDirectory ?? ''} disabled={props.disabled}
+      <label className="field"><span id="personal-agent-directory-label">Personal Agent working directory</span><input aria-labelledby="personal-agent-directory-label" maxLength={4096} value={value.workingDirectory ?? ''} disabled={props.disabled || props.cloud}
         placeholder="Automatic work directory" onChange={event => props.onChange({ ...value, workingDirectory: event.target.value || null })} /></label>
       <fieldset disabled={props.disabled}><legend>Personal Agent tools</legend>{[...new Set([...tools, ...value.tools])].map(name => <label className="personal-document-option" key={name}>
         <input type="checkbox" aria-label={`Enable Personal Agent tool ${name}`} checked={value.tools.includes(name)} onChange={event => props.onChange({ ...value,
@@ -92,7 +94,7 @@ export function PersonalConfiguration(props: Props) {
         {value.extensions.enabledExtensions.map(ref => <p key={`${ref.id}:${ref.version}`}>Unsupported selected extension {ref.id} {ref.version}.{' '}
           <button type="button" onClick={() => props.onChange({ ...value, extensions: { enabledExtensions: value.extensions.enabledExtensions.filter(item => item.id !== ref.id) } })}>Remove extension {ref.id} {ref.version}</button></p>)}</fieldset>
       <p>Saved configuration revision {props.configuration.revision}. Enabled tools: {value.tools.join(', ') || 'none'}.</p>
-      <div className="button-row"><button type="submit" disabled={props.disabled}>Save assistant configuration</button><button type="button" onClick={props.onModels}>Manage saved models</button>
+      <div className="button-row"><button type="submit" disabled={props.disabled}>Save assistant configuration</button>{!props.cloud && <button type="button" onClick={props.onModels}>Manage saved models</button>}
         <button type="button" disabled={!props.ready || props.disabled} onClick={props.onReload}>Reload saved configuration</button></div>
     </form> : <p>Assistant configuration is not available.</p>}
   </details>;

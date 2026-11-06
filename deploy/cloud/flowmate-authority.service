@@ -1,0 +1,25 @@
+[Unit]
+Description=Flowmate cloud Authority
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=flowmate-authority
+Group=flowmate-authority
+WorkingDirectory=/opt/flowmate/cloud
+ExecStart=/usr/bin/env /opt/flowmate/bin/bun --no-env-file /opt/flowmate/cloud/cloud-authority-main.js /etc/flowmate/authority.json
+LoadCredential=deepseek-api-key:/etc/flowmate/credentials/deepseek-api-key
+StateDirectory=flowmate-authority
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/flowmate-authority /run/flowmate-authority-runtime
+Restart=on-failure
+RestartSec=20s
+
+[Install]
+WantedBy=multi-user.target

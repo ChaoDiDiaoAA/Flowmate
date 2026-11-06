@@ -17,10 +17,13 @@ function answer(text: string) {
     usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } };
   return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
 }
-async function fixture(hold = false, api: 'openai-completions' | 'google-generative-ai' = 'openai-completions') {
+async function fixture(hold = false, api: 'openai-completions' | 'google-generative-ai' = 'openai-completions', cloud = false,
+  verifyQueueInputs?: () => Promise<void>) {
   const coordinator = createDatabaseCoordinator(new Database(':memory:'));
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   const requests: Array<{ summary: boolean; key: string | null; body: { messages?: Array<{ role: string; content?: unknown }>; tools?: unknown[] } }> = [];
+  const cloudAttempts: Array<{ modelAttemptId: string; nativeTaskId: number; checkpointEntryId: number }> = [];
+  const cloudDiagnostics: Array<{ signal: boolean; status: string }> = [];
   let building = true, allowed = true, normalChecks = 0, projections = 0, reserved = 0, key = 'before-reopen';
   const server = Bun.serve({ port: 0, fetch: async request => {
     const body = await request.json() as typeof requests[number]['body'];
@@ -42,6 +45,18 @@ async function fixture(hold = false, api: 'openai-completions' | 'google-generat
     verifyModelUse: () => { normalChecks++; return building ? ok(undefined) : fail(appError('normal_generation_blocked', 'runtime', 'This closed input cannot generate again.')); },
     reserveModelRequest: () => ok(undefined),
     readCompactionUse: (signal, model) => compactions ? compactions.modelUse(signal, model) : Promise.resolve(ok(null)) };
+  if (cloud) access.fetch = async (target, init, originalSignal) => {
+    if (!building) {
+      const found = await compactions.cloudAttempt(originalSignal);
+      cloudDiagnostics.push({ signal: Boolean(originalSignal), status: found.ok ? found.data ? 'found' : 'none' : found.error.code });
+      const attempt = need(found);
+      if (!attempt) throw Error('Expected a bound cloud summary request.');
+      const repeated = cloudAttempts.some(original => original.modelAttemptId === attempt.modelAttemptId);
+      cloudAttempts.push(attempt);
+      if (repeated) throw Error('Controlled Authority rejected the uncertain original transport.');
+    }
+    return fetch(target, init);
+  };
   let source = need(await createDurableModels(config, access, binding));
   let harness = await Harness.open(storage, { models: source.models, registry,
     settings: { compaction: { enabled: false }, retry: { enabled: false }, stream: { maxRetries: 0, deferred: false }, afterFailedRun: 'keep' } }, context);
@@ -61,12 +76,13 @@ async function fixture(hold = false, api: 'openai-completions' | 'google-generat
   const callbacks = { readPlan: async () => ok(plan), verify: async () => allowed ? ok(undefined)
     : fail(appError('compaction_revoked', 'runtime', 'Original compaction permission was revoked.')),
   reserveModelRequest: async () => { reserved++; return ok(undefined); } };
-  const openCompactions = () => createDurableCompactionRuntime({ harness, storage, registry, models: source.models, callbacks,
+  const openCompactions = () => createDurableCompactionRuntime({ harness, storage, registry, models: source.models, callbacks, cloud,
+    ...(verifyQueueInputs ? { verifyQueueInputs } : {}),
     resolvePhase: async () => ({ ...query, nativeConversationId: conversationId, nativeSubmissionId: submission.id, nativeEntryId: original.entry!, model: source.modelRef }),
     read: <T>(action: () => Promise<T>) => action(), isClosed: () => false, isStopping: () => false });
   compactions = openCompactions(); building = false;
   access.readWorkingContext = () => { projections++; return fail(appError('generation_projection_used', 'runtime', 'Summaries must retain their native request.')); };
-  return { coordinator, binding, plan, entered, release, requests, get storage() { return storage; }, get harness() { return harness; }, get registry() { return registry; },
+  return { coordinator, binding, plan, entered, release, requests, cloudAttempts, cloudDiagnostics, get storage() { return storage; }, get harness() { return harness; }, get registry() { return registry; },
     get compactions() { return compactions; }, conversationId, originalEntry: original.entry,
     counters: () => ({ normalChecks, projections, reserved }), revoke: () => { allowed = false; },
     async restart() {
@@ -79,6 +95,44 @@ async function fixture(hold = false, api: 'openai-completions' | 'google-generat
     },
     async close() { release.resolve(); await harness.close(context); await coordinator.close(); server.stop(true); } };
 }
+
+test('cloud compaction checks queued input authorization before sending a summary request', async () => {
+  let checks = 0;
+  const f = await fixture(false, 'openai-completions', true, async () => { checks++; throw Error('state_conflict'); });
+  try {
+    const started = need(await f.compactions.start(f.plan)); await f.harness.waitForTask(started.nativeTaskId as TaskId, context);
+    expect(checks).toBeGreaterThan(0);
+    expect(need(await f.compactions.observe(f.plan))).toMatchObject({ summarySaved: false });
+    expect(f.requests.filter(request => request.summary)).toHaveLength(0);
+  } finally { await f.close(); }
+}, 15000);
+
+test('cloud native compaction binds its model request to one durable summary attempt', async () => {
+  const f = await fixture(false, 'openai-completions', true);
+  try {
+    const started = need(await f.compactions.start(f.plan)); await f.harness.waitForTask(started.nativeTaskId as TaskId, context);
+    expect({ observed: need(await f.compactions.observe(f.plan)), diagnostics: f.cloudDiagnostics })
+      .toMatchObject({ observed: { outcome: 'completed', summarySaved: true }, diagnostics: [{ status: 'found' }] });
+    expect(f.cloudAttempts).toHaveLength(1);
+    expect(f.cloudAttempts[0]).toMatchObject({ nativeTaskId: started.nativeTaskId, checkpointEntryId: expect.any(Number),
+      modelAttemptId: expect.any(String) });
+    expect(f.counters().reserved).toBe(0);
+  } finally { await f.close(); }
+}, 15000);
+
+test('recovered cloud compaction keeps its original model attempt instead of reissuing an uncertain send', async () => {
+  const f = await fixture(true, 'openai-completions', true);
+  try {
+    const started = need(await f.compactions.start(f.plan)); await f.entered.promise;
+    expect(f.cloudAttempts).toHaveLength(1); await f.restart();
+    need(await f.compactions.restoreAll()); f.harness.resume();
+    await f.harness.waitForTask(started.nativeTaskId as TaskId, context);
+    expect(f.cloudAttempts).toHaveLength(2);
+    expect(f.cloudAttempts[1]!.modelAttemptId).toBe(f.cloudAttempts[0]!.modelAttemptId);
+    expect(f.requests).toHaveLength(2);
+    expect(f.counters().reserved).toBe(0);
+  } finally { await f.close(); }
+}, 15000);
 
 test('the official CompactionTask keeps its summary request, original entries and operation identity despite the generation working-set adapter', async () => {
   const f = await fixture();

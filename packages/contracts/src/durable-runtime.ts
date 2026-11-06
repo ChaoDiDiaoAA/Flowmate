@@ -7,6 +7,14 @@ import type { DurableChildToolOwner, DurableSubagentIdentity, DurableSubagentObs
 import type { PersonalHistoryRequest, PersonalHistoryPage, PersonalHistoryEntryRequest, PersonalHistoryEntry } from './personal-history.ts';
 import type { DurableCompactionIdentity, DurableCompactionRequest, DurableCompactionObservation } from './durable-compaction.ts';
 
+export const CloudRuntimeIdSchema = z.string().uuid().refine(value => value === value.toLowerCase());
+export const CloudWorkspaceIdSchema = z.string().uuid().refine(value => value === value.toLowerCase());
+export const DurableRuntimeIdSchema = z.union([z.literal('local'), CloudRuntimeIdSchema]);
+export type DurableRuntimeId = z.infer<typeof DurableRuntimeIdSchema>;
+export const CloudRuntimeBindingSchema = z.object({ workspaceId: CloudWorkspaceIdSchema, cloudRuntimeId: CloudRuntimeIdSchema,
+  workId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), sessionId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict();
+export type CloudRuntimeBinding = z.infer<typeof CloudRuntimeBindingSchema>;
+
 export type DurableConversationIdentity = { workId: DbId; sessionId: DbId };
 export type DurableAttemptIdentity = DurableConversationIdentity & { attemptId: DbId };
 export type DurableSubmissionQuery = DurableAttemptIdentity & { requestId: string };

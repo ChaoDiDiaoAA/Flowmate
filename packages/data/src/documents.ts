@@ -113,6 +113,7 @@ function preparedOriginal(bytes: Uint8Array, name: string): boolean {
   try { return name === 'source.md' && new TextDecoder('utf-8', { fatal: true }).decode(bytes).trim().length > 0; }
   catch { return false; }
 }
+export { decodeParsed as decodeStoredParsedDocument, preparedOriginal as isPreparedInvoiceOriginal };
 
 function scopeAllows(scope: RunScope, document: DocumentSnapshot): boolean {
   return scope.allowedDocumentIds.includes(document.documentRef.id)

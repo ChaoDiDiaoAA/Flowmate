@@ -1,0 +1,25 @@
+[Unit]
+Description=Flowmate cloud Runtime
+Wants=flowmate-authority.service
+After=flowmate-authority.service
+
+[Service]
+Type=simple
+User=flowmate-runtime
+Group=flowmate-runtime
+WorkingDirectory=/opt/flowmate/cloud
+ExecStart=/usr/bin/env /opt/flowmate/bin/bun --no-env-file /opt/flowmate/cloud/cloud-runtime-main.js /etc/flowmate/runtime.json
+StateDirectory=flowmate-runtime
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/flowmate-runtime
+RestrictAddressFamilies=AF_UNIX
+Restart=on-failure
+RestartSec=20s
+
+[Install]
+WantedBy=multi-user.target

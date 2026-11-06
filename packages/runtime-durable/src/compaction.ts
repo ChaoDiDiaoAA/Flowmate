@@ -7,12 +7,14 @@ import { appError, fail, ok, DurableCompactionIdentitySchema, DurableCompactionR
   type DurableCompactionRequest, type DurableCompactionPlan, type DurableCompactionObservation, type DurableModelBinding,
   type DurableAttemptIdentity, type DurableSubmissionQuery, type Result, type UsageRecord } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { DurableCompactionModelUse } from './models.ts';
 
 const context = BACKGROUND_CONTEXT, id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 type Source = { firstKept: number; tail: number | null; inputEntryId: number; entries: number[] };
-type RequestFact = { reservedAt: string; enteredAt: string | null; responseAt: string | null; usageJson: string | null };
+type RequestFact = { reservedAt: string; enteredAt: string | null; responseAt: string | null; usageJson: string | null;
+  modelAttemptId?: string; retryAttemptIds?: string[] };
 type State = { planJson: string | null; taskId: number | null; model: ModelRef | null; source: Source | null;
   cancelRequestedAt: string | null; requests: RequestFact[] };
 const Operation = defineDocFamily({ kind: 'flowmate.runtime.compaction', version: 1, family: true, scope: 'conversation', history: 'latest', fork: 'initial',
@@ -41,9 +43,11 @@ export type DurableCompactionRuntimeOptions = {
   prepareModel?(plan: DurableCompactionPlan, model: ModelRef): Promise<void>;
   beforeSchedule?(): Promise<void>;
   hasLiveOwnedTasks?(tx: Tx, conversationId: ConversationId): Promise<boolean>;
+  verifyQueueInputs?(plan: DurableCompactionPlan, conversationId: ConversationId, view: ContextView): Promise<void>;
   read<T>(action: () => Promise<T>): Promise<T>;
   isClosed(): boolean;
   isStopping(query: DurableSubmissionQuery): boolean;
+  cloud?: boolean;
 };
 
 /** Public built-in tasks stay untouched; only the application's Models instance is instrumented. */
@@ -112,7 +116,9 @@ export function createDurableCompactionRuntime(options: DurableCompactionRuntime
     if (!phase?.lowerBound || firstKept < phase.lowerBound || entries.some(entry => entry.id < phase.lowerBound!)) throw Error('state_conflict');
     const original = await options.resolvePhase(record.plan), conversation = await harness.conversation(record.conversationId, context);
     if (!conversation) throw Error('storage_corrupt');
-    await verifyInput(record.plan, record.conversationId, await conversation.context(context), original.nativeEntryId);
+    const view = await conversation.context(context);
+    await verifyInput(record.plan, record.conversationId, view, original.nativeEntryId);
+    await options.verifyQueueInputs?.(record.plan, record.conversationId, view);
     await harness.commit(async tx => {
       const state = await tx.doc(Operation, record.conversationId, record.key, null), ids = entries.map(entry => entry.id);
       if (state.source && (state.source.firstKept !== firstKept || state.source.inputEntryId !== original.nativeEntryId
@@ -132,6 +138,7 @@ export function createDurableCompactionRuntime(options: DurableCompactionRuntime
     const view = await conversation.context(context, { at: checkpoint.tail as EntryId }), cut = view.entries.findIndex(entry => entry.id === checkpoint.firstKept);
     if (cut < 0 || !isDeepStrictEqual(view.entries.slice(0, cut).map(entry => entry.id), record.state.source.entries)) throw Error('state_conflict');
     await checks(record.plan, signal);
+    await options.verifyQueueInputs?.(record.plan, record.conversationId, view);
     await harness.commit(async tx => {
       const state = await tx.doc(Operation, record.conversationId, record.key, null);
       if (!state.source || state.source.tail !== null && state.source.tail !== checkpoint.tail) throw Error('state_conflict'); state.source.tail = checkpoint.tail;
@@ -261,6 +268,18 @@ export function createDurableCompactionRuntime(options: DurableCompactionRuntime
       || summary.state.source.entries.some(entry => entry < phase.lowerBound!)) throw Error('state_conflict');
   };
   return { preparePhase, observe,
+    cloudAttempt: async (signal?: AbortSignal) => safe(async () => {
+      const active = signal ? signals.get(signal) : null;
+      if (!options.cloud || !active) return null;
+      const current = await at(active.record.conversationId, active.record.key);
+      const slot = active.index === null ? undefined : current?.state.requests[active.index];
+      if (!current || !slot?.modelAttemptId || !z.string().uuid().safeParse(slot.modelAttemptId).success
+        || !z.array(z.string().uuid()).length(3).safeParse(slot.retryAttemptIds).success
+        || !current.state.taskId || !current.state.source?.tail) throw Error('state_conflict');
+      const phase = await options.resolvePhase(current.plan);
+      return { plan: current.plan, modelAttemptId: slot.modelAttemptId, modelAttemptIds: [slot.modelAttemptId, ...slot.retryAttemptIds!], nativeTaskId: current.state.taskId,
+        nativeConversationId: current.conversationId, nativeSubmissionId: phase.nativeSubmissionId, checkpointEntryId: current.state.source.tail };
+    }),
     verifyInput,
     projectPhase: async (query: DurableSubmissionQuery, conversationId: ConversationId, view: ContextView): Promise<{ messages: Message[]; summary?: UserMessage }> => {
       const phase = await harness.snapshot(Phase, conversationId, phaseKey(query), context);
@@ -336,13 +355,21 @@ export function createDurableCompactionRuntime(options: DurableCompactionRuntime
         const current = await at(active.record.conversationId, active.record.key); if (!current || current.state.cancelRequestedAt !== null) throw Error('state_conflict');
         await checks(current.plan, signal);
       }), reserve: async () => safe(async () => {
-        await checks(active.record.plan, signal); need(await options.callbacks!.reserveModelRequest(active.record.plan));
+        await checks(active.record.plan, signal);
+        if (!options.cloud) need(await options.callbacks!.reserveModelRequest(active.record.plan));
         await harness.commit(async tx => { const state = await tx.doc(Operation, active.record.conversationId, active.record.key, null);
-          active.index = state.requests.length; state.requests.push({ reservedAt: new Date().toISOString(), enteredAt: null, responseAt: null, usageJson: null }); }, context);
+          if (options.cloud && state.requests.length) {
+            if (state.requests.length !== 1 || !state.requests[0]?.modelAttemptId) throw Error('state_conflict');
+            state.requests[0].retryAttemptIds ??= [randomUUID(), randomUUID(), randomUUID()];
+            active.index = 0;
+          } else {
+            active.index = state.requests.length; state.requests.push({ reservedAt: new Date().toISOString(), enteredAt: null, responseAt: null, usageJson: null,
+              ...(options.cloud ? { modelAttemptId: randomUUID(), retryAttemptIds: [randomUUID(), randomUUID(), randomUUID()] } : {}) });
+          } }, context);
       }), entered: async () => {
         if (active.index === null) throw Error('state_conflict');
         await harness.commit(async tx => { const state = await tx.doc(Operation, active.record.conversationId, active.record.key, null);
-          const slot = state.requests[active.index!]; if (!slot) throw Error('storage_corrupt'); slot.enteredAt = new Date().toISOString(); }, context);
+          const slot = state.requests[active.index!]; if (!slot) throw Error('storage_corrupt'); slot.enteredAt ??= new Date().toISOString(); }, context);
       } };
     }),
   };

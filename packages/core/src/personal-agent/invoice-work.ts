@@ -1,4 +1,5 @@
-import { appError, fail, ok, InvoiceWorkCreateRequestSchema, InvoiceWorkContinueRequestSchema,
+import { randomUUID } from 'node:crypto';
+import { appError, CloudWorkspaceIdSchema, fail, ok, InvoiceWorkCreateRequestSchema, InvoiceWorkContinueRequestSchema,
   InvoiceWorkSupplementRequestSchema, InvoiceWorkDisposeItemRequestSchema, InvoiceWorkCancelRequestSchema,
   InvoiceWorkListRequestSchema, InvoiceWorkGetRequestSchema, InvoiceWorkQueryOperationRequestSchema,
   DurableModelBindingSchema, RuntimeRequestOverridesSchema } from '@flowmate/contracts';
@@ -8,17 +9,18 @@ import type { InvoiceWorksApi, InvoiceWorkCreateRequest, InvoiceWorkContinueRequ
   InvoiceWorkSupplementReceipt, InvoiceWorkDisposeItemReceipt, InvoiceWorkCancelReceipt, InvoiceWorkListResult,
   InvoiceWorkGetResult, DurableModelBinding, PersonalAgentConfiguration, RuntimeRequestOverrides,
   InvoiceWorkTimelineRequest, InvoiceWorkTimelinePage, Result } from '@flowmate/contracts';
-import type { DbHandle } from '../storage/database.ts';
+import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { InvoiceWorkAdmission, InvoiceWorkRepository } from './repository.ts';
 import { createInvoiceWorkTimelineService } from './timeline.ts';
 
-export type InvoiceWorkExecutionCommand = { kind: 'create'; request: InvoiceWorkCreateRequest }
+export type InvoiceWorkExecutionCommand = { kind: 'create'; request: InvoiceWorkCreateRequest; runtimeOwner?: { workspaceId: string; cloudRuntimeId: string } }
   | { kind: 'continueWork'; request: InvoiceWorkContinueRequest }
   | { kind: 'supplement'; request: InvoiceWorkSupplementRequest };
 export type InvoiceWorkServiceOptions = {
   database: Pick<DbHandle, 'read' | 'transaction'>;
   now: () => string;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  cloudWorkspaceId?: string;
   captureModel?: (configuration: PersonalAgentConfiguration) => Result<DurableModelBinding | null> | Promise<Result<DurableModelBinding | null>>;
   assessExecution: (command: InvoiceWorkExecutionCommand) => Result<InvoiceWorkAdmission> | Promise<Result<InvoiceWorkAdmission>>;
   /** Signal persisted facts; the coordinator must recheck authorization before dispatch. */
@@ -27,24 +29,39 @@ export type InvoiceWorkServiceOptions = {
 
 const invalid = () => fail(appError('input_invalid', 'input', 'Invoice Work request is invalid.'));
 const writeFailure = () => fail(appError('storage_write_failed', 'storage', 'Invoice Work operation could not be confirmed.', true));
+const forbidden = () => fail(appError('cloud_workspace_forbidden', 'input', 'The Work does not belong to this cloud workspace.'));
 const replayAdmission: InvoiceWorkAdmission = { kind: 'waiting', reason: 'Only the original operation receipt is being recovered.' };
 
 export class InvoiceWorkService implements InvoiceWorksApi {
-  public constructor(private readonly options: InvoiceWorkServiceOptions) {}
+  private readonly cloudWorkspaceId: string | undefined;
+  public constructor(private readonly options: InvoiceWorkServiceOptions) {
+    this.cloudWorkspaceId = options.cloudWorkspaceId === undefined ? undefined : CloudWorkspaceIdSchema.parse(options.cloudWorkspaceId);
+  }
 
-  public timeline(input: InvoiceWorkTimelineRequest): Promise<Result<InvoiceWorkTimelinePage>> {
+  private allowed(scope: SqlDatabaseStore, workId: number): boolean {
+    if (!this.cloudWorkspaceId) return true;
+    return scope.db.query(`SELECT w.id FROM invoice_works w JOIN sessions s ON s.id=w.session_id
+      WHERE w.id=? AND s.durable_runtime_id!='local' AND s.cloud_workspace_id=?`).get(workId, this.cloudWorkspaceId) !== null;
+  }
+
+  public async timeline(input: InvoiceWorkTimelineRequest): Promise<Result<InvoiceWorkTimelinePage>> {
+    if (this.cloudWorkspaceId) {
+      try { if (!await this.options.database.read(scope => this.allowed(scope, input.workId))) return forbidden(); }
+      catch { return fail(appError('storage_read_failed', 'storage', 'Invoice Work state could not be read.', true)); }
+    }
     return createInvoiceWorkTimelineService({ database: this.options.database }).timeline(input);
   }
 
-  private async read<T>(operation: (repository: InvoiceWorkRepository) => Result<T>): Promise<Result<T>> {
-    try { return await this.options.database.read(scope => operation(scope.invoiceWorks)); }
+  private async read<T>(operation: (repository: InvoiceWorkRepository) => Result<T>, workId?: number): Promise<Result<T>> {
+    try { return await this.options.database.read(scope => workId !== undefined && !this.allowed(scope, workId) ? forbidden() : operation(scope.invoiceWorks)); }
     catch { return fail(appError('storage_read_failed', 'storage', 'Invoice Work state could not be read.', true)); }
   }
 
   private async command<T extends InvoiceWorkOperationReceipt>(key: InvoiceWorkQueryOperationRequest,
-    write: (repository: InvoiceWorkRepository, at: string, admission: InvoiceWorkAdmission, runtimeDefaults?: RuntimeRequestOverrides) => Result<T>,
+    write: (repository: InvoiceWorkRepository, at: string, admission: InvoiceWorkAdmission, runtimeDefaults: RuntimeRequestOverrides | undefined,
+      scope: SqlDatabaseStore) => Result<T>,
     execution?: InvoiceWorkExecutionCommand): Promise<Result<T>> {
-    const original = await this.read(repository => repository.queryOperation(key));
+    const original = await this.read(repository => repository.queryOperation(key), key.operation === 'create' ? undefined : key.workId);
     if (!original.ok) return original;
     let admission: InvoiceWorkAdmission = replayAdmission;
     let captured: { modelId: string; binding: DurableModelBinding } | undefined;
@@ -84,6 +101,7 @@ export class InvoiceWorkService implements InvoiceWorksApi {
     let rejected: Result<never> | undefined;
     try {
       const saved = await this.options.database.transaction(scope => {
+        if (key.operation !== 'create' && !this.allowed(scope, key.workId)) { rejected = forbidden(); throw Error('cloud_workspace_forbidden'); }
         const prior = scope.invoiceWorks.queryOperation(key);
         if (!prior.ok) { rejected = prior; throw Error('invoice_work_command_rejected'); }
         const replayed = prior.data !== null;
@@ -99,7 +117,7 @@ export class InvoiceWorkService implements InvoiceWorksApi {
           }
           runtimeDefaults = parsed.data;
         }
-        const result = write(scope.invoiceWorks, this.options.now(), replayed ? replayAdmission : admission, runtimeDefaults);
+        const result = write(scope.invoiceWorks, this.options.now(), replayed ? replayAdmission : admission, runtimeDefaults, scope);
         if (!result.ok) { rejected = result; throw Error('invoice_work_command_rejected'); }
         if (!replayed) {
           if (captured && result.data.operation === 'create') {
@@ -123,7 +141,8 @@ export class InvoiceWorkService implements InvoiceWorksApi {
         return await this.options.database.transaction(scope => {
           const prior = scope.invoiceWorks.queryOperation(key);
           if (!prior.ok || prior.data === null) return writeFailure();
-          return write(scope.invoiceWorks, this.options.now(), replayAdmission);
+          if (key.operation !== 'create' && !this.allowed(scope, key.workId)) return forbidden();
+          return write(scope.invoiceWorks, this.options.now(), replayAdmission, undefined, scope);
         });
       } catch { return writeFailure(); }
     }
@@ -132,8 +151,26 @@ export class InvoiceWorkService implements InvoiceWorksApi {
   public async create(input: InvoiceWorkCreateRequest): Promise<Result<InvoiceWorkCreateReceipt>> {
     const parsed = InvoiceWorkCreateRequestSchema.safeParse(input);
     if (!parsed.success) return invalid();
-    return this.command({ operation: 'create', personalAgentId: parsed.data.personalAgentId, requestId: parsed.data.requestId },
-      (repository, at, admission, runtimeDefaults) => repository.create(parsed.data, { at, admission, runtimeDefaults }), { kind: 'create', request: parsed.data });
+    const key = { operation: 'create' as const, personalAgentId: parsed.data.personalAgentId, requestId: parsed.data.requestId };
+    const proposedOwner = this.cloudWorkspaceId ? { workspaceId: this.cloudWorkspaceId, cloudRuntimeId: randomUUID() } : undefined;
+    return this.command(key, (repository, at, admission, runtimeDefaults, scope) => {
+      let runtimeOwner: { workspaceId: string; cloudRuntimeId: string } | undefined;
+      if (this.cloudWorkspaceId) {
+        const prior = repository.queryOperation(key); if (!prior.ok) return prior;
+        if (prior.data) {
+          if (prior.data.operation !== 'create' || !this.allowed(scope, prior.data.workId)) return forbidden();
+          const session = scope.sessions.get(prior.data.sessionId); if (!session.ok) return session;
+          if (session.data.runtimeKind !== 'durable' || session.data.durableRuntimeId === 'local') return forbidden();
+          runtimeOwner = { workspaceId: this.cloudWorkspaceId, cloudRuntimeId: session.data.durableRuntimeId };
+        } else {
+          if (parsed.data.documents.some(ref => !scope.db.query(`SELECT d.id FROM cloud_workspace_documents m JOIN documents d
+            ON d.id=m.document_id AND d.version=m.document_version WHERE m.workspace_id=? AND m.document_id=? AND m.document_version=?
+            AND d.status='available' AND d.hidden_at IS NULL`).get(this.cloudWorkspaceId!, ref.id, ref.version))) return forbidden();
+          runtimeOwner = proposedOwner;
+        }
+      }
+      return repository.create(parsed.data, { at, admission, runtimeDefaults, runtimeOwner });
+    }, { kind: 'create', request: parsed.data, ...(proposedOwner ? { runtimeOwner: proposedOwner } : {}) });
   }
 
   public async continueWork(input: InvoiceWorkContinueRequest): Promise<Result<InvoiceWorkContinueReceipt>> {
@@ -166,16 +203,23 @@ export class InvoiceWorkService implements InvoiceWorksApi {
 
   public async list(input: InvoiceWorkListRequest): Promise<Result<InvoiceWorkListResult>> {
     const parsed = InvoiceWorkListRequestSchema.safeParse(input);
-    return parsed.success ? this.read(repository => repository.list(parsed.data)) : invalid();
+    return parsed.success ? this.read(repository => repository.list(parsed.data, this.cloudWorkspaceId ? { cloudWorkspaceId: this.cloudWorkspaceId } : undefined)) : invalid();
   }
 
   public async get(input: InvoiceWorkGetRequest): Promise<Result<InvoiceWorkGetResult>> {
     const parsed = InvoiceWorkGetRequestSchema.safeParse(input);
-    return parsed.success ? this.read(repository => repository.get(parsed.data)) : invalid();
+    return parsed.success ? this.read(repository => repository.get(parsed.data), parsed.data.workId) : invalid();
   }
 
   public async queryOperation(input: InvoiceWorkQueryOperationRequest): Promise<Result<InvoiceWorkOperationReceipt | null>> {
     const parsed = InvoiceWorkQueryOperationRequestSchema.safeParse(input);
-    return parsed.success ? this.read(repository => repository.queryOperation(parsed.data)) : invalid();
+    if (!parsed.success) return invalid();
+    try {
+      return await this.options.database.read(scope => {
+        if (parsed.data.operation !== 'create' && !this.allowed(scope, parsed.data.workId)) return forbidden();
+        const result = scope.invoiceWorks.queryOperation(parsed.data);
+        return result.ok && result.data && !this.allowed(scope, result.data.workId) ? ok(null) : result;
+      });
+    } catch { return fail(appError('storage_read_failed', 'storage', 'Invoice Work state could not be read.', true)); }
   }
 }

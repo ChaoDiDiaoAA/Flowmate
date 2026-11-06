@@ -1,4 +1,4 @@
-import { appError, fail, ok, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, DelegateArgsSchema, PersonalAgentConfigurationSchema, resourceRefKey,
+import { appError, CloudWorkspaceIdSchema, fail, ok, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, DelegateArgsSchema, PersonalAgentConfigurationSchema, resourceRefKey,
   type AppError, type DurableAttemptIdentity, type DurableProductToolCall, type DurableRuntimePort, type FrozenResources, type ManagedFileContents,
   type PersonalAgentConfiguration, type ProviderConfig, type RuntimeRequestOverrides, type Result } from '@flowmate/contracts';
 import { createResourceService, createToolExecutor, createInvoiceWorkToolBridge, DurableInvoiceGovernor,
@@ -6,13 +6,18 @@ import { createResourceService, createToolExecutor, createInvoiceWorkToolBridge,
   InvoiceWorkService, PersonalTasksService, InvoiceWorkCoordinator, prepareInvoiceWorkInstructions, createDurableInvoiceSubagentService,
   createPersonalHistoryService, createInvoiceWorkCompactionCallbacks } from '@flowmate/core';
 import type { DbHandle } from '../packages/core/src/storage/database.ts';
-import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage, prepareDurableModelBinding, DURABLE_SDK_VERSIONS } from '@flowmate/runtime-durable';
+import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage, prepareDurableModelBinding, DURABLE_SDK_VERSIONS,
+  type DurableRuntimeOptions } from '@flowmate/runtime-durable';
 import { inspectNativeResources, toPiParameters } from '@flowmate/runtime-pi';
+import { createLocalDurableRuntime } from './local-durable-runtime.ts';
+import type { CloudAuthorityCallbacks } from './cloud-authority-rpc.ts';
+import type { CloudQueueAuthority } from './cloud-queue-authority.ts';
 
 export type PersonalAgentRuntimeOptions = {
   database: DbHandle;
   definitions: Parameters<typeof createToolExecutor>[0]['definitions'];
   resourceRoot: string;
+  importedResourceRoot?: string;
   bundleRoot: string;
   resolveConfiguration: (modelId: string) => Result<ProviderConfig> | Promise<Result<ProviderConfig>>;
   readApiKey: (config: ProviderConfig) => string | undefined | Promise<string | undefined>;
@@ -20,6 +25,7 @@ export type PersonalAgentRuntimeOptions = {
   now: () => string;
   defaultConfiguration?: PersonalAgentConfiguration;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  cloud?: { workspaceId: string; runtime: DurableRuntimePort };
   onError?: (error: AppError) => void;
 };
 type OriginalFile = { owner_kind: string; owner_id: string; relative_path: string; content: Uint8Array };
@@ -31,7 +37,7 @@ const callIdentity = ({ workId, sessionId, attemptId, requestId }: DurableProduc
 /** One product owner assembles both runtime boundaries; only committed commands wake business execution. */
 export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOptions) {
   const { database, now } = options;
-  const governor = new DurableInvoiceGovernor(database, now, options.foregroundBusy);
+  const governor = new DurableInvoiceGovernor(database, now, options.foregroundBusy, options.cloud ? 'cloud' : 'local');
   let nativeRuntime: DurableRuntimePort | undefined;
   try {
   const subagents = createDurableInvoiceSubagentService({ database, now, governor,
@@ -45,7 +51,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     if (configuration.extensions.enabledExtensions.length)
       return fail(appError('personal_agent_extensions_unavailable', 'extension', 'The selected extensions have no Durable phase adapter.'));
     const key = resourceKey(configuration, revision), original = preparedResources.get(key);
-    const hub = createResourceService({ resourceRoot: options.resourceRoot, bundleRoot: options.bundleRoot,
+    const hub = createResourceService({ resourceRoot: options.resourceRoot, importedResourceRoot: options.importedResourceRoot, bundleRoot: options.bundleRoot,
       registeredToolNames: definitions.map(tool => tool.name), inspectNativeResources });
     if (preparedResources.has(key)) {
       if (original === null) return ok(undefined);
@@ -58,7 +64,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       const selected = new Set([...(configuration.resources.prompt ? [configuration.resources.prompt] : []),
         ...configuration.resources.enabledSkills].map(resourceRefKey));
       const rows = await database.read(scope => scope.db.query<OriginalFile, [string]>(
-        "SELECT * FROM managed_file_contents WHERE owner_kind='resource-author' AND owner_id IN (SELECT value FROM json_each(?))")
+        "SELECT * FROM managed_file_contents WHERE owner_kind IN ('resource-author','cloud-resource-manifest') AND owner_id IN (SELECT value FROM json_each(?))")
         .all(JSON.stringify([...selected])));
       const values = new Map(rows.map(row => [JSON.stringify([row.owner_kind, row.owner_id, row.relative_path]), Uint8Array.from(row.content)]));
       const writes: Array<{ owner: Parameters<ManagedFileContents['read']>[0]; content: Uint8Array }> = [];
@@ -89,13 +95,14 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       const configuration = PersonalAgentConfigurationSchema.parse(JSON.parse(work.configuration_json));
       const key = resourceKey(configuration, input.phase.basis.configurationRevision);
       if (!preparedResources.has(key)) return fail(appError('resource_bundle_unavailable', 'storage', 'The original phase resources have not been prepared.'));
-      const hub = createResourceService({ resourceRoot: options.resourceRoot, bundleRoot: options.bundleRoot,
+      const hub = createResourceService({ resourceRoot: options.resourceRoot, importedResourceRoot: options.importedResourceRoot, bundleRoot: options.bundleRoot,
         registeredToolNames: definitions.map(tool => tool.name), inspectNativeResources });
       return prepareInvoiceWorkInstructions({ configuration, resources: preparedResources.get(key) ?? null,
         readFrozenFile: (frozen, request) => hub.readFrozenFile(frozen, request, scope.contents) });
     } });
   let coordinator: InvoiceWorkCoordinator | undefined;
   let observer: InvoiceWorkPhaseObserver | undefined;
+  let cloudQueue: Pick<CloudQueueAuthority, 'currentEdit' | 'wasCancelled' | 'verifyInputs'> | undefined;
   let activated = false;
   const reader = createInvoiceWorkToolBridge({ database, executor: createToolExecutor({ database, definitions, now }) });
   const executors = new Map<number, Promise<ReturnType<typeof createInvoiceWorkToolBridge>>>();
@@ -120,13 +127,21 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     }
     return bridge;
   };
-  const opened = await createDurableRuntime({ storage: await createDurableSqliteStorage(database.coordinator),
+  if (options.cloud) CloudWorkspaceIdSchema.parse(options.cloud.workspaceId);
+  const runtimeOptions: Omit<DurableRuntimeOptions, 'storage'> = {
     readApiKey: (_identity, config) => options.readApiKey(config), verifyModelUse: identity => governor.verifyModelUse(identity),
     verifySchedulingUse: (identity, pendingFeedback) => governor.verifySchedulingUse(identity, pendingFeedback),
     reserveModelRequest: identity => governor.reserveModelRequest(identity),
     compactions: createInvoiceWorkCompactionCallbacks({ database, governor, contexts, subagents: subagents.callbacks }),
     subagents: subagents.callbacks,
-    readWorkingContext: query => query.child ? subagents.readWorkingContext(query) : contexts.get(query),
+    readWorkingContext: async query => {
+      const saved = query.child ? await subagents.readWorkingContext(query) : await contexts.get(query);
+      if (!saved.ok || !options.cloud) return saved;
+      if (!cloudQueue) return fail(appError('cloud_queue_unavailable', 'runtime', 'The cloud queue authority is unavailable.', true));
+      const edit = await cloudQueue.currentEdit({ workId: query.workId, sessionId: query.sessionId, attemptId: query.attemptId, requestId: query.requestId });
+      if (!edit.ok) return edit;
+      return edit.data ? ok({ ...saved.data, queueInstruction: { provenance: 'user-provided' as const, ...edit.data } }) : saved;
+    },
     verifyWorkingContext: async query => {
       if (!query.child) return contexts.verify(query);
       const context = await subagents.readWorkingContext(query); return context.ok ? ok(undefined) : context;
@@ -140,9 +155,11 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       catch { return fail(appError('tool_execution_failed', 'runtime', 'The original invoice tool execution could not be admitted.', true)); }
     }, readToolResult: call => reader.readToolResult(call), onToolFeedback: feedback => reader.onToolFeedback(feedback),
     onChanged: () => { if (activated) coordinator?.wake(); },
-  });
+  };
+  const opened = options.cloud ? ok(options.cloud.runtime)
+    : await createDurableRuntime({ ...runtimeOptions, storage: await createDurableSqliteStorage(database.coordinator) });
   if (!opened.ok) return opened;
-  const runtime = opened.data;
+  const runtime = options.cloud ? opened.data : createLocalDurableRuntime(opened.data, database);
   nativeRuntime = runtime;
   observer = new InvoiceWorkPhaseObserver({ database, runtime, now });
   const modelService = new InvoiceWorkModelService({ database, runtime, now,
@@ -159,7 +176,10 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       return ok(undefined);
     } });
   coordinator = new InvoiceWorkCoordinator({ database, runtime, modelService, contexts, phaseObserver: observer,
-    governor, tasks, now, sdk: DURABLE_SDK_VERSIONS, verifyResources: prepareResources, onError: report });
+    governor, tasks, now, runtimeScope: options.cloud ? 'cloud' : 'local', sdk: DURABLE_SDK_VERSIONS, verifyResources: prepareResources,
+    queueCancelled: options.cloud ? input => cloudQueue ? cloudQueue.wasCancelled(input)
+      : Promise.resolve(fail(appError('cloud_queue_unavailable', 'runtime', 'The cloud queue authority is unavailable.', true))) : undefined,
+    onError: report });
   const agent = new PersonalAgentService({ database, now, validateConfiguration: async configuration => {
     if (configuration.tools.some(name => !definitions.some(tool => tool.name === name)))
       return fail(appError('personal_agent_tool_unavailable', 'input', 'The selected tool has no Personal Agent adapter.'));
@@ -168,7 +188,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     const config = await options.resolveConfiguration(configuration.modelId); if (!config.ok) return config;
     const fixed = await prepareDurableModelBinding(config.data); return fixed.ok ? ok(undefined) : fixed;
   } });
-  const works = new InvoiceWorkService({ database, now, runtimeDefaults: options.runtimeDefaults,
+  const works = new InvoiceWorkService({ database, now, runtimeDefaults: options.runtimeDefaults, cloudWorkspaceId: options.cloud?.workspaceId,
     onChanged: () => { if (activated) coordinator?.wake(); },
     captureModel: async configuration => {
       if (configuration.modelId === null) return ok(null);
@@ -190,7 +210,25 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     thinkingLevel: 'off', tools: definitions.map(tool => tool.name), resources: { prompt: null, enabledSkills: [] },
     extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' }));
   if (!initialized.ok) { await runtime.close(); return initialized; }
+  const callbacks: CloudAuthorityCallbacks = {
+    readWorkingContext: async input => runtimeOptions.readWorkingContext!(input),
+    verifyQueueInputs: async input => {
+      if (!options.cloud || !cloudQueue) return fail(appError('cloud_queue_unavailable', 'runtime', 'The cloud queue authority is unavailable.', true));
+      const verified = await contexts.verify({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId, requestId: input.requestId });
+      return verified.ok ? cloudQueue.verifyInputs(input) : verified;
+    },
+    verifyWorkingContext: async input => runtimeOptions.verifyWorkingContext!(input),
+    verifyModelUse: async input => runtimeOptions.verifyModelUse(input),
+    verifySchedulingUse: async (input, pending) => runtimeOptions.verifySchedulingUse!(input, pending),
+    executeTool: async input => runtimeOptions.executeTool!(input),
+    readToolResult: async input => runtimeOptions.readToolResult!(input),
+    onToolFeedback: async input => runtimeOptions.onToolFeedback!(input),
+    subagents: runtimeOptions.subagents, compactions: runtimeOptions.compactions,
+  };
   return ok({ personal: { agent, works, tasks }, coordinator,
+    cloudAuthority: options.cloud ? { workspaceId: options.cloud.workspaceId, callbacks, governor, tools: runtimeOptions.tools ?? [],
+      attachQueue: (queue: Pick<CloudQueueAuthority, 'currentEdit' | 'wasCancelled' | 'verifyInputs'>) => { if (cloudQueue && cloudQueue !== queue) throw Error('cloud_queue_owner_conflict'); cloudQueue = queue; },
+      reconcilePhase: (identity: Parameters<InvoiceWorkPhaseObserver['reconcile']>[0]) => observer!.reconcile(identity) } : null,
     conditionsChanged: () => { if (activated) coordinator?.wake(); },
     start: async () => {
       activated = true;

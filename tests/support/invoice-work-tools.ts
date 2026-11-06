@@ -20,7 +20,7 @@ const sdk = { durable: installedVersion('@earendil-works/pi-durable'), ai: insta
   chord: installedVersion('@earendil-works/chord') };
 
 export async function invoiceWorkToolsFixture(options: { at?: string; provider?: ProviderConfig; configuration?: PersonalAgentConfiguration;
-  maxToolFeedbackBytes?: number } = {}) {
+  maxToolFeedbackBytes?: number; durableRuntimeId?: string } = {}) {
   const at = options.at ?? '2026-10-29T00:00:00.000Z';
   const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-work-tools-'));
   const paths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
@@ -52,7 +52,8 @@ export async function invoiceWorkToolsFixture(options: { at?: string; provider?:
     }
     return need(scope.invoiceWorks.create({ personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision,
       requestId: 'create-work-tools', goal: 'Prepare candidates for the fixed invoices.', documents: [{ id: 1, version: 'v1' }, { id: 2, version: 'v1' }] },
-    { at, admission: { kind: 'ready' } }));
+    { at, admission: { kind: 'ready' }, ...(options.durableRuntimeId ? { runtimeOwner: { cloudRuntimeId: options.durableRuntimeId,
+      workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' } } : {}) }));
   });
   if (!('attempt' in created.execution) || !created.execution.attempt) throw Error('Expected the real admitted attempt.');
   if (options.maxToolFeedbackBytes !== undefined) await database.transaction(scope => scope.db.query(

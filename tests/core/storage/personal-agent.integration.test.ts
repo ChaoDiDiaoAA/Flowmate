@@ -181,6 +181,13 @@ test('the real Durable model consumes the committed invoice snapshot and reconci
     expect(observed?.nativeSubmissionId).toBeNumber();
     expect(observed?.phaseId).toBe(first.context.phase.phaseId);
     expect(need(await f.query(repository => repository.getPhase(f.phaseQuery)))).toEqual(observed);
+    const earlier = new Date(Date.parse(observed!.consumedAt!) - 1000).toISOString();
+    const afterClockStep = new InvoiceWorkPhaseObserver({ database: f.database, runtime, now: () => earlier });
+    expect(need(await afterClockStep.reconcile(f.phaseQuery))).toEqual(observed);
+    const originalObservation = need(await runtime.observeSubmission(f.phaseQuery));
+    if (!originalObservation) throw Error('Expected the original native observation.');
+    expect(await f.command(repository => repository.recordPhaseObservation({ observation: { ...originalObservation, consumedAt: earlier }, at: earlier })))
+      .toMatchObject({ ok: false, error: { code: 'source_invalid' } });
     const nextRequest = { ...f.request, requestId: 'next-frozen-phase', basis: { ...f.request.basis, inputIds: [] } };
     const next = need(await contexts.freeze(nextRequest));
     expect(next.context.historicalInputReferences).toHaveLength(1);
@@ -400,6 +407,70 @@ test('a phase keeps its original basis and native linkage cannot rewrite admissi
   expect(linked).toMatchObject({ phaseId: phase.phaseId, basis: input.basis, nativeConversationId: 41, nativeSubmissionId: 101, consumedAt: null });
   expect(await f.query(repository => repository.queryOperation({ operation: 'create', personalAgentId: f.agent.personalAgentId, requestId: f.request.requestId })))
     .toEqual({ ok: true, data: receipt });
+});
+
+test('a cloud Work keeps its original workspace and runtime across retries and cannot fall back locally', async () => {
+  const f = await fixture(1);
+  const runtimeOwner = { cloudRuntimeId: '11111111-1111-4111-8111-111111111111', workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' };
+  const options = { at, admission: { kind: 'queued' as const }, runtimeOwner };
+  const receipt = need(await f.command(repository => repository.create(f.request, options)));
+  expect(await f.query((_repository, store) => store.sessions.get(receipt.sessionId)))
+    .toMatchObject({ ok: true, data: { durableRuntimeId: runtimeOwner.cloudRuntimeId, cloudWorkspaceId: runtimeOwner.workspaceId } });
+  expect(await f.command(repository => repository.create(f.request, options))).toEqual({ ok: true, data: receipt });
+  expect(await f.command(repository => repository.create(f.request, { at, admission: { kind: 'queued' } })))
+    .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  expect(await f.command(repository => repository.create(f.request, { ...options,
+    runtimeOwner: { ...runtimeOwner, cloudRuntimeId: '22222222-2222-4222-8222-222222222222' } })))
+    .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  expect(await f.command(repository => repository.create({ ...f.request, requestId: 'second-work-same-runtime' }, options)))
+    .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  const local = need(await f.command((_repository, store) => store.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: 'Local', at })));
+  expect(() => f.database.db.query('UPDATE invoice_works SET session_id=? WHERE id=?').run(local.sessionId, receipt.workId)).toThrow();
+});
+
+test('related Work inherits source facts only within its original local or cloud workspace', async () => {
+  const f = await fixture(1), local = await f.create();
+  const localItem = (await f.work(local.workId)).items[0]!;
+  const runtimeOwner = { cloudRuntimeId: '11111111-1111-4111-8111-111111111111', workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' };
+  const options = { at, admission: { kind: 'queued' as const }, runtimeOwner };
+  const sourceOf = (workId: number, item: typeof localItem) => ({ workId, items: [{ itemId: item.itemId, documentRef: item.documentRef, candidateRef: null }] });
+  expect(await f.command(repository => repository.create({ ...f.request, requestId: 'local-source-to-cloud',
+    source: sourceOf(local.workId, localItem) }, options))).toMatchObject({ ok: false, error: { code: 'source_invalid' } });
+  const cloud = need(await f.command(repository => repository.create({ ...f.request, requestId: 'cloud-source' }, options)));
+  const cloudItem = (await f.work(cloud.workId)).items[0]!;
+  const source = sourceOf(cloud.workId, cloudItem);
+  expect(await f.command(repository => repository.create({ ...f.request, requestId: 'cloud-source-to-local', source },
+    { at, admission: { kind: 'queued' } }))).toMatchObject({ ok: false, error: { code: 'source_invalid' } });
+  expect(await f.command(repository => repository.create({ ...f.request, requestId: 'cloud-source-to-other-workspace', source },
+    { ...options, runtimeOwner: { cloudRuntimeId: '22222222-2222-4222-8222-222222222222', workspaceId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } })))
+    .toMatchObject({ ok: false, error: { code: 'source_invalid' } });
+  expect(await f.command(repository => repository.create({ ...f.request, requestId: 'cloud-source-to-same-workspace', source },
+    { ...options, runtimeOwner: { ...runtimeOwner, cloudRuntimeId: '22222222-2222-4222-8222-222222222222' } }))).toMatchObject({ ok: true });
+});
+
+test('phase native identifiers are scoped to the immutable runtime owning their Work', async () => {
+  const f = await fixture(1);
+  const owners = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
+  const phases: Array<{ workId: number; attemptId: number; phaseId: number }> = [];
+  for (const [index, owner] of owners.entries()) {
+    const receipt = need(await f.command(repository => repository.create({ ...f.request, requestId: `scoped-create-${index}` },
+      { at, admission: { kind: 'ready' }, runtimeOwner: { cloudRuntimeId: owner, workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' } })));
+    if (!('attempt' in receipt.execution) || !receipt.execution.attempt) throw Error('Expected an attempt.');
+    const item = (await f.work(receipt.workId)).items[0]!;
+    const frozen = need(await f.command(repository => repository.freezePhase({ workId: receipt.workId,
+      attemptId: receipt.execution.attempt!.attemptId, itemId: item.itemId, requestId: `scoped-phase-${index}`, kind: 'prompt', at,
+      basis: { contextSnapshotId: null, inputIds: [], documentRefs: [item.documentRef], configurationRevision: f.agent.revision, itemRevision: item.revision } })));
+    phases.push({ workId: receipt.workId, attemptId: receipt.execution.attempt.attemptId, phaseId: frozen.phaseId });
+    expect(await f.command(repository => repository.linkPhase({ ...phases[index]!, nativeConversationId: 41, nativeSubmissionId: 101, at })))
+      .toMatchObject({ ok: true, data: { nativeConversationId: 41, nativeSubmissionId: 101 } });
+  }
+  expect(await f.query((_repository, store) => store.db.query('SELECT durable_runtime_id FROM invoice_work_phases ORDER BY id').all()))
+    .toEqual(owners.map(durable_runtime_id => ({ durable_runtime_id })));
+  expect(() => f.database.db.query('UPDATE invoice_work_phases SET durable_runtime_id=? WHERE id=?').run(owners[1]!, phases[0]!.phaseId)).toThrow();
+  expect(() => f.database.db.query(`INSERT INTO invoice_work_phases
+    (work_id,attempt_id,item_id,request_id,kind,basis_json,durable_runtime_id,created_at)
+    SELECT work_id,attempt_id,item_id,'wrong-owner',kind,basis_json,?,created_at FROM invoice_work_phases WHERE id=?`)
+    .run(owners[1]!, phases[0]!.phaseId)).toThrow();
 });
 
 test('supplement persists the original Todo input and immutable authorization separately from native linkage', async () => {

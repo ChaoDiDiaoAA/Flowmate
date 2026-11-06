@@ -7,10 +7,10 @@ import { openTestDatabase } from '../../support/database.ts';
 
 const at = '2026-10-29T00:00:00.000Z', endedAt = '2026-10-29T00:00:01.000Z';
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
-async function fixture() {
+async function fixture(durableRuntimeId?: string) {
   return invoiceWorkToolsFixture({ configuration: PersonalAgentConfigurationSchema.parse({ modelId: null, thinkingLevel: 'off',
     tools: ['Agent', 'read_invoice_document'], resources: { prompt: null, enabledSkills: [] },
-    extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' }) });
+    extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' }), durableRuntimeId });
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 async function request(f: Fixture, nativeToolTaskId = 10): Promise<NewDurableSubagentRun> {
@@ -70,6 +70,15 @@ test('one original Durable Agent call owns one real child Run and Durable Sessio
   expect(need(await reopened.read(store => store.sessions.get(child.sessionId))))
     .toMatchObject({ runtimeKind: 'durable', durableConversationId: 81 });
   await reopened.close();
+});
+
+test('a Durable child inherits the cloud runtime owner of its original parent', async () => {
+  const runtimeId = '11111111-1111-4111-8111-111111111111';
+  const f = await fixture(runtimeId), input = await request(f);
+  const child = need(await f.database.transaction(store => store.runs.createDurableSubagent(input)));
+  expect(await f.database.read(store => store.sessions.get(child.sessionId)))
+    .toMatchObject({ ok: true, data: { runtimeKind: 'durable', durableRuntimeId: runtimeId, cloudWorkspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' } });
+  await f.database.close();
 });
 
 test('Durable child admission rejects another creator, changed arguments, model or material expansion', async () => {

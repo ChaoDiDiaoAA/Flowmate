@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "root": "/var/lib/flowmate-runtime",
+  "runtimeSocketPath": "/run/flowmate-runtime/runtime.sock",
+  "authoritySocketPath": "/run/flowmate-authority-runtime/authority.sock",
+  "modelSocketPath": "/run/flowmate-authority-runtime/model.sock"
+}

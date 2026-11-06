@@ -13,11 +13,15 @@ import type { AgentRunEvent, Application, CloseReport, DesktopState, InvoiceForm
 import { defaultProductSettings, readProductSettings, saveProductSettings, validateProductSettings } from '@flowmate/core';
 import { createPromptTraceBuffer, createRuntimeLogBuffer } from '@flowmate/logging';
 import { HostDiagnosticCodeSchema, HostDiagnosticsSchema } from '@flowmate/contracts';
+import { CloudMaterialExportCommandSchema, isCloudMaterialExportHostCommand, parseCloudMaterialExportResult } from '@flowmate/contracts';
+import { CloudResourceExportCommandSchema, isCloudResourceExportHostCommand, parseCloudResourceExportResult } from '@flowmate/contracts';
 import { PI_SDK_VERSION } from '@flowmate/runtime-pi';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths, resolveRuntimeLayout } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
 import type { PersonalAgentRuntime } from '../personal-agent.ts';
+import type { CloudMaterialExport } from '../cloud-material-export.ts';
+import type { CloudResourceExport } from '../cloud-resource-export.ts';
 import { isPersonalAgentHostCommand, parsePersonalAgentCommand, parsePersonalAgentHostResult,
   matchesPersonalAgentResponse, personalAgentHostFailure } from './protocol.ts';
 import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from './protocol.ts';
@@ -109,6 +113,8 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
   const seenOrder: string[] = [];
   let application: Application;
   let personalControl: Pick<PersonalAgentRuntime, 'start' | 'conditionsChanged'> | undefined;
+  let cloudMaterial: CloudMaterialExport | undefined;
+  let cloudResource: CloudResourceExport | undefined;
   let credentialRecoveryHook: ((scope: ProductSettingsWriteScope) => Promise<Result<void>>) | undefined;
   let settingsWriteQueue = Promise.resolve();
   const enqueueSettingsWrite = <T>(action: () => Promise<Result<T>>): Promise<Result<T>> => {
@@ -246,6 +252,8 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
     parameters: { ...RUNTIME_CONFIG.provider },
   });
   const created = await createApplication({
+    onCloudMaterialReady: material => { cloudMaterial = material; },
+    onCloudResourceReady: resource => { cloudResource = resource; },
     logger: hostLog,
     paths,
     ...(layout?.release ? { installedRelease: layout.release, resourceRoot: layout.resourceRoot } : {}),
@@ -433,6 +441,32 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
   };
 
   const execute = async (command: HostCommand, control?: { signal?: AbortSignal }): Promise<void> => {
+    if (isCloudResourceExportHostCommand(command.type)) {
+      const captured = CloudResourceExportCommandSchema.safeParse({ type: command.type, input: 'input' in command ? command.input : undefined });
+      if (!captured.success || !cloudResource) {
+        await send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('cloud_resource_unavailable', 'storage', 'The local resource service is unavailable.', true)) }); return;
+      }
+      const original = captured.data;
+      const value = original.type === 'cloud_resource_export_prepare' ? await cloudResource.prepare(original.input)
+        : original.type === 'cloud_resource_export_chunk' ? await cloudResource.chunk(original.input) : await cloudResource.complete(original.input);
+      await send({ version: 1, type: 'response', requestId: command.requestId,
+        value: parseCloudResourceExportResult(original, value) ?? fail(appError('cloud_resource_unavailable', 'storage', 'The local resource result is unavailable.', true)) });
+      return;
+    }
+    if (isCloudMaterialExportHostCommand(command.type)) {
+      const captured = CloudMaterialExportCommandSchema.safeParse({ type: command.type, input: 'input' in command ? command.input : undefined });
+      if (!captured.success || !cloudMaterial) {
+        await send({ version: 1, type: 'response', requestId: command.requestId,
+          value: fail(appError('cloud_material_unavailable', 'storage', 'The local material service is unavailable.', true)) }); return;
+      }
+      const original = captured.data;
+      const value = original.type === 'cloud_material_export_prepare' ? await cloudMaterial.prepare(original.input)
+        : original.type === 'cloud_material_export_chunk' ? await cloudMaterial.chunk(original.input) : await cloudMaterial.complete(original.input);
+      await send({ version: 1, type: 'response', requestId: command.requestId,
+        value: parseCloudMaterialExportResult(original, value) ?? fail(appError('cloud_material_unavailable', 'storage', 'The local material result is unavailable.', true)) });
+      return;
+    }
     if (isPersonalAgentHostCommand(command.type)) {
       const captured = parsePersonalAgentCommand({ type: command.type, input: 'input' in command ? command.input : undefined });
       if (!captured) { await send({ version: 1, type: 'response', requestId: command.requestId,

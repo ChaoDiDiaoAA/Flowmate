@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "productRoot": "/var/lib/flowmate-authority",
+  "resourceRoot": "/opt/flowmate/cloud/resources",
+  "workspaceId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "desktopSocket": "/run/flowmate-authority/desktop.sock",
+  "authoritySocket": "/run/flowmate-authority-runtime/authority.sock",
+  "modelSocket": "/run/flowmate-authority-runtime/model.sock",
+  "runtimeSocket": "/run/flowmate-runtime/runtime.sock",
+  "model": {
+    "id": "deepseek-official",
+    "name": "deepseek-chat",
+    "contextWindow": 64000,
+    "maxTokens": 8192,
+    "reasoning": false
+  }
+}

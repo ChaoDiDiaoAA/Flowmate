@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { appError, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema, DurableWorkBudgetSchema,
+import { appError, CloudRuntimeIdSchema, CloudWorkspaceIdSchema, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema, DurableWorkBudgetSchema,
   PersonalAgentConfigurationSchema, UsageRecordSchema, InvoiceWorkTodoViewSchema } from '@flowmate/contracts';
 import type { AppError, DurableAttemptIdentity, DurableProductToolCall, DurableSubagentIdentity, InvoiceWorkContextBuildInput, InvoiceWorkTodoView, Result, UsageRecord } from '@flowmate/contracts';
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
@@ -26,7 +26,8 @@ const activeRun = (status: string) => status === 'created' || status === 'runnin
 /** Business admission and request reservations share the existing database owner's transaction. */
 export class DurableInvoiceGovernor {
   public constructor(private readonly database: Pick<DbHandle, 'read' | 'transaction' | 'recoveryError'>,
-    private readonly now: () => string, private readonly foregroundBusy: () => boolean) {}
+    private readonly now: () => string, private readonly foregroundBusy: () => boolean,
+    private readonly runtimeScope: 'local' | 'cloud' = 'local') {}
 
   private guarded<T>(action: () => T): Result<T> {
     try { return ok(action()); }
@@ -209,6 +210,9 @@ export class DurableInvoiceGovernor {
     const session = need(store.sessions.get(work.session_id));
     requireFact(session.runtimeKind === 'durable' && session.status === 'active' && !session.deletePending && !session.modelUseBlocked,
       'session_scope_revoked', 'The original Durable Session is no longer authorized.');
+    if ((session.durableRuntimeId === 'local') !== (this.runtimeScope === 'local')) return { kind: 'blocked',
+      reason: appError(this.runtimeScope === 'local' ? 'cloud_runtime_unavailable' : 'runtime_scope_mismatch', 'runtime',
+        'The original runtime is outside this execution scope.', true) };
     const configuration = PersonalAgentConfigurationSchema.parse(JSON.parse(work.configuration_json));
     requireFact(configuration.modelId !== null, 'personal_agent_model_unavailable', 'The original explicit model is unavailable.');
     const attempt = this.attempt(store, work);
@@ -281,11 +285,15 @@ export class DurableInvoiceGovernor {
   }
 
   private occupiedWorks(store: SqlDatabaseStore): Set<number> {
+    const owner = this.runtimeScope === 'local' ? "s.durable_runtime_id='local'" : "s.durable_runtime_id!='local'";
     const rows = store.db.query<{ work_id: number }, []>(`WITH RECURSIVE owned(work_id,id) AS (
-      SELECT work_id,run_id FROM invoice_work_attempts WHERE run_id IS NOT NULL AND stopped_at IS NULL
+      SELECT a.work_id,a.run_id FROM invoice_work_attempts a JOIN invoice_works w ON w.id=a.work_id
+        JOIN sessions s ON s.id=w.session_id WHERE a.run_id IS NOT NULL AND a.stopped_at IS NULL AND ${owner}
       UNION SELECT p.work_id,r.id FROM runs r JOIN owned p ON r.parent_run_id=p.id)
-      SELECT DISTINCT a.work_id FROM invoice_work_attempts a WHERE a.stopped_at IS NULL AND (a.stop_requested_at IS NOT NULL OR a.run_id IS NOT NULL)
-      UNION SELECT DISTINCT work_id FROM invoice_work_phases WHERE closed_at IS NULL
+      SELECT DISTINCT a.work_id FROM invoice_work_attempts a JOIN invoice_works w ON w.id=a.work_id JOIN sessions s ON s.id=w.session_id
+        WHERE a.stopped_at IS NULL AND (a.stop_requested_at IS NOT NULL OR a.run_id IS NOT NULL) AND ${owner}
+      UNION SELECT DISTINCT p.work_id FROM invoice_work_phases p JOIN invoice_works w ON w.id=p.work_id JOIN sessions s ON s.id=w.session_id
+        WHERE p.closed_at IS NULL AND ${owner}
       UNION SELECT DISTINCT o.work_id FROM owned o JOIN runs r ON r.id=o.id WHERE r.status IN ('created','running')
         OR r.stopped_at IS NULL OR COALESCE(json_extract(r.cleanup_json,'$.stopped'),0)!=1
         OR COALESCE(json_extract(r.cleanup_json,'$.lateObservationRequired'),1)!=0
@@ -300,6 +308,10 @@ export class DurableInvoiceGovernor {
     if (this.database.recoveryError) throw new AdmissionFault(this.database.recoveryError);
     const command = typeof input === 'number' ? undefined : input;
     if (command?.kind === 'create') {
+      const owner = command.runtimeOwner;
+      if (this.runtimeScope === 'cloud' ? !owner || !CloudWorkspaceIdSchema.safeParse(owner.workspaceId).success
+        || !CloudRuntimeIdSchema.safeParse(owner.cloudRuntimeId).success : owner !== undefined) return { kind: 'blocked',
+        reason: appError('cloud_runtime_unavailable', 'runtime', 'The Work requires an authorized runtime owner.', true) };
       const agent = need(store.personalAgents.getDefault());
       requireFact(agent && agent.personalAgentId === command.request.personalAgentId, 'personal_agent_not_found', 'Personal Agent does not exist.');
       requireFact(agent.configuration.modelId !== null, 'personal_agent_model_unavailable', 'Select an explicit model before executing invoice Work.');
@@ -307,28 +319,36 @@ export class DurableInvoiceGovernor {
         const document = need(store.documents.get(reference.id));
         requireFact(document.documentRef.version === reference.version && document.status === 'available' && !document.isHidden
           && document.parsedArtifactId !== null, 'input_unavailable', 'The selected invoice version is unavailable.');
+        if (owner) requireFact(store.db.query(`SELECT document_id FROM cloud_workspace_documents WHERE workspace_id=? AND document_id=?
+          AND document_version=?`).get(owner.workspaceId, reference.id, reference.version),
+        'cloud_workspace_forbidden', 'The invoice version is not authorized for this cloud workspace.');
       }
     }
     const work = typeof input === 'number' ? this.work(store, input)
       : input.kind === 'create' ? null : this.work(store, input.request.workId);
     if (work) { const qualified = this.qualify(store, work, at, command, requireRequestBudget, pendingFeedback); if (qualified.kind !== 'ready') return qualified; }
     const occupied = this.occupiedWorks(store);
-    if ([...occupied].some(workId => workId !== work?.id)) return { kind: 'queued' };
-    const foreground = store.db.query(`SELECT r.id FROM runs r LEFT JOIN sessions s ON s.id=r.session_id
+    const limit = this.runtimeScope === 'local' ? 1 : 2;
+    if (!work || !occupied.has(work.id)) if (occupied.size >= limit) return { kind: 'queued' };
+    const foreground = this.runtimeScope === 'local' && store.db.query(`SELECT r.id FROM runs r LEFT JOIN sessions s ON s.id=r.session_id
       WHERE (r.kind='provider' OR s.runtime_kind='agent_session')
       AND (r.status IN ('created','running') OR r.stopped_at IS NULL OR COALESCE(json_extract(r.cleanup_json,'$.stopped'),0)!=1
         OR COALESCE(json_extract(r.cleanup_json,'$.lateObservationRequired'),1)!=0)
       UNION SELECT t.run_id FROM tool_calls t JOIN sessions s ON s.id=t.session_id WHERE s.runtime_kind='agent_session'
         AND (t.status IN ('requested','running') OR t.stopped_at IS NULL OR COALESCE(json_extract(t.cleanup_json,'$.stopped'),0)!=1
           OR EXISTS (SELECT 1 FROM json_each(t.cleanup_json,'$.nativeProcesses') p WHERE COALESCE(json_extract(p.value,'$.stopped'),0)!=1)) LIMIT 1`).get();
-    if (!admittedPhase && (this.foregroundBusy() || foreground)) return { kind: 'queued' };
+    if (this.runtimeScope === 'local' && !admittedPhase && (this.foregroundBusy() || foreground)) return { kind: 'queued' };
     if (work && occupied.has(work.id)) return { kind: 'ready' };
+    const owner = this.runtimeScope === 'local' ? "s.durable_runtime_id='local'" : "s.durable_runtime_id!='local'";
     const queued = store.db.query<WorkRow, []>(`SELECT w.* FROM invoice_works w JOIN invoice_work_attempts a ON a.id=w.current_attempt_id
-      WHERE w.status='open' AND a.stop_requested_at IS NULL AND a.stopped_at IS NULL ORDER BY w.created_at,w.id`).all();
+      JOIN sessions s ON s.id=w.session_id WHERE w.status='open' AND a.stop_requested_at IS NULL AND a.stopped_at IS NULL
+        AND ${owner} ORDER BY w.created_at,w.id`).all();
+    let available = limit - occupied.size;
     for (const candidate of queued) {
       if (work && (candidate.created_at > work.created_at || candidate.created_at === work.created_at && candidate.id >= work.id)) break;
+      if (occupied.has(candidate.id)) continue;
       const checked = this.guarded(() => this.qualify(store, candidate, at));
-      if (checked.ok && checked.data.kind === 'ready') return { kind: 'queued' };
+      if (checked.ok && checked.data.kind === 'ready' && --available === 0) return { kind: 'queued' };
     }
     return { kind: 'ready' };
   }
@@ -378,19 +398,32 @@ export class DurableInvoiceGovernor {
     catch { return fail(appError('storage_read_failed', 'storage', 'Original tool feedback recovery eligibility could not be verified.', true)); }
   }
 
-  public async reserveModelRequest(identity: DurableAttemptIdentity): Promise<Result<void>> {
-    try {
-      return await this.database.transaction(store => this.guarded(() => {
+  public verifyModelUseInStore(store: SqlDatabaseStore, identity: DurableAttemptIdentity): Result<void> {
+    return this.guarded(() => {
+      requireFact(store.db.inTransaction, 'state_conflict', 'Model authorization requires the product transaction.');
+      this.verify(store, identity, this.now(), false);
+    });
+  }
+
+  public reserveModelRequestInStore(store: SqlDatabaseStore, identity: DurableAttemptIdentity): Result<void> {
+    return this.guarded(() => {
+      requireFact(store.db.inTransaction, 'state_conflict', 'Model reservation requires the product transaction.');
+      store.db.transaction(() => {
         const at = z.string().datetime({ offset: true }).parse(this.now()), run = this.verify(store, identity, at, true), usage = run.usage;
         const count = this.requestCount(store, run.runId, usage) + 1;
         store.db.query(`INSERT INTO invoice_work_model_reservations(run_id,count) VALUES (?,?)
           ON CONFLICT(run_id) DO UPDATE SET count=excluded.count`).run(run.runId, count);
-        // A later eligibility check can still prevent transport; a reservation is not observed model usage.
         const reserved: UsageRecord = { ...usage, attempts: null, attemptsComplete: false, updatedAt: at,
           source: usage.source === 'not-requested' ? 'unknown' : usage.source, reason: 'model-request-reserved' };
         requireFact(store.db.query('UPDATE runs SET usage_json=? WHERE id=? AND status=\'running\' AND cancel_requested_at IS NULL')
           .run(JSON.stringify(reserved), run.runId).changes === 1, 'run_state_invalid', 'The model request reservation was not committed.');
-      }));
+      }).immediate();
+    });
+  }
+
+  public async reserveModelRequest(identity: DurableAttemptIdentity): Promise<Result<void>> {
+    try {
+      return await this.database.transaction(store => this.reserveModelRequestInStore(store, identity));
     } catch { return fail(appError('storage_write_failed', 'storage', 'The model request reservation could not be confirmed.', true)); }
   }
 
@@ -424,9 +457,17 @@ export class DurableInvoiceGovernor {
     catch { return fail(appError('storage_read_failed', 'storage', 'Child model eligibility could not be verified.', true)); }
   }
 
-  public async reserveSubagentModelRequest(identity: DurableSubagentIdentity): Promise<Result<void>> {
-    try {
-      return await this.database.transaction(store => this.guarded(() => {
+  public verifySubagentModelUseInStore(store: SqlDatabaseStore, identity: DurableSubagentIdentity): Result<void> {
+    return this.guarded(() => {
+      requireFact(store.db.inTransaction, 'state_conflict', 'Child model authorization requires the product transaction.');
+      this.verifyChild(store, identity, false);
+    });
+  }
+
+  public reserveSubagentModelRequestInStore(store: SqlDatabaseStore, identity: DurableSubagentIdentity): Result<void> {
+    return this.guarded(() => {
+      requireFact(store.db.inTransaction, 'state_conflict', 'Child model reservation requires the product transaction.');
+      store.db.transaction(() => {
         const run = this.verifyChild(store, identity, true), at = this.now(), count = this.requestCount(store, run.runId, run.usage) + 1;
         store.db.query(`INSERT INTO invoice_work_model_reservations(run_id,count) VALUES (?,?)
           ON CONFLICT(run_id) DO UPDATE SET count=excluded.count`).run(run.runId, count);
@@ -434,7 +475,13 @@ export class DurableInvoiceGovernor {
           source: run.usage.source === 'not-requested' ? 'unknown' : run.usage.source, reason: 'model-request-reserved' };
         requireFact(store.db.query("UPDATE runs SET usage_json=? WHERE id=? AND status='running' AND cancel_requested_at IS NULL")
           .run(JSON.stringify(usage), run.runId).changes === 1, 'run_state_invalid', 'The original child model reservation was not committed.');
-      }));
+      }).immediate();
+    });
+  }
+
+  public async reserveSubagentModelRequest(identity: DurableSubagentIdentity): Promise<Result<void>> {
+    try {
+      return await this.database.transaction(store => this.reserveSubagentModelRequestInStore(store, identity));
     } catch { return fail(appError('storage_write_failed', 'storage', 'The child model reservation could not be confirmed.', true)); }
   }
 

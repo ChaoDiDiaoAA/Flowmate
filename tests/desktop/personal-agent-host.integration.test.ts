@@ -1,19 +1,40 @@
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { Database } from 'bun:sqlite';
 import { z } from 'zod';
-import { defaultProductSettings } from '@flowmate/core';
+import { createFileStore, defaultProductSettings } from '@flowmate/core';
+import { createDocumentService } from '@flowmate/data';
 import { prepareDurableModelBinding } from '@flowmate/runtime-durable';
 import { RUNTIME_CONFIG, type Result, type DocumentSnapshot, type ProviderConfig } from '@flowmate/contracts';
 import * as P from '../../packages/contracts/src/personal-agent.ts';
 import { HostClient } from '../../apps/desktop/main/host-client.ts';
+import { createHostCloudMaterialExport, uploadCloudMaterial } from '../../apps/desktop/main/cloud-material-transfer.ts';
+import { createHostCloudResourceExport } from '../../apps/desktop/main/cloud-resource-transfer.ts';
+import { CloudSshSession } from '../../apps/desktop/main/cloud-ssh-session.ts';
+import { CloudMaterialUpload } from '../../apps/cloud-material-upload.ts';
+import { createCloudDesktopHandler } from '../../apps/cloud-desktop-gateway.ts';
+import { listenCloudUnixRpc } from '../../apps/cloud-unix-rpc.ts';
 import { PersonalAgentSnapshotSchema, PersonalHistoryPageSchema, PersonalHistoryEntrySchema, InvoiceWorkTimelinePageSchema } from '@flowmate/contracts';
 import { parsePersonalAgentHostResult } from '../../apps/host/protocol.ts';
 import { deferCleanup, mkdtempSync, waitFor } from '../support/resources.ts';
+import { readFileSync } from 'node:fs';
 import { openTestDatabase } from '../support/database.ts';
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
+
+it('the desktop Host exports the exact selected Prompt bytes with a stable cloud identity', async () => {
+  const f = await controlledHost(), workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const exporter = createHostCloudResourceExport(f.client), ref = { kind: 'prompt' as const, id: 'invoice', version: 'v1' };
+  try {
+    const first = need(await exporter.prepare({ workspaceId, ref }));
+    expect(Buffer.from(first.manifest.manifestBase64, 'base64').equals(readFileSync(resolve(import.meta.dir, '../../resources/prompts/invoice/resource.json')))).toBe(true);
+    const chunk = need(await exporter.chunk({ workspaceId, uploadId: first.manifest.uploadId, path: 'prompt.md', offset: 0 }));
+    expect(Buffer.from(chunk.base64, 'base64').equals(readFileSync(resolve(import.meta.dir, '../../resources/prompts/invoice/prompt.md')))).toBe(true);
+    expect(need(await exporter.prepare({ workspaceId, ref })).manifest.uploadId).toBe(first.manifest.uploadId);
+  } finally { expect(await f.client.close()).toMatchObject({ ok: true, data: { closed: true } }); }
+}, 30_000);
 type Command = Parameters<HostClient['request']>[0];
 async function invoke<S extends z.ZodTypeAny>(client: HostClient, command: Command, schema: S): Promise<z.infer<S>> {
   return z.object({ ok: z.literal(true), data: schema }).strict().parse(await client.request(command, 5_000)).data;
@@ -86,6 +107,63 @@ it('assembles the independent Personal Agent through the actual Host and keeps q
     for (const table of ['runs', 'session_inputs', 'tool_calls', 'invoice_works'])
       expect(db.query(`SELECT count(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
   } finally { db.close(); }
+}, 30_000);
+
+it('exports the registered original material over the real product Host with a stable workspace upload ID', async () => {
+  const f = await controlledHost(), workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  try {
+    const input = { workspaceId, documentRef: f.document.documentRef };
+    const local = createHostCloudMaterialExport(f.client);
+    const prepared = need(await local.prepare(input));
+    expect(prepared.manifest.sourceDocumentRef).toEqual(f.document.documentRef);
+    const original = need(await local.chunk({ workspaceId, uploadId: prepared.manifest.uploadId, kind: 'original', name: 'source.md', offset: 0 }));
+    expect(Buffer.from(original.base64, 'base64').toString('utf8')).toBe('Controlled invoice total 113.00');
+    const again = need(await local.prepare(input));
+    expect(again.manifest.uploadId).toBe(prepared.manifest.uploadId);
+    expect(f.wire).toHaveLength(0);
+  } finally { expect(await f.client.close()).toMatchObject({ ok: true, data: { closed: true } }); }
+}, 30_000);
+
+it.skipIf(process.platform !== 'linux')('transfers a Host-managed invoice through a separate bridge and recovers a lost chunk receipt', async () => {
+  const f = await controlledHost(), workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-material-authority-'));
+  const paths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
+    outputsDir: join(root, 'outputs'), runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs') };
+  const database = need(openTestDatabase(paths)), files = createFileStore(paths, database);
+  const documents = createDocumentService({ paths, files, allowedSourceRoot: root, now: () => '2026-11-05T00:00:00.000Z',
+    transaction: action => database.transaction(scope => action({ repository: scope.documents,
+      files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })) });
+  const material = new CloudMaterialUpload({ database, files, now: () => '2026-11-05T00:00:00.000Z',
+    inspect: (ref, scope) => documents.inspectForWorkspace(ref, { repository: scope.documents,
+      files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }) });
+  const gateway = createCloudDesktopHandler({ workspaceId, authorize: async () => ({ ok: true, data: undefined }),
+    dispatch: async () => ({ ok: false, error: { code: 'unused', category: 'input', message: 'Unavailable.', retryable: false } }), material });
+  const socket = join(root, 'desktop.sock'); let lost = false;
+  const server = need(await listenCloudUnixRpc({ socketPath: socket, handle: async raw => {
+    const result = await gateway(raw);
+    if (!lost && result.ok && raw && typeof raw === 'object' && 'command' in raw
+      && raw.command && typeof raw.command === 'object' && 'type' in raw.command && raw.command.type === 'cloud_material_append') {
+      lost = true; throw Error('Controlled response loss after saving the original chunk.');
+    }
+    return result;
+  } }));
+  const bridge = new URL('../../apps/cloud-desktop-bridge.ts', import.meta.url).href;
+  const transport = new URL('../../apps/cloud-unix-rpc.ts', import.meta.url).href;
+  const script = `import {runCloudDesktopBridge} from ${JSON.stringify(bridge)}; import {callCloudUnixRpc} from ${JSON.stringify(transport)};
+    await runCloudDesktopBridge(process.stdin,process.stdout,envelope=>callCloudUnixRpc(${JSON.stringify(socket)},envelope));`;
+  const child = spawn(process.execPath, ['--no-env-file', '-e', script], { stdio: ['pipe', 'pipe', 'pipe'],
+    env: { PATH: process.env.PATH ?? '' }, windowsHide: true });
+  const session = new CloudSshSession(child, workspaceId), local = createHostCloudMaterialExport(f.client);
+  try {
+    const input = { workspaceId, documentRef: f.document.documentRef };
+    expect(await uploadCloudMaterial(input, local, session)).toMatchObject({ ok: false, error: { code: 'operation_result_unknown' } });
+    const receipt = need(await uploadCloudMaterial(input, local, session));
+    expect(receipt.sourceDocumentRef).toEqual(f.document.documentRef);
+    expect(need(await database.read(scope => documents.inspectForWorkspace(receipt.cloudDocumentRef, { repository: scope.documents,
+      files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })))).toMatchObject({ kind: 'valid' });
+    expect(need(await local.prepare(input)).receipt).toEqual(receipt);
+    expect(f.wire).toHaveLength(0);
+  } finally { expect(await session.close()).toMatchObject({ ok: true }); need(await server.close()); await database.close(); await f.client.close(); }
 }, 30_000);
 
 it('routes all 17 Personal Agent commands through the actual Host with isolated local SSE and synthetic credentials', async () => {

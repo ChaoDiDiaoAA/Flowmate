@@ -1,11 +1,12 @@
 import { BACKGROUND_CONTEXT, withAbortSignal } from '@earendil-works/chord/context';
 import { createModels, getSupportedThinkingLevels, InMemoryCredentialStore, InMemoryModelsStore, type TranscriptContext } from '@earendil-works/pi-ai';
 import { AgentDoc, AssistantEntry, configure, createRegistry, defineDoc, defineDocFamily, GenerationTask, Harness, hook, InboxDoc, LiveDoc, StorageRequestError, ToolTask,
-  type ConversationId, type Cursor, type EntryId, type EntryRecord, type Registry, type Storage, type SubmissionRecord, type TaskGraphWatch, type TaskId, type ToolExecutionApi, type ToolRegistration, type Tx } from '@earendil-works/pi-durable';
-import { appError, fail, InvoiceWorkContinueRequestSchema, ok, PersonalAgentConfigurationSchema, ProviderConfigSchema, RUNTIME_CONFIG,
+  type ContextView, type ConversationId, type Cursor, type EntryId, type EntryRecord, type Registry, type Storage, type SubmissionId, type SubmissionRecord, type TaskGraphWatch, type TaskId, type ToolExecutionApi, type ToolRegistration, type Tx, type Wake } from '@earendil-works/pi-durable';
+import { appError, CloudNativeOversizedResultSchema, CloudNativeResultSchema, CloudQueueInstructionSchema, CloudQueueVerifyInputsSchema, CloudRuntimeBindingSchema, fail, InvoiceWorkContinueRequestSchema, isRetryableCloudModelStatus, ok, PersonalAgentConfigurationSchema, ProviderConfigSchema, RUNTIME_CONFIG,
   type AppError, type DurableAttemptIdentity, type DurableConversationIdentity, type DurableRuntimePort, type DurableSubmissionInput,
-  type DurableSubmissionQuery, type DurableSubmissionView, type ProviderConfig, type Result, type ToolResult } from '@flowmate/contracts';
+  type CloudModelAttemptRequest, type CloudNativeOversizedResult, type CloudNativeResult, type CloudQueueInstruction, type CloudQueueVerifyInputs, type CloudRuntimeBinding, type DurableSubmissionQuery, type DurableSubmissionView, type ProviderConfig, type Result, type ToolResult } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { createDurableModels, durableModelBindingSchema, prepareDurableModelBinding, readDurableModelBinding } from './models.ts';
 import type { DurableModelBinding, DurableModelPreparation, DurableProductToolCall, DurableProductToolDefinition, DurableProductToolFeedback } from '../../contracts/src/durable-runtime.ts';
@@ -14,6 +15,8 @@ import { createDurableProductTools, projectDurableToolFeedback, readDurableToolC
 import { createDurableSubagentRuntime, type ParentChildConsumption } from './subagents.ts';
 import type { DurableProductToolExecution, DurableSubagentCallbacks, DurableWorkingContextQuery } from '../../contracts/src/durable-subagents.ts';
 import { createDurableHistoryReader } from './history.ts';
+import { createDurableQueueController, queueSubmissionKey } from './queue.ts';
+import type { CloudQueuePort } from '../../contracts/src/cloud-queue.ts';
 import { createDurableCompactionRuntime } from './compaction.ts';
 import { formatInvoiceWorkContext, formatInvoiceWorkInstructions } from './context.ts';
 import { DurableCompactionIdentitySchema, DurableCompactionRequestSchema, type DurableCompactionCallbacks } from '../../contracts/src/durable-compaction.ts';
@@ -26,14 +29,20 @@ export type DurableRuntimeOptions = {
   verifySchedulingUse?(identity: DurableAttemptIdentity, pendingFeedback: readonly DurableProductToolCall[]): Result<void> | Promise<Result<void>>;
   reserveModelRequest(identity: DurableAttemptIdentity): Result<void> | Promise<Result<void>>;
   readWorkingContext?(identity: DurableWorkingContextQuery): Result<InvoiceWorkWorkingContext> | Promise<Result<InvoiceWorkWorkingContext>>;
+  verifyQueueInputs?(input: CloudQueueVerifyInputs): Result<CloudQueueInstruction[]> | Promise<Result<CloudQueueInstruction[]>>;
   verifyWorkingContext?(identity: DurableWorkingContextQuery): Result<void> | Promise<Result<void>>;
   tools?: readonly DurableProductToolDefinition[];
   executeTool?(call: DurableProductToolExecution): Result<ToolResult<unknown>> | Promise<Result<ToolResult<unknown>>>;
   readToolResult?(call: DurableProductToolCall): Result<ToolResult<unknown> | null> | Promise<Result<ToolResult<unknown> | null>>;
   onToolFeedback?(feedback: DurableProductToolFeedback): Result<void> | Promise<Result<void>>;
   onChanged?: () => void;
+  onWake?(wake: Wake): void;
   subagents?: DurableSubagentCallbacks;
   compactions?: DurableCompactionCallbacks;
+  cloudModel?: { binding: CloudRuntimeBinding; send(input: CloudModelAttemptRequest, signal?: AbortSignal): Promise<Result<Response>> };
+  onNativeResult?(result: CloudNativeResult): Promise<Result<void>>;
+  onNativeResultOversized?(result: CloudNativeOversizedResult): Promise<Result<void>>;
+  onNativeResultError?(error: AppError): void;
 };
 
 const id = InvoiceWorkContinueRequestSchema.shape.workId;
@@ -49,6 +58,8 @@ const inputSchema = preparationSchema.extend({ text: z.string().min(1).max(22000
   binding: durableModelBindingSchema.optional(), thinkingLevel: thinkingLevelSchema.default('off') });
 const entryIdentity = querySchema.extend({ configName: z.string(), configRevision: z.number().int().positive(),
   thinkingLevel: thinkingLevelSchema.default('off'), inputText: z.string().optional() });
+const queuedEntryIdentity = querySchema.extend({ controlRequestId: z.string().min(1).max(128), submissionId: id,
+  inputText: z.string().min(1).max(22000) }).strict();
 const Binding = defineDoc({ kind: 'flowmate.runtime.binding', version: 1, scope: 'conversation', history: 'latest', fork: 'initial',
   initial: (): { workId: number | null; sessionId: number | null; attemptId: number | null; requestKey: string | null } =>
     ({ workId: null, sessionId: null, attemptId: null, requestKey: null }), checkpointWhen: () => true });
@@ -80,7 +91,10 @@ async function hasLiveOwnedTasks(tx: Tx, root: ConversationId): Promise<boolean>
   return false;
 }
 
-export async function createDurableRuntime(options: DurableRuntimeOptions): Promise<Result<DurableRuntimePort>> {
+export async function createDurableRuntime(options: DurableRuntimeOptions): Promise<Result<DurableRuntimePort & { queue: CloudQueuePort }>> {
+  const cloud = options.cloudModel && CloudRuntimeBindingSchema.safeParse(options.cloudModel.binding);
+  if (options.cloudModel && (!cloud || !cloud.success))
+    return fail(appError('input_invalid', 'input', 'A cloud runtime needs a valid owner.'));
   if (Boolean(options.readWorkingContext) !== Boolean(options.verifyWorkingContext))
     return fail(appError('input_invalid', 'input', 'A phase runtime needs both working context reading and live basis verification.'));
   if (Boolean(options.executeTool) !== Boolean(options.readToolResult)
@@ -91,27 +105,28 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
   const models = createModels({ credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore(),
     authContext: { env: async () => undefined, fileExists: async () => false } });
   let harness: Harness;
-  try { harness = await Harness.open(options.storage, { models, registry,
+  try { harness = await Harness.open(options.storage, { models, registry, ...(options.onWake ? { onWake: options.onWake } : {}),
     settings: { stream: { maxRetries: 0, transport: 'sse', deferred: false }, retry: { enabled: false }, afterFailedRun: 'keep',
       compaction: { enabled: Boolean(options.compactions) && RUNTIME_CONFIG.compaction.autoEnabled, backgroundTokens: 0,
         reserveTokens: RUNTIME_CONFIG.compaction.reserveTokens, keepRecentTokens: RUNTIME_CONFIG.compaction.keepRecentTokens } } }, context); }
   catch { return fail(appError('durable_runtime_unavailable', 'runtime', 'Durable runtime could not be opened.', true)); }
   let closed = false;
   let changes: TaskGraphWatch | undefined;
+  let requestResultScan: (() => void) | undefined, resultScan: Promise<void> | undefined, scanPending = false;
   let closeInFlight: Promise<Result<void>> | null = null;
   const close = (): Promise<Result<void>> => {
     if (closeInFlight) return closeInFlight;
     closed = true;
     closeInFlight = (async () => {
-      try { await changes?.stop(); await harness.close(context); return ok(undefined); }
+      try { await changes?.stop(); if (resultScan) await resultScan; await harness.close(context); return ok(undefined); }
       catch { return fail(appError('durable_close_failed', 'runtime', 'Durable runtime close could not be confirmed.', true)); }
     })();
     return closeInFlight;
   };
-  if (options.onChanged) {
+  if (options.onChanged || options.onNativeResult) {
     try {
       changes = await harness.watchTaskGraph(context);
-      changes.start(async () => { if (!closed) options.onChanged?.(); });
+      changes.start(async () => { if (!closed) { options.onChanged?.(); requestResultScan?.(); } });
     } catch { await close(); return fail(appError('durable_runtime_unavailable', 'runtime', 'Native task changes could not be observed.', true)); }
   }
   const read = async <T>(action: () => Promise<T>): Promise<T> => {
@@ -122,8 +137,52 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
   const phases = new Map<string, { provider: string; modelId: string }>();
   const requested = new Map<TaskId, { query: DurableSubmissionQuery; conversationId: ConversationId;
     nativeSubmissionId: number; nativeEntryId: number; cutoff: number; phaseId: number; children: ParentChildConsumption[] }>();
+  const cloudAttempts = new Map<TaskId, { modelAttemptIds: string[]; cutoff: number }>();
   let children: ReturnType<typeof createDurableSubagentRuntime>;
   let compactions: ReturnType<typeof createDurableCompactionRuntime>;
+  const sendCloud = async (input: Omit<CloudModelAttemptRequest, 'modelAttemptId' | 'transportOrdinal'>,
+    ids: readonly string[], signal?: AbortSignal): Promise<Result<Response>> => {
+    for (let ordinal = 0; ordinal < ids.length; ordinal++) {
+      if (signal?.aborted) return fail(appError('run_cancelled', 'runtime', 'The original cloud model request was cancelled.'));
+      const sent = await options.cloudModel!.send({ ...input, modelAttemptId: ids[ordinal]!, transportOrdinal: ordinal }, signal);
+      if (!sent.ok || !isRetryableCloudModelStatus(sent.data.status) || ordinal === ids.length - 1) return sent;
+      if (sent.data.body) {
+        const reader = sent.data.body.getReader(); let received = 0;
+        try {
+          for (;;) { const part = await reader.read(); if (part.done) break; received += part.value.byteLength;
+            if (received > 65_536) { await reader.cancel(); return fail(appError('cloud_model_result_unknown', 'runtime', 'The original model failure could not be confirmed.', true)); } }
+        } catch { return fail(appError('cloud_model_result_unknown', 'runtime', 'The original model failure could not be confirmed.', true)); }
+        finally { reader.releaseLock(); }
+      }
+      try { await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, 1000 * 2 ** ordinal);
+        const abort = () => { clearTimeout(timer); reject(Error('cancelled')); };
+        if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
+      }); } catch { return fail(appError('run_cancelled', 'runtime', 'The original cloud model request was cancelled.')); }
+    }
+    return fail(appError('cloud_model_result_unknown', 'runtime', 'The original model request has no available attempt.', true));
+  };
+  const sendCloudSummary = async (body: string, originalSignal?: AbortSignal, signal?: AbortSignal): Promise<Response | null> => {
+    if (!cloud?.success) return null;
+    const observed = await compactions.cloudAttempt(originalSignal);
+    if (!observed.ok) throw new ProductFailure(observed.error);
+    const summary = observed.data; if (!summary) return null;
+    const plan = summary.plan, query = { workId: plan.workId, sessionId: plan.sessionId, attemptId: plan.attemptId, requestId: plan.requestId };
+    const parent = await lookup(query);
+    if (!parent || !options.readWorkingContext) throw Error('state_conflict');
+    const child = plan.child;
+    const working = await options.readWorkingContext({ ...query, ...(child ? { child: { childRunId: child.childRunId,
+      childSessionId: child.childSessionId, originToolCallId: child.originToolCallId } } : {}) });
+    if (!working.ok) throw new ProductFailure(working.error);
+    const sent = await sendCloud({ ...cloud.data, ...query, phaseId: working.data.phase.phaseId,
+      nativeConversationId: summary.nativeConversationId, nativeSubmissionId: parent.record.id, nativeTaskId: summary.nativeTaskId,
+      checkpointEntryId: summary.checkpointEntryId,
+      model: plan.binding.configuration.modelRef.model, body, kind: 'compaction', compactionOperationId: plan.operationId,
+      ...(child ? { child: { childRunId: child.childRunId, childSessionId: child.childSessionId, originToolCallId: child.originToolCallId,
+        nativeToolTaskId: child.nativeToolTaskId, nativeSubmissionId: summary.nativeSubmissionId } } : {}) }, summary.modelAttemptIds, signal);
+    if (!sent.ok) throw new ProductFailure(sent.error);
+    return sent.data;
+  };
   const submitting = new Map<number, { identity: DurableAttemptIdentity;
     pending: Set<{ query: DurableSubmissionQuery; settled: Promise<void>; abort: AbortController }> }>();
   const stopping = new Map<string, Promise<Result<'stopped' | 'not-started'>> | null>();
@@ -141,6 +200,36 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
   };
   const parse = <T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, raw: unknown): T => {
     const value = schema.safeParse(raw); if (!value.success) throw Error('input_invalid'); return value.data;
+  };
+  const verifyQueueAuthorization = async (queued: CloudQueueVerifyInputs) => {
+    if (!cloud?.success || !options.verifyQueueInputs) throw Error('state_conflict');
+    const verified = await options.verifyQueueInputs(queued); if (!verified.ok) throw new ProductFailure(verified.error);
+    const instructions = z.array(CloudQueueInstructionSchema).max(100).parse(verified.data);
+    if (instructions.length !== queued.items.length || instructions.some((item, index) =>
+      item.controlRequestId !== queued.items[index]!.controlRequestId || item.submissionId !== queued.items[index]!.submissionId
+        || item.content !== queued.items[index]!.content)) throw Error('state_conflict');
+    return instructions;
+  };
+  const verifyQueuedInputs = async (query: DurableSubmissionQuery, conversationId: ConversationId, view: ContextView) => {
+    const queued = await read(() => harness.commit(async tx => {
+      const items: CloudQueueVerifyInputs['items'] = [];
+      for (const entry of view.entries.filter(value => value.kind === 'flowmate.queue-input')) {
+        const original = queuedEntryIdentity.parse(entry.data), message = entry.model?.[0];
+        if (entry.conversationId !== conversationId || entry.model?.length !== 1 || message?.role !== 'user'
+          || original.workId !== query.workId || original.sessionId !== query.sessionId || original.attemptId !== query.attemptId
+          || original.requestId !== query.requestId) throw Error('state_conflict');
+        const content = typeof message.content === 'string' ? message.content
+          : message.content.length === 1 && message.content[0]?.type === 'text' ? message.content[0].text : null;
+        const submission = await tx.submissionByRequest(conversationId, queueSubmissionKey(query.attemptId, original.controlRequestId));
+        if (content === null || !submission || submission.type !== 'input' || !['placed', 'done'].includes(submission.status)
+          || submission.id !== original.submissionId || submission.conversationId !== conversationId || submission.entry !== entry.id
+          || submission.requestId !== queueSubmissionKey(query.attemptId, original.controlRequestId)) throw Error('state_conflict');
+        items.push({ controlRequestId: original.controlRequestId, submissionId: original.submissionId, entryId: entry.id, content });
+      }
+      return CloudQueueVerifyInputsSchema.parse({ ...query, items });
+    }, context));
+    if (!queued.items.length) return { queued, instructions: undefined };
+    return { queued, instructions: await verifyQueueAuthorization(queued) };
   };
   const find = async (identity: DurableConversationIdentity): Promise<ConversationId | undefined> => {
     let cursor: Cursor | undefined;
@@ -178,21 +267,41 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
   const register = async (input: DurableModelPreparation, saved?: DurableModelBinding) => {
     const identity = attemptIdentity(input), query = parse(querySchema, { ...identity, requestId: input.requestId });
     const binding = await prepareBinding(input, saved);
+    if (cloud?.success) {
+      if (!options.readWorkingContext || !options.verifyWorkingContext) throw Error('state_conflict');
+      if (cloud.data.workId !== input.workId || cloud.data.sessionId !== input.sessionId) throw Error('state_conflict');
+      const checked = readDurableModelBinding(binding);
+      if (!checked.ok || checked.data.selected.api !== 'openai-completions') throw Error('state_conflict');
+    }
     const registered = phases.get(key(query)); if (registered) return registered;
-    const prepared = await createDurableModels(input.config, { readApiKey: config => options.readApiKey(identity, config),
+    const prepared = await createDurableModels(input.config, { readApiKey: config => cloud?.success ? 'flowmate-cloud-proxy' : options.readApiKey(identity, config),
       verifyModelUse: signal => withToolFeedback(query, signal, [], async () => {
         const allowed = await options.verifyModelUse(identity); if (!allowed.ok) return allowed;
         if (stopping.has(scopeKey(input))) return fail(appError('state_conflict', 'runtime', 'The attempt is stopping.'));
         return await options.verifyWorkingContext?.(query) ?? ok(undefined);
-      }), reserveModelRequest: signal => withToolFeedback(query, signal, [], () => options.reserveModelRequest(identity)),
+      }), reserveModelRequest: signal => cloud?.success ? ok(undefined) : withToolFeedback(query, signal, [], () => options.reserveModelRequest(identity)),
       readCompactionUse: (signal, binding) => compactions.modelUse(signal, binding),
+      ...(cloud?.success ? { fetch: async (_target: RequestInfo | URL, init?: RequestInit, originalSignal?: AbortSignal) => {
+        if (typeof init?.body !== 'string') throw Error('state_conflict');
+        const summary = await sendCloudSummary(init.body, originalSignal, init.signal ?? undefined);
+        if (summary) return summary;
+        const conversationId = await find(query), live = conversationId && await harness.snapshot(LiveDoc, conversationId, context);
+        const taskId = live?.run?.taskId, selected = taskId && requested.get(taskId), attempt = taskId && cloudAttempts.get(taskId);
+        if (!taskId || !selected || !attempt || !isDeepStrictEqual(selected.query, query) || selected.cutoff !== attempt.cutoff) throw Error('state_conflict');
+        const sent = await sendCloud({ ...cloud.data, ...query, phaseId: selected.phaseId,
+          nativeConversationId: selected.conversationId, nativeSubmissionId: selected.nativeSubmissionId,
+          nativeTaskId: taskId, checkpointEntryId: selected.cutoff,
+          model: binding.configuration.modelRef.model, body: init.body }, attempt.modelAttemptIds, init.signal ?? undefined);
+        if (!sent.ok) throw new ProductFailure(sent.error);
+        return sent.data;
+      } } : {}),
       ...(options.readWorkingContext ? { readWorkingContext: async (native: TranscriptContext) => guard(async () => {
         const current = await lookup(query);
-        if (!current || current.record.status !== 'placed' || current.record.entry === undefined) throw Error('state_conflict');
+        if (!current || !['placed', 'done'].includes(current.record.status) || current.record.entry === undefined) throw Error('state_conflict');
         const conversationId = current.view.nativeConversationId as ConversationId;
         const binding = await harness.snapshot(Binding, conversationId, context), live = await harness.snapshot(LiveDoc, conversationId, context);
         if (binding?.workId !== query.workId || binding.sessionId !== query.sessionId || binding.attemptId !== query.attemptId
-          || !live?.run?.inputs.includes(current.record.id)) throw Error('state_conflict');
+          || !live?.run) throw Error('state_conflict');
         const task = await read(() => options.storage.task(live.run!.taskId, context));
         if (!task || task.kind !== GenerationTask.definition.name || task.conversationId !== conversationId || task.abortRequested
           || task.state.status !== 'running') throw Error('state_conflict');
@@ -204,8 +313,11 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
         const view = await conversation.context(context, { at: checkpoint.cutoff as EntryId });
         if (!isDeepStrictEqual(view.messages, native.messages)) throw Error('state_conflict');
         await compactions.verifyInput(query, conversationId, view, current.record.entry);
+        const { queued, instructions: queueInstructions } = await verifyQueuedInputs(query, conversationId, view);
+        if (!live.run.inputs.includes(current.record.id) && !queued.items.some(item => live.run!.inputs.includes(item.submissionId as SubmissionId)))
+          throw Error('state_conflict');
         const saved = await options.readWorkingContext!(query); if (!saved.ok) throw new ProductFailure(saved.error);
-        const workingContext = parse(InvoiceWorkWorkingContextSchema, saved.data);
+        const workingContext = parse(InvoiceWorkWorkingContextSchema, queueInstructions ? { ...saved.data, queueInstructions } : saved.data);
         if (workingContext.work.workId !== query.workId || workingContext.work.sessionId !== query.sessionId
           || workingContext.phase.attemptId !== query.attemptId || workingContext.phase.requestId !== query.requestId
           || workingContext.item.workId !== query.workId) throw Error('state_conflict');
@@ -369,11 +481,35 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
             if (!record.requestId) throw Error('storage_corrupt');
             const current = await tx.submissionByRequest(record.conversationId, record.requestId);
             if (!current || current.id !== record.id) throw Error('storage_corrupt');
-            return current.status === 'queued' || current.status === 'placed' ? original(record.conversationId, current, tx) : null;
+            if (current.status !== 'queued' && current.status !== 'placed') return null;
+            let auxiliary: [string, number, string] | null = null;
+            try { auxiliary = z.tuple([z.literal('flowmate.queue'), id, z.string().min(1).max(128)]).parse(JSON.parse(record.requestId)); } catch { /* Original phases use their own request key. */ }
+            if (!auxiliary) {
+              const saved = await original(record.conversationId, current, tx);
+              return { query: parse(querySchema, { ...attemptIdentity(saved.binding), requestId: saved.binding.requestId }), item: null };
+            }
+            const binding = await tx.doc(Binding, record.conversationId);
+            const entry = current.status === 'placed' ? await tx.entry(current.entry) : null;
+            const inboxItem = current.status === 'queued' ? (await tx.doc(InboxDoc, record.conversationId)).items.find(item => item.id === current.id) : null;
+            const data = entry?.data ?? inboxItem?.entry?.data, kind = entry?.kind ?? inboxItem?.entry?.kind;
+            const queuedOriginal = queuedEntryIdentity.parse(data), message = entry?.model?.[0];
+            let content: string | null = null;
+            if (inboxItem && inboxItem.mode !== 'write' && typeof inboxItem.content === 'string') content = inboxItem.content;
+            else if (message?.role === 'user') {
+              if (typeof message.content === 'string') content = message.content;
+              else if (message.content.length === 1 && message.content[0]?.type === 'text') content = message.content[0].text;
+            }
+            if (kind !== 'flowmate.queue-input' || typeof content !== 'string' || current.id !== queuedOriginal.submissionId
+              || auxiliary[1] !== queuedOriginal.attemptId || auxiliary[2] !== queuedOriginal.controlRequestId
+              || binding.workId !== queuedOriginal.workId || binding.sessionId !== queuedOriginal.sessionId || binding.attemptId !== queuedOriginal.attemptId
+              || binding.requestKey !== JSON.stringify([queuedOriginal.attemptId, queuedOriginal.requestId])
+              || entry && (entry.conversationId !== record.conversationId || entry.model?.length !== 1)) throw Error('state_conflict');
+            const query = { workId: queuedOriginal.workId, sessionId: queuedOriginal.sessionId, attemptId: queuedOriginal.attemptId, requestId: queuedOriginal.requestId };
+            return { query, item: { controlRequestId: queuedOriginal.controlRequestId, submissionId: current.id, entryId: entry?.id ?? null, content } };
           }, context));
           if (!saved) continue;
-          const query = parse(querySchema, { ...attemptIdentity(saved.binding), requestId: saved.binding.requestId });
-          await verifyPhase(query);
+          await verifyPhase(saved.query);
+          if (saved.item) await verifyQueueAuthorization(CloudQueueVerifyInputsSchema.parse({ ...saved.query, items: [saved.item] }));
         }
         cursor = page.next;
       } while (cursor);
@@ -533,8 +669,12 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
     }
     return result;
   };
-  compactions = createDurableCompactionRuntime({ harness, storage: options.storage, models, registry, callbacks: options.compactions,
+  compactions = createDurableCompactionRuntime({ harness, storage: options.storage, models, registry, callbacks: options.compactions, cloud: Boolean(cloud?.success),
     read, isClosed: () => closed, isStopping: query => stopping.has(scopeKey(query)), hasLiveOwnedTasks,
+    verifyQueueInputs: async (plan, conversationId, view) => {
+      if (plan.child && view.entries.some(entry => entry.kind === 'flowmate.queue-input')) throw Error('state_conflict');
+      await verifyQueuedInputs({ workId: plan.workId, sessionId: plan.sessionId, attemptId: plan.attemptId, requestId: plan.requestId }, conversationId, view);
+    },
     beforeSchedule: () => assertSchedulable(),
     resolvePhase: async input => {
       if (input.child) return children.resolvePhase(input.child);
@@ -562,8 +702,10 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
         const record = await read(() => options.storage.submission(submissionId, context));
         if (record?.type !== 'input' || record.entry === undefined) throw Error('state_conflict');
         const entry = (await read(() => options.storage.entry(record.entry!, context)))?.entry;
-        if (entry?.kind !== 'flowmate.input' || selected) throw Error('state_conflict');
-        const raw = parse(entryIdentity, entry.data); selected = { workId: raw.workId, sessionId: raw.sessionId, attemptId: raw.attemptId, requestId: raw.requestId };
+        if (!entry || entry.kind !== 'flowmate.input' && entry.kind !== 'flowmate.queue-input') throw Error('state_conflict');
+        const raw = entry.kind === 'flowmate.input' ? parse(entryIdentity, entry.data) : parse(queuedEntryIdentity, entry.data);
+        const identity = { workId: raw.workId, sessionId: raw.sessionId, attemptId: raw.attemptId, requestId: raw.requestId };
+        if (selected && !isDeepStrictEqual(selected, identity)) throw Error('state_conflict'); selected = identity;
       }
       if (!selected) throw Error('state_conflict');
       return { ...selected, operationId: `durable-compaction:${taskId}`, reason, expectedTailEntryId: tail, instructions: null };
@@ -571,6 +713,20 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
   });
   children = createDurableSubagentRuntime({ harness, storage: options.storage, models, registry, callbacks: options.subagents,
     isClosed: () => closed, isStopping: identity => stopping.has(scopeKey(identity)), readApiKey: options.readApiKey,
+    ...(cloud?.success ? { cloudModel: { sendSummary: sendCloudSummary, send: async (identity, native, signal) => {
+      const attempt = cloudAttempts.get(native.taskId as TaskId), parent = await lookup({ workId: identity.workId,
+        sessionId: identity.sessionId, attemptId: identity.attemptId, requestId: identity.requestId });
+      if (!attempt || attempt.cutoff !== native.cutoff || !parent) throw Error('state_conflict');
+      const sent = await sendCloud({ ...cloud.data, workId: identity.workId, sessionId: identity.sessionId,
+        attemptId: identity.attemptId, requestId: identity.requestId, phaseId: native.phaseId,
+        nativeConversationId: native.conversationId, nativeSubmissionId: parent.record.id, nativeTaskId: native.taskId,
+        checkpointEntryId: native.cutoff,
+        model: native.model, body: native.body,
+        child: { childRunId: identity.childRunId, childSessionId: identity.childSessionId, originToolCallId: identity.originToolCallId,
+          nativeToolTaskId: identity.nativeToolTaskId, nativeSubmissionId: native.submissionId } }, attempt.modelAttemptIds, signal);
+      if (!sent.ok) throw new ProductFailure(sent.error);
+      return sent.data;
+    } } } : {}),
     readWorkingContext: options.readWorkingContext, read, hasLiveOwnedTasks, withToolFeedback, compactions });
   const history = createDurableHistoryReader({ storage: options.storage, read, resolveOwner: async input => ({
     owner: { runtimeKind: 'durable', workId: input.workId, sessionId: input.child?.childSessionId ?? input.sessionId,
@@ -598,8 +754,21 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
       return options.executeTool!(call);
     }, read: call => options.readToolResult!(call),
     ...(options.subagents ? { delegate: children.invoker } : {}) }) });
-  registry.install({ name: 'flowmate-phase-consumption', hooks: [hook(GenerationTask, { afterResponse: async (message, api) => {
+  registry.install({ name: 'flowmate-phase-consumption', hooks: [hook(GenerationTask, { beforeRequest: async (_request, api, nativeContext) => {
+    if (!cloud?.success) return undefined;
+    const task = await read(() => options.storage.task(api.taskId, context));
+    const checkpoint = z.object({ phase: z.literal('request'), cutoff: id }).parse(task?.state.status === 'running' ? task.state.checkpoint : null);
+    const modelAttemptIds: string[] = [];
+    for (let ordinal = 0; ordinal < 4; ordinal++) {
+      const key = `flowmate.cloud-model:${checkpoint.cutoff}${ordinal === 0 ? '' : `:${ordinal}`}`;
+      const modelAttemptId = await api.memo(key, randomUUID(), nativeContext);
+      if (!z.string().uuid().safeParse(modelAttemptId).success) throw Error('storage_corrupt'); modelAttemptIds.push(modelAttemptId);
+    }
+    cloudAttempts.set(api.taskId, { modelAttemptIds, cutoff: checkpoint.cutoff });
+    return undefined;
+  }, afterResponse: async (message, api) => {
     const selected = requested.get(api.taskId); requested.delete(api.taskId);
+    cloudAttempts.delete(api.taskId);
     if (!selected || selected.conversationId !== api.conversationId || !['stop', 'length', 'toolUse'].includes(message.stopReason)) return;
     await harness.commit(async tx => {
       const submission = await tx.submissionByRequest(api.conversationId, key(selected.query)), task = await tx.task(api.taskId);
@@ -640,7 +809,12 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
       throw new ProductFailure(appError('tool_commit_unconfirmed', 'runtime', 'The original product tool result remains unknown.'));
     }
   } })] });
-  const port: DurableRuntimePort = {
+  const port: DurableRuntimePort & { queue: CloudQueuePort } = {
+    queue: createDurableQueueController({ harness, resolve: owner => find(owner), activePhase: async (tx, conversationId, owner, requestId) => {
+      const binding = await tx.doc(Binding, conversationId), live = await tx.doc(LiveDoc, conversationId);
+      return !closed && !stopping.has(scopeKey(owner)) && binding.workId === owner.workId && binding.sessionId === owner.sessionId
+        && binding.attemptId === owner.attemptId && binding.requestKey === key({ ...owner, requestId }) && live.run !== undefined;
+    } }),
     openConversation: raw => guard(async () => {
       const input = parse(identitySchema, raw);
       const conversationId = await harness.commit(async tx => {
@@ -762,6 +936,7 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
         const binding = await tx.doc(Binding, conversationId);
         if (record.type !== 'input' || record.conversationId !== conversationId || record.requestId !== key(input)
           || binding.workId !== input.workId || binding.sessionId !== input.sessionId) throw Error('storage_corrupt');
+        if (record.status === 'unanswered' && record.entry === undefined) return { record, execution: 'closed' as const };
         if (record.status === 'queued' || binding.attemptId !== input.attemptId) return { record, execution: 'unknown' as const };
         const live = await tx.doc(LiveDoc, conversationId);
         return { record, execution: live.run || await hasLiveOwnedTasks(tx, conversationId) ? 'active' as const
@@ -859,5 +1034,56 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
     cancelCompaction: raw => guard(async () => { const result = await compactions.cancel(parse(DurableCompactionIdentitySchema, raw)); if (!result.ok) throw new ProductFailure(result.error); return result.data; }),
     close,
   };
+  if (cloud?.success && options.onNativeResult) {
+    const binding = cloud.data;
+    const report = (error: AppError) => { try { options.onNativeResultError?.(error); } catch { /* The original native result remains available. */ } };
+    requestResultScan = () => {
+      if (closed) return;
+      scanPending = true; if (resultScan) return;
+      resultScan = (async () => {
+        while (scanPending && !closed) {
+          scanPending = false;
+          for (const status of ['done', 'unanswered'] as const) {
+            let cursor: Cursor | undefined;
+            do {
+              const page = await read(() => options.storage.scanSubmissions({ status }, 100, cursor, context));
+              for (const record of page.items) {
+                if (closed || record.type !== 'input' || !record.requestId) continue;
+                let key: [number, string];
+                try { key = parse(z.tuple([id, InvoiceWorkContinueRequestSchema.shape.requestId]), JSON.parse(record.requestId)); }
+                catch { continue; }
+                const query = { workId: binding.workId, sessionId: binding.sessionId, attemptId: key[0], requestId: key[1] };
+                const current = await lookup(query); if (!current || current.record.id !== record.id) continue;
+                const observed = await port.observeSubmission(query); if (!observed.ok || !observed.data || observed.data.execution !== 'closed') continue;
+                const answerBytes = current.view.answer === null ? 0 : Buffer.byteLength(current.view.answer, 'utf8');
+                let oversized: CloudNativeOversizedResult | null = null;
+                if (record.status === 'done' && answerBytes > RUNTIME_CONFIG.llmPayload.maxOutputTextBytes) {
+                  oversized = CloudNativeOversizedResultSchema.parse({ version: 1, ...binding, ...query, nativeConversationId: record.conversationId,
+                    nativeSubmissionId: record.id, nativeInputEntryId: record.entry, nativeAnswerEntryId: record.answer,
+                    consumedAt: observed.data.consumedAt, status: 'done', answerBytes });
+                } else if (record.status === 'unanswered' && record.reason.length > 8192) {
+                  oversized = CloudNativeOversizedResultSchema.parse({ version: 1, ...binding, ...query, nativeConversationId: record.conversationId,
+                    nativeSubmissionId: record.id, nativeInputEntryId: record.entry ?? null, nativeAnswerEntryId: null,
+                    consumedAt: observed.data.consumedAt, status: 'unanswered', reasonLength: record.reason.length });
+                }
+                if (oversized) {
+                  if (!options.onNativeResultOversized) { report(appError('cloud_result_too_large', 'runtime', 'The original result exceeds the delivery limit.')); continue; }
+                  const saved = await options.onNativeResultOversized(oversized); if (!saved.ok) report(saved.error); continue;
+                }
+                const event = CloudNativeResultSchema.parse({ version: 1, ...binding, ...query, nativeConversationId: record.conversationId,
+                  nativeSubmissionId: record.id, nativeInputEntryId: record.entry ?? null,
+                  nativeAnswerEntryId: record.status === 'done' ? record.answer : null, consumedAt: observed.data.consumedAt,
+                  status: record.status, answer: current.view.answer, reason: current.view.reason });
+                const saved = await options.onNativeResult!(event); if (!saved.ok) report(saved.error);
+              }
+              cursor = page.next;
+            } while (cursor && !closed);
+          }
+        }
+      })().catch(() => report(appError('cloud_result_unavailable', 'runtime', 'Native terminal results could not be reconciled.', true)))
+        .finally(() => { resultScan = undefined; if (scanPending && !closed) requestResultScan?.(); });
+    };
+    requestResultScan();
+  }
   return ok(port);
 }

@@ -18,6 +18,34 @@ import { BackgroundServiceStateSchema, BackgroundServiceConnectRequestSchema, Ba
   BackgroundServiceActivationQuerySchema, BackgroundServiceActivationViewSchema,
   type BackgroundServiceState } from '../../../packages/contracts/src/background-service.ts';
 import { AppErrorSchema } from '../../../packages/contracts/src/runtime.ts';
+import { CloudDesktopConnectionSchema, CloudDesktopRequestSchema, CloudDesktopStateSchema, CloudDesktopUploadResourceSchema, CloudDesktopUploadSchema, CloudDesktopWorkspaceSchema,
+  CloudMaterialReceiptSchema, CloudResourceReceiptSchema, cloudDesktopFailure, parseCloudDesktopResult } from '@flowmate/contracts';
+
+async function invokeCloud<T>(type: 'cloud-state' | 'cloud-connect' | 'cloud-disconnect' | 'cloud-upload' | 'cloud-upload-resource', input: unknown,
+  request: z.ZodTypeAny, response: z.ZodType<T>, matches: (value: T) => boolean): Promise<Result<T>> {
+  const parsed = request.safeParse(input);
+  if (!parsed.success) return fail(appError('input_invalid', 'input', 'The cloud workspace request is invalid.'));
+  try {
+    const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.unknown() }).strict(),
+      z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke(`flowmate:${type}`,
+        ...(type === 'cloud-state' ? [] : [parsed.data])));
+    if (result.success) {
+      if (!result.data.ok) return result.data;
+      const value = response.safeParse(result.data.data);
+      if (value.success && matches(value.data)) return { ok: true, data: value.data };
+    }
+  } catch { /* The original workspace request remains the recovery identity. */ }
+  return fail(appError(type === 'cloud-upload' || type === 'cloud-upload-resource' ? 'operation_result_unknown' : 'cloud_workspace_unavailable', 'runtime',
+    'The cloud workspace response could not be confirmed.', true));
+}
+
+async function invokeCloudRequest(input: unknown): Promise<Result<unknown>> {
+  const parsed = CloudDesktopRequestSchema.safeParse(input);
+  if (!parsed.success) return fail(appError('input_invalid', 'input', 'The cloud workspace request is invalid.'));
+  try { return parseCloudDesktopResult(parsed.data.command, await ipcRenderer.invoke('flowmate:cloud-request', parsed.data))
+    ?? cloudDesktopFailure(parsed.data.command); }
+  catch { return cloudDesktopFailure(parsed.data.command); }
+}
 
 async function invokeBackgroundService(type: 'get-service-state' | 'connect-service' | 'disconnect-service', input?: unknown): Promise<Result<BackgroundServiceState>> {
   const parsed = type === 'get-service-state' ? input === undefined : (type === 'connect-service'
@@ -101,6 +129,17 @@ const bridge: DesktopBridge = {
       return result.data;
     } catch { return fail(appError('evaluation_response_unknown', 'runtime', '评测闭环回复未知，请查询原记录。', true)); }
   },
+  cloudDesktop: { state: (...args: unknown[]) => args.length ? Promise.resolve(fail(appError('input_invalid', 'input', 'The cloud state request is invalid.')))
+      : invokeCloud('cloud-state', undefined, z.undefined(), CloudDesktopStateSchema, () => true),
+    connect: input => invokeCloud('cloud-connect', input, CloudDesktopConnectionSchema, CloudDesktopWorkspaceSchema,
+      value => value.workspaceId === input.workspaceId),
+    disconnect: input => invokeCloud('cloud-disconnect', input, CloudDesktopWorkspaceSchema, z.undefined(), () => true),
+    request: invokeCloudRequest,
+    upload: input => invokeCloud('cloud-upload', input, CloudDesktopUploadSchema, CloudMaterialReceiptSchema,
+      value => value.workspaceId === input.workspaceId && value.sourceDocumentRef.id === input.documentRef.id
+        && value.sourceDocumentRef.version === input.documentRef.version),
+    uploadResource: input => invokeCloud('cloud-upload-resource', input, CloudDesktopUploadResourceSchema, CloudResourceReceiptSchema,
+      value => value.workspaceId === input.workspaceId && value.ref.kind === input.ref.kind && value.ref.id === input.ref.id && value.ref.version === input.ref.version) },
   backgroundService: { getServiceState: (...args: unknown[]) => args.length ? Promise.resolve(fail(appError('input_invalid', 'input', 'Service state takes no arguments.')))
       : invokeBackgroundService('get-service-state'),
     connect: input => invokeBackgroundService('connect-service', input), disconnect: input => invokeBackgroundService('disconnect-service', input),

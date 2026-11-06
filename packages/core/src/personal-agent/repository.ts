@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
-import { appError, fail, ok, DocumentRefSchema, InvoiceWorkCreateRequestSchema, InvoiceWorkCreateReceiptSchema,
+import { CloudRuntimeBindingSchema, CloudWorkspaceIdSchema, appError, fail, ok, DocumentRefSchema, InvoiceWorkCreateRequestSchema, InvoiceWorkCreateReceiptSchema,
   InvoiceWorkListRequestSchema, InvoiceWorkListResultSchema, InvoiceWorkGetRequestSchema, InvoiceWorkGetResultSchema,
   InvoiceWorkViewSchema, InvoiceWorkItemViewSchema, InvoiceWorkTodoViewSchema, InvoiceWorkOperationReceiptSchema,
   InvoiceWorkQueryOperationRequestSchema, InvoiceWorkContinueRequestSchema, InvoiceWorkCancelRequestSchema,
@@ -35,8 +35,9 @@ export type InvoiceWorkPhase = { phaseId: number; workId: number; attemptId: num
   requestId: string; kind: 'prompt'; basis: InvoiceWorkPhaseBasis; createdAt: string;
   nativeConversationId: number | null; nativeSubmissionId: number | null; consumedAt: string | null };
 export interface InvoiceWorkRepository {
-  create(input: InvoiceWorkCreateRequest, options: CommandOptions & { runtimeDefaults?: RuntimeRequestOverrides }): Result<InvoiceWorkCreateReceipt>;
-  list(input: InvoiceWorkListRequest): Result<InvoiceWorkListResult>;
+  create(input: InvoiceWorkCreateRequest, options: CommandOptions & { runtimeDefaults?: RuntimeRequestOverrides;
+    runtimeOwner?: { workspaceId: string; cloudRuntimeId: string } }): Result<InvoiceWorkCreateReceipt>;
+  list(input: InvoiceWorkListRequest, scope?: { cloudWorkspaceId: string }): Result<InvoiceWorkListResult>;
   get(input: InvoiceWorkGetRequest): Result<InvoiceWorkGetResult>;
   queryOperation(input: InvoiceWorkQueryOperationRequest): Result<InvoiceWorkOperationReceipt | null>;
   continueWork(input: InvoiceWorkContinueRequest, options: CommandOptions): Result<InvoiceWorkContinueReceipt>;
@@ -101,6 +102,7 @@ const observationSchema = z.object({ workId: id, sessionId: id, attemptId: id, r
   execution: z.enum(['active', 'closed', 'unknown']) }).strict();
 const sourceSnapshotSchema = z.object({ workId: id, items: z.array(z.object({ itemId: id, documentRef: DocumentRefSchema,
   candidateRef: z.object({ id, sequence: id }).strict().nullable(), jobId: id.nullable() }).strict()).min(1) }).strict();
+const runtimeOwnerSchema = CloudRuntimeBindingSchema.pick({ workspaceId: true, cloudRuntimeId: true });
 
 export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): InvoiceWorkRepository {
   const sessions = createSessionRepository(db), documents = createDocumentRepository(db), candidates = createCandidateRepository(db),
@@ -130,7 +132,9 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
     requireFact(revision.safeParse(row.revision).success && ['open', 'completed', 'cancelled'].includes(row.status),
       'storage_corrupt', 'Stored invoice work identity is invalid.');
     PersonalAgentConfigurationSchema.parse(JSON.parse(row.configuration_json));
-    DurableWorkBudgetSchema.parse(JSON.parse(row.budget_json));
+    const budget = DurableWorkBudgetSchema.parse(JSON.parse(row.budget_json)), session = requireResult(sessions.get(row.session_id));
+    requireFact(session.runtimeKind === 'durable' && (session.durableRuntimeId !== 'local') === (budget.limits.cloud === true),
+      'storage_corrupt', 'The Work budget does not match its original runtime owner.');
     if (row.source_json !== null) sourceSnapshotSchema.parse(JSON.parse(row.source_json));
     return row;
   }
@@ -398,11 +402,27 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
     create(raw, options) {
       return operation(true, () => {
         const input = parse(InvoiceWorkCreateRequestSchema, raw), at = parse(atSchema, options.at), owner = agent(input.personalAgentId);
+        const runtimeOwner = options.runtimeOwner === undefined ? null : parse(runtimeOwnerSchema, options.runtimeOwner);
+        requireFact(runtimeOwner !== null || input.cloudTimeoutMs === undefined, 'input_invalid', 'A cloud time budget requires a cloud runtime.');
         const existing = prior<InvoiceWorkCreateReceipt>({ personalAgentId: owner.personalAgentId }, 'create', input.requestId, input);
-        if (existing) return existing;
+        if (existing) {
+          const session = requireResult(sessions.get(existing.sessionId));
+          requireFact(session.runtimeKind === 'durable' && session.durableRuntimeId === (runtimeOwner?.cloudRuntimeId ?? 'local')
+            && session.cloudWorkspaceId === (runtimeOwner?.workspaceId ?? null));
+          return existing;
+        }
         requireFact(owner.revision === input.expectedAgentRevision);
+        if (runtimeOwner) requireFact(!db.query(`SELECT w.id FROM invoice_works w JOIN sessions s ON s.id=w.session_id
+          WHERE s.durable_runtime_id=? LIMIT 1`).get(runtimeOwner.cloudRuntimeId));
         input.documents.forEach(checkDocument);
         const source = input.source ? work(input.source.workId) : null;
+        if (source) {
+          const sourceSession = requireResult(sessions.get(source.session_id));
+          requireFact(sourceSession.runtimeKind === 'durable' && (runtimeOwner === null
+            ? sourceSession.durableRuntimeId === 'local'
+            : sourceSession.durableRuntimeId !== 'local' && sourceSession.cloudWorkspaceId === runtimeOwner.workspaceId),
+          'source_invalid', 'The source Work belongs to another workspace.');
+        }
         const sourceItems = input.source?.items.map(reference => {
           const original = item(source!.id, reference.itemId);
           requireFact(original.document_id === reference.documentRef.id && original.document_version === reference.documentRef.version
@@ -426,14 +446,16 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         }) ?? [];
         const sourceSnapshot = input.source ? sourceSnapshotSchema.parse({ workId: input.source.workId,
           items: input.source.items.map((reference, index) => ({ ...reference, jobId: sourceItems[index]!.job_id })) }) : null;
-        const session = requireResult(sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: input.goal.slice(0, 80), at }));
+        const session = requireResult(sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: input.goal.slice(0, 80), at,
+          ...(runtimeOwner ? { durableRuntimeId: runtimeOwner.cloudRuntimeId, cloudWorkspaceId: runtimeOwner.workspaceId } : {}) }));
         const defaults = parse(RuntimeRequestOverridesSchema, options.runtimeDefaults ?? {});
         const budget = DurableWorkBudgetSchema.parse({ runtimeBudget: { maxModelCalls: RUNTIME_CONFIG.runBudget.maxModelCalls.workspace,
           maxToolCalls: RUNTIME_CONFIG.runBudget.maxToolCalls, toolTimeoutMs: RUNTIME_CONFIG.runBudget.toolTimeoutMs,
           ...defaults.budget,
           maxToolFeedbackBytes: RUNTIME_CONFIG.runBudget.maxToolFeedbackBytes },
-        limits: { timeoutMs: defaults.timeoutMs ?? RUNTIME_CONFIG.request.saveCandidateTimeoutMs,
-          stopGraceMs: defaults.stopGraceMs ?? RUNTIME_CONFIG.request.stopGraceMs } });
+        limits: { timeoutMs: runtimeOwner ? input.cloudTimeoutMs ?? RUNTIME_CONFIG.request.saveCandidateTimeoutMs
+          : defaults.timeoutMs ?? RUNTIME_CONFIG.request.saveCandidateTimeoutMs,
+          stopGraceMs: defaults.stopGraceMs ?? RUNTIME_CONFIG.request.stopGraceMs, ...(runtimeOwner ? { cloud: true } : {}) } });
         const inserted = db.query('INSERT INTO invoice_works(personal_agent_id,session_id,agent_revision,configuration_json,budget_json,goal,status,source_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
           .run(owner.personalAgentId, session.sessionId, owner.revision, JSON.stringify(owner.configuration), JSON.stringify(budget), input.goal, 'open',
             sourceSnapshot ? JSON.stringify(sourceSnapshot) : null, at, at);
@@ -457,12 +479,15 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         work(input.workId); return prior({ workId: input.workId }, input.operation, input.requestId);
       });
     },
-    list(raw) {
+    list(raw, scope) {
       return operation(false, () => {
         const input = parse(InvoiceWorkListRequestSchema, raw); agent(input.personalAgentId);
-        const rows = db.query<WorkRow, [number, number | null, number | null, string | null, string | null, number]>(
-          'SELECT * FROM invoice_works WHERE personal_agent_id=? AND (? IS NULL OR id<?) AND (? IS NULL OR status=?) ORDER BY id DESC LIMIT ?')
-          .all(input.personalAgentId, input.beforeId ?? null, input.beforeId ?? null, input.status ?? null, input.status ?? null, input.limit + 1);
+        const workspace = scope ? parse(CloudWorkspaceIdSchema, scope.cloudWorkspaceId) : null;
+        const rows = db.query<WorkRow, [number, string | null, string | null, number | null, number | null, string | null, string | null, number]>(
+          `SELECT w.* FROM invoice_works w JOIN sessions s ON s.id=w.session_id WHERE w.personal_agent_id=?
+           AND (? IS NULL OR s.cloud_workspace_id=? AND s.durable_runtime_id!='local') AND (? IS NULL OR w.id<?)
+           AND (? IS NULL OR w.status=?) ORDER BY w.id DESC LIMIT ?`)
+          .all(input.personalAgentId, workspace, workspace, input.beforeId ?? null, input.beforeId ?? null, input.status ?? null, input.status ?? null, input.limit + 1);
         const items: import('@flowmate/contracts').InvoiceWorkView[] = [];
         for (const row of rows.slice(0, input.limit)) {
           const next = view(row);
@@ -603,8 +628,10 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
           const snapshot = db.query<{ session_id: number }, [number]>('SELECT session_id FROM context_snapshots WHERE id=?').get(input.basis.contextSnapshotId);
           requireFact(snapshot && snapshot.session_id === row.session_id);
         }
-        const inserted = db.query('INSERT INTO invoice_work_phases(work_id,attempt_id,item_id,request_id,kind,basis_json,created_at) VALUES(?,?,?,?,?,?,?)')
-          .run(row.id, current.id, input.itemId, input.requestId, input.kind, JSON.stringify(input.basis), input.at);
+        const session = requireResult(sessions.get(row.session_id));
+        requireFact(session.runtimeKind === 'durable');
+        const inserted = db.query('INSERT INTO invoice_work_phases(work_id,attempt_id,item_id,request_id,kind,basis_json,durable_runtime_id,created_at) VALUES(?,?,?,?,?,?,?,?)')
+          .run(row.id, current.id, input.itemId, input.requestId, input.kind, JSON.stringify(input.basis), session.durableRuntimeId, input.at);
         return phase(db.query<PhaseRow, [number]>('SELECT * FROM invoice_work_phases WHERE id=?').get(Number(inserted.lastInsertRowid))!);
       });
     },
@@ -647,8 +674,10 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
           && stored.native_conversation_id === observed.nativeConversationId && stored.native_submission_id === observed.nativeSubmissionId,
         'source_invalid', 'The native observation is not bound to this original invoice phase.');
         if (observed.consumedAt !== null) {
+          // An already confirmed receipt stays valid if the wall clock moves backwards.
           requireFact(observed.nativeEntryId !== null && observed.status !== 'queued'
-            && Date.parse(observed.consumedAt) >= Date.parse(stored.created_at) && Date.parse(observed.consumedAt) <= Date.parse(at),
+            && (stored.consumed_at !== null || Date.parse(observed.consumedAt) >= Date.parse(stored.created_at)
+              && Date.parse(observed.consumedAt) <= Date.parse(at)),
           'source_invalid', 'The native observation does not prove consumption of this submitted input.');
           requireFact(db.query('SELECT id FROM invoice_work_context_snapshots WHERE phase_id=?').get(stored.id),
             'source_invalid', 'The observed phase has no committed working context.');

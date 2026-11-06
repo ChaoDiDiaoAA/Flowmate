@@ -121,6 +121,10 @@ import { readManagedInvoiceExport } from '../../../packages/core/src/storage/fil
 import { publishInvoiceExportCopy } from './invoice-export.ts';
 import { publishExportCopy } from './invoice-export.ts';
 import { ResearchReportRequestSchema, ResearchExportResultSchema } from '@flowmate/contracts';
+import { CloudDesktopController } from './cloud-desktop-controller.ts';
+import { connectCloudSsh } from './cloud-ssh-session.ts';
+import { createHostCloudMaterialExport, uploadCloudMaterial } from './cloud-material-transfer.ts';
+import { createHostCloudResourceExport, uploadCloudResource } from './cloud-resource-transfer.ts';
 
 const channels = {
   evaluationWorkflow: 'flowmate:evaluation-workflow',
@@ -234,6 +238,18 @@ let stateBroadcastSequence = 0;
 const legacyHost = new HostClient(), serviceClient = new ServiceClient();
 let host: HostClient | ServiceClient = legacyHost;
 let transportEpoch = 0, transportGeneration = 0;
+function cloudHostOwner() {
+  const original = host, epoch = transportEpoch, generation = transportGeneration;
+  return { request: async (command: Parameters<HostClient['request']>[0], timeoutMs?: number) => {
+    if (host !== original || transportEpoch !== epoch || transportGeneration !== generation) throw Error('host_connection_changed');
+    return requestProduct(command, timeoutMs);
+  } };
+}
+const cloudDesktop = new CloudDesktopController({ connect: connectCloudSsh,
+  upload: async (input, session) => !transportAvailable() ? fail(appError('cloud_material_unavailable', 'storage', 'The local material service is unavailable.', true))
+    : uploadCloudMaterial(input, createHostCloudMaterialExport(cloudHostOwner()), session),
+  uploadResource: async (input, session) => !transportAvailable() ? fail(appError('cloud_resource_unavailable', 'storage', 'The local resource service is unavailable.', true))
+    : uploadCloudResource(input, createHostCloudResourceExport(cloudHostOwner()), session) });
 let clientSubscription: (() => void) | null = null;
 let serviceMode = false, legacyAllowed = true;
 let serviceInstallation: ServiceInstallation | null = null;
@@ -726,11 +742,11 @@ async function closeDesktop(): Promise<void> {
   if (serviceActivation.busy) { hostError = true; hostErrorCode = 'service_activation_busy'; await broadcastState(); return; }
   desktopClosing = true;
   await startup;
-  const [closed, evaluationClosed] = await Promise.all([host === serviceClient ? disconnectBackgroundService().then(result => result.ok
+  const [closed, evaluationClosed, cloudClosed] = await Promise.all([host === serviceClient ? disconnectBackgroundService().then(result => result.ok
     ? ok({ closed: true, stopped: true, errors: [] }) : result) : legacyHost.close(),
-    evaluation?.close() ?? Promise.resolve(ok({ closed: true, stopped: true, errors: [] }))]);
-  const allClosed = closed.ok && closed.data.closed && evaluationClosed.ok && evaluationClosed.data.closed;
-  const allStopped = closed.ok && closed.data.stopped && evaluationClosed.ok && evaluationClosed.data.stopped;
+    evaluation?.close() ?? Promise.resolve(ok({ closed: true, stopped: true, errors: [] })), cloudDesktop.close()]);
+  const allClosed = closed.ok && closed.data.closed && evaluationClosed.ok && evaluationClosed.data.closed && cloudClosed.ok;
+  const allStopped = closed.ok && closed.data.stopped && evaluationClosed.ok && evaluationClosed.data.stopped && cloudClosed.ok;
   await sendDevelopmentNotice({ version: 1, type: 'flowmate_dev_closed', requestId: devShutdownRequestId,
     closed: allClosed, stopped: allStopped });
   // Preserve stop uncertainty without trapping a window whose processes have exited.
@@ -744,7 +760,8 @@ async function closeDesktop(): Promise<void> {
   } else {
     hostError = true;
     hostErrorCode = !closed.ok ? closed.error.code : !closed.data.closed || !closed.data.stopped ? 'host_close_unconfirmed'
-      : evaluationClosed.ok ? 'evaluation_stop_unconfirmed' : evaluationClosed.error.code;
+      : !evaluationClosed.ok ? evaluationClosed.error.code : !evaluationClosed.data.closed || !evaluationClosed.data.stopped ? 'evaluation_stop_unconfirmed'
+      : !cloudClosed.ok ? cloudClosed.error.code : 'host_close_unconfirmed';
     await broadcastState();
   }
 }
@@ -874,6 +891,12 @@ function registerIpc(): void {
       finally { if (configurationWrite) configurationWriting = false; }
     });
   };
+  handle('flowmate:cloud-state', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'The cloud state request is invalid.')) : cloudDesktop.state());
+  handle('flowmate:cloud-connect', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud connection is invalid.')) : cloudDesktop.connect(input));
+  handle('flowmate:cloud-disconnect', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud connection is invalid.')) : cloudDesktop.disconnect(input));
+  handle('flowmate:cloud-request', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud request is invalid.')) : cloudDesktop.request(input));
+  handle('flowmate:cloud-upload', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud upload is invalid.')) : cloudDesktop.upload(input));
+  handle('flowmate:cloud-upload-resource', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud resource upload is invalid.')) : cloudDesktop.uploadResource(input));
   handle('flowmate:restart-host', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Recheck takes no arguments.')) : restartHost());
   handle('flowmate:prepare-service', async (_event, raw, ...extra) => {
     if (extra.length || !BackgroundServicePrepareRequestSchema.safeParse(raw).success) return fail(appError('input_invalid', 'input', 'The service preparation request is invalid.'));

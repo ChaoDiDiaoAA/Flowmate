@@ -24,7 +24,7 @@ export type DurableModelAccess = {
   reserveModelRequest(signal?: AbortSignal): Result<void> | Promise<Result<void>>;
   readWorkingContext?(nativeContext: TranscriptContext, signal?: AbortSignal): Result<DurableWorkingContext> | Promise<Result<DurableWorkingContext>>;
   readCompactionUse?(signal: AbortSignal | undefined, binding: DurableModelBinding): Result<DurableCompactionModelUse | null> | Promise<Result<DurableCompactionModelUse | null>>;
-  fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  fetch?: (input: RequestInfo | URL, init?: RequestInit, originalSignal?: AbortSignal) => Promise<Response>;
 };
 
 const drivers: Record<string, ProviderStreams> = {
@@ -189,7 +189,8 @@ export async function createDurableModels(raw: ProviderConfig, access: DurableMo
       const fetch: FetchFunction = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
         const currentKey = await readKey(); await verify();
         if (currentKey !== key) throw Error('provider_auth_failed');
-        await reserve(); if (summary) { await summary.entered(); await verify(); } return (access.fetch ?? globalThis.fetch)(input, init);
+        await reserve(); if (summary) { await summary.entered(); await verify(); }
+        return access.fetch ? access.fetch(input, init, options?.signal) : globalThis.fetch(input, init);
       // Bun's fetch contract includes preconnect; product calls do not warm connections.
       }, { preconnect: () => {} });
       const request = { ...options, apiKey: key, maxRetries: 0, transport: 'sse' as const,

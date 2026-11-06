@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { appError, fail, ok, AcceptInvoiceCandidateRequestSchema, DocumentRefSchema, InvoiceWorkCreateRequestSchema,
+import { appError, fail, ok, AcceptInvoiceCandidateRequestSchema, CloudWorkspaceIdSchema, DocumentRefSchema, InvoiceWorkCreateRequestSchema,
   WorkspaceExpectationSchema, type DesktopBridge, type InvoiceWorkOperationReceipt, type PersonalTaskStopReceipt,
   type InvoiceWorkExecutionDecision, type InvoiceWorkQueryOperationRequest, type Result } from '@flowmate/contracts';
 import { parsePersonalAgentCommand, matchesPersonalAgentResponse, type PersonalAgentCommand } from '../../../../packages/contracts/src/personal-agent-commands.ts';
@@ -62,6 +62,7 @@ export const PersonalReviewTargetSchema = z.object({ workId: id, itemId: id, doc
 export type PersonalReviewTarget = z.infer<typeof PersonalReviewTargetSchema>;
 const personalDraftSchema = z.object({ version: z.literal(1), selectedWorkId: id.nullable(), goal: z.string().max(22000),
   documents: z.array(DocumentRefSchema), source: InvoiceWorkCreateRequestSchema.innerType().shape.source,
+  cloudTimeoutSeconds: z.string().max(12).optional(),
   supplements: z.record(z.string().max(128), z.object({ text: z.string().max(22000), materials: z.array(DocumentRefSchema) }).strict()),
   pending: z.custom<PersonalWriteCommand>(value => capturePersonalWrite(value) !== null).nullable(),
   review: z.object({ target: PersonalReviewTargetSchema, acceptRequest: AcceptInvoiceCandidateRequestSchema.nullable() }).strict().nullable(),
@@ -69,20 +70,22 @@ const personalDraftSchema = z.object({ version: z.literal(1), selectedWorkId: id
 export type PersonalDraft = z.infer<typeof personalDraftSchema>;
 export function emptyPersonalDraft(): PersonalDraft { return { version: 1, selectedWorkId: null, goal: '', documents: [], supplements: {}, pending: null, review: null }; }
 export const PERSONAL_DRAFT_KEY = 'flowmate.personal-agent.draft.v1';
-export function readPersonalDraft(storage: Pick<Storage, 'getItem'>): Result<PersonalDraft> {
+export function readPersonalDraft(storage: Pick<Storage, 'getItem'>, workspaceId?: string): Result<PersonalDraft> {
   try {
-    const raw = storage.getItem(PERSONAL_DRAFT_KEY); if (raw === null) return ok(emptyPersonalDraft());
+    const key = workspaceId === undefined ? PERSONAL_DRAFT_KEY : `${PERSONAL_DRAFT_KEY}.cloud.${CloudWorkspaceIdSchema.parse(workspaceId)}`;
+    const raw = storage.getItem(key); if (raw === null) return ok(emptyPersonalDraft());
     if (new TextEncoder().encode(raw).byteLength > 4 * 1024 * 1024) throw Error('draft_too_large');
     const draft = personalDraftSchema.safeParse(JSON.parse(raw));
     if (!draft.success) throw Error('draft_invalid');
     return ok({ ...draft.data, pending: draft.data.pending === null ? null : capturePersonalWrite(draft.data.pending) });
   } catch { return fail(appError('personal_draft_unavailable', 'storage', 'The saved Personal Agent draft could not be verified. It has not been replaced.', true)); }
 }
-export function savePersonalDraft(storage: Pick<Storage, 'setItem'>, draft: PersonalDraft): boolean {
+export function savePersonalDraft(storage: Pick<Storage, 'setItem'>, draft: PersonalDraft, workspaceId?: string): boolean {
   try {
+    const key = workspaceId === undefined ? PERSONAL_DRAFT_KEY : `${PERSONAL_DRAFT_KEY}.cloud.${CloudWorkspaceIdSchema.parse(workspaceId)}`;
     const parsed = personalDraftSchema.safeParse(draft); if (!parsed.success) return false;
     const raw = JSON.stringify(parsed.data); if (new TextEncoder().encode(raw).byteLength > 4 * 1024 * 1024) return false;
-    storage.setItem(PERSONAL_DRAFT_KEY, raw); return true;
+    storage.setItem(key, raw); return true;
   } catch { return false; }
 }
 export function executionDecisionText(value: InvoiceWorkExecutionDecision): string {

@@ -8,6 +8,7 @@ import { RegisteredToolNameSchema } from './tools.ts';
 import { WorkingDirectorySchema } from './schemas.ts';
 import { SUBAGENT_ROLE } from './subagents.ts';
 import { ToolCallDeliverySchema } from './activity.ts';
+import { CLOUD_WORK_TIMEOUT_MS_MAX, RUNTIME_CONFIG } from './runtime-config.ts';
 import type { PersonalHistoryApi } from './personal-history.ts';
 import type { InvoiceWorkTimelineApi } from './invoice-work-timeline.ts';
 
@@ -46,6 +47,7 @@ export const InvoiceWorkCreateRequestSchema = bounded(z.object({
   personalAgentId: id, expectedAgentRevision: revision, requestId, goal: requiredText,
   documents: z.array(DocumentRefSchema).min(1).refine(values => uniqueIds(values.map(value => value.id)), 'Invoice membership must be unique.'),
   source: z.object({ workId: id, items: z.array(sourceItem).min(1) }).strict().optional(),
+  cloudTimeoutMs: z.number().int().min(RUNTIME_CONFIG.ranges.timeoutMs.min).max(CLOUD_WORK_TIMEOUT_MS_MAX).optional(),
 }).strict());
 export type InvoiceWorkCreateRequest = z.infer<typeof InvoiceWorkCreateRequestSchema>;
 

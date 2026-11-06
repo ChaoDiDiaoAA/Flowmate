@@ -10,6 +10,22 @@ const receipt = InvoiceWorkCreateReceiptSchema.parse({ operation: 'create', pers
   execution: { kind: 'waiting', authorizationAccepted: false, attempt: null, reason: 'Select a model.', todoIds: [] } });
 const denied = async () => fail(appError('state_conflict', 'runtime', 'Refused.'));
 
+it('keeps local and each cloud workspace draft under distinct identities', () => {
+  const values = new Map<string, string>(), storage = { getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); } };
+  const first = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', second = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  expect(savePersonalDraft(storage, { ...emptyPersonalDraft(), goal: 'local' })).toBe(true);
+  const pending = capturePersonalWrite({ ...create, input: { ...create.input, cloudTimeoutMs: 86_400_000 } });
+  expect(savePersonalDraft(storage, { ...emptyPersonalDraft(), goal: 'first cloud', cloudTimeoutSeconds: '86400', pending }, first)).toBe(true);
+  expect(savePersonalDraft(storage, { ...emptyPersonalDraft(), goal: 'second cloud' }, second)).toBe(true);
+  expect(readPersonalDraft(storage)).toMatchObject({ ok: true, data: { goal: 'local' } });
+  expect(readPersonalDraft(storage, first)).toMatchObject({ ok: true, data: { goal: 'first cloud', cloudTimeoutSeconds: '86400',
+    pending: { input: { cloudTimeoutMs: 86_400_000 } } } });
+  expect(readPersonalDraft(storage, second)).toMatchObject({ ok: true, data: { goal: 'second cloud' } });
+  expect(savePersonalDraft(storage, emptyPersonalDraft(), 'invalid')).toBe(false);
+  expect(readPersonalDraft(storage, 'invalid')).toMatchObject({ ok: false });
+});
+
 it('keeps an unconfirmed create request across reload and queries it without a Work ID or another write', async () => {
   let writes = 0, queries = 0;
   const bridge: PersonalWriteBridge = { invoiceWorks: { create: async () => { writes++; return fail(appError('operation_result_unknown', 'runtime', 'Receipt lost.')); },

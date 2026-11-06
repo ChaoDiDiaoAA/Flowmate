@@ -1,3 +1,5 @@
+export const CLOUD_WORK_TIMEOUT_MS_MAX = 86_400_000;
+
 /** 当前 LLM／Run 默认值与请求范围；历史政策字面量留在对应读取契约。 */
 export const RUNTIME_CONFIG = {
   compaction: {

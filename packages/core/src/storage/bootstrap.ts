@@ -1,7 +1,8 @@
 import { createManagedFileContents } from './managed-file-contents.ts';
 import { backupLegacyStore, migrateLegacyMetadata, type LegacyStoreBackup } from './migration-020.ts';
-import { mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { closeSync, constants, copyFileSync, fstatSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { createDatabaseCoordinator, type SynchronousDatabaseExecutor } from './write-coordinator.ts';
 import type { DbHandle, SqlDatabaseStore } from './database.ts';
@@ -40,17 +41,68 @@ function createSqlStore(db: SynchronousDatabaseExecutor, listeners: Set<EventLis
   };
 }
 
-type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22;
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23;
 function migrationSql(version: SchemaVersion): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql'][version - 1];
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
 
 function runMigration(db: Database, version: SchemaVersion, paths?: ProductPaths, backup: LegacyStoreBackup | null = null): void {
-  const legacyAlter = version === 17 || version === 21 ? (db.query('PRAGMA legacy_alter_table').get() as { legacy_alter_table: number }).legacy_alter_table : 0;
+  const legacyAlter = version === 17 || version === 21 || version === 23 ? (db.query('PRAGMA legacy_alter_table').get() as { legacy_alter_table: number }).legacy_alter_table : 0;
   try {
-    if (version === 21) {
+    if (version === 23) {
+      if (db.inTransaction || (db.query('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys !== 1)
+        throw new Error('migration_foreign_keys_disabled');
+      const columns = db.query<{ name: string }, []>('PRAGMA table_info(sessions)').all().map(row => `"${row.name.replaceAll('"', '""')}"`);
+      const before = JSON.stringify(db.query(`SELECT ${columns.join(',')} FROM sessions ORDER BY id`).all());
+      const phaseColumns = db.query<{ name: string }, []>('PRAGMA table_info(invoice_work_phases)').all().map(row => `"${row.name.replaceAll('"', '""')}"`);
+      const phasesBefore = JSON.stringify(db.query(`SELECT ${phaseColumns.join(',')} FROM invoice_work_phases ORDER BY id`).all());
+      const phaseSequence = db.query<{ seq: number }, []>("SELECT seq FROM sqlite_sequence WHERE name='invoice_work_phases'").get();
+      const addedNames = ['session_runtime_owner_immutable', 'session_runtime_workspace_owner', 'invoice_work_phase_runtime_immutable',
+        'invoice_work_phase_runtime_owner', 'invoice_work_runtime_owner_immutable', 'invoice_work_runtime_unique',
+        'cloud_model_attempts', 'cloud_model_attempt_identity_immutable', 'cloud_model_attempt_preserved',
+        'cloud_native_result_receipts', 'cloud_native_result_receipt_immutable', 'cloud_native_result_receipt_preserved',
+        'cloud_workspace_documents', 'cloud_workspace_document_owner', 'cloud_workspace_document_immutable', 'cloud_workspace_document_preserved',
+        'cloud_material_uploads', 'cloud_material_chunks', 'cloud_material_upload_identity_immutable', 'cloud_material_chunk_immutable', 'cloud_material_chunk_preserved',
+        'cloud_desktop_material_uploads', 'cloud_desktop_material_identity_immutable', 'cloud_queue_controls',
+        'cloud_queue_control_identity_immutable', 'cloud_queue_control_preserved', 'cloud_resource_uploads', 'cloud_resource_chunks',
+        'cloud_resource_upload_identity_immutable', 'cloud_resource_receipt_immutable', 'cloud_resource_upload_preserved', 'cloud_resource_chunk_immutable', 'cloud_resource_chunk_preserved',
+        'cloud_desktop_resource_uploads', 'cloud_desktop_resource_identity_immutable', 'cloud_desktop_resource_receipt_immutable',
+        'cloud_desktop_resource_upload_preserved', 'cloud_workspace_resources',
+        'cloud_workspace_resource_ref', 'cloud_workspace_resource_immutable', 'cloud_workspace_resource_preserved'];
+      if (db.query('SELECT name FROM sqlite_master WHERE name IN (SELECT value FROM json_each(?)) LIMIT 1').get(JSON.stringify(addedNames)))
+        throw new Error('migration_definition_name_conflict');
+      const priorTriggers = migrationSql(21).split(/^\s*-- statement\s*$/m).map(sql => sql.trim());
+      for (const name of ['runs_engine_active_insert', 'runs_engine_active_update']) {
+        const expected = priorTriggers.find(sql => sql.startsWith(`CREATE TRIGGER ${name} `));
+        const installed = db.query<{ sql: string }, [string]>('SELECT sql FROM sqlite_master WHERE type=\'trigger\' AND name=?').get(name);
+        const normalized = (sql: string) => sql.replaceAll('\r\n', '\n').trim().replace(/;$/, '');
+        if (!expected || !installed || normalized(expected) !== normalized(installed.sql)) throw new Error('migration_active_guard_changed');
+      }
+      const definitions = db.query<{ name: string; sql: string }, []>(`SELECT name,sql FROM sqlite_master
+        WHERE tbl_name IN ('sessions','invoice_work_phases') AND type IN ('index','trigger') AND sql IS NOT NULL
+        ORDER BY name`).all();
+      const schemaQuery = "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL AND tbl_name NOT IN ('sessions','invoice_work_phases','cloud_model_attempts','cloud_native_result_receipts','cloud_workspace_documents','cloud_material_uploads','cloud_material_chunks','cloud_desktop_material_uploads','cloud_queue_controls','cloud_resource_uploads','cloud_resource_chunks','cloud_desktop_resource_uploads','cloud_workspace_resources') AND name NOT IN ('invoice_work_runtime_owner_immutable','invoice_work_runtime_unique','runs_engine_active_insert','runs_engine_active_update') ORDER BY name";
+      const schema = JSON.stringify(db.query(schemaQuery).all());
+      db.exec('PRAGMA foreign_keys=OFF'); db.exec('PRAGMA legacy_alter_table=ON');
+      for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) {
+        const definitionName = /^CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TRIGGER)\s+([A-Za-z_][A-Za-z_0-9]*)\b/i.exec(statement)?.[1];
+        db.exec(definitions.find(definition => definition.name === definitionName)?.sql ?? statement);
+      }
+      for (const definition of definitions) {
+        if (!db.query('SELECT name FROM sqlite_master WHERE name=?').get(definition.name)) db.exec(definition.sql);
+      }
+      if (phaseSequence) db.query("UPDATE sqlite_sequence SET seq=? WHERE name='invoice_work_phases'").run(phaseSequence.seq);
+      const preserved = db.query<{ name: string; sql: string }, [string]>(
+        'SELECT name,sql FROM sqlite_master WHERE name IN (SELECT value FROM json_each(?)) ORDER BY name').all(JSON.stringify(definitions.map(row => row.name)));
+      if (db.query('PRAGMA foreign_key_check').all().length
+        || JSON.stringify(db.query(`SELECT ${columns.join(',')} FROM sessions ORDER BY id`).all()) !== before
+        || JSON.stringify(db.query(`SELECT ${phaseColumns.join(',')} FROM invoice_work_phases ORDER BY id`).all()) !== phasesBefore
+        || JSON.stringify(preserved) !== JSON.stringify(definitions)
+        || JSON.stringify(db.query(schemaQuery).all()) !== schema) throw new Error('migration_preservation_failed');
+      db.exec('COMMIT');
+    } else if (version === 21) {
       const foreignKeys = db.query<{ foreign_keys: number }, []>('PRAGMA foreign_keys').get()?.foreign_keys;
       if (db.inTransaction || foreignKeys !== 1) throw new Error('migration_foreign_keys_disabled');
       const columns = db.query<{ name: string }, []>('PRAGMA table_info(sessions)').all().map(row => row.name);
@@ -131,11 +183,40 @@ function runMigration(db: Database, version: SchemaVersion, paths?: ProductPaths
     throw error;
   } finally {
     if (version === 10) db.exec('PRAGMA foreign_keys=ON');
-    if (version === 17 || version === 21) {
+    if (version === 17 || version === 21 || version === 23) {
       db.exec(`PRAGMA legacy_alter_table=${legacyAlter ? 'ON' : 'OFF'}`); db.exec('PRAGMA foreign_keys=ON');
       if ((db.query('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys !== 1) throw new Error('migration_foreign_keys_disabled');
     }
   }
+}
+
+function backupBeforeRuntimeScopes(db: Database, paths: ProductPaths): void {
+  db.exec('BEGIN EXCLUSIVE; COMMIT');
+  const directory = join(dirname(paths.databaseFile), `pre-v23-${randomUUID()}`);
+  mkdirSync(directory, { mode: 0o700 });
+  const target = join(directory, 'app.sqlite');
+  copyFileSync(paths.databaseFile, target, constants.COPYFILE_EXCL);
+  const original = openSync(paths.databaseFile, 'r');
+  try {
+    const copied = openSync(target, 'r');
+    try {
+      const size = fstatSync(original).size;
+      if (fstatSync(copied).size !== size) throw new Error('migration_backup_mismatch');
+      const left = Buffer.allocUnsafe(1024 * 1024), right = Buffer.allocUnsafe(left.length);
+      for (let offset = 0; offset < size; offset += left.length) {
+        const length = Math.min(left.length, size - offset);
+        if (readSync(original, left, 0, length, offset) !== length || readSync(copied, right, 0, length, offset) !== length
+          || !left.subarray(0, length).equals(right.subarray(0, length))) throw new Error('migration_backup_mismatch');
+      }
+    } finally { closeSync(copied); }
+  } finally { closeSync(original); }
+  const copied = new Database(target, { readonly: true });
+  try {
+    if (copied.query('PRAGMA integrity_check').all().some(row => Object.values(row as object)[0] !== 'ok')
+      || copied.query('PRAGMA foreign_key_check').all().length
+      || (copied.query('SELECT max(version) AS version FROM schema_migrations').get() as { version: number }).version !== 22)
+      throw new Error('migration_backup_invalid');
+  } finally { copied.close(); }
 }
 
 function migrateToLatest(db: Database, paths: ProductPaths): void {
@@ -144,13 +225,16 @@ function migrateToLatest(db: Database, paths: ProductPaths): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 22) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 23) {
     throw new Error('unsupported_schema_version');
   }
   const backup = migrationTable && versions.length < 20 ? backupLegacyStore(db, paths) : null;
-  for (let version = versions.length + 1; version <= 22; version += 1) runMigration(db, version as SchemaVersion, paths, backup);
+  for (let version = versions.length + 1; version <= 23; version += 1) {
+    if (version === 23 && migrationTable) backupBeforeRuntimeScopes(db, paths);
+    runMigration(db, version as SchemaVersion, paths, backup);
+  }
   const completed = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
-  if (completed.length !== 22 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
+  if (completed.length !== 23 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
 }
 
 export function bootstrapDatabase(paths: ProductPaths): Result<DatabaseBootstrap> {

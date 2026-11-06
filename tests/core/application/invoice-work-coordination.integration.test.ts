@@ -3,10 +3,11 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createRegistry, defineTask, defineTool } from '@earendil-works/pi-durable';
+import { createRegistry, defineTask, defineTool, type SubmissionId } from '@earendil-works/pi-durable';
+import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { Type } from '@earendil-works/pi-ai';
-import { appError, fail, ok, PersonalAgentConfigurationSchema, type InvoiceWorkCreateRequest, type InvoiceWorkWorkingContext,
-  type ProviderConfig, type Result } from '@flowmate/contracts';
+import { appError, DelegateArgsSchema, fail, ok, PersonalAgentConfigurationSchema, type InvoiceWorkCreateRequest, type InvoiceWorkWorkingContext,
+  type CloudRuntimeDeliveryPort, type DurableRuntimePort, type ProviderConfig, type Result } from '@flowmate/contracts';
 import { InvoiceWorkCoordinator } from '../../../packages/core/src/personal-agent/coordination.ts';
 import { DurableInvoiceGovernor } from '../../../packages/core/src/personal-agent/admission.ts';
 import { InvoiceWorkService } from '../../../packages/core/src/personal-agent/invoice-work.ts';
@@ -18,7 +19,22 @@ import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts
 import { createFileStore } from '../../../packages/core/src/storage/file-store.ts';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools } from '@flowmate/employee-invoice';
-import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage } from '@flowmate/runtime-durable';
+import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage, type DurableRuntimeOptions } from '@flowmate/runtime-durable';
+import { openCloudRuntimeStore } from '../../../apps/cloud-runtime-storage.ts';
+import { createCloudRuntimeRouter } from '../../../apps/cloud-runtime-router.ts';
+import { CloudDeepSeekProxy } from '../../../apps/cloud-deepseek-proxy.ts';
+import { callCloudModelSocket, listenCloudModelSocket } from '../../../apps/cloud-model-socket.ts';
+import { callCloudUnixRpc, listenCloudUnixRpc } from '../../../apps/cloud-unix-rpc.ts';
+import { createCloudRuntimeRpcClient, createCloudRuntimeRpcHandler } from '../../../apps/cloud-runtime-rpc.ts';
+import { createCloudRuntimeAuthorizer } from '../../../apps/cloud-runtime-authority.ts';
+import { createCloudChildReportReader } from '../../../apps/cloud-desktop-authority.ts';
+import { createCloudAuthorityCallbacksClient, createCloudAuthorityRpcClient, createCloudAuthorityRpcHandler } from '../../../apps/cloud-authority-rpc.ts';
+import { createCloudRuntimeService } from '../../../apps/cloud-runtime-service.ts';
+import { startCloudAuthorityEndpoints } from '../../../apps/cloud-authority-service.ts';
+import { CloudNativeResultReceiver } from '../../../apps/cloud-native-result-receiver.ts';
+import { CloudModelAttempts } from '../../../packages/core/src/personal-agent/cloud-model-attempts.ts';
+import { createDurableInvoiceSubagentService } from '../../../packages/core/src/personal-agent/subagents.ts';
+import { createInvoiceWorkCompactionCallbacks } from '../../../packages/core/src/personal-agent/compaction.ts';
 import { toPiParameters } from '../../../packages/runtime-pi/src/schema.ts';
 import { openTestDatabase } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync, waitFor } from '../../support/resources.ts';
@@ -30,14 +46,28 @@ const requireRuntime = createRequire(new URL('../../../packages/runtime-durable/
 const installedVersion = (name: string): string => JSON.parse(readFileSync(requireRuntime.resolve(`${name}/package.json`), 'utf8')).version;
 const sdk = { durable: installedVersion('@earendil-works/pi-durable'), ai: installedVersion('@earendil-works/pi-ai'), chord: installedVersion('@earendil-works/chord') };
 
-async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | 'mixed' = 'candidate', thinkingLevel: 'off' | 'high' = 'off') {
+async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | 'mixed' | 'child' | 'child-retryable' | 'compaction' | 'compaction-retryable' | 'oversize' | 'retryable' = 'candidate', thinkingLevel: 'off' | 'high' = 'off',
+  runtimeScope: 'local' | 'cloud' = 'local', isolated = false, throughProxy = false, socketTransport = false, runtimeSocket = false,
+  authoritySocket = false, authorityCallbacks = false, authorityTools = false, authoritySubagents = false, authorityCompactions = false,
+  useRuntimeService = false) {
+  const childMode = mode === 'child' || mode === 'child-retryable', compactionMode = mode === 'compaction' || mode === 'compaction-retryable';
   const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-work-coordination-'));
   const paths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
     runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') };
+  const cloudRoot = join(root, 'cloud-runtime');
+  if (isolated) { if (runtimeScope !== 'cloud' || mode === 'owned') throw Error('Unsupported cloud test fixture.'); mkdirSync(cloudRoot, { mode: 0o700 }); }
+  const modelSocketDir = join(root, 'cloud-model-socket');
+  if (socketTransport) { if (!throughProxy || process.platform !== 'linux') throw Error('Unsupported socket test fixture.'); mkdirSync(modelSocketDir, { mode: 0o700 }); }
+  const runtimeSocketDir = join(root, 'cloud-runtime-socket');
+  if (runtimeSocket) { if (!isolated || process.platform !== 'linux') throw Error('Unsupported runtime socket fixture.'); mkdirSync(runtimeSocketDir, { mode: 0o700 }); }
+  const authoritySocketDir = join(root, 'cloud-authority-socket');
+  if (authoritySocket) { if (!isolated || process.platform !== 'linux') throw Error('Unsupported Authority socket fixture.'); mkdirSync(authoritySocketDir, { mode: 0o700 }); }
+  if ((authorityCallbacks || authorityTools || authoritySubagents || authorityCompactions) && !authoritySocket) throw Error('Authority callbacks need their socket.');
+  if (useRuntimeService && (!runtimeSocket || !authoritySocket || !socketTransport)) throw Error('Runtime service needs all three sockets.');
   let database = need(openTestDatabase(paths));
   const configuration = PersonalAgentConfigurationSchema.parse({ modelId: 'coordination-local-profile', thinkingLevel,
     resources: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] },
-    tools: ['read_invoice_document', 'save_invoice_candidate'], workingDirectory: null, preferences: '' });
+    tools: childMode ? ['Agent', 'read_invoice_document'] : ['read_invoice_document', 'save_invoice_candidate'], workingDirectory: null, preferences: '' });
   await database.transaction(scope => {
     need(scope.personalAgents.ensureDefault(configuration, now()));
     for (const documentId of mode === 'mixed' ? Array.from({ length: 15 }, (_, index) => index + 1) : [1, 2]) {
@@ -66,16 +96,25 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
   });
   const requests: InvoiceWorkWorkingContext[] = [];
   const wireRequests: Array<Record<string, unknown>> = [];
+  let childFailed = false, summaryRequests = 0;
   const owned = { entered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>(), closed: Promise.withResolvers<void>() };
   deferCleanup(() => owned.release.resolve());
-  let held: { entered: ReturnType<typeof Promise.withResolvers<void>>; release: ReturnType<typeof Promise.withResolvers<void>> } | null = null;
+  let held: { entered: ReturnType<typeof Promise.withResolvers<void>>; release: ReturnType<typeof Promise.withResolvers<void>>; skip: number } | null = null;
   const server = Bun.serve({ port: 0, fetch: async request => {
     const body = await request.json() as { messages: Array<{ role: string; content: string }> };
     wireRequests.push(body);
+    if (compactionMode && JSON.stringify(body).includes('context summarization assistant')) {
+      summaryRequests++; if (mode === 'compaction-retryable' && summaryRequests === 1) return new Response('Controlled summary failure.', { status: 503 });
+      const chunk = { id: 'controlled-cloud-summary', object: 'chat.completion.chunk', created: 1, model: 'coordination-local-model',
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'Original invoice evidence summary.' }, finish_reason: 'stop' }] };
+      return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    }
     const context = JSON.parse(body.messages.find(message => message.role === 'user')!.content) as InvoiceWorkWorkingContext;
     requests.push(context);
-    if (held) { const original = held; held = null; original.entered.resolve(); await original.release.promise; }
-    if (mode === 'fail') return new Response('Controlled transport failure.', { status: 503 });
+    if (held?.skip) held.skip--;
+    else if (held) { const original = held; held = null; original.entered.resolve(); await original.release.promise; }
+    if (mode === 'fail' || mode === 'retryable' && requests.length === 1) return new Response('Controlled transport failure.', { status: 503 });
+    if (mode === 'child-retryable' && context.delegation && !childFailed) { childFailed = true; return new Response('Controlled child failure.', { status: 503 }); }
     const ordinal = body.messages.filter(message => message.role === 'tool').length;
     const documentId = context.item.documentRef.id, candidate = invoiceWorkCandidateDraft();
     const source = (quote: string, blockId = 'b1') => ({ documentId, version: 'v1', artifactId: documentId * 2, page: 1, blockId, quote });
@@ -103,13 +142,17 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
         taxRate: missing, taxAmount: missing, totalAmount: missing }));
     }
     let tool: { name: string; arguments: unknown } | null = null;
-    if (mode !== 'no-candidate' && ordinal === 0) {
+    if (childMode && !context.delegation && ordinal === 0) {
+      tool = { name: 'Agent', arguments: { subagent_type: 'invoice-evidence-checker', run_in_background: false,
+        description: 'Check the original invoice', prompt: 'Verify the original invoice evidence.' } };
+    } else if (mode !== 'no-candidate' && mode !== 'oversize' && mode !== 'retryable' && !childMode && ordinal === 0) {
       if (mode === 'mixed') tool = { name: 'save_invoice_candidate', arguments: { documentId, candidate } };
       else tool = { name: 'read_invoice_document', arguments: { documentId, page: 1, afterBlockId: null, limit: 10 } };
-    } else if (mode !== 'no-candidate' && mode !== 'mixed' && ordinal === 1) tool = { name: 'save_invoice_candidate', arguments: { documentId, candidate } };
-    const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `coordinator-wire-${requests.length}`, type: 'function',
+    } else if (mode !== 'no-candidate' && mode !== 'mixed' && !childMode && !compactionMode && ordinal === 1) tool = { name: 'save_invoice_candidate', arguments: { documentId, candidate } };
+    const delta = tool ? { role: 'assistant', ...(compactionMode ? { content: 'Original evidence '.repeat(9000) } : {}),
+      tool_calls: [{ index: 0, id: `coordinator-wire-${requests.length}`, type: 'function',
       function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } }] }
-      : { role: 'assistant', content: 'Original phase completed for human review.' };
+      : { role: 'assistant', content: mode === 'oversize' ? 'x'.repeat(262_145) : 'Original phase completed for human review.' };
     const chunk = { id: `coordinator-model-${requests.length}`, object: 'chat.completion.chunk', created: 1, model: 'coordination-local-model',
       choices: [{ index: 0, delta, finish_reason: tool ? 'tool_calls' : 'stop' }] };
     return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
@@ -120,19 +163,29 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
     connection: { api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, contextWindow: 64000, maxTokens: 8192, reasoning: thinkingLevel !== 'off' },
     parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
   let foreground = true;
-  const errors: string[] = [];
+  const errors: string[] = [], childObservations: unknown[] = [], phaseObservations: unknown[] = []; let rpcRequests = 0, authorityRequests = 0, callbackRequests = 0, toolRequests = 0, childRequests = 0, compactionRequests = 0, resultRequests = 0;
+  let resultDelivery = true, loseResultReceipt = false;
   async function connect() {
-  const governor = new DurableInvoiceGovernor(database, now, () => foreground);
+  const governor = new DurableInvoiceGovernor(database, now, () => foreground, runtimeScope);
+  let runtime!: DurableRuntimePort;
+  let childRuntime: DurableRuntimePort | undefined;
+  const subagents = createDurableInvoiceSubagentService({ database, now, governor, observeSubagent: async input => {
+    const result = childRuntime ? await childRuntime.observeSubagent(input)
+      : fail(appError('personal_agent_unavailable', 'runtime', 'Controlled child runtime unavailable.'));
+    if (result.ok && result.data) { const { answer: _answer, ...facts } = result.data; childObservations.push(facts); }
+    return result;
+  } });
   const contexts = new InvoiceWorkPhaseContextService({ database, now, buildContext: buildInvoiceWorkContext });
+  const productCompactions = createInvoiceWorkCompactionCallbacks({ database, governor, contexts, subagents: subagents.callbacks });
   const files = createFileStore(paths, database), documents = createDocumentService({ paths, files, allowedSourceRoot: root, now,
     transaction: operation => database.transaction(scope => operation({ repository: scope.documents,
       files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })) });
-  const definitions = createInvoiceTools({ documents: { readParsedForRun: (id, context) => database.read(scope =>
+  const definitions = [...createInvoiceTools({ documents: { readParsedForRun: (id, context) => database.read(scope =>
     documents.readParsedForRun(id, context, { repository: scope.documents, files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } })) },
     documentRepository: { get: id => database.read(scope => scope.documents.get(id)) },
     candidates: { save: input => database.transaction(scope => scope.candidates.save(input)),
       listForRun: input => database.read(scope => scope.candidates.listForRun(input)),
-      readForRun: input => database.read(scope => scope.candidates.readForRun(input)) }, now });
+      readForRun: input => database.read(scope => scope.candidates.readForRun(input)) }, now }), ...(childMode ? [subagents.tool] : [])];
   const bridge = createInvoiceWorkToolBridge({ database, executor: createToolExecutor({ database, definitions, now }) });
   let observer: InvoiceWorkPhaseObserver, coordinator: InvoiceWorkCoordinator;
   const registry = createRegistry();
@@ -157,29 +210,123 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
         return { output: [{ type: 'text', text: 'An original owned evidence Task is pending.' }], control: { terminate: true } };
       } })] });
   }
-  const runtime = need(await createDurableRuntime({ storage: await createDurableSqliteStorage(database.coordinator), registry,
+  let authorityClient: ReturnType<typeof createCloudAuthorityCallbacksClient> | null = null;
+  const runtimeOptions: Omit<DurableRuntimeOptions, 'storage'> = { registry,
     onChanged: () => coordinator?.wake(),
-    readApiKey: () => 'controlled-local-key', verifyModelUse: input => governor.verifyModelUse(input), reserveModelRequest: input => governor.reserveModelRequest(input),
-    readWorkingContext: input => contexts.get(input), verifyWorkingContext: input => contexts.verify(input),
+    readApiKey: () => 'controlled-local-key', verifyModelUse: input => authorityCallbacks ? authorityClient!.verifyModelUse(input) : governor.verifyModelUse(input),
+    verifySchedulingUse: (input, pending) => authorityCallbacks ? authorityClient!.verifySchedulingUse(input, pending) : governor.verifySchedulingUse(input, pending),
+    reserveModelRequest: input => governor.reserveModelRequest(input),
+    ...(childMode ? { subagents: authoritySubagents ? {
+      readPlan: input => authorityClient!.subagents.readPlan(input), verify: input => authorityClient!.subagents.verify(input),
+      adopt: input => authorityClient!.subagents.adopt(input), reserveModelRequest: input => authorityClient!.subagents.reserveModelRequest(input),
+      onParentConsumed: input => authorityClient!.subagents.onParentConsumed(input),
+    } : subagents.callbacks } : {}),
+    ...(compactionMode ? { compactions: authorityCompactions ? {
+      readPlan: input => authorityClient!.compactions.readPlan(input), verify: input => authorityClient!.compactions.verify(input),
+      reserveModelRequest: input => authorityClient!.compactions.reserveModelRequest(input),
+    } : productCompactions } : {}),
+    readWorkingContext: input => authorityCallbacks ? authorityClient!.readWorkingContext(input)
+      : input.child ? subagents.readWorkingContext(input) : contexts.get(input),
+    verifyWorkingContext: async input => authorityCallbacks ? authorityClient!.verifyWorkingContext(input)
+      : input.child ? (await subagents.readWorkingContext(input)).ok ? ok(undefined)
+        : fail(appError('state_conflict', 'runtime', 'Controlled child context unavailable.')) : contexts.verify(input),
     tools: mode === 'owned' ? [] : definitions.filter(tool => configuration.tools.includes(tool.name)).map(tool => ({ name: tool.name, description: tool.description,
-      executionMode: tool.executionMode, inputSchema: { ...toPiParameters(tool.inputSchema) } })),
+      executionMode: tool.executionMode, inputSchema: { ...toPiParameters(tool.name === 'Agent'
+        ? DelegateArgsSchema.extend({ run_in_background: DelegateArgsSchema.shape.run_in_background.removeDefault() }) : tool.inputSchema) } })),
     executeTool: async input => {
+      if (authorityTools) return authorityClient!.executeTool(input);
       const reconciled = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId, requestId: input.requestId });
       return reconciled.ok ? bridge.executeTool(input) : reconciled;
-    }, readToolResult: input => bridge.readToolResult(input), onToolFeedback: input => bridge.onToolFeedback(input) }));
+    }, readToolResult: input => authorityTools ? authorityClient!.readToolResult(input) : bridge.readToolResult(input),
+    onToolFeedback: input => authorityTools ? authorityClient!.onToolFeedback(input) : bridge.onToolFeedback(input) };
+  const cloudStore = isolated && !useRuntimeService ? need(await openCloudRuntimeStore(cloudRoot)) : null;
+  const proxy = throughProxy ? new CloudDeepSeekProxy({ ledger: new CloudModelAttempts(database, governor, now),
+    readApiKey: () => 'controlled-authority-key', fetch: (_url, init) => fetch(`${provider.connection!.baseUrl}/chat/completions`, init) }) : null;
+  const modelSocketPath = join(modelSocketDir, 'model.sock');
+  const modelServer = socketTransport && proxy ? need(await listenCloudModelSocket({ socketPath: modelSocketPath, proxy,
+    prepare: async input => {
+      const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId,
+        attemptId: input.attemptId, requestId: input.requestId });
+      return linked.ok ? ok(undefined) : linked;
+    } })) : null;
+  const authoritySocketPath = join(authoritySocketDir, 'authority.sock');
+  const authorityHandler = createCloudAuthorityRpcHandler(createCloudRuntimeAuthorizer(database), {
+    readWorkingContext: input => input.child ? subagents.readWorkingContext(input) : contexts.get(input),
+    verifyWorkingContext: async input => input.child ? (await subagents.readWorkingContext(input)).ok ? ok(undefined)
+      : fail(appError('state_conflict', 'runtime', 'Controlled child context unavailable.')) : contexts.verify(input),
+    verifyModelUse: input => governor.verifyModelUse(input), verifySchedulingUse: (input, pending) => governor.verifySchedulingUse(input, pending),
+    executeTool: async input => {
+      const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId, requestId: input.requestId });
+      return linked.ok ? bridge.executeTool(input) : linked;
+    }, readToolResult: input => bridge.readToolResult(input), onToolFeedback: input => bridge.onToolFeedback(input),
+    subagents: subagents.callbacks, compactions: productCompactions,
+  }, async () => { coordinator?.wake(); return ok(undefined); }, async event => {
+    resultRequests++;
+    if (!resultDelivery) return fail(appError('cloud_result_unavailable', 'runtime', 'Controlled Authority outage.', true));
+    const result = await new CloudNativeResultReceiver(database, runtime, now).receive(event);
+    if (result.ok && loseResultReceipt) { loseResultReceipt = false; return fail(appError('operation_result_unknown', 'runtime', 'Controlled lost receipt.', true)); }
+    return result;
+  });
+  const authorityServer = authoritySocket ? need(await listenCloudUnixRpc({ socketPath: authoritySocketPath,
+    handle: (value, signal) => { authorityRequests++; if (value && typeof value === 'object' && 'method' in value && value.method !== 'authorize') {
+      callbackRequests++; if (['executeTool', 'readToolResult', 'onToolFeedback'].includes(String(value.method))) toolRequests++;
+      if (['readChildPlan', 'verifyChild', 'adoptChild', 'childConsumed'].includes(String(value.method))) childRequests++;
+      if (['readCompactionPlan', 'verifyCompaction'].includes(String(value.method))) compactionRequests++;
+    } return authorityHandler(value, signal); } })) : null;
+  authorityClient = authorityServer ? createCloudAuthorityCallbacksClient(authoritySocketPath) : null;
+  const nativeRuntime = useRuntimeService ? null : cloudStore ? createCloudRuntimeRouter({ store: cloudStore,
+    runtimeOptions: binding => ({ ...runtimeOptions, registry: createRegistry(),
+      onNativeResult: async event => { const opened = await cloudStore.openSession(binding, false); return opened.ok ? opened.data.enqueueResult(event) : opened; },
+      onNativeResultOversized: async event => { const opened = await cloudStore.openSession(binding, false); return opened.ok ? opened.data.enqueueOversizedResult(event) : opened; },
+      cloudModel: { binding,
+      send: async (input, signal) => {
+        if (modelServer) return callCloudModelSocket(modelSocketPath, input, signal);
+        const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId,
+          attemptId: input.attemptId, requestId: input.requestId });
+        if (!linked.ok) return linked;
+        if (proxy) return proxy.send(input, signal);
+        try { return ok(await fetch(`${provider.connection!.baseUrl}/chat/completions`, { method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: 'Bearer controlled-local-key' }, body: input.body, signal })); }
+        catch { return fail(appError('cloud_model_result_unknown', 'runtime', 'Controlled transport failed.', true)); }
+      } } }),
+    authorize: authorityServer ? createCloudAuthorityRpcClient(authoritySocketPath) : (_operation, input) => database.read(scope => {
+      const work = scope.db.query<{ session_id: number }, [number]>('SELECT session_id FROM invoice_works WHERE id=?').get(input.workId);
+      const session = scope.sessions.get(input.sessionId);
+      if (!work || work.session_id !== input.sessionId || !session.ok || session.data.runtimeKind !== 'durable'
+        || session.data.durableRuntimeId === 'local' || session.data.cloudWorkspaceId === null)
+        return fail(appError('cloud_access_denied', 'runtime', 'The controlled fixture owner does not match.'));
+      const binding = { workId: input.workId, sessionId: input.sessionId, cloudRuntimeId: session.data.durableRuntimeId,
+        workspaceId: session.data.cloudWorkspaceId };
+      return session.data.durableConversationId === null ? ok({ binding, state: 'allocated' as const })
+        : ok({ binding, state: 'ready' as const, nativeConversationId: session.data.durableConversationId });
+    }) }) : need(await createDurableRuntime({ ...runtimeOptions, storage: await createDurableSqliteStorage(database.coordinator) }));
+  const runtimeSocketPath = join(runtimeSocketDir, 'runtime.sock'), handleRuntime = nativeRuntime ? createCloudRuntimeRpcHandler(nativeRuntime) : null;
+  const runtimeServer = runtimeSocket && handleRuntime ? need(await listenCloudUnixRpc({ socketPath: runtimeSocketPath,
+    handle: value => { rpcRequests++; return handleRuntime(value); } })) : null;
+  const cloudRuntimeService = useRuntimeService ? need(await createCloudRuntimeService({ root: cloudRoot, runtimeSocketPath, authoritySocketPath,
+    modelSocketPath, tools: runtimeOptions.tools ?? [] })) : null;
+  runtime = runtimeServer || cloudRuntimeService ? createCloudRuntimeRpcClient(runtimeSocketPath) : nativeRuntime!;
+  const observe = runtime.observeSubmission.bind(runtime);
+  runtime.observeSubmission = async input => { const result = await observe(input);
+    if (result.ok && result.data) phaseObservations.push({ ...result.data, readAt: now() }); return result; };
+  childRuntime = runtime;
   observer = new InvoiceWorkPhaseObserver({ database, runtime, now });
   const models = new InvoiceWorkModelService({ database, runtime, now, resolveConfiguration: () => ok(provider) });
-  const tasks = new PersonalTasksService({ database, runtime, now, phaseObserver: observer, restoreAttempt: async identity => {
+  const tasks = new PersonalTasksService({ database, runtime, now, phaseObserver: observer,
+    ...(childMode ? { reconcileChildren: identity => subagents.reconcileAttempt(identity) } : {}), restoreAttempt: async identity => {
     const phase = await database.read(scope => scope.db.query<{ request_id: string }, [number]>(
       'SELECT request_id FROM invoice_work_phases WHERE attempt_id=? ORDER BY id DESC LIMIT 1').get(identity.attemptId));
     return phase ? models.restore({ ...identity, requestId: phase.request_id }) : ok(undefined);
   }, verifyModelUse: identity => governor.verifyModelUse(identity), onChanged: () => coordinator.wake() });
   coordinator = new InvoiceWorkCoordinator({ database, runtime, modelService: models, contexts, phaseObserver: observer, governor, tasks,
-    now, sdk, verifyResources: () => ok(undefined), onError: error => errors.push(error.code) });
+    now, sdk, runtimeScope, verifyResources: () => ok(undefined), onError: error => errors.push(error.code) });
   const service = new InvoiceWorkService({ database, now, assessExecution: input => governor.assess(input), onChanged: () => coordinator.wake(),
     ...(mode === 'mixed' ? { runtimeDefaults: () => ok({ budget: { maxModelCalls: 32, maxToolCalls: 100 }, timeoutMs: 300000 }) } : {}) });
-  deferCleanup(async () => { owned.release.resolve(); const quiescing = coordinator.close(); need(await runtime.close()); need(await quiescing); });
-  return { governor, contexts, models, observer, runtime, coordinator, service, tasks };
+  deferCleanup(async () => { owned.release.resolve(); const quiescing = coordinator.close(); need(await runtime.close());
+    if (runtimeServer) need(await nativeRuntime!.close()); if (cloudRuntimeService) need(await cloudRuntimeService.close()); need(await quiescing);
+    if (runtimeServer) need(await runtimeServer.close()); if (modelServer) need(await modelServer.close());
+    if (authorityServer) need(await authorityServer.close()); if (cloudStore) need(await cloudStore.close()); });
+  return { governor, contexts, models, observer, runtime, nativeRuntime, coordinator, service, tasks, cloudStore, modelServer, runtimeServer, authorityServer, cloudRuntimeService };
   }
   let connection = await connect();
   const create = (requestId: string, documentIds = [1, 2]) => {
@@ -202,16 +349,27 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
     const request = { workId, itemId: selected.itemId, todoId: todo.todoId, requestId, expectedRevision: current.work.revision, text, materials: [] };
     return { request, receipt: need(await connection.service.supplement(request)) };
   };
-  const holdNext = () => { const original = { entered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() };
+  const holdNext = (skip = 0) => { const original = { entered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>(), skip };
     held = original; deferCleanup(() => original.release.resolve()); return original; };
-  const restart = async () => {
-    const quiescing = connection.coordinator.close(); need(await connection.runtime.close()); need(await quiescing);
-    await database.close(); database = need(openTestDatabase(paths)); connection = await connect();
+  const restart = async (beforeReconnect?: () => Promise<void>) => {
+    const quiescing = connection.coordinator.close(); need(await connection.runtime.close());
+    if (connection.runtimeServer) need(await connection.nativeRuntime!.close());
+    if (connection.cloudRuntimeService) need(await connection.cloudRuntimeService.close()); need(await quiescing);
+    if (connection.runtimeServer) need(await connection.runtimeServer.close());
+    if (connection.modelServer) need(await connection.modelServer.close());
+    if (connection.authorityServer) need(await connection.authorityServer.close());
+    if (connection.cloudStore) need(await connection.cloudStore.close());
+    await database.close(); await beforeReconnect?.(); database = need(openTestDatabase(paths)); connection = await connect();
   };
-  return { get database() { return database; }, paths, configuration, provider, get governor() { return connection.governor; },
+  return { get database() { return database; }, paths, cloudRoot, configuration, provider, get governor() { return connection.governor; },
     get contexts() { return connection.contexts; }, get models() { return connection.models; }, get observer() { return connection.observer; },
     get runtime() { return connection.runtime; }, get coordinator() { return connection.coordinator; },
-    get service() { return connection.service; }, get tasks() { return connection.tasks; }, requests, wireRequests, owned, errors, create, work, item, supplement, start, restart, holdNext };
+    get service() { return connection.service; }, get tasks() { return connection.tasks; }, requests, wireRequests, owned, errors,
+    runtimeRpcRequests: () => rpcRequests, authorityRpcRequests: () => authorityRequests, authorityCallbackRequests: () => callbackRequests, childObservations, phaseObservations,
+    get cloudStore() { return connection.cloudStore; }, authorityToolRequests: () => toolRequests, authoritySubagentRequests: () => childRequests, authorityCompactionRequests: () => compactionRequests,
+    usedRuntimeService: () => Boolean(connection.cloudRuntimeService), authorityResultRequests: () => resultRequests,
+    setResultDelivery: (value: boolean) => { resultDelivery = value; }, loseNextResultReceipt: () => { loseResultReceipt = true; },
+    create, work, item, supplement, start, restart, holdNext };
 }
 
 test('a saved candidate with an unavailable required field creates an original field and source bound supplement Todo', async () => {
@@ -391,6 +549,790 @@ test('cold recovery admits a persisted queued attempt and never revives its norm
   await f.restart(); need(await f.coordinator.recover());
   expect(f.requests).toHaveLength(3); expect((await f.work(created.workId)).work.execution.attempt).toEqual(original);
   expect(await f.database.read(scope => scope.db.query('SELECT COUNT(*) count FROM runs').get())).toEqual({ count: 1 });
+}, 15_000);
+
+test('the local coordinator leaves a cloud Work queued instead of executing it locally', async () => {
+  const f = await fixture('no-candidate');
+  const request: InvoiceWorkCreateRequest = { personalAgentId: 1, expectedAgentRevision: 0, requestId: 'cloud-not-local',
+    goal: 'Review this cloud invoice.', documents: [{ id: 1, version: 'v1' }] };
+  const created = need(await f.database.transaction(scope => scope.invoiceWorks.create(request, { at: now(), admission: { kind: 'queued' },
+    runtimeOwner: { cloudRuntimeId: '11111111-1111-4111-8111-111111111111', workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' } })));
+  if (!created.execution.attempt) throw Error('Expected the cloud attempt.');
+  const item = (await f.work(created.workId)).items[0]!;
+  need(await f.database.transaction(scope => scope.invoiceWorks.freezePhase({ workId: created.workId,
+    attemptId: created.execution.attempt!.attemptId, itemId: item.itemId, requestId: 'cloud-pending-phase', kind: 'prompt', at: now(),
+    basis: { contextSnapshotId: null, inputIds: [], documentRefs: [item.documentRef], configurationRevision: 0, itemRevision: item.revision } })));
+  const local = await f.create('local-after-cloud', [1]);
+  await f.start();
+  expect(f.requests).toHaveLength(1);
+  expect(await f.database.read(scope => scope.db.query('SELECT COUNT(*) count FROM runs WHERE session_id=?').get(created.sessionId))).toEqual({ count: 0 });
+  expect((await f.work(local.workId)).work.execution.runStatus).toBe('completed');
+  expect((await f.work(created.workId)).work.execution).toMatchObject({ queued: true, runStatus: null });
+}, 15_000);
+
+test.each([false, true])('cloud coordinator advances a third Work while the first is held; isolated storage=%s', async isolated => {
+  const f = await fixture('no-candidate', 'off', 'cloud', isolated);
+  const workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const create = async (requestId: string, cloudRuntimeId: string) => need(await f.database.transaction(scope => scope.invoiceWorks.create({
+    personalAgentId: 1, expectedAgentRevision: 0, requestId, goal: 'Review this original cloud invoice.',
+    documents: [{ id: 1, version: 'v1' }] }, { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId, cloudRuntimeId } })));
+  const first = await create('cloud-independent-first', '11111111-1111-4111-8111-111111111111');
+  const gate = f.holdNext(); f.coordinator.wake(); await waitFor(async () => f.requests.length > 0, 3_000); await gate.entered.promise;
+  const second = await create('cloud-independent-second', '22222222-2222-4222-8222-222222222222');
+  const third = await create('cloud-independent-third', '33333333-3333-4333-8333-333333333333');
+  try {
+    for (let index = 0; index < 5; index++) f.coordinator.wake();
+    await waitFor(async () => f.requests.length >= 3);
+    expect(f.requests.map(context => context.work.workId)).toEqual([first.workId, second.workId, third.workId]);
+    expect((await f.work(first.workId)).work.execution.runStatus).toBe('running');
+    expect((await f.work(second.workId)).work.execution.runStatus).toBe('completed');
+    expect(f.requests.filter(context => context.work.workId === first.workId)).toHaveLength(1);
+  } finally { gate.release.resolve(); }
+  need(await f.coordinator.drain());
+  expect(f.errors).toEqual([]);
+}, 20_000);
+
+test('cloud coordinator records the original native Session before preparing a model or submitting a phase', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud');
+  const created = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-bind-before-model', goal: 'Review the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  const originalPrepare = f.runtime.prepareModel.bind(f.runtime);
+  let bindingAtPrepare: number | null = null;
+  f.runtime.prepareModel = async input => {
+    const session = need(await f.database.read(scope => scope.sessions.get(input.sessionId)));
+    if (session.runtimeKind === 'durable') bindingAtPrepare = session.durableConversationId;
+    return originalPrepare(input);
+  };
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect(bindingAtPrepare).toBeGreaterThan(0);
+  const session = need(await f.database.read(scope => scope.sessions.get(created.sessionId)));
+  expect(session.runtimeKind === 'durable' && session.durableConversationId).toBe(bindingAtPrepare);
+  expect(f.requests).toHaveLength(1);
+}, 15_000);
+
+test('cloud coordination uses isolated real Durable stores even when their native Session IDs coincide', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true);
+  const workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const create = async (requestId: string, cloudRuntimeId: string) => need(await f.database.transaction(scope => scope.invoiceWorks.create({
+    personalAgentId: 1, expectedAgentRevision: 0, requestId, goal: 'Review the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId, cloudRuntimeId } })));
+  const first = await create('cloud-isolated-first', '11111111-1111-4111-8111-111111111111');
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  const second = await create('cloud-isolated-second', '22222222-2222-4222-8222-222222222222');
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  const sessions = await f.database.read(scope => scope.db.query<{ durable_runtime_id: string; durable_conversation_id: number }, [number, number]>(
+    'SELECT durable_runtime_id,durable_conversation_id FROM sessions WHERE id IN (?,?) ORDER BY id').all(first.sessionId, second.sessionId));
+  expect(sessions).toHaveLength(2);
+  expect(sessions[0]!.durable_runtime_id).not.toBe(sessions[1]!.durable_runtime_id);
+  expect(sessions[0]!.durable_conversation_id).toBe(sessions[1]!.durable_conversation_id);
+  expect(f.requests.map(context => context.work.workId)).toEqual([first.workId, second.workId]);
+}, 15_000);
+
+test('native cloud result outbox keeps the exact original submission across reopen and duplicate delivery', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true);
+  const binding = { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111' };
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-outbox-original', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number }, [number]>(
+    'SELECT request_id,attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  if (!phase || !f.cloudStore) throw Error('Expected the original native phase and isolated store.');
+  const query = { workId: work.workId, sessionId: work.sessionId, attemptId: phase.attempt_id, requestId: phase.request_id };
+  const view = need(await f.runtime.getSubmission(query)), observation = need(await f.runtime.observeSubmission(query));
+  if (!view || !observation || view.status !== 'done') throw Error('Expected the original native completion.');
+  const session = need(await f.cloudStore.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+  const submission = await session.storage.submission(view.nativeSubmissionId as SubmissionId, BACKGROUND_CONTEXT);
+  if (!submission || submission.type !== 'input' || submission.status !== 'done') throw Error('Expected the original submitted answer.');
+  const event = { version: 1 as const, ...binding, ...query, nativeConversationId: view.nativeConversationId,
+    nativeSubmissionId: view.nativeSubmissionId, nativeInputEntryId: observation.nativeEntryId, nativeAnswerEntryId: submission.answer,
+    consumedAt: observation.consumedAt, status: view.status, answer: view.answer, reason: view.reason };
+  expect(await session.enqueueResult({ ...event, answer: 'Changed original answer.' })).toMatchObject({ ok: false });
+  need(await session.enqueueResult(event)); need(await session.enqueueResult(event));
+  expect(await session.enqueueResult({ ...event, answer: 'Changed original answer.' })).toMatchObject({ ok: false });
+  expect(need(await session.pendingResults())).toMatchObject([{ event, attempts: 0 }]);
+  let historyChunks = 0;
+  const boundedHistory = { getSubmission: f.runtime.getSubmission.bind(f.runtime), observeSubmission: f.runtime.observeSubmission.bind(f.runtime),
+    queryHistory: async () => fail(appError('cloud_transport_unavailable', 'runtime', 'A full history page exceeds the transport boundary.')),
+    queryHistoryEntry: (input: Parameters<DurableRuntimePort['queryHistoryEntry']>[0]) => { historyChunks++;
+      return f.runtime.queryHistoryEntry({ ...input, limit: 17 }); } };
+  const firstReceipt = need(await new CloudNativeResultReceiver(f.database, boundedHistory, now).receive(event));
+  expect(historyChunks).toBeGreaterThan(1);
+  if (process.platform === 'linux') {
+    const root = mkdtempSync(join(tmpdir(), 'flowmate-result-wake-')); let wakes = 0;
+    const personal = { cloudAuthority: { workspaceId: binding.workspaceId, governor: f.governor, callbacks: {}, tools: [], attachQueue: () => {},
+      reconcilePhase: async () => ok(null) }, personal: {}, conditionsChanged: () => { wakes++; } } as unknown as import('../../../apps/personal-agent.ts').PersonalAgentRuntime;
+    const endpoints = need(await startCloudAuthorityEndpoints({ workspaceId: binding.workspaceId, database: f.database, personal, runtime: f.runtime,
+      files: createFileStore(f.paths, f.database), inspect: () => fail(appError('source_invalid', 'input', 'Unused.')),
+      now, readApiKey: () => undefined, desktopSocket: join(root, 'desktop.sock'), authoritySocket: join(root, 'authority.sock'), modelSocket: join(root, 'model.sock') }));
+    try {
+      expect(await callCloudUnixRpc(join(root, 'authority.sock'), { version: 1, method: 'nativeResult', request: event }))
+        .toEqual({ ok: true, data: { ok: true, data: firstReceipt } });
+      expect(wakes).toBe(1);
+    } finally { need(await endpoints.close()); }
+  }
+  await f.restart();
+  if (!f.cloudStore) throw Error('Expected the reopened isolated store.');
+  const reopened = need(await f.cloudStore.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+  expect(need(await reopened.pendingResults())).toMatchObject([{ event, attempts: 0 }]);
+  expect(need(await new CloudNativeResultReceiver(f.database, f.runtime, now).receive(event))).toEqual(firstReceipt);
+  const failure = { deliveryId: crypto.randomUUID(), at: '2000-01-01T00:00:00.000Z', nextAt: '2000-01-01T00:00:01.000Z' };
+  need(await reopened.recordDeliveryFailure(event, failure)); need(await reopened.recordDeliveryFailure(event, failure));
+  expect(need(await reopened.pendingResults())).toMatchObject([{ event, attempts: 1 }]);
+  for (let index = 0; index < 7; index++) need(await reopened.recordDeliveryFailure(event, { ...failure, deliveryId: crypto.randomUUID() }));
+  expect(need(await reopened.pendingResults())).toEqual([]);
+  expect(need(await reopened.listResults({ attemptId: query.attemptId, limit: 10 }))).toMatchObject({
+    items: [{ requestId: query.requestId, nativeSubmissionId: event.nativeSubmissionId, state: 'blocked', attempts: 8 }], nextAfterSubmissionId: null });
+  expect(await reopened.retryResultByIdentity({ attemptId: query.attemptId, requestId: 'another-phase', nativeSubmissionId: event.nativeSubmissionId }))
+    .toMatchObject({ ok: false });
+  need(await reopened.retryResultByIdentity({ attemptId: query.attemptId, requestId: query.requestId, nativeSubmissionId: event.nativeSubmissionId }));
+  expect(need(await reopened.pendingResults())).toMatchObject([{ event, attempts: 0 }]);
+  expect(await reopened.acknowledgeResult(event, { ...firstReceipt, workId: firstReceipt.workId + 1 })).toMatchObject({ ok: false });
+  expect(need(await reopened.pendingResults())).toHaveLength(1);
+  need(await reopened.acknowledgeResult(event, firstReceipt)); need(await reopened.acknowledgeResult(event, firstReceipt));
+  expect(await reopened.acknowledgeResult(event, { ...firstReceipt, receiptId: '22222222-2222-4222-8222-222222222222' })).toMatchObject({ ok: false });
+  expect(need(await reopened.pendingResults())).toEqual([]);
+}, 15_000);
+
+test('an oversized native answer stays available in its original entry and is shown as blocked', async () => {
+  const f = await fixture('oversize', 'off', 'cloud', true, true);
+  const binding = { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111' };
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-oversized-result', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
+  f.coordinator.wake();
+  let attemptId = 0;
+  await waitFor(async () => { const phase = await f.database.read(scope => scope.db.query<{ attempt_id: number }, [number]>(
+    'SELECT attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId)); if (!phase) return false;
+    attemptId = phase.attempt_id; const session = need(await f.cloudStore!.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+    return need(await session.listResults({ attemptId })).items.some(item => item.state === 'blocked' && item.blockedReason === 'size_limit');
+  }, 10_000);
+  const session = need(await f.cloudStore!.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+  const result = need(await session.listResults({ attemptId })).items[0]!;
+  expect(result).toMatchObject({ state: 'blocked', blockedReason: 'size_limit', nativeStatus: 'done' });
+  expect(await session.retryResultByIdentity({ attemptId, requestId: result.requestId, nativeSubmissionId: result.nativeSubmissionId }))
+    .toMatchObject({ ok: false, error: { code: 'cloud_result_too_large' } });
+  expect(need(await session.pendingResults())).toEqual([]); expect(f.requests).toHaveLength(1);
+  need(await f.coordinator.drain());
+  const saved = await f.database.read(scope => scope.db.query<{ run_id: number }, [number]>('SELECT run_id FROM invoice_work_attempts WHERE id=?').get(attemptId));
+  if (!saved) throw Error('Expected the original run.');
+  expect(need(await f.database.read(scope => scope.runs.get(saved.run_id)))).toMatchObject({ status: 'failed', output: null, error: { code: 'cloud_result_too_large' } });
+  await f.restart();
+  const reopened = need(await f.cloudStore!.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+  expect(need(await reopened.listResults({ attemptId })).items[0]).toMatchObject({ ...result });
+  const submission = await reopened.storage.submission(result.nativeSubmissionId as SubmissionId, BACKGROUND_CONTEXT);
+  if (!submission || submission.type !== 'input' || submission.status !== 'done') throw Error('Expected the original completed submission.');
+  const entry = await reopened.storage.entry(submission.answer, BACKGROUND_CONTEXT);
+  expect(JSON.stringify(entry)).toContain('x'.repeat(262_145));
+  expect(f.requests).toHaveLength(1);
+}, 20_000);
+
+test('cloud Runtime automatically records a completed native Submission in its outbox', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true);
+  const binding = { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111' };
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-auto-outbox', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  if (!f.cloudStore) throw Error('Expected the original cloud store.');
+  const session = need(await f.cloudStore.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+  await waitFor(async () => need(await session.pendingResults()).length === 1, 3_000);
+  expect(need(await session.pendingResults())[0]!.event).toMatchObject({ workId: work.workId, sessionId: work.sessionId,
+    status: 'done', nativeAnswerEntryId: expect.any(Number), answer: 'Original phase completed for human review.' });
+}, 15_000);
+
+test('a confirmed retryable cloud model failure uses a new durable attempt and the original Work budget', async () => {
+  const f = await fixture('retryable', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-retryable-503', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed'); expect(f.requests).toHaveLength(2);
+  const attempts = await f.database.read(scope => scope.db.query<{ model_attempt_id: string; transport_ordinal: number; state: string; http_status: number }, [number]>(
+    'SELECT model_attempt_id,transport_ordinal,state,http_status FROM cloud_model_attempts WHERE work_id=? ORDER BY transport_ordinal').all(work.workId));
+  expect(attempts.map(({ transport_ordinal, state, http_status }) => ({ transport_ordinal, state, http_status }))).toEqual([
+    { transport_ordinal: 0, state: 'confirmed', http_status: 503 }, { transport_ordinal: 1, state: 'confirmed', http_status: 200 }]);
+  expect(attempts[0]!.model_attempt_id).not.toBe(attempts[1]!.model_attempt_id);
+  expect(need(await f.governor.remainingBudget(work.workId)).modelCalls).toBe(14);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('the independent cloud Runtime retries a confirmed 503 through Authority sockets', async () => {
+  const f = await fixture('retryable', 'off', 'cloud', true, true, true, true, true, true, true, false, false, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-socket-retryable', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed'); expect(f.requests).toHaveLength(2);
+  const attempts = await f.database.read(scope => scope.db.query<{ transport_ordinal: number; http_status: number }, [number]>(
+    'SELECT transport_ordinal,http_status FROM cloud_model_attempts WHERE work_id=? ORDER BY transport_ordinal').all(work.workId));
+  expect(attempts).toEqual([{ transport_ordinal: 0, http_status: 503 }, { transport_ordinal: 1, http_status: 200 }]);
+}, 20_000);
+
+test('restart after a confirmed retryable failure reuses the original checkpoint and does not resend the failed attempt', async () => {
+  const f = await fixture('retryable', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-retryable-restart', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake();
+  await waitFor(async () => !!await f.database.read(scope => scope.db.query("SELECT model_attempt_id FROM cloud_model_attempts WHERE state='confirmed' AND http_status=503").get()), 5_000);
+  expect(f.requests).toHaveLength(1);
+  await f.restart(); need(await f.coordinator.recover());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed'); expect(f.requests).toHaveLength(2);
+  const attempts = await f.database.read(scope => scope.db.query<{ transport_ordinal: number; http_status: number }, [number]>(
+    'SELECT transport_ordinal,http_status FROM cloud_model_attempts WHERE work_id=? ORDER BY transport_ordinal').all(work.workId));
+  expect(attempts).toEqual([{ transport_ordinal: 0, http_status: 503 }, { transport_ordinal: 1, http_status: 200 }]);
+}, 20_000);
+
+test('repeated confirmed 503 failures stop after four original-checkpoint attempts', async () => {
+  const f = await fixture('fail', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-retryable-exhausted', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('failed'); expect(f.requests).toHaveLength(4);
+  const attempts = await f.database.read(scope => scope.db.query<{ transport_ordinal: number; http_status: number }, [number]>(
+    'SELECT transport_ordinal,http_status FROM cloud_model_attempts WHERE work_id=? ORDER BY transport_ordinal').all(work.workId));
+  expect(attempts).toEqual([0, 1, 2, 3].map(transport_ordinal => ({ transport_ordinal, http_status: 503 })));
+  expect(need(await f.governor.remainingBudget(work.workId)).modelCalls).toBe(12);
+}, 20_000);
+
+test('reopening a cloud Session repairs a missing outbox record without repeating its model request', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true);
+  const binding = { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111' };
+  if (!f.cloudStore) throw Error('Expected the original cloud store.');
+  const open = f.cloudStore.openSession.bind(f.cloudStore);
+  f.cloudStore.openSession = async (...input) => {
+    const result = await open(...input);
+    if (result.ok) result.data.enqueueResult = async () => fail(appError('cloud_result_unavailable', 'runtime', 'Controlled outbox interruption.', true));
+    return result;
+  };
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-outbox-repair', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number }, [number]>(
+    'SELECT request_id,attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  if (!phase) throw Error('Expected the original cloud phase.');
+  const originalCalls = f.requests.length; expect(originalCalls).toBe(1);
+  await f.restart();
+  need(await f.runtime.getSubmission({ workId: work.workId, sessionId: work.sessionId, attemptId: phase.attempt_id, requestId: phase.request_id }));
+  if (!f.cloudStore) throw Error('Expected the reopened cloud store.');
+  const session = need(await f.cloudStore.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+  await waitFor(async () => need(await session.pendingResults()).length === 1, 3_000);
+  expect(need(await session.pendingResults())[0]!.event).toMatchObject({ workId: work.workId, status: 'done' });
+  expect(f.requests).toHaveLength(originalCalls);
+}, 15_000);
+
+test('a real isolated cloud generation passes through the Authority model-attempt proxy', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-proxy-generation', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  const attempts = await f.database.read(scope => scope.db.query<{ state: string; request_json: string }, []>(
+    'SELECT state,request_json FROM cloud_model_attempts').all());
+  expect(attempts).toHaveLength(1); expect(attempts[0]!.state).toBe('confirmed');
+  expect(JSON.parse(attempts[0]!.request_json)).toMatchObject({ workId: work.workId, sessionId: work.sessionId,
+    model: 'coordination-local-model', nativeTaskId: expect.any(Number), checkpointEntryId: expect.any(Number),
+    modelAttemptId: expect.any(String) });
+}, 15_000);
+
+test('a cloud invoice child uses the same Authority proxy and shared Work model budget', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-proxy-child', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); const settled = await f.coordinator.drain();
+  if (!settled.ok) throw Error(JSON.stringify({ error: settled.error, reports: f.errors, phaseObservations: f.phaseObservations }));
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  const childRuns = await f.database.read(scope => scope.db.query('SELECT status,error_json FROM runs WHERE kind=\'subagent\'').all());
+  expect(childRuns).toMatchObject([{ status: 'completed' }]);
+  const attempts = await f.database.read(scope => scope.db.query<{ state: string; request_json: string }, []>(
+    'SELECT state,request_json FROM cloud_model_attempts ORDER BY created_at,rowid').all());
+  const facts = attempts.map(value => ({ state: value.state, request: JSON.parse(value.request_json) }));
+  expect(facts.filter(value => value.request.child)).toHaveLength(1);
+  if (!facts.every(value => value.state === 'confirmed')) throw Error(JSON.stringify({ states: facts.map(value => ({ state: value.state,
+    nativeTaskId: value.request.nativeTaskId, child: Boolean(value.request.child) })), reports: f.errors, phaseObservations: f.phaseObservations }));
+  expect(facts.every(value => value.state === 'confirmed')).toBe(true);
+  const child = facts.find(value => value.request.child)!;
+  const target = { workId: work.workId, sessionId: work.sessionId, attemptId: child.request.attemptId,
+    childRunId: child.request.child.childRunId, originToolCallId: child.request.child.originToolCallId };
+  expect(child.request).toMatchObject({ workId: work.workId, child: { childRunId: expect.any(Number), childSessionId: expect.any(Number) } });
+  expect(need(await f.governor.remainingBudget(work.workId)).modelCalls).toBe(16 - facts.length);
+  const report = createCloudChildReportReader(f.database, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  expect(need(await report(target))).toMatchObject({ ...target, output: { text: expect.any(String) } });
+  expect(await report({ ...target, originToolCallId: target.originToolCallId + 1 })).toMatchObject({ ok: false });
+  const anotherWorkspace = createCloudChildReportReader(f.database, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+  expect(await anotherWorkspace(target)).toMatchObject({ ok: false });
+}, 20_000);
+
+test('a confirmed retryable child model failure retains the original child and uses a new attempt', async () => {
+  const f = await fixture('child-retryable', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-child-retryable', goal: 'Check this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  const attempts = await f.database.read(scope => scope.db.query<{ request_json: string; transport_ordinal: number; http_status: number }, [number]>(
+    "SELECT request_json,transport_ordinal,http_status FROM cloud_model_attempts WHERE work_id=? AND json_extract(request_json,'$.child') IS NOT NULL ORDER BY transport_ordinal").all(work.workId));
+  expect(attempts.map(value => [value.transport_ordinal, value.http_status])).toEqual([[0, 503], [1, 200]]);
+  const children = attempts.map(value => JSON.parse(value.request_json).child.childRunId);
+  expect(children[0]).toBe(children[1]);
+  expect(await f.database.read(scope => scope.db.query("SELECT COUNT(*) count FROM runs WHERE kind='subagent'").get())).toEqual({ count: 1 });
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('native cloud parent and child use the real Unix model socket with Authority reservations', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-socket-child', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  const attempts = await f.database.read(scope => scope.db.query<{ state: string; child: number }, []>(
+    "SELECT state,json_extract(request_json,'$.child.childRunId') child FROM cloud_model_attempts ORDER BY rowid").all());
+  expect(attempts.filter(value => value.child !== null)).toHaveLength(1);
+  expect(attempts.every(value => value.state === 'confirmed')).toBe(true);
+  expect(need(await f.governor.remainingBudget(work.workId)).modelCalls).toBe(16 - attempts.length);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud parent and child cross both Runtime and model Unix sockets', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-two-sockets', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  expect(f.runtimeRpcRequests()).toBeGreaterThan(5);
+  const attempts = await f.database.read(scope => scope.db.query<{ state: string; child: number | null }, []>(
+    "SELECT state,json_extract(request_json,'$.child.childRunId') child FROM cloud_model_attempts").all());
+  expect(attempts.filter(value => value.child !== null)).toHaveLength(1);
+  expect(attempts.every(value => value.state === 'confirmed')).toBe(true);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud parent and child recheck product authority across a third Unix socket', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-three-sockets', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  expect(f.authorityRpcRequests()).toBeGreaterThan(10);
+  expect(f.runtimeRpcRequests()).toBeGreaterThan(5);
+  const attempts = await f.database.read(scope => scope.db.query<{ state: string; child: number | null }, []>(
+    "SELECT state,json_extract(request_json,'$.child.childRunId') child FROM cloud_model_attempts").all());
+  expect(attempts.filter(value => value.child !== null)).toHaveLength(1);
+  expect(attempts.every(value => value.state === 'confirmed')).toBe(true);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud native context and model authorization use the Authority callback socket', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-authority-callbacks', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  expect(f.authorityCallbackRequests()).toBeGreaterThan(3);
+  const attempts = await f.database.read(scope => scope.db.query<{ state: string; child: number | null }, []>(
+    "SELECT state,json_extract(request_json,'$.child.childRunId') child FROM cloud_model_attempts").all());
+  expect(attempts.filter(value => value.child !== null)).toHaveLength(1);
+  expect(attempts.every(value => value.state === 'confirmed')).toBe(true);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud invoice tools execute and deliver original receipts through the Authority socket', async () => {
+  const f = await fixture('candidate', 'off', 'cloud', true, true, true, true, true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-authority-tools', goal: 'Prepare the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  const view = await f.work(work.workId);
+  expect(view.work.execution.runStatus).toBe('completed'); expect(view.items[0]!.candidateRef).not.toBeNull();
+  expect(f.authorityToolRequests()).toBeGreaterThan(1);
+  const tools = await f.database.read(scope => scope.db.query<{ result_json: string | null }, []>(
+    'SELECT result_json FROM tool_calls ORDER BY id').all());
+  expect(tools).toHaveLength(2); expect(tools.every(call => call.result_json !== null)).toBe(true);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud invoice delegation crosses the Authority socket and returns the original child result', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true, true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-authority-delegation', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake();
+  const settled = await f.coordinator.drain();
+  if (!settled.ok) throw Error(JSON.stringify({ error: settled.error, reports: f.errors,
+    runs: await f.database.read(scope => scope.db.query('SELECT id,kind,status,session_id,ended_at,stopped_at,error_json FROM runs').all()),
+    sessions: await f.database.read(scope => scope.db.query('SELECT id,durable_conversation_id FROM sessions').all()),
+    calls: await f.database.read(scope => scope.db.query('SELECT id,tool_name,status,stopped_at FROM tool_calls').all()),
+    observations: f.childObservations, phases: await f.database.read(scope => scope.db.query('SELECT id,created_at,consumed_at,closed_at FROM invoice_work_phases').all()),
+    phaseObservations: f.phaseObservations }));
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  const children = await f.database.read(scope => scope.db.query<{ status: string }, []>("SELECT status FROM runs WHERE kind='subagent'").all());
+  expect(children).toEqual([{ status: 'completed' }]);
+  expect(f.authorityToolRequests()).toBeGreaterThan(1);
+  const calls = await f.database.read(scope => scope.db.query<{ child: number | null }, []>(
+    "SELECT json_extract(request_json,'$.child.childRunId') child FROM cloud_model_attempts").all());
+  expect(calls.filter(value => value.child !== null)).toHaveLength(1);
+  const observed = f.childObservations.find(value => (value as { creation?: string }).creation === 'created') as import('@flowmate/contracts').DurableSubagentObservation | undefined;
+  if (!observed) throw Error('The original child observation is missing.');
+  const child = { workId: observed.workId, sessionId: observed.sessionId, attemptId: observed.attemptId, requestId: observed.requestId,
+    childRunId: observed.childRunId, childSessionId: observed.childSessionId, originToolCallId: observed.originToolCallId,
+    nativeToolTaskId: observed.nativeToolTaskId };
+  const history = need(await f.runtime.queryHistoryPage({ workId: work.workId, sessionId: work.sessionId, child, limit: 100 }));
+  expect(history.owner).toMatchObject({ workId: work.workId, sessionId: child.childSessionId, childRunId: child.childRunId });
+  expect(history.entries.length).toBeGreaterThan(0);
+  expect(await f.runtime.queryHistoryPage({ workId: work.workId, sessionId: work.sessionId,
+    child: { ...child, requestId: 'another-original-phase' }, limit: 100 })).toMatchObject({ ok: false });
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud child plan, adoption and consumption callbacks cross the Authority socket', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true, true, true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-child-callbacks', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); const settled = await f.coordinator.drain();
+  if (!settled.ok) throw Error(JSON.stringify({ error: settled.error, reports: f.errors,
+    phases: await f.database.read(scope => scope.db.query('SELECT id,created_at,consumed_at,closed_at FROM invoice_work_phases').all()),
+    runs: await f.database.read(scope => scope.db.query('SELECT id,kind,status,session_id,ended_at,stopped_at,error_json FROM runs').all()),
+    observations: f.childObservations, phaseObservations: f.phaseObservations }));
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  expect(f.authoritySubagentRequests()).toBeGreaterThan(2);
+  const children = await f.database.read(scope => scope.db.query<{ status: string }, []>("SELECT status FROM runs WHERE kind='subagent'").all());
+  expect(children).toEqual([{ status: 'completed' }]);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('the cloud Runtime service executes a parent and child using only its sockets and native store', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true, true, true, true, true, false, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-runtime-service', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); const settled = await f.coordinator.drain();
+  if (!settled.ok) throw Error(JSON.stringify({ error: settled.error, reports: f.errors,
+    phases: await f.database.read(scope => scope.db.query('SELECT id,created_at,consumed_at,closed_at FROM invoice_work_phases').all()),
+    attempts: await f.database.read(scope => scope.db.query('SELECT id,run_id,stop_requested_at,stopped_at FROM invoice_work_attempts').all()),
+    runs: await f.database.read(scope => scope.db.query('SELECT id,kind,status,started_at,ended_at,stopped_at FROM runs').all()),
+    observations: f.childObservations, phaseObservations: f.phaseObservations }));
+  expect(f.usedRuntimeService()).toBe(true);
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  expect(f.authoritySubagentRequests()).toBeGreaterThan(2);
+  expect(f.authorityToolRequests()).toBeGreaterThan(1);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud Runtime delivers the original native terminal result to Authority automatically', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true, true, true, true, true, true, false, false, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-runtime-result-delivery', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); const settled = await f.coordinator.drain();
+  if (!settled.ok) throw Error(JSON.stringify({ error: settled.error, reports: f.errors,
+    phases: await f.database.read(scope => scope.db.query('SELECT id,created_at,consumed_at,closed_at FROM invoice_work_phases').all()),
+    attempts: await f.database.read(scope => scope.db.query('SELECT id,run_id,stop_requested_at,stopped_at FROM invoice_work_attempts').all()),
+    runs: await f.database.read(scope => scope.db.query('SELECT id,kind,status,started_at,ended_at,stopped_at FROM runs').all()),
+    phaseObservations: f.phaseObservations }));
+  await waitFor(async () => (await f.database.read(scope => scope.db.query<{ count: number }, [number]>(
+    'SELECT COUNT(*) count FROM cloud_native_result_receipts WHERE work_id=?').get(work.workId)))!.count === 1, 3_000);
+  expect(f.requests).toHaveLength(1);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('a restarted Runtime redelivers its persisted native result when Authority returns', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true, true, true, true, true, true, false, false, true);
+  f.setResultDelivery(false);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-result-restart', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  await waitFor(async () => f.authorityResultRequests() > 0, 3_000);
+  expect(await f.database.read(scope => scope.db.query('SELECT COUNT(*) count FROM cloud_native_result_receipts').get())).toEqual({ count: 0 });
+  const phase = await f.database.read(scope => scope.db.query<{ attempt_id: number }, [number]>(
+    'SELECT attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  if (!phase) throw Error('Expected the original phase.');
+  const owner = { workId: work.workId, sessionId: work.sessionId, attemptId: phase.attempt_id };
+  const before = need(await (f.runtime as DurableRuntimePort & { delivery: CloudRuntimeDeliveryPort }).delivery.status(owner));
+  await f.restart(); f.setResultDelivery(true);
+  const after = need(await (f.runtime as DurableRuntimePort & { delivery: CloudRuntimeDeliveryPort }).delivery.status(owner));
+  expect(after.runtimeGeneration).not.toBe(before.runtimeGeneration); expect(after.observationRevision).toBeGreaterThanOrEqual(before.observationRevision);
+  await waitFor(async () => (await f.database.read(scope => scope.db.query<{ count: number }, [number]>(
+    'SELECT COUNT(*) count FROM cloud_native_result_receipts WHERE work_id=?').get(work.workId)))!.count === 1, 6_000);
+  expect(f.requests).toHaveLength(1);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('manual delivery retry after a blocked outbox keeps the original result without another model call', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true, true, true, true, true, true, false, false, true);
+  f.setResultDelivery(false);
+  const binding = { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111' };
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-result-manual-retry', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  await waitFor(async () => f.authorityResultRequests() > 0, 3_000);
+  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number }, [number]>(
+    'SELECT request_id,attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  if (!phase) throw Error('Expected the original phase.');
+  let nativeSubmissionId = 0;
+  await f.restart(async () => {
+    const store = need(await openCloudRuntimeStore(f.cloudRoot));
+    try {
+      const session = need(await store.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
+      await waitFor(async () => need(await session.pendingResults()).length === 1, 4_000);
+      const original = need(await session.pendingResults())[0]!; nativeSubmissionId = original.event.nativeSubmissionId;
+      for (let attempts = original.attempts; attempts < 8; attempts++) need(await session.recordDeliveryFailure(original.event,
+        { deliveryId: crypto.randomUUID(), at: '2000-01-01T00:00:00.000Z', nextAt: '2000-01-01T00:00:01.000Z' }));
+    } finally { need(await store.close()); }
+  });
+  const delivery = (f.runtime as DurableRuntimePort & { delivery: CloudRuntimeDeliveryPort }).delivery;
+  const owner = { workId: work.workId, sessionId: work.sessionId, attemptId: phase.attempt_id };
+  const original = { ...owner, requestId: phase.request_id, nativeSubmissionId };
+  expect(need(await delivery.status(owner)).results.items).toMatchObject([{ requestId: original.requestId, nativeSubmissionId, state: 'blocked', attempts: 8 }]);
+  expect(await delivery.retry({ ...original, nativeSubmissionId: nativeSubmissionId + 1 })).toMatchObject({ ok: false });
+  f.setResultDelivery(true);
+  expect(await delivery.retry(original)).toMatchObject({ ok: true, data: { ...original, state: 'pending' } });
+  await waitFor(async () => (await f.database.read(scope => scope.db.query<{ count: number }, [number]>(
+    'SELECT COUNT(*) count FROM cloud_native_result_receipts WHERE work_id=?').get(work.workId)))!.count === 1, 5_000);
+  await waitFor(async () => need(await delivery.status(owner)).results.items[0]?.state === 'delivered', 5_000);
+  expect(f.requests).toHaveLength(1);
+  expect(await f.database.read(scope => scope.db.query('SELECT COUNT(*) count FROM cloud_native_result_receipts').get())).toEqual({ count: 1 });
+}, 25_000);
+
+test.skipIf(process.platform !== 'linux')('a lost Authority result receipt is recovered without another model call or business receipt', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true, true, true, true, true, true, false, false, true);
+  f.loseNextResultReceipt();
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-result-lost-ack', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  await waitFor(async () => f.authorityResultRequests() >= 2, 5_000);
+  expect(await f.database.read(scope => scope.db.query('SELECT COUNT(*) count FROM cloud_native_result_receipts').get())).toEqual({ count: 1 });
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed'); expect(f.requests).toHaveLength(1);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('stopping a delegated cloud Work aborts its original child through both sockets', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true, true, true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-authority-delegation-stop', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  const gate = f.holdNext(1); f.coordinator.wake();
+  try {
+    await waitFor(async () => f.requests.some(context => Boolean(context.delegation)), 5_000);
+    const current = await f.work(work.workId), attempt = current.work.execution.attempt;
+    if (!attempt) throw Error('Expected the original cloud attempt.');
+    const stopped = need(await f.tasks.stop({ workId: work.workId, attemptId: attempt.attemptId,
+      requestId: 'cloud-original-stop', expectedRevision: current.work.revision }));
+    expect(stopped.accepted).toBe(true);
+  } finally { gate.release.resolve(); }
+  need(await f.coordinator.drain());
+  const current = await f.work(work.workId);
+  expect(current.work.execution).toMatchObject({ runStatus: 'cancelled', stopUnconfirmed: false });
+  expect(f.requests.filter(context => Boolean(context.delegation))).toHaveLength(1);
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('a lost cross-socket cloud delegation never creates another child or resends its uncertain model call', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true, true, true, true, true, true);
+  need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-cross-socket-child-restart', goal: 'Independently check the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  const gate = f.holdNext(1); f.coordinator.wake();
+  await waitFor(async () => f.requests.some(context => Boolean(context.delegation)), 5_000);
+  const before = await f.database.read(scope => scope.db.query<{ model_attempt_id: string }, []>(
+    "SELECT model_attempt_id FROM cloud_model_attempts WHERE json_extract(request_json,'$.child') IS NOT NULL").get());
+  expect(before).not.toBeNull();
+  await f.restart(); gate.release.resolve();
+  const recovered = await f.coordinator.recover();
+  if (!recovered.ok) expect(['source_invalid', 'cloud_authorization_unavailable', 'tool_commit_unconfirmed', 'invoice_work_budget_unknown']).toContain(recovered.error.code);
+  const children = await f.database.read(scope => scope.db.query<{ count: number }, []>("SELECT COUNT(*) count FROM runs WHERE kind='subagent'").get());
+  expect(children).toEqual({ count: 1 });
+  const attempts = await f.database.read(scope => scope.db.query<{ model_attempt_id: string; state: string }, []>(
+    "SELECT model_attempt_id,state FROM cloud_model_attempts WHERE json_extract(request_json,'$.child') IS NOT NULL").all());
+  expect(attempts).toEqual([{ model_attempt_id: before!.model_attempt_id, state: 'uncertain' }]);
+  expect(f.requests.filter(context => Boolean(context.delegation))).toHaveLength(1);
+}, 20_000);
+
+test('cloud native compaction sends its summary through the same Authority proxy and Work budget', async () => {
+  const f = await fixture('compaction', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-proxy-compaction', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  const summary = await f.database.read(scope => scope.db.query<{ request_json: string; state: string }, []>(
+    "SELECT request_json,state FROM cloud_model_attempts WHERE json_extract(request_json,'$.kind')='compaction'").get());
+  expect(summary?.state).toBe('confirmed');
+  const original = JSON.parse(summary!.request_json);
+  const observed = need(await f.runtime.queryCompaction({ workId: work.workId, sessionId: work.sessionId,
+    attemptId: original.attemptId, requestId: original.requestId, operationId: original.compactionOperationId }));
+  expect(observed).toMatchObject({ nativeTaskId: original.nativeTaskId, outcome: 'completed', summarySaved: true });
+  const reservations = await f.database.read(scope => scope.db.query<{ count: number }, []>('SELECT SUM(count) count FROM invoice_work_model_reservations').get());
+  const attempts = await f.database.read(scope => scope.db.query<{ count: number }, []>('SELECT COUNT(*) count FROM cloud_model_attempts').get());
+  expect(reservations!.count).toBe(attempts!.count);
+}, 20_000);
+
+test('a confirmed retryable compaction failure retains the original summary task and uses a new attempt', async () => {
+  const f = await fixture('compaction-retryable', 'off', 'cloud', true, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-compaction-retryable', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  const attempts = await f.database.read(scope => scope.db.query<{ request_json: string; transport_ordinal: number; http_status: number }, [number]>(
+    "SELECT request_json,transport_ordinal,http_status FROM cloud_model_attempts WHERE work_id=? AND json_extract(request_json,'$.kind')='compaction' ORDER BY transport_ordinal").all(work.workId));
+  expect(attempts.map(value => [value.transport_ordinal, value.http_status])).toEqual([[0, 503], [1, 200]]);
+  const first = JSON.parse(attempts[0]!.request_json), second = JSON.parse(attempts[1]!.request_json);
+  expect(first.nativeTaskId).toBe(second.nativeTaskId); expect(first.modelAttemptId).not.toBe(second.modelAttemptId);
+  expect(need(await f.runtime.queryCompaction({ workId: work.workId, sessionId: work.sessionId, attemptId: first.attemptId,
+    requestId: first.requestId, operationId: first.compactionOperationId }))).toMatchObject({ nativeTaskId: first.nativeTaskId, outcome: 'completed', summarySaved: true });
+}, 20_000);
+
+test.skipIf(process.platform !== 'linux')('cloud compaction verifies its original plan through the Authority callback socket', async () => {
+  const f = await fixture('compaction', 'off', 'cloud', true, true, true, true, true, true, true, false, true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-compaction-callbacks', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect(f.authorityCompactionRequests()).toBeGreaterThan(1);
+  const attempts = await f.database.read(scope => scope.db.query<{ state: string }, [number]>(
+    "SELECT state FROM cloud_model_attempts WHERE work_id=? AND json_extract(request_json,'$.kind')='compaction'").all(work.workId));
+  expect(attempts).toEqual([{ state: 'confirmed' }]);
+}, 20_000);
+
+test('a lost real cloud generation response is not sent upstream again after runtime restart', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true, true);
+  need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-proxy-lost-response', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  const gate = f.holdNext(); f.coordinator.wake(); await waitFor(async () => f.requests.length > 0, 3_000);
+  const before = await f.database.read(scope => scope.db.query<{ model_attempt_id: string; state: string }, []>(
+    'SELECT model_attempt_id,state FROM cloud_model_attempts').get());
+  expect(before).toMatchObject({ model_attempt_id: expect.any(String), state: 'sending' });
+  await f.restart(); gate.release.resolve();
+  need(await f.coordinator.recover());
+  const after = await f.database.read(scope => scope.db.query<{ model_attempt_id: string; state: string }, []>(
+    'SELECT model_attempt_id,state FROM cloud_model_attempts').all());
+  expect(after).toEqual([{ model_attempt_id: before!.model_attempt_id, state: 'uncertain' }]);
+  expect(f.requests).toHaveLength(1);
+}, 15_000);
+
+test('a lost cloud child response keeps its original model identity after runtime restart', async () => {
+  const f = await fixture('child', 'off', 'cloud', true, true);
+  need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-proxy-lost-child', goal: 'Independently check this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  const gate = f.holdNext(1); f.coordinator.wake(); await waitFor(async () => f.requests.some(context => Boolean(context.delegation)), 5_000);
+  const before = await f.database.read(scope => scope.db.query<{ model_attempt_id: string; state: string }, []>(
+    "SELECT model_attempt_id,state FROM cloud_model_attempts WHERE json_extract(request_json,'$.child') IS NOT NULL").get());
+  expect(before).toMatchObject({ model_attempt_id: expect.any(String), state: 'sending' });
+  await f.restart(); gate.release.resolve();
+  need(await f.coordinator.recover());
+  const after = await f.database.read(scope => scope.db.query<{ model_attempt_id: string; state: string }, []>(
+    "SELECT model_attempt_id,state FROM cloud_model_attempts WHERE json_extract(request_json,'$.child') IS NOT NULL").all());
+  expect(after).toEqual([{ model_attempt_id: before!.model_attempt_id, state: 'uncertain' }]);
+  expect(f.requests.filter(context => Boolean(context.delegation))).toHaveLength(1);
+}, 20_000);
+
+test('isolated cloud runtime can shut down while a native model request remains held', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true);
+  need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-shutdown-held', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  const gate = f.holdNext(); f.coordinator.wake(); await waitFor(async () => f.requests.length > 0, 3_000);
+  const restarting = f.restart();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const closed = await Promise.race([restarting.then(() => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 3000); })]);
+    expect(closed).toBe(true);
+  } finally { if (timer) clearTimeout(timer); gate.release.resolve(); await restarting; }
+}, 15_000);
+
+test('isolated cloud coordinator recovers queued original Works after restarting before native allocation', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true);
+  const workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const runtimes = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'];
+  const works = await Promise.all(runtimes.map((cloudRuntimeId, index) => f.database.transaction(scope => need(scope.invoiceWorks.create({
+    personalAgentId: 1, expectedAgentRevision: 0, requestId: `cloud-recover-queued-${index}`,
+    goal: 'Review the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId, cloudRuntimeId } })) )));
+  await f.restart(); need(await f.coordinator.recover());
+  expect(f.requests.map(context => context.work.workId).sort()).toEqual(works.map(work => work.workId).sort());
+  for (const work of works) expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+  expect(await f.database.read(scope => scope.db.query('SELECT COUNT(*) count FROM invoice_work_attempts').get())).toEqual({ count: 2 });
+}, 15_000);
+
+test('cloud recovery keeps the original recovery intent after a temporary model-binding failure', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true);
+  const work = need(await f.database.transaction(scope => scope.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0,
+    requestId: 'cloud-recover-binding', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  f.observer.reconcile = async () => fail(appError('storage_write_failed', 'storage', 'Controlled product receipt outage.', true));
+  const gate = f.holdNext(); f.coordinator.wake();
+  expect(await f.coordinator.drain()).toMatchObject({ ok: false, error: { code: 'storage_write_failed' } });
+  const phase = await f.database.read(scope => scope.db.query<{ request_id: string }, [number]>(
+    'SELECT request_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  expect(phase).not.toBeNull();
+  await f.restart(); gate.release.resolve();
+  const originalRestore = f.models.restore.bind(f.models), originalResume = f.runtime.resumeAttempt.bind(f.runtime);
+  let failed = false, resumed = 0;
+  f.models.restore = async input => {
+    if (!failed) { failed = true; return fail(appError('provider_model_configuration_unavailable', 'runtime', 'Controlled restore outage.', true)); }
+    return originalRestore(input);
+  };
+  f.runtime.resumeAttempt = async input => { resumed++; return originalResume(input); };
+  expect(await f.coordinator.recover()).toMatchObject({ ok: false, error: { code: 'provider_model_configuration_unavailable' } });
+  f.coordinator.wake(); need(await f.coordinator.drain());
+  expect(resumed).toBe(1);
+  expect((await f.work(work.workId)).work.execution.runStatus).toBe('completed');
+}, 15_000);
+
+test('a recovered cloud Work does not keep an old transient coordination error at shutdown', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true), work = need(await f.database.transaction(scope => scope.invoiceWorks.create({
+    personalAgentId: 1, expectedAgentRevision: 0, requestId: 'cloud-transient-recovery', goal: 'Review the original invoice.',
+    documents: [{ id: 1, version: 'v1' }] }, { at: now(), admission: { kind: 'queued' }, runtimeOwner: {
+      workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111' } })));
+  const reconcile = f.observer.reconcile.bind(f.observer); let first = true;
+  f.observer.reconcile = async input => { if (first) { first = false; return fail(appError('cloud_transport_result_unknown', 'runtime', 'Controlled outage.', true)); }
+    return reconcile(input); };
+  f.coordinator.wake(); await waitFor(async () => f.errors.includes('cloud_transport_result_unknown'), 3_000);
+  f.coordinator.wake(); await waitFor(async () => (await f.work(work.workId)).work.execution.runStatus === 'completed', 5_000);
+  expect(await f.coordinator.close()).toEqual(ok(undefined));
+}, 15_000);
+
+test('successful recovery of one cloud Work does not clear another Work\'s unresolved error', async () => {
+  const f = await fixture('no-candidate', 'off', 'cloud', true), workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const create = (requestId: string, cloudRuntimeId: string) => f.database.transaction(scope => scope.invoiceWorks.create({
+    personalAgentId: 1, expectedAgentRevision: 0, requestId, goal: 'Review the original invoice.', documents: [{ id: 1, version: 'v1' }] },
+  { at: now(), admission: { kind: 'queued' }, runtimeOwner: { workspaceId, cloudRuntimeId } })).then(need);
+  const failed = await create('cloud-unresolved-one', '11111111-1111-4111-8111-111111111111');
+  const other = await create('cloud-unresolved-two', '22222222-2222-4222-8222-222222222222');
+  const reconcile = f.observer.reconcile.bind(f.observer);
+  f.observer.reconcile = async input => input.workId === failed.workId
+    ? fail(appError('cloud_transport_result_unknown', 'runtime', 'Controlled outage.', true)) : reconcile(input);
+  f.coordinator.wake();
+  await waitFor(async () => f.errors.includes('cloud_transport_result_unknown') && (await f.work(other.workId)).work.execution.runStatus === 'completed', 5_000);
+  expect(await f.coordinator.close()).toMatchObject({ ok: false, error: { code: 'cloud_transport_result_unknown' } });
 }, 15_000);
 
 test('cold recovery resumes an admitted native input with its stored model and context without resubmitting user input', async () => {

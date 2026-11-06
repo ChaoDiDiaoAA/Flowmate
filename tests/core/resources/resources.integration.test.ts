@@ -9,7 +9,7 @@ import { createApplication } from '../../../apps/composition.ts';
 import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import * as core from '../../../packages/core/src/index.ts';
 import * as pi from '../../../packages/runtime-pi/src/index.ts';
-import { canonicalResourceManifest, EMPTY_RESOURCE_SELECTION, ResourceManifestSchema, ResourceRefSchema, FrozenResourcesSchema, ok } from '../../../packages/contracts/src/index.ts';
+import { canonicalResourceManifest, EMPTY_RESOURCE_SELECTION, ResourceManifestSchema, ResourceRefSchema, FrozenResourcesSchema, resourceRefKey, ok } from '../../../packages/contracts/src/index.ts';
 import type { ResourceDependency, ResourceSelection, ToolDefinition, AgentRunEvent, RunScope, Result } from '../../../packages/contracts/src/index.ts';
 import { mkdtempSync, createHttpProvider, deferCleanup } from '../../support/resources.ts';
 
@@ -45,6 +45,57 @@ function fixture() {
 }
 
 describe('P11 real resource files and native discovery', () => {
+  it('keeps separately imported cloud versions available without replacing the registered original', () => {
+    const f = fixture(), original = f.pack('prompt', 'invoice', 'v1', 'Original invoice prompt.');
+    const importedRoot = join(f.root, 'cloud-imports'), dir = join(importedRoot, 'prompts', 'invoice', 'v2');
+    mkdirSync(dir, { recursive: true });
+    const text = 'A separately selected invoice prompt.';
+    const manifest = ResourceManifestSchema.parse({ ...original.manifest, version: 'v2', files: [{ path: 'prompt.md', bytes: Buffer.byteLength(text) }] });
+    writeFileSync(join(dir, 'resource.json'), JSON.stringify(manifest)); writeFileSync(join(dir, 'prompt.md'), text);
+    const ownerId = resourceRefKey({ ...original.ref, version: 'v2' });
+    f.contents.remember({ ownerKind: 'cloud-resource-manifest', ownerId, relativePath: 'resource.json' }, Buffer.from(JSON.stringify(manifest)));
+    f.contents.remember({ ownerKind: 'resource-author', ownerId, relativePath: 'resource.json' }, Buffer.from(canonicalResourceManifest(manifest)));
+    f.contents.remember({ ownerKind: 'resource-author', ownerId, relativePath: 'prompt.md' }, Buffer.from(text));
+    const hub = core.createResourceService({ resourceRoot: f.resourceRoot, importedResourceRoot: importedRoot,
+      bundleRoot: f.bundleRoot, contents: f.contents, registeredToolNames: tools, inspectNativeResources: f.inspect });
+    const oldSelection = { prompt: original.ref, enabledSkills: [] }, newRef = { ...original.ref, version: 'v2' },
+      newSelection = { prompt: newRef, enabledSkills: [] };
+    expect(hub.catalog({ revision: 1, selection: EMPTY_RESOURCE_SELECTION })).toMatchObject({ ok: true, data: { items: [
+      { ref: original.ref, available: true }, { ref: newRef, available: true },
+    ] } });
+    const old = hub.freeze({ selection: oldSelection, settingsRevision: 1, activeToolNames: tools, requiredSkill: null });
+    const next = hub.freeze({ selection: newSelection, settingsRevision: 2, activeToolNames: tools, requiredSkill: null });
+    expect(old.ok && old.data).toBeTruthy(); expect(next.ok && next.data).toBeTruthy();
+    if (!old.ok || !old.data || !next.ok || !next.data) throw Error('Both original resource versions must remain available.');
+    expect(hub.readFrozenFile(old.data, { ref: original.ref, path: 'prompt.md' })).toMatchObject({ ok: true, data: { text: original.bodyText } });
+    expect(hub.readFrozenFile(next.data, { ref: newRef, path: 'prompt.md' })).toMatchObject({ ok: true, data: { text } });
+  });
+
+  it('rejects an imported resource that reuses a registered version with different original bytes', () => {
+    const f = fixture(), original = f.pack('prompt', 'invoice', 'v1', 'Original invoice prompt.');
+    const importedRoot = join(f.root, 'cloud-imports'), dir = join(importedRoot, 'prompts', 'invoice', 'v1');
+    mkdirSync(join(dir, 'references'), { recursive: true });
+    writeFileSync(join(dir, 'resource.json'), readFileSync(join(original.dir, 'resource.json')));
+    writeFileSync(join(dir, 'prompt.md'), readFileSync(join(original.dir, 'prompt.md')));
+    writeFileSync(join(dir, 'references/field-rules.md'), readFileSync(join(original.dir, 'references/field-rules.md')));
+    const ownerId = resourceRefKey(original.ref);
+    f.contents.remember({ ownerKind: 'cloud-resource-manifest', ownerId, relativePath: 'resource.json' }, readFileSync(join(original.dir, 'resource.json')));
+    f.contents.remember({ ownerKind: 'resource-author', ownerId, relativePath: 'resource.json' }, Buffer.from(canonicalResourceManifest(original.manifest)));
+    for (const path of ['prompt.md', 'references/field-rules.md'])
+      f.contents.remember({ ownerKind: 'resource-author', ownerId, relativePath: path }, readFileSync(join(original.dir, path)));
+    const hub = core.createResourceService({ resourceRoot: f.resourceRoot, importedResourceRoot: importedRoot,
+      bundleRoot: f.bundleRoot, contents: f.contents, registeredToolNames: tools, inspectNativeResources: f.inspect });
+    const identical = hub.catalog({ revision: 1, selection: EMPTY_RESOURCE_SELECTION });
+    expect(identical).toMatchObject({ ok: true, data: { diagnostics: [], items: [{ ref: original.ref, available: true }] } });
+    writeFileSync(join(dir, 'prompt.md'), Buffer.alloc(Buffer.byteLength(original.bodyText), 88));
+    const catalog = hub.catalog({ revision: 1, selection: EMPTY_RESOURCE_SELECTION });
+    expect(catalog).toMatchObject({ ok: true, data: { diagnostics: [expect.objectContaining({ code: 'resource_version_changed' })] } });
+    if (!catalog.ok) throw Error('Expected the original resource diagnostics.');
+    expect(catalog.data.items.some(item => item.ref.id === 'invoice' && item.ref.version === 'v1' && item.available)).toBe(false);
+    expect(hub.freeze({ selection: { prompt: original.ref, enabledSkills: [] }, settingsRevision: 1,
+      activeToolNames: tools, requiredSkill: null })).toMatchObject({ ok: false });
+  });
+
   it('constructs without root contents and requires explicit current originals for nonempty resource operations', async () => {
     const f = fixture(), skill = f.pack('skill'), selection = { prompt: null, enabledSkills: [skill.ref] };
     const hub = core.createResourceService({ resourceRoot: f.resourceRoot, bundleRoot: f.bundleRoot,

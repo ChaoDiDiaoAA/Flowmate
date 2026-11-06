@@ -7,6 +7,8 @@ import { createInterface } from 'node:readline';
 import { StringDecoder } from 'node:string_decoder';
 import { protectedSecrets } from '../../../agent-eval/src/execution/evidence-safety.ts';
 import { HostDiagnosticCodeSchema, HostDiagnosticsResultSchema } from '@flowmate/contracts';
+import { CloudMaterialExportCommandSchema, isCloudMaterialExportHostCommand, parseCloudMaterialExportResult } from '@flowmate/contracts';
+import { CloudResourceExportCommandSchema, isCloudResourceExportHostCommand, parseCloudResourceExportResult } from '@flowmate/contracts';
 import { randomUUID } from 'node:crypto';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, RuntimeEventsWakeSchema, appError, fail, ok } from '@flowmate/contracts';
@@ -178,7 +180,7 @@ export class HostClient {
     if (!child || this.processExited || child.killed || child.stdin.destroyed || !child.stdin.writable) throw new Error('host_not_writable');
     const requestId = command.requestId ?? randomUUID();
     const rawMessage = { ...command, version: 1, requestId };
-    const message = isPersonalAgentHostCommand(command.type) || isResearchHostCommand(command.type) || isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type) || isInputDefinitionHostCommand(command.type)
+    const message = isCloudMaterialExportHostCommand(command.type) || isCloudResourceExportHostCommand(command.type) || isPersonalAgentHostCommand(command.type) || isResearchHostCommand(command.type) || isRuntimeHostCommand(command.type) || isWorkspaceHostCommand(command.type) || isContextHostCommand(command.type) || isHistoryHostCommand(command.type) || isCompactionHostCommand(command.type) || isResourceHostCommand(command.type) || isExtensionHostCommand(command.type) || isSubagentHostCommand(command.type) || isInputDefinitionHostCommand(command.type)
       ? parseHostCommand(rawMessage) : rawMessage as HostCommand;
     if (!message) throw new Error('host_protocol_invalid');
     return new Promise((resolve, reject) => {
@@ -325,7 +327,7 @@ export class HostClient {
 }
 
 export function parseHostResponse(command: HostCommand, output: Extract<HostOutput, { type: 'response' }>): unknown {
-  const guarded = command.type === 'query_diagnostics' || isPersonalAgentHostCommand(command.type) || isResearchHostCommand(command.type)
+  const guarded = command.type === 'query_diagnostics' || isCloudMaterialExportHostCommand(command.type) || isCloudResourceExportHostCommand(command.type) || isPersonalAgentHostCommand(command.type) || isResearchHostCommand(command.type)
     || isCompactionHostCommand(command.type) || isRuntimeHostCommand(command.type) || isHistoryHostCommand(command.type)
     || isContextHostCommand(command.type) || isInputDefinitionHostCommand(command.type) || isSubagentHostCommand(command.type)
     || isExtensionHostCommand(command.type) || isResourceHostCommand(command.type) || isWorkspaceHostCommand(command.type);
@@ -335,6 +337,12 @@ export function parseHostResponse(command: HostCommand, output: Extract<HostOutp
   if (command.type === 'query_diagnostics') {
     const result = HostDiagnosticsResultSchema.safeParse(output.value);
     value = result.success ? result.data : null;
+  } else if (isCloudMaterialExportHostCommand(command.type)) {
+    const captured = CloudMaterialExportCommandSchema.safeParse({ type: command.type, input: 'input' in command ? command.input : undefined });
+    value = captured.success ? parseCloudMaterialExportResult(captured.data, output.value) : null;
+  } else if (isCloudResourceExportHostCommand(command.type)) {
+    const captured = CloudResourceExportCommandSchema.safeParse({ type: command.type, input: 'input' in command ? command.input : undefined });
+    value = captured.success ? parseCloudResourceExportResult(captured.data, output.value) : null;
   } else if (isPersonalAgentHostCommand(command.type)) {
     value = parsePersonalAgentHostResult(command.type, output.value); matched = value !== null && matchesPersonalAgentResponse(command, value);
   } else if (isResearchHostCommand(command.type)) {

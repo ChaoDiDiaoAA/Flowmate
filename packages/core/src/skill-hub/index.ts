@@ -16,7 +16,7 @@ export { visibleFrozenSkills } from './capability-map.ts';
 
 type ResourceToolStore = Pick<SqlDatabaseStore, 'runs' | 'contents'> & Partial<Pick<SqlDatabaseStore, 'db' | 'invoiceWorkContexts'>>;
 
-export function createResourceService(options: { resourceRoot: string; bundleRoot: string; contents?: ManagedFileContents;
+export function createResourceService(options: { resourceRoot: string; importedResourceRoot?: string; bundleRoot: string; contents?: ManagedFileContents;
   registeredToolNames: readonly string[]; inspectNativeResources: InspectNativeResources;
   getRun?: (runId: number) => Result<RunSnapshot> }) {
   const loader = createResourceLoader(options), { discover } = loader;

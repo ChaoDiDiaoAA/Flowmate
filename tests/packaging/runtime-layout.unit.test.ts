@@ -55,6 +55,18 @@ describe('P17 runtime layout', () => {
     } });
   });
 
+  it('accepts both a legacy schema22 release and a schema23 release with its migration', () => {
+    const fixture = installation();
+    expect(resolveRuntimeLayout(fixture.input).ok).toBe(true);
+    const migration = 'apps/migrations/023_runtime_scopes.sql';
+    writeFileSync(join(fixture.runtime, migration), 'synthetic package asset');
+    const release = { ...fixture.release, schemaVersion: 23, files: [...fixture.release.files, migration] };
+    writeFileSync(fixture.manifest, JSON.stringify(release));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release } });
+    writeFileSync(fixture.manifest, JSON.stringify({ ...release, files: fixture.release.files }));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: false, error: { code: 'installation_runtime_invalid' } });
+  });
+
   it.each(['1.4.0', '1.4.4'])('recognizes only an explicitly supported Bun release for original and target package lookup: %s', bunVersion => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, bunVersion }));
     expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: { bunVersion } } });
@@ -72,7 +84,7 @@ describe('P17 runtime layout', () => {
     if (!result.ok) expect(result.error.code).toBe('installation_dependency_missing');
   });
 
-  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 23 }, { settingsVersion: 8 },
+  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 24 }, { settingsVersion: 8 },
     { arch: 'arm64' }, { platform: 'linux' }, { releaseId: 'not-an-id' }, { extra: 'untrusted' }])
   ('rejects an incompatible or malformed release: %j', change => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, ...change }));

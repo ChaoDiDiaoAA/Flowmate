@@ -164,6 +164,7 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
   runEvaluationWorkflow(input: import('./evaluation-workflow.ts').EvaluationWorkflowRequest): Promise<import('./runtime.ts').Result<import('./evaluation-workflow.ts').EvaluationWorkflowResult>>;
   personalAgent: import('./personal-agent.ts').PersonalAgentApi;
+  cloudDesktop: import('./cloud-desktop.ts').CloudDesktopApi;
   backgroundService: import('./background-service.ts').BackgroundServiceApi;
   invoiceWorks: import('./personal-agent.ts').InvoiceWorksApi;
   personalTasks: Omit<import('./personal-agent.ts').PersonalTasksApi, 'resume'>;

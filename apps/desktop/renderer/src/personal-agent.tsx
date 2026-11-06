@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { compareInvoiceWorkTimelineCursor, type DocumentSnapshot, type InvoiceWorkView, type InvoiceWorkItemView,
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { CLOUD_WORK_TIMEOUT_MS_MAX, CloudChildReportSchema, CloudDesktopConnectionSchema, CloudProgressEventSchema, CloudReviewAcceptReceiptSchema, compareInvoiceWorkTimelineCursor, ok, type CloudDesktopConnection, type DesktopBridge, type DocumentSnapshot, type InvoiceWorkView, type InvoiceWorkItemView,
   type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
   type PersonalAgentSnapshot, type PersonalHistoryPage, type PersonalHistoryEntry, type PersonalHistoryTarget,
   type PersonalTaskView, type PersonalTaskGetResult, type Result } from '@flowmate/contracts';
@@ -7,16 +7,100 @@ import { capturePersonalWrite, emptyPersonalDraft, executePersonalWrite, readPer
   savePersonalDraft, personalReceiptText, type PersonalDraft, type PersonalReviewTarget, type PersonalWriteCommand,
   type PersonalWriteReceipt } from './personal-state.ts';
 import { PersonalConfiguration } from './personal-configuration.tsx';
+import { createCloudPersonalBridge, prepareCloudPersonalWrite } from './cloud-personal-bridge.ts';
+import { CLOUD_CONNECTION_KEY, readCloudConnection, saveCloudConnection } from './cloud-connection-state.ts';
+import { CloudInvoiceReview } from './cloud-invoice-review.tsx';
+import { CloudQueuePanel } from './cloud-queue.tsx';
+import { CloudDeliveryPanel } from './cloud-delivery.tsx';
 
 type Props = { ready: boolean; hostEpoch: number; models: readonly ModelProfile[];
   onModels(): void; onOpenInvoice(target: PersonalReviewTarget): Promise<void> };
+type WorkspaceProps = Props & { personal?: Pick<DesktopBridge, 'personalAgent' | 'invoiceWorks' | 'personalTasks'>;
+  cloudWorkspaceId?: string; localReady?: boolean };
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(result.error.message); return result.data; }
 const requestId = () => crypto.randomUUID();
 const title = (value: string) => value.replaceAll('_', ' ');
 const supplementKey = (workId: number, itemId: number, todoId: number) => `${workId}:${itemId}:${todoId}`;
 
 export function PersonalAgentPage(props: Props) {
-  const [initial] = useState(() => readPersonalDraft(localStorage));
+  const [mode, setMode] = useState<'local' | 'cloud'>('local');
+  return <><div className="page-content"><div className="button-row" role="group" aria-label="Personal Agent location">
+    <button type="button" aria-pressed={mode === 'local'} onClick={() => setMode('local')}>Local workspace</button>
+    <button type="button" aria-pressed={mode === 'cloud'} onClick={() => setMode('cloud')}>Cloud workspace</button>
+  </div></div>{mode === 'local' ? <PersonalAgentWorkspace {...props} /> : <CloudPersonalWorkspace {...props} />}</>;
+}
+
+function newCloudProfile(): CloudDesktopConnection {
+  return { workspaceId: crypto.randomUUID(), target: { host: '', port: 22, username: 'flowmate-bridge', privateKeyPath: '', knownHostsPath: '' } };
+}
+
+function CloudPersonalWorkspace(props: Props) {
+  const [saved] = useState(() => readCloudConnection(localStorage));
+  const [profile, setProfile] = useState<CloudDesktopConnection>(saved.ok && saved.data ? saved.data : newCloudProfile());
+  const [unreadable, setUnreadable] = useState(!saved.ok);
+  const [profileError, setProfileError] = useState<string | null>(saved.ok ? null : saved.error.message);
+  const [connected, setConnected] = useState<string | null>(null), [busy, setBusy] = useState(false);
+  const [reviewTarget, setReviewTarget] = useState<PersonalReviewTarget | null>(null);
+  const personal = useMemo(() => connected ? createCloudPersonalBridge(window.flowmate.cloudDesktop, connected) : null, [connected]);
+  useEffect(() => { let live = true; void window.flowmate.cloudDesktop.state().then(result => {
+    if (!live) return; if (result.ok) setConnected(result.data.workspaceId); else setProfileError(result.error.message);
+  }); return () => { live = false; }; }, []);
+  async function connect() {
+    if (busy || unreadable) return;
+    const parsed = CloudDesktopConnectionSchema.safeParse(profile);
+    if (!parsed.success) { setProfileError('Enter a valid workspace ID, non-root SSH account, host, port and key file paths.'); return; }
+    if (!saveCloudConnection(localStorage, parsed.data)) { setProfileError('The cloud connection settings could not be saved.'); return; }
+    setBusy(true);
+    try { const result = await window.flowmate.cloudDesktop.connect(parsed.data);
+      if (result.ok) { setConnected(result.data.workspaceId); setProfileError(null); }
+      else setProfileError(result.error.message);
+    } finally { setBusy(false); }
+  }
+  async function disconnect() {
+    if (!connected || busy) return; setBusy(true);
+    try { const result = await window.flowmate.cloudDesktop.disconnect({ workspaceId: connected });
+      if (result.ok) { setConnected(null); setReviewTarget(null); setProfileError(null); } else setProfileError(result.error.message);
+    } finally { setBusy(false); }
+  }
+  const update = (value: Partial<CloudDesktopConnection['target']>) => { setProfile(previous => ({ ...previous, target: { ...previous.target, ...value } }));
+    if (!unreadable) setProfileError(null); };
+  return <><section className="page-content" aria-label="Cloud connection"><div className="panel"><h2>Cloud connection</h2>
+    <p>Use a dedicated non-root SSH account and a known_hosts file whose server key you have verified. Passwords are not stored here.</p>
+    {profileError && <p role="alert" className="notice bad">{profileError}</p>}
+    {unreadable && <button type="button" onClick={() => { try { localStorage.removeItem(CLOUD_CONNECTION_KEY);
+      setProfile(newCloudProfile()); setUnreadable(false); setProfileError(null); } catch { setProfileError('The unreadable connection settings could not be cleared.'); } }}>Discard unreadable connection settings</button>}
+    <fieldset disabled={busy || connected !== null || unreadable}>
+      <label className="field"><span>Cloud workspace ID</span><input value={profile.workspaceId} onChange={event => { setProfile({ ...profile, workspaceId: event.target.value }); if (!unreadable) setProfileError(null); }} /></label>
+      <label className="field"><span>SSH host</span><input value={profile.target.host} onChange={event => update({ host: event.target.value })} /></label>
+      <label className="field"><span>SSH port</span><input type="number" min={1} max={65535} value={profile.target.port} onChange={event => update({ port: Number(event.target.value) })} /></label>
+      <label className="field"><span>SSH user</span><input value={profile.target.username} onChange={event => update({ username: event.target.value })} /></label>
+      <label className="field"><span>SSH private key path</span><input value={profile.target.privateKeyPath} onChange={event => update({ privateKeyPath: event.target.value })} /></label>
+      <label className="field"><span>Verified known_hosts path</span><input value={profile.target.knownHostsPath} onChange={event => update({ knownHostsPath: event.target.value })} /></label>
+    </fieldset>
+    {connected ? <><p role="status">Connected workspace: {connected}</p><button type="button" disabled={busy} onClick={() => void disconnect()}>Disconnect cloud</button>
+      {connected !== profile.workspaceId && <p role="alert">The connected workspace differs from the saved connection. Disconnect before choosing another.</p>}</>
+      : <button type="button" disabled={busy || unreadable} onClick={() => void connect()}>Connect to cloud</button>}
+  </div></section>
+  {connected && connected === profile.workspaceId && personal && (reviewTarget
+    ? <CloudInvoiceReview workspaceId={connected} target={reviewTarget} onClose={() => setReviewTarget(null)} onAcceptancePrepared={(target, request) => {
+      const current = readPersonalDraft(localStorage, connected); if (!current.ok) return false;
+      const prior = current.data.review?.acceptRequest;
+      if (prior && JSON.stringify(prior) !== JSON.stringify(request)) return false;
+      return savePersonalDraft(localStorage, { ...current.data, selectedWorkId: target.workId, review: { target, acceptRequest: request } }, connected);
+    }} />
+    : <PersonalAgentWorkspace {...props} key={connected} ready={true} localReady={props.ready} cloudWorkspaceId={connected} personal={personal}
+      onOpenInvoice={async target => {
+        const current = readPersonalDraft(localStorage, connected); if (!current.ok) throw Error(current.error.message);
+        if (current.data.review?.acceptRequest && (current.data.review.target.workId !== target.workId || current.data.review.target.itemId !== target.itemId))
+          throw Error('The original cloud acceptance for another invoice is retained. Confirm it before reviewing another invoice.');
+        setReviewTarget(target);
+      }} />)}
+  </>;
+}
+
+export function PersonalAgentWorkspace(props: WorkspaceProps) {
+  const personal = props.personal ?? window.flowmate, cloud = props.cloudWorkspaceId;
+  const [initial] = useState(() => readPersonalDraft(localStorage, cloud));
   const [draft, setDraft] = useState<PersonalDraft>(initial.ok ? initial.data : emptyPersonalDraft());
   const draftRef = useRef(draft);
   const [draftError, setDraftError] = useState(initial.ok ? null : initial.error.message);
@@ -24,11 +108,17 @@ export function PersonalAgentPage(props: Props) {
   const [configuration, setConfiguration] = useState<{ revision: number; value: PersonalAgentConfiguration } | null>(null);
   const [works, setWorks] = useState<readonly InvoiceWorkView[]>([]), [workCursor, setWorkCursor] = useState<number | null>(null);
   const [work, setWork] = useState<InvoiceWorkView | null>(null), [items, setItems] = useState<readonly InvoiceWorkItemView[]>([]);
+  const [progressVersion, setProgressVersion] = useState(0), [progressRetry, setProgressRetry] = useState(0), [progressError, setProgressError] = useState<string | null>(null);
+  const [liveOutput, setLiveOutput] = useState<{ attemptId: number; requestId: string; modelAttemptId: string; text: string; truncated: boolean } | null>(null);
   const [itemCursor, setItemCursor] = useState<number | null>(null), [selectedItem, setSelectedItem] = useState<InvoiceWorkItemView | null>(null);
+  const selectedItemRef = useRef(selectedItem);
+  useEffect(() => { selectedItemRef.current = selectedItem; }, [selectedItem]);
   const [todos, setTodos] = useState<readonly InvoiceWorkTodoView[]>([]), [todoCursor, setTodoCursor] = useState<number | null>(null);
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]), [documentCursor, setDocumentCursor] = useState<number | null>(null);
   const [tasks, setTasks] = useState<readonly PersonalTaskView[]>([]), [taskCursor, setTaskCursor] = useState<number | null>(null);
   const [task, setTask] = useState<PersonalTaskGetResult | null>(null);
+  const taskRef = useRef(task);
+  useEffect(() => { taskRef.current = task; }, [task]);
   const [timeline, setTimeline] = useState<InvoiceWorkTimelinePage | null>(null);
   const [history, setHistory] = useState<PersonalHistoryPage | null>(null), [historyDetail, setHistoryDetail] = useState<PersonalHistoryEntry | null>(null);
   const [creating, setCreating] = useState(false), [view, setView] = useState<'Invoices' | 'Tasks' | 'History' | 'Timeline'>('Invoices');
@@ -40,7 +130,7 @@ export function PersonalAgentPage(props: Props) {
 
   function persist(change: Partial<PersonalDraft>): boolean {
     const next = { ...draftRef.current, ...change };
-    if (!savePersonalDraft(localStorage, next)) { setDraftError('Your draft could not be saved. No command was submitted.'); return false; }
+    if (!savePersonalDraft(localStorage, next, cloud)) { setDraftError('Your draft could not be saved. No command was submitted.'); return false; }
     draftRef.current = next; setDraft(next); setDraftError(null); return true;
   }
   function current(token: number) { return token === generation.current; }
@@ -48,10 +138,11 @@ export function PersonalAgentPage(props: Props) {
     const workId = draftRef.current.selectedWorkId; if (workId === null) return;
     const token = ++itemGeneration.current;
     try {
-      const page = need(await window.flowmate.invoiceWorks.get({ view: 'item', workId, itemId,
+      const page = need(await personal.invoiceWorks.get({ view: 'item', workId, itemId,
         ...(append && todoCursor !== null ? { afterTodoId: todoCursor } : {}), limit: 50 }));
       if (token !== itemGeneration.current || workId !== draftRef.current.selectedWorkId || page.view !== 'item') return;
-      setWork(page.work); setSelectedItem(page.item); setDecision('');
+      setWork(page.work); setSelectedItem(page.item);
+      if (!cloud || selectedItemRef.current?.workId !== workId || selectedItemRef.current.itemId !== itemId) setDecision('');
       setTodos(previous => append ? [...previous, ...page.todos] : page.todos); setTodoCursor(page.nextAfterTodoId);
     } catch (cause) { if (token === itemGeneration.current) setError(cause instanceof Error ? cause.message : 'The original invoice could not be read.'); }
   }
@@ -59,35 +150,71 @@ export function PersonalAgentPage(props: Props) {
     const workId = draftRef.current.selectedWorkId; if (workId === null) return;
     const token = ++taskGeneration.current;
     try {
-      const result = need(await window.flowmate.personalTasks.get({ workId, attemptId,
+      const result = need(await personal.personalTasks.get({ workId, attemptId,
         ...(append && task?.nextAfterChildRunId ? { afterChildRunId: task.nextAfterChildRunId } : {}), limit: 50 }));
       if (token !== taskGeneration.current || workId !== draftRef.current.selectedWorkId) return;
       setTask(previous => append && previous?.task.attempt.attemptId === attemptId
-        ? { ...result, children: [...previous.children, ...result.children] } : result); setReport(null);
+        ? { ...result, children: [...previous.children, ...result.children] } : result);
+      if (!cloud || taskRef.current?.task.workId !== workId || taskRef.current.task.attempt.attemptId !== attemptId) setReport(null);
     } catch (cause) { if (token === taskGeneration.current) setError(cause instanceof Error ? cause.message : 'The original task could not be read.'); }
   }
   async function refresh(workId = draftRef.current.selectedWorkId) {
     const token = ++generation.current; setLoading(true); setError(null);
     try {
-      const [savedAgent, material] = await Promise.all([window.flowmate.personalAgent.get(), window.flowmate.listDocuments({ limit: 50 })]);
+      const [savedAgent, material] = await Promise.all([personal.personalAgent.get(), props.localReady === false
+        ? Promise.resolve(ok({ items: [], nextBeforeId: null })) : window.flowmate.listDocuments({ limit: 50 })]);
       const assistant = need(savedAgent), docs = need(material);
-      const list = need(await window.flowmate.invoiceWorks.list({ personalAgentId: assistant.personalAgentId, limit: 30 }));
+      const list = need(await personal.invoiceWorks.list({ personalAgentId: assistant.personalAgentId, limit: 30 }));
       if (!current(token)) return;
       setAgent(assistant); setConfiguration(previous => previous ?? { revision: assistant.revision, value: structuredClone(assistant.configuration) });
       setWorks(list.items); setWorkCursor(list.nextBeforeId); setDocuments(docs.items); setDocumentCursor(docs.nextBeforeId);
       if (workId === null) { setWork(null); setItems([]); setTasks([]); setTask(null); setTimeline(null); return; }
-      const [saved, attempts, activity] = await Promise.all([window.flowmate.invoiceWorks.get({ view: 'work', workId, limit: 50 }),
-        window.flowmate.personalTasks.list({ workId, limit: 30 }), window.flowmate.invoiceWorks.timeline({ workId, limit: 50 })]);
+      const [saved, attempts, activity] = await Promise.all([personal.invoiceWorks.get({ view: 'work', workId, limit: 50 }),
+        personal.personalTasks.list({ workId, limit: 30 }), personal.invoiceWorks.timeline({ workId, limit: 50 })]);
       const value = need(saved), executions = need(attempts), events = need(activity);
       if (!current(token) || workId !== draftRef.current.selectedWorkId || value.view !== 'work') return;
       setWork(value.work); setItems(value.items); setItemCursor(value.nextAfterItemId); setTasks(executions.items); setTaskCursor(executions.nextBeforeAttemptId); setTimeline(events);
       if (selectedItem?.workId === workId) void readItem(selectedItem.itemId);
-      const attemptId = value.work.execution.attempt?.attemptId ?? executions.items[0]?.attempt.attemptId;
+      const attemptId = cloud && taskRef.current?.task.workId === workId ? taskRef.current.task.attempt.attemptId
+        : value.work.execution.attempt?.attemptId ?? executions.items[0]?.attempt.attemptId;
       if (attemptId !== undefined) void readTask(attemptId); else setTask(null);
     } catch (cause) { if (current(token)) setError(cause instanceof Error ? cause.message : 'Personal Agent could not be read.'); }
     finally { if (current(token)) setLoading(false); }
   }
   useEffect(() => { if (props.ready) void refresh(); return () => { generation.current++; itemGeneration.current++; taskGeneration.current++; historyGeneration.current++; }; }, [props.ready, props.hostEpoch]);
+  const refreshRef = useRef(refresh);
+  useEffect(() => { refreshRef.current = refresh; });
+  useEffect(() => {
+    if (!cloud || !props.ready || !work) return;
+    let active = true, cursor: { generation: string; sequence: number } | null = null, idle = 0;
+    const owner = { workId: work.workId, sessionId: work.sessionId }, attemptId = work.execution.attempt?.attemptId;
+    setProgressError(null); setLiveOutput(null);
+    void (async () => {
+      while (active) {
+        const result = await window.flowmate.cloudDesktop.request({ workspaceId: cloud, command: { type: 'cloud_progress_wait', input: { ...owner, cursor } } });
+        if (!active) return;
+        if (!result.ok) { setLiveOutput(null); setProgressError('Live cloud updates are unavailable. Refresh or reconnect the cloud workspace.'); return; }
+        const parsed = CloudProgressEventSchema.safeParse(result.data);
+        if (!parsed.success || parsed.data.workId !== owner.workId || parsed.data.sessionId !== owner.sessionId) {
+          setLiveOutput(null); setProgressError('Live cloud updates could not be verified. Refresh or reconnect the cloud workspace.'); return;
+        }
+        const event = parsed.data; cursor = event.cursor;
+        if (event.resync) setLiveOutput(null);
+        for (const fragment of event.fragments) if (fragment.attemptId === attemptId) setLiveOutput(previous => {
+          const same = previous?.attemptId === fragment.attemptId && previous.requestId === fragment.requestId
+            && previous.modelAttemptId === fragment.modelAttemptId;
+          const text = (same ? previous.text : '') + fragment.text, truncated = (same && previous.truncated) || text.length > 32_000;
+          const clipped = text.slice(-32_000);
+          return { ...fragment, text: text.length > 32_000 && /^[\uDC00-\uDFFF]/.test(clipped) ? clipped.slice(1) : clipped, truncated };
+        });
+        if (event.snapshotChanged || event.resync || !event.changed && ++idle >= 5) {
+          idle = 0; await refreshRef.current(owner.workId);
+          if (active) setProgressVersion(value => value + 1);
+        }
+      }
+    })();
+    return () => { active = false; };
+  }, [cloud, props.ready, work?.workId, work?.sessionId, work?.execution.attempt?.attemptId, progressRetry]);
   useEffect(() => { if (creating) goalInput.current?.focus(); }, [creating]);
 
   async function operate(action: () => Promise<void>) {
@@ -112,20 +239,21 @@ export function PersonalAgentPage(props: Props) {
   }
   async function submit(raw: unknown) {
     if (draftRef.current.pending || draftError) return;
-    const command = capturePersonalWrite(raw); if (!command) throw Error('The invoice command is incomplete or exceeds its size limit.');
+    let command = capturePersonalWrite(raw); if (!command) throw Error('The invoice command is incomplete or exceeds its size limit.');
+    if (cloud) command = need(await prepareCloudPersonalWrite(window.flowmate.cloudDesktop, cloud, command));
     if (!persist({ pending: command })) return;
-    const result = await executePersonalWrite(window.flowmate, command);
+    const result = await executePersonalWrite(personal, command);
     if (result.ok) { await acceptReceipt(result.data); return; }
     if (['input_invalid', 'state_conflict', 'source_invalid', 'invoice_work_closed'].includes(result.error.code)) persist({ pending: null });
     setError(result.error.message); setReceiptMissing(false);
   }
   async function recover(retry = false) {
     const original = draftRef.current.pending; if (!original) return;
-    const receipt = await recoverPersonalWrite(window.flowmate, original);
+    const receipt = await recoverPersonalWrite(personal, original);
     if (!receipt.ok) throw Error(receipt.error.message);
     if (receipt.data) { await acceptReceipt(receipt.data); return; }
     setReceiptMissing(true); setMessage('No saved receipt was found. Your original request and draft are retained.');
-    if (retry) { const result = await executePersonalWrite(window.flowmate, original); if (!result.ok) throw Error(result.error.message); await acceptReceipt(result.data); }
+    if (retry) { const result = await executePersonalWrite(personal, original); if (!result.ok) throw Error(result.error.message); await acceptReceipt(result.data); }
   }
   async function selectWork(workId: number) {
     if (!persist({ selectedWorkId: workId })) return;
@@ -136,7 +264,7 @@ export function PersonalAgentPage(props: Props) {
   async function readHistory(target: PersonalHistoryTarget, append = false) {
     const token = ++historyGeneration.current;
     try {
-      const page = need(await window.flowmate.personalTasks.history({ target, limit: 30,
+      const page = need(await personal.personalTasks.history({ target, limit: 30,
         ...(append && history?.nextBeforeEntryId ? { throughEntryId: history.throughEntryId, beforeEntryId: history.nextBeforeEntryId } : {}) }));
       if (token !== historyGeneration.current || target.workId !== draftRef.current.selectedWorkId) return;
       setHistory(previous => append && previous?.owner.sessionId === page.owner.sessionId ? { ...page, entries: [...previous.entries, ...page.entries] } : page);
@@ -146,11 +274,18 @@ export function PersonalAgentPage(props: Props) {
   async function readEntry(entryId: number, offset = 0) {
     if (!history) return; const token = ++historyGeneration.current;
     const target = { workId: history.owner.workId, ...(history.owner.childRunId === null ? {} : { childRunId: history.owner.childRunId }) };
-    const detail = need(await window.flowmate.personalTasks.historyEntry({ target, entryId, throughEntryId: history.throughEntryId, offset, limit: 8192 }));
+    const detail = need(await personal.personalTasks.historyEntry({ target, entryId, throughEntryId: history.throughEntryId, offset, limit: 8192 }));
     if (token === historyGeneration.current && target.workId === draftRef.current.selectedWorkId) setHistoryDetail(detail);
   }
   async function originalAcceptance(review: NonNullable<PersonalDraft['review']>) {
     if (!review.acceptRequest) throw Error('The original acceptance request is not available.');
+    if (cloud) {
+      const result = need(await window.flowmate.cloudDesktop.request({ workspaceId: cloud, command: { type: 'cloud_review_query_accept',
+        input: { workId: review.target.workId, itemId: review.target.itemId, documentRef: review.target.documentRef, request: review.acceptRequest } } }));
+      const receipt = CloudReviewAcceptReceiptSchema.safeParse(result);
+      if (!receipt.success) throw Error('The original cloud acceptance is not confirmed.');
+      return { candidate: { candidateId: receipt.data.candidateId, sequence: receipt.data.sequence, status: receipt.data.status }, job: { jobId: receipt.data.jobId } };
+    }
     const original = need(await window.flowmate.queryInvoiceCandidateOperation({ kind: 'accept', request: review.acceptRequest }));
     if (!original || !('candidate' in original) || !('job' in original) || original.candidate.status !== 'accepted'
       || original.candidate.candidateId !== review.acceptRequest.candidateId || original.job.jobId !== review.acceptRequest.jobId)
@@ -162,7 +297,7 @@ export function PersonalAgentPage(props: Props) {
     const token = generation.current;
     await originalAcceptance(review);
     if (!current(token)) return;
-    const saved = need(await window.flowmate.invoiceWorks.get({ view: 'item', workId: review.target.workId, itemId: review.target.itemId, limit: 1 }));
+    const saved = need(await personal.invoiceWorks.get({ view: 'item', workId: review.target.workId, itemId: review.target.itemId, limit: 1 }));
     if (!current(token)) return;
     if (saved.view !== 'item' || saved.item.documentRef.id !== review.target.documentRef.id || saved.item.documentRef.version !== review.target.documentRef.version)
       throw Error('The original Work invoice has changed.');
@@ -177,7 +312,7 @@ export function PersonalAgentPage(props: Props) {
   async function attachAcceptance() {
     const review = draftRef.current.review; if (!review?.acceptRequest || !work || work.workId !== review.target.workId) return;
     const original = await originalAcceptance(review);
-    const item = need(await window.flowmate.invoiceWorks.get({ view: 'item', workId: work.workId, itemId: review.target.itemId, limit: 1 }));
+    const item = need(await personal.invoiceWorks.get({ view: 'item', workId: work.workId, itemId: review.target.itemId, limit: 1 }));
     if (item.view !== 'item' || item.item.documentRef.id !== review.target.documentRef.id || item.item.documentRef.version !== review.target.documentRef.version)
       throw Error('The original Work invoice has changed.');
     await submit({ type: 'invoice_work_dispose_item', input: { workId: work.workId, itemId: item.item.itemId,
@@ -187,7 +322,7 @@ export function PersonalAgentPage(props: Props) {
   const writeDisabled = !props.ready || saving || loading || draft.pending !== null || draftError !== null;
   const eligible = documents.filter(document => !document.isHidden && document.status === 'available');
   const action = (kind: 'continue' | 'stop' | 'cancel') => work?.actions.find(value => value.kind === kind);
-  const displayDocument = (id: number) => documents.find(document => document.documentRef.id === id)?.displayName ?? `Invoice ${id}`;
+  const displayDocument = (id: number) => cloud ? `Cloud invoice ${id}` : documents.find(document => document.documentRef.id === id)?.displayName ?? `Invoice ${id}`;
   const selectedItemId = selectedItem?.itemId;
 
   return <section className="page-content personal-agent-page" aria-label="Personal Agent workspace">
@@ -202,27 +337,49 @@ export function PersonalAgentPage(props: Props) {
       <p>Your saved {title(draft.pending.type)} request is retained. Checking its receipt does not execute it again.</p>
       <div className="button-row"><button type="button" disabled={!props.ready || saving} onClick={() => void operate(() => recover())}>Check saved receipt</button>
         {receiptMissing && <button type="button" disabled={!props.ready || saving} onClick={() => void operate(() => recover(true))}>Retry original request</button>}</div></section>}
-    <PersonalConfiguration ready={props.ready} hostEpoch={props.hostEpoch} disabled={writeDisabled} models={props.models} configuration={configuration}
+    {cloud && <p className="notice">Selected invoice materials and visible tool feedback may be sent to DeepSeek.</p>}
+    {cloud && progressError && <div className="notice" role="alert">{progressError} <button type="button" onClick={() => setProgressRetry(value => value + 1)}>Retry progress updates</button></div>}
+    {cloud && liveOutput && work?.execution.runStatus === 'running' && liveOutput.attemptId === work.execution.attempt?.attemptId
+      && <section className="panel" aria-label="Live cloud response"><h2>Live cloud response</h2><p>Temporary output may be incomplete; the saved result may differ.</p>
+        <pre>{liveOutput.truncated ? '…' : ''}{liveOutput.text}</pre></section>}
+    {cloud && <CloudQueuePanel workspaceId={cloud} owner={work?.execution.attempt ? { workId: work.workId, sessionId: work.sessionId,
+      attemptId: work.execution.attempt.attemptId } : null} refreshSignal={progressVersion} onChanged={() => void refresh()} />}
+    {cloud && <CloudDeliveryPanel workspaceId={cloud} owner={work && (task?.task.attempt ?? work.execution.attempt) ? { workId: work.workId, sessionId: work.sessionId,
+      attemptId: (task?.task.attempt ?? work.execution.attempt)!.attemptId } : null} refreshSignal={progressVersion} />}
+    <PersonalConfiguration ready={props.ready} hostEpoch={props.hostEpoch} disabled={writeDisabled} models={props.models} configuration={configuration} cloud={!!cloud}
       onModels={props.onModels} onChange={value => { if (configuration) setConfiguration({ ...configuration, value }); }} onSave={() => void operate(async () => {
         if (!configuration) return;
-        if (!agent) return; const saved = need(await window.flowmate.personalAgent.update({ personalAgentId: agent.personalAgentId,
+        if (cloud) for (const ref of [...(configuration.value.resources.prompt ? [configuration.value.resources.prompt] : []), ...configuration.value.resources.enabledSkills])
+          need(await window.flowmate.cloudDesktop.uploadResource({ workspaceId: cloud, ref }));
+        if (!agent) return; const saved = need(await personal.personalAgent.update({ personalAgentId: agent.personalAgentId,
           expectedRevision: configuration.revision, configuration: configuration.value }));
         setAgent(saved); setConfiguration({ revision: saved.revision, value: structuredClone(saved.configuration) }); setMessage('Assistant configuration saved. Existing work keeps its accepted configuration.');
-      })} onReload={() => void operate(async () => { const saved = need(await window.flowmate.personalAgent.get()); setAgent(saved); setConfiguration({ revision: saved.revision, value: structuredClone(saved.configuration) }); })} />
-    {creating && agent ? <form className="panel personal-create" onSubmit={event => { event.preventDefault(); void operate(() => submit({ type: 'invoice_work_create', input: {
-      personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision, requestId: requestId(), goal: draft.goal,
-      documents: draft.documents, ...(draft.source ? { source: { ...draft.source, items: draft.source.items.filter(item => draft.documents.some(ref => ref.id === item.documentRef.id && ref.version === item.documentRef.version)) } } : {}) } })); }}>
+      })} onReload={() => void operate(async () => { const saved = need(await personal.personalAgent.get()); setAgent(saved); setConfiguration({ revision: saved.revision, value: structuredClone(saved.configuration) }); })} />
+    {creating && agent ? <form className="panel personal-create" onSubmit={event => { event.preventDefault(); void operate(async () => {
+      const text = cloud ? draft.cloudTimeoutSeconds?.trim() : undefined, seconds = text ? Number(text) : undefined;
+      if (text && (!/^\d+$/.test(text) || !Number.isSafeInteger(seconds) || seconds! < 1 || seconds! > CLOUD_WORK_TIMEOUT_MS_MAX / 1000))
+        throw Error('The cloud execution time limit must be a whole number from 1 to 86400 seconds.');
+      await submit({ type: 'invoice_work_create', input: { personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision,
+        requestId: requestId(), goal: draft.goal, documents: draft.documents, ...(seconds === undefined ? {} : { cloudTimeoutMs: seconds * 1000 }),
+        ...(draft.source ? { source: { ...draft.source, items: draft.source.items.filter(item => draft.documents.some(ref => ref.id === item.documentRef.id && ref.version === item.documentRef.version)) } } : {}) } });
+    }); }}>
       <h2>{draft.source ? 'Create related invoice work' : 'New invoice work'}</h2><label className="field"><span id="personal-work-goal-label">Invoice work goal</span>
         <textarea ref={goalInput} aria-labelledby="personal-work-goal-label" required maxLength={22000} value={draft.goal} onChange={event => persist({ goal: event.target.value })} /></label>
+      {cloud && <label className="field"><span>Cloud execution time limit (seconds)</span><input type="number" min={1} max={CLOUD_WORK_TIMEOUT_MS_MAX / 1000} step={1}
+        placeholder="120" value={draft.cloudTimeoutSeconds ?? ''} disabled={writeDisabled} onChange={event => persist({ cloudTimeoutSeconds: event.target.value })} />
+        <small>Default: 120 seconds. Maximum: 24 hours.</small></label>}
       <p>The selected invoices are fixed when submitted. Each invoice still needs an explicit final disposition.</p>
       {draft.source && <p>Related to Work {draft.source.workId}; original dispositions and permissions are not inherited.</p>}
       <fieldset disabled={writeDisabled}><legend>Parsed invoices · {draft.documents.length} selected</legend>
-        {eligible.map(document => <label key={document.documentRef.id} className="personal-document-option"><input type="checkbox"
+        {cloud && draft.source ? draft.source.items.map(item => <label key={item.itemId} className="personal-document-option"><input type="checkbox"
+          checked={draft.documents.some(ref => ref.id === item.documentRef.id && ref.version === item.documentRef.version)} onChange={event => persist({ documents: event.target.checked
+            ? [...draft.documents.filter(ref => ref.id !== item.documentRef.id), item.documentRef] : draft.documents.filter(ref => ref.id !== item.documentRef.id) })} />
+          Cloud invoice {item.documentRef.id}<small>Version {item.documentRef.version}</small></label>) : eligible.map(document => <label key={document.documentRef.id} className="personal-document-option"><input type="checkbox"
           checked={draft.documents.some(ref => ref.id === document.documentRef.id)} onChange={event => persist({ documents: event.target.checked
             ? [...draft.documents.filter(ref => ref.id !== document.documentRef.id), document.documentRef] : draft.documents.filter(ref => ref.id !== document.documentRef.id) })} />
           {document.displayName}<small>Version {document.documentRef.version}</small></label>)}
-        {!eligible.length && <p>No available parsed invoices. Import and parse invoices in Invoices first.</p>}</fieldset>
-      {documentCursor && <button type="button" disabled={loading || saving} onClick={() => void operate(async () => { const token = generation.current; const page = need(await window.flowmate.listDocuments({ beforeId: documentCursor, limit: 50 })); if (!current(token)) return; setDocuments(previous => [...previous, ...page.items]); setDocumentCursor(page.nextBeforeId); })}>More parsed invoices</button>}
+        {!eligible.length && !(cloud && draft.source) && <p>No available parsed invoices. Import and parse invoices in Invoices first.</p>}</fieldset>
+      {documentCursor && !(cloud && draft.source) && <button type="button" disabled={loading || saving} onClick={() => void operate(async () => { const token = generation.current; const page = need(await window.flowmate.listDocuments({ beforeId: documentCursor, limit: 50 })); if (!current(token)) return; setDocuments(previous => [...previous, ...page.items]); setDocumentCursor(page.nextBeforeId); })}>More parsed invoices</button>}
       <div className="button-row"><button type="submit" className="primary-button" disabled={writeDisabled || !draft.goal.trim() || draft.documents.length === 0}>Submit invoice work</button>
         <button type="button" disabled={saving} onClick={() => setCreating(false)}>Keep draft and close</button></div></form> : null}
     <div className="personal-layout">
@@ -230,7 +387,7 @@ export function PersonalAgentPage(props: Props) {
         {!works.length && !loading && <p>No invoice work yet.</p>}{works.map(value => <button type="button" key={value.workId} className={work?.workId === value.workId ? 'active' : ''} aria-label={`Open Work ${value.workId}: ${value.goal}`}
           aria-current={work?.workId === value.workId ? 'true' : undefined} onClick={() => void selectWork(value.workId)}><strong>{value.goal}</strong>
           <span>Work {value.workId} · {value.status} · {value.counts.total - value.counts.unresolved}/{value.counts.total} disposed</span></button>)}
-        {workCursor && agent && <button type="button" disabled={loading || saving} onClick={() => void operate(async () => { const token = generation.current; const page = need(await window.flowmate.invoiceWorks.list({ personalAgentId: agent.personalAgentId, beforeId: workCursor, limit: 30 })); if (!current(token)) return; setWorks(previous => [...previous, ...page.items]); setWorkCursor(page.nextBeforeId); })}>Earlier invoice work</button>}
+        {workCursor && agent && <button type="button" disabled={loading || saving} onClick={() => void operate(async () => { const token = generation.current; const page = need(await personal.invoiceWorks.list({ personalAgentId: agent.personalAgentId, beforeId: workCursor, limit: 30 })); if (!current(token)) return; setWorks(previous => [...previous, ...page.items]); setWorkCursor(page.nextBeforeId); })}>Earlier invoice work</button>}
       </aside>
       <div className="panel personal-work-detail" aria-busy={loading}>
         {!work ? <p>Select saved work or explicitly submit a new invoice work.</p> : <>
@@ -251,7 +408,7 @@ export function PersonalAgentPage(props: Props) {
           {view === 'Invoices' && <>
             <ul className="personal-items">{items.map(item => <li key={item.itemId}><button type="button" aria-pressed={selectedItemId === item.itemId} onClick={() => void readItem(item.itemId)}>
               {displayDocument(item.documentRef.id)} · {item.disposition} · {item.todoCount} Todo</button><span>Candidate {item.candidateRef ? `${item.candidateRef.id}/${item.candidateRef.sequence}` : 'not saved'}</span></li>)}</ul>
-            {itemCursor && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await window.flowmate.invoiceWorks.get({ view: 'work', workId: work.workId, afterItemId: itemCursor, limit: 50 })); if (current(token) && draftRef.current.selectedWorkId === work.workId && page.view === 'work') { setItems(previous => [...previous, ...page.items]); setWork(page.work); setItemCursor(page.nextAfterItemId); } })}>More work invoices</button>}
+            {itemCursor && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await personal.invoiceWorks.get({ view: 'work', workId: work.workId, afterItemId: itemCursor, limit: 50 })); if (current(token) && draftRef.current.selectedWorkId === work.workId && page.view === 'work') { setItems(previous => [...previous, ...page.items]); setWork(page.work); setItemCursor(page.nextAfterItemId); } })}>More work invoices</button>}
             {selectedItem && <section className="personal-item-detail" aria-label="Selected Work invoice"><h3>{displayDocument(selectedItem.documentRef.id)}</h3><p>Invoice item {selectedItem.itemId} · version {selectedItem.documentRef.version} · {selectedItem.disposition}</p>
               <button type="button" disabled={!props.ready || saving} onClick={() => void operate(() => props.onOpenInvoice({ workId: work.workId, itemId: selectedItem.itemId,
                 documentRef: selectedItem.documentRef, jobId: selectedItem.jobId, candidateRef: selectedItem.candidateRef }))}>View original invoice / review</button>
@@ -279,11 +436,17 @@ export function PersonalAgentPage(props: Props) {
               {work.status === 'open' && <button type="button" disabled={writeDisabled} onClick={() => void operate(attachAcceptance)}>Attach confirmed acceptance</button>}</section>}
           </>}
           {view === 'Tasks' && <section aria-label="Work execution attempts"><h3>Execution attempts</h3>{tasks.map(value => <button type="button" key={value.attempt.attemptId} onClick={() => void readTask(value.attempt.attemptId)}>Attempt {value.attempt.attemptId} · {value.runStatus ?? 'not started'}{value.queued ? ' · queued' : ''}</button>)}
-            {taskCursor && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await window.flowmate.personalTasks.list({ workId: work.workId, beforeAttemptId: taskCursor, limit: 30 })); if (!current(token) || draftRef.current.selectedWorkId !== work.workId) return; setTasks(previous => [...previous, ...page.items]); setTaskCursor(page.nextBeforeAttemptId); })}>Earlier attempts</button>}
+            {taskCursor && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await personal.personalTasks.list({ workId: work.workId, beforeAttemptId: taskCursor, limit: 30 })); if (!current(token) || draftRef.current.selectedWorkId !== work.workId) return; setTasks(previous => [...previous, ...page.items]); setTaskCursor(page.nextBeforeAttemptId); })}>Earlier attempts</button>}
             {task && <><p>Attempt {task.task.attempt.attemptId}: {task.task.runStatus ?? 'no Run'} · stop {task.task.stoppedAt ? 'confirmed' : 'not confirmed'}</p>{task.children.length === 0 && <p>No saved child execution for this attempt.</p>}
               {task.children.map(child => <article className="personal-child" key={child.childRunId}><h4>Evidence checker {child.childRunId}</h4><p>{child.runStatus} · report {child.resultRecorded ? 'saved' : 'not confirmed'} · returned to Master {child.delivery.messageObservedAt ? 'observed' : 'not confirmed'} · Master received {child.parentModelReceivedAt ?? 'not confirmed'} · stop {child.stopConfirmed ? 'confirmed' : 'not confirmed'}</p>
                 <p>Report delivery and source references do not prove that its conclusions are correct.</p><div className="button-row"><button type="button" onClick={() => void readHistory({ workId: work.workId, childRunId: child.childRunId })}>View child history {child.childRunId}</button>
-                  <button type="button" onClick={() => void operate(async () => { const token = taskGeneration.current; const run = need(await window.flowmate.queryRun(child.childRunId));
+                  <button type="button" onClick={() => void operate(async () => { const token = taskGeneration.current;
+                    if (cloud) {
+                      const result = CloudChildReportSchema.parse(need(await window.flowmate.cloudDesktop.request({ workspaceId: cloud, command: { type: 'cloud_child_report',
+                        input: { workId: work.workId, sessionId: work.sessionId, attemptId: task.task.attempt.attemptId, childRunId: child.childRunId, originToolCallId: child.originToolCallId } } })));
+                      if (token === taskGeneration.current && draftRef.current.selectedWorkId === work.workId) setReport(JSON.stringify(result.output, null, 2)); return;
+                    }
+                    const run = need(await window.flowmate.queryRun(child.childRunId));
                     if (run.runId !== child.childRunId || run.kind !== 'subagent' || !('runtimeKind' in run) || run.runtimeKind !== 'durable'
                       || run.scope.workId !== work.workId || run.scope.attemptId !== task.task.attempt.attemptId || run.originToolCallId !== child.originToolCallId)
                       throw Error('The child report does not belong to the selected original execution.');
@@ -308,7 +471,7 @@ export function PersonalAgentPage(props: Props) {
                 <button type="button" onClick={() => void readHistory({ workId: work.workId, childRunId: reference.childRunId })}>Read cited child {reference.childRunId}</button>
               </p>)}
               {entry.evidence.stopConfirmed && <p>Execution stop confirmed.</p>}</article>)}
-            {timeline?.nextBefore && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await window.flowmate.invoiceWorks.timeline({ workId: work.workId, before: timeline.nextBefore!, limit: 50 }));
+            {timeline?.nextBefore && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await personal.invoiceWorks.timeline({ workId: work.workId, before: timeline.nextBefore!, limit: 50 }));
               if (!current(token) || draftRef.current.selectedWorkId !== work.workId) return;
               setTimeline(previous => ({ ...page, entries: [...new Map([...(previous?.entries ?? []), ...page.entries].map(entry => [entry.key, entry])).values()].sort((a, b) => compareInvoiceWorkTimelineCursor(b, a)) })); })}>Earlier timeline facts</button>}
           </section>}

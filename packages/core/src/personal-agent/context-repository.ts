@@ -80,7 +80,8 @@ export function createInvoiceWorkContextRepository(db: SynchronousDatabaseExecut
         && value.child.parentAttemptId === original.attemptId), code);
   }
   function checkInstructions(context: InvoiceWorkWorkingContext, code = 'source_invalid') {
-    requireFact(context.delegation === undefined && (context.instructions === undefined || context.instructions.role === 'invoice-master'), code);
+    requireFact(context.delegation === undefined && context.queueInstruction === undefined && context.queueInstructions === undefined
+      && (context.instructions === undefined || context.instructions.role === 'invoice-master'), code);
     const row = db.query<{ configuration_json: string }, [number]>('SELECT configuration_json FROM invoice_works WHERE id=?').get(context.work.workId);
     requireFact(row, code);
     const configuration = PersonalAgentConfigurationSchema.parse(JSON.parse(row.configuration_json)), instructions = context.instructions;

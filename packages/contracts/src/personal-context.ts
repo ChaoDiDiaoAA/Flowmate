@@ -1,8 +1,9 @@
 import { z } from 'zod';
+import { CloudQueueInstructionSchema } from './cloud-queue.ts';
 import { AcceptInvoiceCandidateRequestSchema, DocumentRefSchema } from './invoice.ts';
 import { InvoiceCandidateFieldPathSchema, WorkspaceExpectationSchema } from './workspace.ts';
 import { RegisteredToolNameSchema } from './tools.ts';
-import { RUNTIME_CONFIG } from './runtime-config.ts';
+import { CLOUD_WORK_TIMEOUT_MS_MAX, RUNTIME_CONFIG } from './runtime-config.ts';
 import { RESOURCE_LIMITS, ResourceRefSchema } from './resources.ts';
 import { InvoiceWorkActionSchema, InvoiceWorkChildReferenceSchema, InvoiceWorkContinueReceiptSchema,
   InvoiceWorkItemViewSchema, InvoiceWorkSourceLocatorSchema, InvoiceWorkStatusSchema, InvoiceWorkSupplementReceiptSchema,
@@ -64,7 +65,7 @@ export type InvoiceWorkContextModelReport = z.infer<typeof InvoiceWorkContextMod
 
 const remainingBudget = z.object({
   modelCalls: revision.max(RUNTIME_CONFIG.ranges.maxModelCalls.max), toolCalls: revision.max(RUNTIME_CONFIG.ranges.maxToolCalls.max),
-  toolFeedbackBytes: revision.max(RUNTIME_CONFIG.runBudget.maxToolFeedbackBytes), timeoutMs: revision.max(RUNTIME_CONFIG.ranges.timeoutMs.max),
+  toolFeedbackBytes: revision.max(RUNTIME_CONFIG.runBudget.maxToolFeedbackBytes), timeoutMs: revision.max(CLOUD_WORK_TIMEOUT_MS_MAX),
   childSlots: revision.max(4),
 }).strict().readonly();
 const tools = z.array(RegisteredToolNameSchema).refine(values => new Set(values).size === values.length, 'Tools must be unique.').readonly();
@@ -103,6 +104,9 @@ const provenance = z.enum(['business-rule', 'model-self-report', 'user-provided'
 export const InvoiceWorkWorkingContextSchema = z.object({
   version: z.literal(1), runtimeKind: z.literal('durable'), inputUse: z.literal('phase-bound-only'),
   instructions: InvoiceWorkPhaseInstructionsSchema.optional(),
+  queueInstruction: z.object({ provenance: z.literal('user-provided'), controlRequestId: requestId,
+    content: text.refine(value => value.trim().length > 0) }).strict().readonly().optional(),
+  queueInstructions: z.array(CloudQueueInstructionSchema).max(100).readonly().optional(),
   delegation: z.object({ childRunId: id, childSessionId: id, parentRunId: id, originToolCallId: id,
     role: z.literal('invoice-evidence-checker'), prompt: z.string().min(1).max(65_000)
       .refine(value => new TextEncoder().encode(value).byteLength <= 65_000),

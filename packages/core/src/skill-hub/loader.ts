@@ -4,7 +4,7 @@ import { appError, RESOURCE_LIMITS, canonicalResourceManifest, ResourceIdSchema,
 import type { InspectNativeResources, ResourceCatalog, ResourceManifest, ResourceRef, ResourceSelection, ResourceErrorCode, ManagedFileContents } from '@flowmate/contracts';
 import { decoder, compare, checked, reject, errorFacts, directory, safePath, bytes } from './resources.ts';
 
-export type Package = { ref: ResourceRef; manifest: ResourceManifest; directory: string; contents: Map<string, Buffer>;
+export type Package = { ref: ResourceRef; manifest: ResourceManifest; manifestBytes: Buffer; directory: string; contents: Map<string, Buffer>;
   item: ResourceCatalog['items'][number] };
 export type AvailableExtensions = readonly { id: string; version: string }[];
 export type CatalogInput = { revision: number; selection: ResourceSelection; availableExtensions?: AvailableExtensions };
@@ -22,19 +22,25 @@ export function find<T extends Pick<Package, 'ref'> & { item?: Package['item'] }
   return pack;
 }
 
-export function createResourceLoader(options: { resourceRoot: string; contents?: ManagedFileContents; inspectNativeResources: InspectNativeResources }) {
+export function createResourceLoader(options: { resourceRoot: string; importedResourceRoot?: string; contents?: ManagedFileContents; inspectNativeResources: InspectNativeResources }) {
   const authorRoot = resolve(options.resourceRoot);
-  function load(kind: 'prompt' | 'skill', id: string, store: ManagedFileContents): Package {
-    const relativeRoot = `${kind === 'prompt' ? 'prompts' : 'skills'}/${id}`;
-    const root = join(authorRoot, relativeRoot);
-    const manifest = ResourceManifestSchema.parse(JSON.parse(decoder.decode(bytes(safePath(authorRoot,
-      `${relativeRoot}/resource.json`), RESOURCE_LIMITS.manifestBytes))));
-    if (manifest.kind !== kind || manifest.id !== id)
+  function load(sourceRoot: string, relativeRoot: string, kind: 'prompt' | 'skill', id: string, store: ManagedFileContents, version?: string): Package {
+    const root = join(sourceRoot, relativeRoot);
+    const manifestBytes = bytes(safePath(sourceRoot, `${relativeRoot}/resource.json`), RESOURCE_LIMITS.manifestBytes);
+    const manifest = ResourceManifestSchema.parse(JSON.parse(decoder.decode(manifestBytes)));
+    if (manifest.kind !== kind || manifest.id !== id || version !== undefined && manifest.version !== version)
       reject('resource_name_conflict', 'Resource manifest and registered package directory disagree.');
     const ref = ResourceRefSchema.parse({ kind, id, version: manifest.version });
+    const originalManifest = store.read({ ownerKind: 'cloud-resource-manifest', ownerId: resourceRefKey(ref), relativePath: 'resource.json' });
+    if (version !== undefined && !originalManifest || originalManifest && !Buffer.from(originalManifest).equals(manifestBytes))
+      reject('resource_version_changed', 'The uploaded resource manifest bytes changed.');
     const contents = new Map<string, Buffer>();
     const owner = { ownerKind: 'resource-author', ownerId: resourceRefKey(ref) };
-    try { store.remember({ ...owner, relativePath: 'resource.json' }, Buffer.from(canonicalResourceManifest(manifest))); }
+    const canonical = Buffer.from(canonicalResourceManifest(manifest));
+    const originalCanonical = store.read({ ...owner, relativePath: 'resource.json' });
+    if (version !== undefined && (!originalCanonical || !Buffer.from(originalCanonical).equals(canonical)))
+      reject('resource_version_changed', 'The uploaded resource manifest record is unavailable.');
+    try { store.remember({ ...owner, relativePath: 'resource.json' }, canonical); }
     catch { reject('resource_version_changed', 'The registered author manifest changed without a new version.'); }
     let name = id, description = '', disableModelInvocation = false;
     const diagnostics: Array<{ code: string; message: string }> = [];
@@ -43,6 +49,9 @@ export function createResourceLoader(options: { resourceRoot: string; contents?:
         const content = bytes(safePath(root, file.path), RESOURCE_LIMITS.fileBytes);
         if (file.bytes !== content.length)
           reject('resource_version_changed', 'Resource file content differs from its fixed manifest.');
+        const original = store.read({ ...owner, relativePath: file.path });
+        if (version !== undefined && (!original || !Buffer.from(original).equals(content)))
+          reject('resource_version_changed', 'The uploaded resource file bytes changed.');
         try { store.remember({ ...owner, relativePath: file.path }, content); }
         catch { reject('resource_version_changed', 'The registered author content changed without a new version.'); }
         contents.set(file.path, content);
@@ -61,31 +70,65 @@ export function createResourceLoader(options: { resourceRoot: string; contents?:
       }
     });
     if (!verified.ok) diagnostics.push({ code: verified.error.code, message: verified.error.message });
-    return { ref, manifest, directory: root, contents, item: { ref, name, description, keywords: manifest.keywords,
+    return { ref, manifest, manifestBytes, directory: root, contents, item: { ref, name, description, keywords: manifest.keywords,
       enabled: false, available: diagnostics.length === 0, disableModelInvocation, bodyFile: manifest.bodyFile, files: manifest.files, dependencies: manifest.requires, dependencyChecks: [], diagnostics } };
   }
   function discover(contents: ManagedFileContents | undefined = options.contents) {
     if (!contents) reject('resource_bundle_unavailable', 'Original resource contents are required.');
     const packages: Package[] = [], diagnostics: ResourceCatalog['diagnostics'][number][] = [];
-    if (!existsSync(authorRoot)) return { packages, diagnostics };
-    directory(authorRoot);
+    const conflicts = new Set<string>();
     let count = 0;
-    for (const kind of ['prompt', 'skill'] as const) {
-      const group = join(authorRoot, kind === 'prompt' ? 'prompts' : 'skills');
-      if (!existsSync(group)) continue;
-      const entries = checked(() => { directory(group); return readdirSync(group).sort(compare); });
-      if (!entries.ok) { diagnostics.push({ resourceId: null, version: null, code: entries.error.code, message: `${kind}: ${entries.error.message}` }); continue; }
-      for (const id of entries.data) {
-        if (!ResourceIdSchema.safeParse(id).success) { diagnostics.push({ resourceId: null, version: null,
-          code: 'resource_manifest_invalid', message: 'Invalid resource directory ID.' }); continue; }
-        if (++count > RESOURCE_LIMITS.packages) reject('resource_content_too_large', 'Resource discovery exceeds 64 registered packages.');
-        const loaded = checked(() => { directory(join(group, id)); return load(kind, id, contents); });
-        if (loaded.ok) packages.push(loaded.data);
-        else diagnostics.push({ resourceId: id, version: null, code: loaded.error.code, message: loaded.error.message });
+    const register = (sourceRoot: string, relativeRoot: string, kind: 'prompt' | 'skill', id: string, version?: string) => {
+      if (++count > RESOURCE_LIMITS.packages) reject('resource_content_too_large', 'Resource discovery exceeds 64 registered packages.');
+      const loaded = checked(() => { directory(join(sourceRoot, relativeRoot)); return load(sourceRoot, relativeRoot, kind, id, contents, version); });
+      const key = version === undefined ? loaded.ok ? resourceRefKey(loaded.data.ref) : null : resourceRefKey({ kind, id, version });
+      const previous = key === null ? -1 : packages.findIndex(item => resourceRefKey(item.ref) === key);
+      if (!loaded.ok) {
+        if (previous >= 0) { packages.splice(previous, 1); conflicts.add(key!); }
+        diagnostics.push({ resourceId: id, version: version ?? null, code: loaded.error.code, message: loaded.error.message }); return;
+      }
+      if (key === null || conflicts.has(key)) return;
+      if (previous < 0) { packages.push(loaded.data); return; }
+      const before = packages[previous]!, after = loaded.data;
+      const equal = before.manifestBytes.equals(after.manifestBytes) && before.contents.size === after.contents.size
+        && [...before.contents].every(([path, content]) => after.contents.get(path)?.equals(content));
+      if (!equal) {
+        packages.splice(previous, 1); conflicts.add(key);
+        diagnostics.push({ resourceId: id, version: after.ref.version, code: 'resource_version_changed', message: 'The same resource version has different original bytes.' });
+      }
+    };
+    for (const [sourceRoot, versioned] of [[authorRoot, false], ...(options.importedResourceRoot ? [[resolve(options.importedResourceRoot), true] as const] : [])] as const) {
+      if (!existsSync(sourceRoot)) continue;
+      directory(sourceRoot);
+      for (const kind of ['prompt', 'skill'] as const) {
+        const groupName = kind === 'prompt' ? 'prompts' : 'skills', group = join(sourceRoot, groupName);
+        if (!existsSync(group)) continue;
+        const entries = checked(() => { directory(group); return readdirSync(group).sort(compare); });
+        if (!entries.ok) { diagnostics.push({ resourceId: null, version: null, code: entries.error.code, message: `${kind}: ${entries.error.message}` }); continue; }
+        for (const id of entries.data) {
+          if (!ResourceIdSchema.safeParse(id).success) { diagnostics.push({ resourceId: null, version: null,
+            code: 'resource_manifest_invalid', message: 'Invalid resource directory ID.' }); continue; }
+          if (!versioned) { register(sourceRoot, `${groupName}/${id}`, kind, id); continue; }
+          const versions = checked(() => { const path = join(group, id); directory(path); return readdirSync(path).sort(compare); });
+          if (!versions.ok) { diagnostics.push({ resourceId: id, version: null, code: versions.error.code, message: versions.error.message }); continue; }
+          for (const version of versions.data) {
+            if (!ResourceIdSchema.safeParse(version).success) { diagnostics.push({ resourceId: id, version: null,
+              code: 'resource_manifest_invalid', message: 'Invalid imported resource version.' }); continue; }
+            register(sourceRoot, `${groupName}/${id}/${version}`, kind, id, version);
+          }
+        }
       }
     }
     return { packages, diagnostics };
   }
 
-  return { discover };
+  function author(raw: ResourceRef, contents: ManagedFileContents | undefined = options.contents) {
+    return checked(() => {
+      if (!contents) reject('resource_bundle_unavailable', 'Original resource contents are required.');
+      const ref = ResourceRefSchema.parse(raw), relativeRoot = `${ref.kind === 'prompt' ? 'prompts' : 'skills'}/${ref.id}`;
+      directory(authorRoot); directory(join(authorRoot, relativeRoot));
+      return find([load(authorRoot, relativeRoot, ref.kind, ref.id, contents)], ref);
+    });
+  }
+  return { discover, author };
 }

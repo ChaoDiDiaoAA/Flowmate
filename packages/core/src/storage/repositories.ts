@@ -12,7 +12,7 @@ import { join, isAbsolute } from 'node:path';
 import { verifyFrozenResourceMetadata } from '../skill-hub/index.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { DurableRunConfigSnapshotSchema, DurableRunOutputSchema, DurableRunScopeSchema, DurableWorkBudgetSchema,
+import { CloudWorkspaceIdSchema, DurableRuntimeIdSchema, DurableRunConfigSnapshotSchema, DurableRunOutputSchema, DurableRunScopeSchema, DurableWorkBudgetSchema,
   DurableSubagentConfigSnapshotSchema, DurableSubagentRunScopeSchema, DurableSubagentRunOutputSchema,
   PersonalAgentConfigurationSchema, SessionRuntimeKindSchema, invoiceExportName } from '@flowmate/contracts';
 export { invoiceExportName } from '@flowmate/contracts';
@@ -207,12 +207,13 @@ type SessionRowFacts = {
 };
 
 export type AgentSessionRow = SessionRowFacts & { runtimeKind: 'agent_session'; nativeSessionId: string; durableConversationId: null };
-export type DurableSessionRow = SessionRowFacts & { runtimeKind: 'durable'; nativeSessionId: null; durableConversationId: DbId | null };
+export type DurableSessionRow = SessionRowFacts & { runtimeKind: 'durable'; nativeSessionId: null; durableRuntimeId: string;
+  cloudWorkspaceId: string | null; durableConversationId: DbId | null };
 export type SessionRow = AgentSessionRow | DurableSessionRow;
 export type NewAgentSession = { runtimeKind?: 'agent_session'; nativeSessionId: string; title: string; at: string;
   expectedRevision?: number; nativeHistory?: NativeSessionHistory };
 export type NewDurableSession = { runtimeKind: 'durable'; nativeSessionId: null; title: string; at: string;
-  expectedRevision?: never; nativeHistory?: never };
+  durableRuntimeId?: string; cloudWorkspaceId?: string; expectedRevision?: never; nativeHistory?: never };
 export type NewSession = NewAgentSession | NewDurableSession;
 
 export type AgentOutputRecord = OutputRecord & { agent: AgentFacts; nativeOutcomeFacts?: string };
@@ -695,7 +696,7 @@ function validatedError(value: unknown): AppError | null {
 
 function sessionRow(value: unknown, hasHistory = false): SessionRow {
   const row = value as {
-    id: number; native_session_id: unknown; runtime_kind?: unknown; durable_conversation_id?: unknown;
+    id: number; native_session_id: unknown; runtime_kind?: unknown; durable_conversation_id?: unknown; durable_runtime_id?: unknown; cloud_workspace_id?: unknown;
     title: string; status: string; created_at: string; updated_at: string; metadata_json: string;
   } | null;
   if (!row || !Number.isSafeInteger(row.id) || row.id <= 0
@@ -724,7 +725,12 @@ function sessionRow(value: unknown, hasHistory = false): SessionRow {
   if (kind !== 'durable' || row.native_session_id !== null || row.durable_conversation_id !== null
     && (typeof row.durable_conversation_id !== 'number' || !Number.isSafeInteger(row.durable_conversation_id) || row.durable_conversation_id < 1))
     throw Error('invalid_session_row');
-  return { ...facts, runtimeKind: 'durable', nativeSessionId: null, durableConversationId: row.durable_conversation_id };
+  const durableRuntimeId = DurableRuntimeIdSchema.parse(row.durable_runtime_id ?? 'local');
+  const cloudWorkspaceId = row.cloud_workspace_id ?? null;
+  if (durableRuntimeId === 'local' ? cloudWorkspaceId !== null : !CloudWorkspaceIdSchema.safeParse(cloudWorkspaceId).success)
+    throw Error('invalid_session_row');
+  return { ...facts, runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId,
+    cloudWorkspaceId: cloudWorkspaceId as string | null, durableConversationId: row.durable_conversation_id };
 }
 
 function parseSessionMetadata(value: string): Record<string, unknown> {
@@ -2895,10 +2901,13 @@ function runRuntimeKind(db: Database, row: Pick<RunRow, 'kind' | 'session_id'>):
   return SessionRuntimeKindSchema.parse(session.runtime_kind ?? 'agent_session');
 }
 
-function durableConfigMatchesWork(config: DurableRunConfigSnapshot, owner: DurableRunWorkRow): boolean {
+function durableConfigMatchesWork(db: Database, config: DurableRunConfigSnapshot, owner: DurableRunWorkRow): boolean {
   const fixed = PersonalAgentConfigurationSchema.parse(readJson(owner.configuration_json, 'durable_configuration'));
   const authorization = DurableWorkBudgetSchema.parse(readJson(owner.budget_json, 'durable_budget'));
-  return config.durable.workId === owner.id && config.durable.configurationRevision === owner.agent_revision
+  const session = db.query<{ durable_runtime_id: string }, [number]>('SELECT durable_runtime_id FROM sessions WHERE id=?').get(owner.session_id);
+  return session !== null && (session.durable_runtime_id !== 'local') === (authorization.limits.cloud === true)
+    && config.limits.cloud === authorization.limits.cloud
+    && config.durable.workId === owner.id && config.durable.configurationRevision === owner.agent_revision
     && isDeepStrictEqual(config.resources, fixed.resources) && isDeepStrictEqual(config.extensions, fixed.extensions)
     && config.workingDirectory === fixed.workingDirectory
     && (['maxModelCalls', 'maxToolCalls', 'toolTimeoutMs', 'maxToolFeedbackBytes'] as const)
@@ -2918,7 +2927,7 @@ function durableRunOwner(db: Database, row: RunRow, config: DurableRunConfigSnap
   const owner = attempt && db.query<DurableRunWorkRow, [number]>('SELECT * FROM invoice_works WHERE id=?').get(attempt.work_id);
   if (row.kind !== 'agent' || row.job_id != null || row.parent_run_id != null || !attempt || !owner
     || owner.session_id !== row.session_id || config.durable.attemptId !== attempt.id || scope.attemptId !== attempt.id
-    || scope.workId !== owner.id || row.goal !== owner.goal || !durableConfigMatchesWork(config, owner)) throw new Error('invalid_durable_run_owner');
+    || scope.workId !== owner.id || row.goal !== owner.goal || !durableConfigMatchesWork(db, config, owner)) throw new Error('invalid_durable_run_owner');
   const fixed = PersonalAgentConfigurationSchema.parse(readJson(owner.configuration_json, 'durable_configuration'));
   if (!isDeepStrictEqual(scope.allowedTools, fixed.tools)) throw new Error('invalid_durable_run_scope');
   return { owner, attempt };
@@ -2952,17 +2961,21 @@ function durableSubagentParent(db: Database, config: DurableSubagentConfigSnapsh
       .some(key => !isDeepStrictEqual(Reflect.get(config, key), Reflect.get(parentConfig, key)))
     || (Object.keys(parentConfig.runtimeBudget) as Array<keyof typeof parentConfig.runtimeBudget>)
       .some(key => config.runtimeBudget[key] > parentConfig.runtimeBudget[key])
-    || config.limits.timeoutMs > parentConfig.limits.timeoutMs || config.limits.stopGraceMs > parentConfig.limits.stopGraceMs) throw conflict();
+    || config.limits.cloud !== parentConfig.limits.cloud || config.limits.timeoutMs > parentConfig.limits.timeoutMs
+    || config.limits.stopGraceMs > parentConfig.limits.stopGraceMs) throw conflict();
   return { parentRow, parent, parentScope, tool: tool.data, args };
 }
 
 function durableSubagentOwner(db: Database, row: RunRow, config: DurableSubagentConfigSnapshot, scope: DurableSubagentRunScope) {
   const original = durableSubagentParent(db, config, scope);
-  const session = db.query<{ runtime_kind: string; native_session_id: string | null }, [number | null]>('SELECT * FROM sessions WHERE id=?').get(row.session_id);
+  const session = db.query<{ runtime_kind: string; native_session_id: string | null; durable_runtime_id: string; cloud_workspace_id: string | null }, [number | null]>('SELECT * FROM sessions WHERE id=?').get(row.session_id);
+  const parentSession = db.query<{ durable_runtime_id: string; cloud_workspace_id: string | null }, [number | null]>('SELECT durable_runtime_id,cloud_workspace_id FROM sessions WHERE id=?').get(original.parentRow.session_id);
   const input = validatedInput(readJson(row.input_json, 'input'));
   if (row.kind !== 'subagent' || row.job_id != null || row.parent_run_id !== scope.parentRunId || row.origin_tool_call_id !== scope.originToolCallId
     || row.plugin_agent_id !== original.tool.nativeToolCallId || row.session_id === original.parentRow.session_id
-    || session?.runtime_kind !== 'durable' || session.native_session_id !== null || row.current_context_snapshot_id != null || row.context_observations_json != null
+    || session?.runtime_kind !== 'durable' || session.native_session_id !== null || !parentSession
+    || session.durable_runtime_id !== parentSession.durable_runtime_id || session.cloud_workspace_id !== parentSession.cloud_workspace_id
+    || row.current_context_snapshot_id != null || row.context_observations_json != null
     || input.version !== 1 || input.goal !== original.args.description || input.text !== original.args.prompt || row.goal !== original.args.description)
     throw new Error('invalid_durable_child_owner');
   return original;
@@ -3213,14 +3226,23 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
   function create(input: NewSession): Result<SessionRow> {
     if (input.runtimeKind === 'durable' && (input.nativeSessionId !== null || input.nativeHistory !== undefined || input.expectedRevision !== undefined))
       return fail(appError('input_invalid', 'input', 'Durable Sessions cannot contain Pi identity, history or Workspace admission.'));
+    if (input.runtimeKind === 'durable') {
+      const runtime = DurableRuntimeIdSchema.safeParse(input.durableRuntimeId ?? 'local');
+      if (!runtime.success || (runtime.data === 'local' ? input.cloudWorkspaceId !== undefined : !CloudWorkspaceIdSchema.safeParse(input.cloudWorkspaceId).success))
+        return fail(appError('input_invalid', 'input', 'Invalid Durable runtime or workspace owner.'));
+    }
     const created = writeTransaction(() => {
+      if (input.runtimeKind === 'durable' && input.durableRuntimeId && input.durableRuntimeId !== 'local'
+        && db.query('SELECT id FROM sessions WHERE durable_runtime_id=? AND cloud_workspace_id IS NOT ? LIMIT 1')
+          .get(input.durableRuntimeId, input.cloudWorkspaceId ?? null))
+        throw new MemoryCommitFault(appError('state_conflict', 'session', 'The original runtime belongs to another workspace.'));
       if (input.expectedRevision !== undefined) {
         const workspace = ensureWorkspace(db, input.at) as { revision: number };
         if (workspace.revision !== input.expectedRevision || !revisionCanAdvance(workspace.revision)) return null;
       }
       const result = input.runtimeKind === 'durable'
-        ? db.query("INSERT INTO sessions(runtime_kind,native_session_id,title,created_at,updated_at,metadata_json) VALUES ('durable',NULL,?,?,?,?)")
-          .run(input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }))
+        ? db.query("INSERT INTO sessions(runtime_kind,native_session_id,durable_runtime_id,cloud_workspace_id,title,created_at,updated_at,metadata_json) VALUES ('durable',NULL,?,?,?,?,?,?)")
+          .run(input.durableRuntimeId ?? 'local', input.cloudWorkspaceId ?? null, input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }))
         : db.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at,metadata_json) VALUES (?,?,?,?,?)')
           .run(input.nativeSessionId, input.title, input.at, input.at, asJson({ version: 1, model_use_blocked: null }));
       const id = Number(result.lastInsertRowid);
@@ -3304,7 +3326,8 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
           if (current.data.durableConversationId !== nativeConversationId) throw conflict();
           return current.data;
         }
-        if (db.query('SELECT id FROM sessions WHERE durable_conversation_id=? AND id!=?').get(nativeConversationId, sessionId)) throw conflict();
+        if (db.query('SELECT id FROM sessions WHERE durable_runtime_id=? AND durable_conversation_id=? AND id!=?')
+          .get(current.data.durableRuntimeId, nativeConversationId, sessionId)) throw conflict();
         if (db.query("UPDATE sessions SET durable_conversation_id=?,updated_at=? WHERE id=? AND runtime_kind='durable' AND durable_conversation_id IS NULL")
           .run(nativeConversationId, at, sessionId).changes !== 1) throw conflict();
         const bound = readSessionRow(db, db.query('SELECT * FROM sessions WHERE id=?').get(sessionId));
@@ -3762,7 +3785,12 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           AND (status IN ('created','running') OR stopped_at IS NULL OR COALESCE(json_extract(cleanup_json,'$.stopped'),0)!=1
             OR COALESCE(json_extract(cleanup_json,'$.lateObservationRequired'),1)!=0)`).get(input.parentRunId)!.count >= 4)
           throw new MemoryCommitFault(appError('subagent_busy', 'runtime', 'Four child executions are already owned.', true));
-        const session = createSessionRepository(db, events).create({ runtimeKind: 'durable', nativeSessionId: null, title: args.data.description.slice(0, 80), at: input.at });
+        const sessions = createSessionRepository(db, events);
+        const parentSession = sessions.get(Number(original.parentRow.session_id));
+        if (!parentSession.ok) throw new MemoryCommitFault(parentSession.error);
+        if (parentSession.data.runtimeKind !== 'durable') throw new Error('invalid_durable_parent_session');
+        const session = sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId: parentSession.data.durableRuntimeId,
+          cloudWorkspaceId: parentSession.data.cloudWorkspaceId ?? undefined, title: args.data.description.slice(0, 80), at: input.at });
         if (!session.ok) throw new MemoryCommitFault(session.error);
         // Keep the existing identity constraint using the actual native creator task key.
         const inserted = db.query(`INSERT INTO runs(kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,
@@ -3907,13 +3935,19 @@ export function createRunRepository(db: Database, events?: RuntimeEventStore): R
           return saved.id;
         }
         if (owner.status !== 'open' || owner.current_attempt_id !== attempt.id || attempt.stop_requested_at !== null || attempt.stopped_at !== null
-          || config.data.durable.attemptId !== attempt.id || !durableConfigMatchesWork(config.data, owner) || record.data.goal !== owner.goal
+          || config.data.durable.attemptId !== attempt.id || !durableConfigMatchesWork(db, config.data, owner) || record.data.goal !== owner.goal
           || input.cleanup.stopped)
           throw new MemoryCommitFault(appError('state_conflict', 'input', 'The product attempt no longer permits this Run admission.'));
         if (!durableSessionAllowsRun(db, owner.session_id))
           throw new MemoryCommitFault(appError('state_conflict', 'session', 'The Work requires its usable Durable Session.'));
-        if (db.query(`SELECT run.id FROM runs run JOIN sessions session ON session.id=run.session_id
-          WHERE session.runtime_kind='durable' AND run.kind='agent' AND run.status IN ('created','running') LIMIT 1`).get())
+        const ownerSession = db.query<{ durable_runtime_id: string }, [number]>('SELECT durable_runtime_id FROM sessions WHERE id=?').get(owner.session_id);
+        if (!ownerSession) throw new Error('invalid_durable_run_owner');
+        const active = db.query<{ count: number; same: number }, [number, string]>(`SELECT COUNT(*) count,
+          COALESCE(SUM(CASE WHEN run.session_id=? THEN 1 ELSE 0 END),0) same FROM runs run JOIN sessions session ON session.id=run.session_id
+          WHERE session.runtime_kind='durable' AND run.kind='agent' AND run.status IN ('created','running')
+            AND CASE WHEN ?='local' THEN session.durable_runtime_id='local' ELSE session.durable_runtime_id!='local' END`)
+          .get(owner.session_id, ownerSession.durable_runtime_id)!;
+        if (active.same > 0 || active.count >= (ownerSession.durable_runtime_id === 'local' ? 1 : 2))
           throw new MemoryCommitFault(appError('runtime_busy', 'runtime', 'A Durable product Run is already active.', true));
         const inserted = db.query(`INSERT INTO runs
           (kind,session_id,job_id,scope_json,status,goal,input_json,config_json,cleanup_json,usage_json,created_at)

@@ -3,6 +3,8 @@ import { InputDefinitionCommandSchema } from '@flowmate/contracts';
 import { ResearchIntentSchema, WorkspaceFocusSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema, InvoiceSaveReplayReceiptSchema } from '@flowmate/contracts';
 import { researchOperations } from '../../packages/contracts/src/research-commands.ts';
 import { personalAgentHostCommandSchemas, isPersonalAgentHostCommand } from '../../packages/contracts/src/personal-agent-commands.ts';
+import { cloudMaterialExportHostCommandSchemas } from '../../packages/contracts/src/cloud-material.ts';
+import { cloudResourceExportHostCommandSchemas } from '../../packages/contracts/src/cloud-resource.ts';
 export { isPersonalAgentHostCommand, parsePersonalAgentCommand, parsePersonalAgentHostResult,
   matchesPersonalAgentResponse, personalAgentHostFailure } from '../../packages/contracts/src/personal-agent-commands.ts';
 import { z } from 'zod';
@@ -126,6 +128,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_extensions'), input: SessionExtensionQuerySchema }).strict(),
   ...InputDefinitionCommandSchema.options.map(option => option.extend({ version: z.literal(1), requestId })),
   ...personalAgentHostCommandSchemas({ version: z.literal(1), requestId }),
+  ...cloudMaterialExportHostCommandSchemas({ version: z.literal(1), requestId }),
+  ...cloudResourceExportHostCommandSchemas({ version: z.literal(1), requestId }),
   ...(Object.keys(researchOperations) as (keyof typeof researchOperations)[]).map(type => z.object({ version: z.literal(1), requestId,
     type: z.literal(type), input: researchOperations[type][1] }).strict()),
   z.object({ version: z.literal(1), requestId, type: z.literal('list_subagents'), input: ListSubagentsRequestSchema }).strict(),

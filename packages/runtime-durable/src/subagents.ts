@@ -50,6 +50,9 @@ export type DurableSubagentRuntimeOptions = {
   hasLiveOwnedTasks(tx: Tx, conversationId: ConversationId): Promise<boolean>;
   withToolFeedback(query: DurableSubmissionQuery, signal: AbortSignal | undefined, excluded: readonly number[],
     verify: () => Result<void> | Promise<Result<void>>): Promise<Result<void>>;
+  cloudModel?: { send(identity: DurableSubagentIdentity, native: { conversationId: number; submissionId: number; taskId: number;
+    cutoff: number; phaseId: number; model: string; body: string }, signal?: AbortSignal): Promise<Response>;
+    sendSummary(body: string, originalSignal?: AbortSignal, signal?: AbortSignal): Promise<Response | null> };
   compactions: ReturnType<typeof createDurableCompactionRuntime>;
 };
 
@@ -58,7 +61,8 @@ export function createDurableSubagentRuntime(options: DurableSubagentRuntimeOpti
   const refs = new Map<number, { plan: DurableSubagentPlan; provider: string; modelId: string }>();
   const creating = new Set<number>();
   const invoking = new Set<number>();
-  const requested = new Map<TaskId, { identity: DurableSubagentIdentity; conversationId: ConversationId; submissionId: number; entryId: number }>();
+  const requested = new Map<TaskId, { identity: DurableSubagentIdentity; conversationId: ConversationId; submissionId: number; entryId: number;
+    cutoff: number; phaseId: number }>();
   const check = (plan: DurableSubagentIdentity, signal?: AbortSignal) => {
     signal?.throwIfAborted(); if (options.isClosed() || options.isStopping(plan)) throw Error('state_conflict');
   };
@@ -146,11 +150,23 @@ export function createDurableSubagentRuntime(options: DurableSubagentRuntimeOpti
     if (existing) { if (!isDeepStrictEqual(existing.plan, plan)) throw Error('state_conflict'); return existing; }
     if (!options.callbacks || plan.allowedTools.some(name => !(SUBAGENT_TOOL_NAMES as readonly string[]).includes(name))) throw Error('state_conflict');
     const source = need(await createDurableModels(plan.binding.configuration, {
-      readApiKey: config => options.readApiKey({ workId: plan.workId, sessionId: plan.sessionId, attemptId: plan.attemptId }, config),
+      readApiKey: config => options.cloudModel ? 'flowmate-cloud-proxy'
+        : options.readApiKey({ workId: plan.workId, sessionId: plan.sessionId, attemptId: plan.attemptId }, config),
       verifyModelUse: async signal => safe(async () => verify(plan, signal)),
       readCompactionUse: (signal, binding) => options.compactions.modelUse(signal, binding),
-      reserveModelRequest: signal => options.withToolFeedback(plan, signal, [plan.nativeToolTaskId],
+      reserveModelRequest: signal => options.cloudModel ? ok(undefined) : options.withToolFeedback(plan, signal, [plan.nativeToolTaskId],
         () => options.callbacks!.reserveModelRequest(identity(plan))),
+      ...(options.cloudModel ? { fetch: async (_target: RequestInfo | URL, init?: RequestInit, originalSignal?: AbortSignal) => {
+        if (typeof init?.body !== 'string') throw Error('state_conflict');
+        const summary = await options.cloudModel!.sendSummary(init.body, originalSignal, init.signal ?? undefined);
+        if (summary) return summary;
+        const child = await locate(plan), live = child && await harness.snapshot(LiveDoc, child.conversation.id, context);
+        const taskId = live?.run?.taskId, selected = taskId && requested.get(taskId);
+        if (!taskId || !selected || !isDeepStrictEqual(selected.identity, identity(plan)))
+          throw Error('state_conflict');
+        return options.cloudModel!.send(identity(plan), { conversationId: selected.conversationId, submissionId: selected.submissionId,
+          taskId, cutoff: selected.cutoff, phaseId: selected.phaseId, model: plan.binding.configuration.modelRef.model, body: init.body }, init.signal ?? undefined);
+      } } : {}),
       readWorkingContext: (native, signal) => safe(async () => {
         await verify(plan, signal);
         const child = await locate(plan); if (!child) throw Error('state_conflict');
@@ -175,7 +191,8 @@ export function createDurableSubagentRuntime(options: DurableSubagentRuntimeOpti
           || workingContext.instructions?.role !== SUBAGENT_ROLE || workingContext.delegation?.childRunId !== plan.childRunId
           || workingContext.delegation.childSessionId !== plan.childSessionId || workingContext.delegation.originToolCallId !== plan.originToolCallId
           || workingContext.delegation.prompt !== plan.prompt || workingContext.actions.tools.some(name => !plan.allowedTools.includes(name))) throw Error('state_conflict');
-        requested.set(task.id, { identity: identity(plan), conversationId: child.conversation.id, submissionId: record.id, entryId: record.entry });
+        requested.set(task.id, { identity: identity(plan), conversationId: child.conversation.id, submissionId: record.id, entryId: record.entry,
+          cutoff: point.cutoff, phaseId: workingContext.phase.phaseId });
         return { workingContext, systemPrompt: `${plan.systemPrompt}\n\nFrozen child instructions:\n${JSON.stringify(workingContext.instructions)}`,
           ...await options.compactions.projectPhase(parent(plan), child.conversation.id, view) };
       }),

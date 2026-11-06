@@ -35,10 +35,10 @@ function historicalStore(input: ReturnType<typeof paths>, maximumVersion = 20) {
   const directory = new URL('../../../packages/core/src/storage/migrations/', import.meta.url);
   for (const name of readdirSync(directory).filter(name => /^\d{3}_.*\.sql$/.test(name) && Number(name.slice(0, 3)) <= maximumVersion).sort()) {
     const version = Number(name.slice(0, 3));
-    if (version === 17) db.exec('PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON');
+    if (version === 17 || version === 21) db.exec('PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON');
     for (const statement of readFileSync(new URL(name, directory), 'utf8').split(/^\s*-- statement\s*$/m).filter(part => part.trim())) db.exec(statement);
     if (db.inTransaction) db.exec('COMMIT');
-    if (version === 10 || version === 17) db.exec('PRAGMA foreign_keys=ON; PRAGMA legacy_alter_table=OFF');
+    if (version === 10 || version === 17 || version === 21) db.exec('PRAGMA foreign_keys=ON; PRAGMA legacy_alter_table=OFF');
   }
   return db;
 }
@@ -50,7 +50,7 @@ test('021 upgrades actual schema20 Sessions as legacy and preserves their rows, 
   const before = old.query('SELECT * FROM sessions').all(); old.close();
   const current = need(openTestDatabase(input));
   try {
-    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
+    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 23 });
     expect(current.db.query('SELECT id,native_session_id,title,status,created_at,updated_at,metadata_json,hidden_at FROM sessions').all()).toEqual(before);
     expect(current.sessions.get(1)).toMatchObject({ ok: true, data: { runtimeKind: 'agent_session', nativeSessionId: 'original-pi-session', durableConversationId: null } });
     expect(current.db.query('SELECT active_session_id FROM workspace WHERE id=1').get()).toEqual({ active_session_id: 1 });
@@ -58,6 +58,118 @@ test('021 upgrades actual schema20 Sessions as legacy and preserves their rows, 
     expect(current.db.query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='sessions' ORDER BY name").all())
       .toEqual(expect.arrayContaining([{ name: 'sessions_recent' }, { name: 'sessions_visible_recent' }]));
   } finally { await current.close(); }
+});
+
+test('schema22 Sessions keep their original identities and receive a verified pre-migration database copy', async () => {
+  const input = paths(), old = historicalStore(input, 22);
+  old.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at) VALUES(?,?,?,?)')
+    .run('legacy-before-cloud', 'Legacy', at, at);
+  old.query("INSERT INTO sessions(runtime_kind,native_session_id,durable_conversation_id,title,created_at,updated_at) VALUES('durable',NULL,17,?,?,?)")
+    .run('Durable', at, at);
+  old.query('INSERT INTO workspace(id,revision,active_session_id,created_at,updated_at) VALUES(1,0,1,?,?)').run(at, at);
+  old.query("INSERT INTO personal_agents(id,revision,configuration_json,created_at,updated_at) VALUES(1,0,'{}',?,?)").run(at, at);
+  old.query(`INSERT INTO invoice_works(id,personal_agent_id,session_id,agent_revision,configuration_json,budget_json,goal,status,created_at,updated_at)
+    VALUES(1,1,2,0,'{}','{}','Original goal','open',?,?)`).run(at, at);
+  old.query(`INSERT INTO invoice_work_operations(personal_agent_id,work_id,kind,request_id,request_json,receipt_json,received_at)
+    VALUES(1,1,'create','original-create','{}','{}',?)`).run(at);
+  old.query(`INSERT INTO invoice_work_attempts(id,work_id,trigger_kind,trigger_request_id,created_at)
+    VALUES(1,1,'create','original-create',?)`).run(at);
+  old.query(`INSERT INTO invoice_work_phases(id,work_id,attempt_id,request_id,kind,basis_json,native_conversation_id,native_submission_id,created_at)
+    VALUES(77,1,1,'original-phase','prompt','{}',17,101,?)`).run(at);
+  old.query("UPDATE sqlite_sequence SET seq=123 WHERE name='invoice_work_phases'").run();
+  old.exec('CREATE INDEX extra_session_title ON sessions(title)');
+  old.exec("CREATE TRIGGER extra_phase_guard BEFORE DELETE ON invoice_work_phases BEGIN SELECT RAISE(ABORT,'preserve phase'); END");
+  old.exec('DROP TRIGGER session_runtime_immutable');
+  old.exec("CREATE TRIGGER session_runtime_immutable BEFORE UPDATE OF runtime_kind ON sessions WHEN NEW.runtime_kind IS NOT OLD.runtime_kind BEGIN SELECT RAISE(ABORT,'preserve existing runtime guard'); END");
+  const extraDefinitions = old.query("SELECT name,sql FROM sqlite_master WHERE name IN ('extra_session_title','extra_phase_guard','session_runtime_immutable') ORDER BY name").all();
+  const phasesBefore = old.query<Record<string, unknown>, []>('SELECT * FROM invoice_work_phases').all();
+  const before = old.query('SELECT * FROM sessions ORDER BY id').all(); old.close();
+
+  const current = need(openTestDatabase(input));
+  try {
+    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 23 });
+    expect(current.sessions.get(1)).toMatchObject({ ok: true, data: { runtimeKind: 'agent_session', nativeSessionId: 'legacy-before-cloud' } });
+    expect(current.sessions.get(2)).toMatchObject({ ok: true, data: { runtimeKind: 'durable', durableRuntimeId: 'local', durableConversationId: 17 } });
+    expect(current.db.query('SELECT active_session_id FROM workspace WHERE id=1').get()).toEqual({ active_session_id: 1 });
+    expect(current.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(current.db.query("SELECT name,sql FROM sqlite_master WHERE name IN ('extra_session_title','extra_phase_guard','session_runtime_immutable') ORDER BY name").all())
+      .toEqual(extraDefinitions);
+    const migratedPhase = current.db.query('SELECT * FROM invoice_work_phases WHERE id=77').get() as Record<string, unknown>;
+    expect(migratedPhase.durable_runtime_id).toBe('local');
+    const { durable_runtime_id: _runtime, ...originalPhase } = migratedPhase;
+    expect(originalPhase).toEqual(phasesBefore[0]);
+    expect(current.db.query("SELECT seq FROM sqlite_sequence WHERE name='invoice_work_phases'").get()).toEqual({ seq: 123 });
+
+    const copies = readdirSync(dirname(input.databaseFile)).filter(name => name.startsWith('pre-v23-'));
+    expect(copies).toHaveLength(1);
+    const backup = new Database(join(dirname(input.databaseFile), copies[0]!, 'app.sqlite'), { readonly: true });
+    try {
+      expect(backup.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
+      expect(backup.query('SELECT * FROM sessions ORDER BY id').all()).toEqual(before);
+      expect(backup.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    } finally { backup.close(); }
+  } finally { await current.close(); }
+});
+
+test('a failed runtime-owner migration preserves schema22 data and foreign keys', async () => {
+  const input = paths(), old = historicalStore(input, 22);
+  old.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at) VALUES(?,?,?,?)')
+    .run('original-before-runtime-migration', 'Preserved', at, at);
+  old.exec("CREATE TRIGGER reject_schema23 BEFORE INSERT ON schema_migrations WHEN NEW.version=23 BEGIN SELECT RAISE(ABORT,'controlled schema23 failure'); END");
+  const rows = old.query('SELECT * FROM sessions').all();
+  const schema = old.query('SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name').all(); old.close();
+
+  expect(openTestDatabase(input)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+  const after = new Database(input.databaseFile, { readonly: true });
+  try {
+    expect(after.query('SELECT * FROM sessions').all()).toEqual(rows);
+    expect(after.query('SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name').all()).toEqual(schema);
+    expect(after.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
+    expect(after.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(readdirSync(dirname(input.databaseFile)).filter(name => name.startsWith('pre-v23-'))).toHaveLength(1);
+  } finally { after.close(); }
+});
+
+test('runtime-owner migration keeps a previously allocated phase sequence even when all phase rows were removed', async () => {
+  const input = paths(), old = historicalStore(input, 22);
+  old.query("INSERT INTO sqlite_sequence(name,seq) VALUES('invoice_work_phases',123)").run();
+  old.close();
+  const current = need(openTestDatabase(input));
+  try {
+    expect(current.db.query("SELECT seq FROM sqlite_sequence WHERE name='invoice_work_phases'").get()).toEqual({ seq: 123 });
+  } finally { await current.close(); }
+});
+
+test('a conflicting existing guard name stops migration without replacing its original definition', async () => {
+  const input = paths(), old = historicalStore(input, 22);
+  old.exec("CREATE TRIGGER session_runtime_owner_immutable BEFORE UPDATE OF title ON sessions BEGIN SELECT 1; END");
+  const schema = old.query('SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name').all(); old.close();
+  expect(openTestDatabase(input)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+  const retained = new Database(input.databaseFile, { readonly: true });
+  try {
+    expect(retained.query('SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name').all()).toEqual(schema);
+    expect(retained.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
+    expect(readdirSync(dirname(input.databaseFile)).filter(name => name.startsWith('pre-v23-'))).toHaveLength(1);
+  } finally { retained.close(); }
+});
+
+test.each(['runs_engine_active_insert', 'runs_engine_active_update'])('migration preserves a modified existing %s guard by stopping the upgrade', name => {
+  const input = paths(), old = historicalStore(input, 22);
+  old.query('INSERT INTO sessions(native_session_id,title,created_at,updated_at) VALUES(?,?,?,?)')
+    .run('existing-active-guard', 'Preserved', at, at);
+  old.exec(`DROP TRIGGER ${name}`);
+  old.exec(`CREATE TRIGGER ${name} BEFORE INSERT ON runs BEGIN SELECT RAISE(ABORT,'custom active guard'); END`);
+  const schema = old.query('SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name').all();
+  const rows = old.query('SELECT * FROM sessions').all(); old.close();
+  expect(openTestDatabase(input)).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+  const retained = new Database(input.databaseFile, { readonly: true });
+  try {
+    expect(retained.query('SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name').all()).toEqual(schema);
+    expect(retained.query('SELECT * FROM sessions').all()).toEqual(rows);
+    expect(retained.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 22 });
+    expect(retained.query('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(readdirSync(dirname(input.databaseFile)).filter(entry => entry.startsWith('pre-v23-'))).toHaveLength(1);
+  } finally { retained.close(); }
 });
 
 test.each([9, 20])('physical schema%d Session reads keep missing engine columns as legacy without rewriting the old schema', version => {
@@ -102,6 +214,49 @@ test('Durable product Sessions exist before their integer Conversation is bound 
     expect(current.sessions.bindDurableConversation(other.sessionId, 17, at)).toMatchObject({ ok: false });
     const legacy = need(current.sessions.create({ nativeSessionId: 'legacy', title: 'Legacy', at }));
     expect(current.sessions.bindDurableConversation(legacy.sessionId, 19, at)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  } finally { await current.close(); }
+});
+
+test('Durable Conversation IDs are unique within their immutable runtime owner', async () => {
+  const current = need(openTestDatabase(paths()));
+  const runtimeA = '11111111-1111-4111-8111-111111111111';
+  const runtimeB = '22222222-2222-4222-8222-222222222222';
+  try {
+    const local = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: 'Local', at }));
+    const cloudWorkspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const first = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId: runtimeA, cloudWorkspaceId, title: 'Cloud A', at }));
+    const second = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId: runtimeB, cloudWorkspaceId, title: 'Cloud B', at }));
+    const duplicate = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId: runtimeA, cloudWorkspaceId, title: 'Same owner', at }));
+
+    expect(current.sessions.bindDurableConversation(local.sessionId, 17, at)).toMatchObject({ ok: true });
+    expect(current.sessions.bindDurableConversation(first.sessionId, 17, at)).toMatchObject({ ok: true });
+    expect(current.sessions.bindDurableConversation(second.sessionId, 17, at)).toMatchObject({ ok: true });
+    expect(current.sessions.bindDurableConversation(duplicate.sessionId, 17, at)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(current.sessions.get(first.sessionId)).toMatchObject({ ok: true, data: { durableRuntimeId: runtimeA, durableConversationId: 17 } });
+    expect(() => current.db.query('UPDATE sessions SET durable_runtime_id=? WHERE id=?').run(runtimeB, first.sessionId)).toThrow();
+    expect(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId: '../outside', title: 'Invalid', at }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+  } finally { await current.close(); }
+});
+
+test('cloud Durable Sessions retain their immutable workspace as well as runtime identity', async () => {
+  const input = paths(), current = need(openTestDatabase(input));
+  const durableRuntimeId = '11111111-1111-4111-8111-111111111111', cloudWorkspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  try {
+    const session = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId, cloudWorkspaceId, title: 'Cloud', at }));
+    expect(current.sessions.get(session.sessionId)).toMatchObject({ ok: true, data: { durableRuntimeId, cloudWorkspaceId } });
+    expect(() => current.db.query('UPDATE sessions SET cloud_workspace_id=? WHERE id=?')
+      .run('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', session.sessionId)).toThrow();
+    const otherWorkspace = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    expect(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId,
+      cloudWorkspaceId: otherWorkspace, title: 'Wrong workspace', at }))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(() => current.db.query(`INSERT INTO sessions(runtime_kind,native_session_id,durable_runtime_id,cloud_workspace_id,title,created_at,updated_at)
+      VALUES('durable',NULL,?,?,?,?,?)`).run(durableRuntimeId, otherWorkspace, 'Wrong workspace', at, at)).toThrow();
+    expect(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, durableRuntimeId, title: 'Missing workspace', at }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, cloudWorkspaceId, title: 'Local with cloud workspace', at }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
   } finally { await current.close(); }
 });
 
@@ -207,14 +362,34 @@ test('the actual active-root constraint separates engines while rejecting same-e
   } finally { await current.close(); }
 });
 
-test('schema22 remains inspectable and backed up without interpreting an unbound Durable Session as Pi history', async () => {
+test('root constraints retain one local run and allow two distinct cloud runtimes, not a third or a second root for one Session', async () => {
+  const current = need(openTestDatabase(paths()));
+  try {
+    const local = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: 'Local', at }));
+    const workspace = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const owners = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222',
+      '33333333-3333-4333-8333-333333333333'];
+    const clouds = owners.map(durableRuntimeId => need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null,
+      durableRuntimeId, cloudWorkspaceId: workspace, title: 'Cloud', at })));
+    const insert = (sessionId: number) => Number(current.db.query(`INSERT INTO runs(kind,session_id,status,goal,input_json,config_json,scope_json,cleanup_json,usage_json,created_at)
+      VALUES('agent',?,'created','Scoped root','{}','{}','{}','{}','{}',?)`).run(sessionId, at).lastInsertRowid);
+    insert(local.sessionId); const first = insert(clouds[0]!.sessionId); insert(clouds[1]!.sessionId);
+    expect(() => insert(local.sessionId)).toThrow(); expect(() => insert(clouds[0]!.sessionId)).toThrow();
+    expect(() => insert(clouds[2]!.sessionId)).toThrow();
+    current.db.query("UPDATE runs SET status='failed',error_json='{}',ended_at=? WHERE id=?").run(at, first);
+    insert(clouds[2]!.sessionId);
+    expect(() => current.db.query("UPDATE runs SET status='created',error_json=NULL,ended_at=NULL WHERE id=?").run(first)).toThrow();
+  } finally { await current.close(); }
+});
+
+test('schema23 remains inspectable and backed up without interpreting an unbound Durable Session as Pi history', async () => {
   const input = paths(), current = need(openTestDatabase(input));
   const session = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: 'Accepted before native binding', at }));
   await current.close();
-  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 22 } });
+  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 23 } });
   mkdirSync(join(input.root, 'backups'));
   const backup = need(await backupStore(input, join(input.root, 'backups/saved-backup')));
-  expect(backup.manifest.schemaVersion).toBe(22);
+  expect(backup.manifest.schemaVersion).toBe(23);
   expect(backup.manifest.gaps).not.toContain(`session_execution_requires_recheck:${session.sessionId}`);
 });
 
@@ -238,7 +413,7 @@ test('maintenance preserves an actual zero-model Durable Conversation binding an
     need(await current.transaction(scope => scope.sessions.bindDurableConversation(session.sessionId, conversation.id, at)));
     expect(await current.read(scope => scope.db.query('SELECT count(*) AS count FROM fm_durable_tasks').get())).toEqual({ count: 0 });
   } finally { await harness.close(BACKGROUND_CONTEXT); await current.close(); }
-  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 22 } });
+  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 23 } });
   mkdirSync(join(input.root, 'backups'));
   expect(await backupStore(input, join(input.root, 'backups/bound-backup'))).toMatchObject({ ok: true });
   const changed = need(openTestDatabase(input));
@@ -254,6 +429,16 @@ test('maintenance rejects a stored Durable binding whose native Conversation row
   await current.close(); mkdirSync(join(input.root, 'backups'));
   expect(await backupStore(input, join(input.root, 'backups/missing-native')))
     .toMatchObject({ ok: false, error: { code: 'maintenance_reference_missing' } });
+});
+
+test('maintenance identifies a cloud Durable binding as requiring its separate runtime backup', async () => {
+  const input = paths(), current = need(openTestDatabase(input));
+  const session = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null,
+    durableRuntimeId: '11111111-1111-4111-8111-111111111111', cloudWorkspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', title: 'Cloud native row', at }));
+  need(current.sessions.bindDurableConversation(session.sessionId, 99, at));
+  await current.close(); mkdirSync(join(input.root, 'backups'));
+  const backup = need(await backupStore(input, join(input.root, 'backups/cloud-authority')));
+  expect(backup.manifest.gaps).toContain(`durable_runtime_external_backup_required:${session.sessionId}`);
 });
 
 for (const operation of ['get', 'messages', 'history', 'history-entry', 'input', 'inputs', 'extensions', 'archive', 'delete']) {

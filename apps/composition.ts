@@ -1,5 +1,10 @@
 import { createInputDefinitions } from '../packages/core/src/prompt-templates.ts';
 import { createPersonalAgentRuntime, type PersonalAgentRuntime, type PersonalAgentRuntimeOptions } from './personal-agent.ts';
+import { CloudMaterialExport } from './cloud-material-export.ts';
+import { CloudResourceExport } from './cloud-resource-export.ts';
+import { startCloudAuthorityEndpoints } from './cloud-authority-service.ts';
+import type { InvoiceEditServiceOptions } from '../packages/core/src/invoice-edit/service.ts';
+import { createCloudRuntimeRpcClient } from './cloud-runtime-rpc.ts';
 import { parseFrontmatter, loadPromptTemplates, expandPromptTemplate } from '@flowmate/runtime-pi';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +31,10 @@ import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest
 import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
+  onCloudMaterialReady?: (material: CloudMaterialExport) => void;
+  onCloudResourceReady?: (resource: CloudResourceExport) => void;
+  cloudAuthority?: { workspaceId: string; runtimeSocket: string; desktopSocket: string; authoritySocket: string; modelSocket: string;
+    readApiKey(): string | undefined | Promise<string | undefined>; fetch?: (url: string, init: RequestInit) => Promise<Response> };
   personalAgent?: Pick<PersonalAgentRuntimeOptions, 'resolveConfiguration' | 'readApiKey' | 'defaultConfiguration'> & {
     onReady?: (control: Pick<PersonalAgentRuntime, 'start' | 'conditionsChanged'>) => void;
   };
@@ -57,6 +66,9 @@ export type ApplicationOptions = {
 };
 
 export async function createApplication(options: ApplicationOptions): Promise<Result<Application>> {
+  if (options.cloudAuthority && (!options.personalAgent || new Set([options.cloudAuthority.runtimeSocket, options.cloudAuthority.desktopSocket,
+    options.cloudAuthority.authoritySocket, options.cloudAuthority.modelSocket]).size !== 4))
+    return fail(appError('input_invalid', 'input', 'The cloud Authority configuration is invalid.'));
   const lock = await acquireProductControllerLock(options.paths);
   if (!lock.ok) return lock;
   if (options.installedRelease) {
@@ -100,11 +112,11 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     materials: { inspectParsed: (input, scope) => documents.inspectParsedForContext(input, {
       repository: scope.documents, files: { read: (artifact, name) => files.read(artifact, name, scope.contents) },
     }) } });
-  const invoiceEdits = createInvoiceEditService({ database: database.data, files,
-    validate: (draft, ref, scope) => validateHumanInvoiceCandidate(draft, ref, {
+  const validateCandidate: InvoiceEditServiceOptions['validate'] = (draft, ref, scope) => validateHumanInvoiceCandidate(draft, ref, {
       readParsedForWorkspace: id => documents.readParsedForWorkspace(id, { repository: scope.documents,
         files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }),
-    }), now });
+    });
+  const invoiceEdits = createInvoiceEditService({ database: database.data, files, validate: validateCandidate, now });
   const native = createNativeTools({
     getWorkingDirectory: context => database.data.read(scope => scope.toolCalls.getNativeWorkingDirectory(context))
       .catch(() => fail(appError('storage_read_failed', 'storage', 'The owned native working directory could not be read.', true))),
@@ -148,7 +160,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     ...(invoiceForms ? [fillInvoiceForm(invoiceForms)] : []), createSubagentTool(() => agent), ...native.definitions];
   const definitions = Object.freeze([...(options.toolDefinitions?.(assembled) ?? assembled)]);
   const unavailableTools = new Set(native.availability.filter(item => !item.available).map(item => item.name as string));
-  const resources = createResourceService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
+  const cloudResourceRoot = options.cloudAuthority ? join(options.paths.root, 'data', 'cloud-resources') : undefined;
+  const resources = createResourceService({ resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)), importedResourceRoot: cloudResourceRoot,
     bundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
     registeredToolNames: definitions.filter(tool => !unavailableTools.has(tool.name)).map(tool => tool.name), inspectNativeResources,
   });
@@ -168,6 +181,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     tools: definitions });
   let sessionService: SessionService;
   let personalRuntime: PersonalAgentRuntime | undefined;
+  const cloudRuntime = options.cloudAuthority ? createCloudRuntimeRpcClient(options.cloudAuthority.runtimeSocket) : undefined;
+  let cloudEndpoints: { stopDesktop(): Promise<Result<void>>; close(): Promise<Result<void>> } | undefined;
   const runtime = new RuntimeService({
     database: database.data,
     recoveryError: database.data.recoveryError,
@@ -204,7 +219,10 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const jobService = createJobService(database.data, now);
   if (options.personalAgent) {
     const personal = await createPersonalAgentRuntime({ ...options.personalAgent, database: database.data, definitions,
+      ...(options.cloudAuthority ? { cloud: { workspaceId: options.cloudAuthority.workspaceId,
+        runtime: cloudRuntime! } } : {}),
       now, runtimeDefaults: options.runtimeDefaults, resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
+      importedResourceRoot: cloudResourceRoot,
       bundleRoot: join(options.paths.runtimeDir, 'resource-bundles'),
       foregroundBusy: () => { const state = runtime.state(); return state.active !== null || state.blocked; },
       onError: error => { logger.write({ at: now(), level: 'error', component: 'personal_agent', event: 'coordination_failed', code: error.code }); },
@@ -304,7 +322,12 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     }
     return { stopped: true, closed: loggerClosed && databaseClosed && lockReleased, errors };
   }, sessionService, promptTrace, workspaceService, jobService, {
-    personal: personalRuntime ? { ...personalRuntime.personal, close: personalRuntime.close } : undefined,
+    personal: personalRuntime ? { ...personalRuntime.personal, close: async () => {
+      const desktop = await cloudEndpoints?.stopDesktop() ?? ok(undefined);
+      const stopped = await personalRuntime!.close();
+      const endpoints = await cloudEndpoints?.close() ?? ok(undefined);
+      return !desktop.ok ? desktop : !stopped.ok ? stopped : endpoints;
+    } } : undefined,
     resources: {
       catalog: input => database.data.read(scope => resources.catalog(input, scope.contents))
         .catch(() => fail(appError('storage_read_failed', 'storage', 'Resources could not be listed.', true))),
@@ -464,11 +487,26 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     try {
       if (!existsSync(join(options.paths.root, 'data/settings.json'))) write('settings.json', installedSettings.data);
       write('installed-release.json', { version: 1, releaseId: options.installedRelease.releaseId,
-        productVersion: options.installedRelease.productVersion, schemaVersion: 22, settingsVersion: 7 });
+        productVersion: options.installedRelease.productVersion, schemaVersion: 23, settingsVersion: 7 });
     } catch {
       await application.close();
       return fail(appError('maintenance_release_record_failed', 'storage', 'The installed release could not be recorded; original data and backups were retained.', true));
     }
+  }
+  if (options.cloudAuthority && personalRuntime) {
+    const cloud = options.cloudAuthority;
+    const endpoints = await startCloudAuthorityEndpoints({ workspaceId: cloud.workspaceId, database: database.data, personal: personalRuntime,
+      runtime: cloudRuntime!,
+      files, now, readApiKey: cloud.readApiKey, fetch: cloud.fetch, desktopSocket: cloud.desktopSocket,
+      readOriginal: (documentId, page) => application.readDocumentOriginal(documentId, page),
+      readPage: input => application.readDocumentPage(input),
+      verifyWorkspace: workspaceVerifier, validateCandidate,
+      resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)), importedResourceRoot: cloudResourceRoot,
+      authoritySocket: cloud.authoritySocket, modelSocket: cloud.modelSocket,
+      inspect: (ref, scope) => documents.inspectForWorkspace(ref, { repository: scope.documents,
+        files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }) });
+    if (!endpoints.ok) { await application.close(); return endpoints; }
+    cloudEndpoints = endpoints.data;
   }
   if (personalRuntime) {
     if (options.personalAgent?.onReady) options.personalAgent.onReady(personalRuntime);
@@ -477,5 +515,10 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       if (!started.ok) { await application.close(); return started; }
     }
   }
+  options.onCloudMaterialReady?.(new CloudMaterialExport({ database: database.data, files, now,
+    inspect: (ref, scope) => documents.inspectForWorkspace(ref, { repository: scope.documents,
+      files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }) }));
+  options.onCloudResourceReady?.(new CloudResourceExport({ database: database.data,
+    resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)), inspectNativeResources, now }));
   return ok(application);
 }

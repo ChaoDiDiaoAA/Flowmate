@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { RuntimeBudgetOverridesSchema } from './runtime.ts';
-import { RUNTIME_CONFIG } from './runtime-config.ts';
+import { CLOUD_WORK_TIMEOUT_MS_MAX, RUNTIME_CONFIG } from './runtime-config.ts';
 import { RegisteredToolNameSchema } from './tools.ts';
 import { ResourceSelectionSchema } from './resources.ts';
 import { ExtensionSelectionSchema } from './extensions.ts';
@@ -17,9 +17,11 @@ export const DurableRuntimeBudgetSchema = RuntimeBudgetOverridesSchema.required(
 }).strict().readonly();
 export type DurableRuntimeBudget = z.infer<typeof DurableRuntimeBudgetSchema>;
 const limits = z.object({
-  timeoutMs: z.number().int().min(RUNTIME_CONFIG.ranges.timeoutMs.min).max(RUNTIME_CONFIG.ranges.timeoutMs.max),
+  timeoutMs: z.number().int().min(RUNTIME_CONFIG.ranges.timeoutMs.min).max(CLOUD_WORK_TIMEOUT_MS_MAX),
   stopGraceMs: z.number().int().min(RUNTIME_CONFIG.ranges.stopGraceMs.min).max(RUNTIME_CONFIG.ranges.stopGraceMs.max),
-}).strict().readonly();
+  cloud: z.literal(true).optional(),
+}).strict().refine(value => value.cloud === true || value.timeoutMs <= RUNTIME_CONFIG.ranges.timeoutMs.max,
+  'Local execution retains its existing time limit.').readonly();
 const budgetFields = { runtimeBudget: DurableRuntimeBudgetSchema, limits };
 export const DurableWorkBudgetSchema = z.object(budgetFields).strict().readonly();
 export type DurableWorkBudget = z.infer<typeof DurableWorkBudgetSchema>;
