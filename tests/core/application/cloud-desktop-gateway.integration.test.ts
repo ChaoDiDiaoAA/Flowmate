@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { appError, fail, ok, type Result } from '@flowmate/contracts';
 import { createCloudDesktopHandler } from '../../../apps/cloud-desktop-gateway.ts';
+import { CloudDesktopRelay } from '../../../apps/cloud-desktop-relay.ts';
 import { callCloudUnixRpc, listenCloudUnixRpc } from '../../../apps/cloud-unix-rpc.ts';
 import { mkdtempSync } from '../../support/resources.ts';
 
@@ -14,6 +15,20 @@ const configuration = { modelId: null, thinkingLevel: 'off', resources: { prompt
 const snapshot = { personalAgentId: 1, revision: 0, runtimeKind: 'durable', configuration, createdAt: at, updatedAt: at };
 const envelope = { version: 1, workspaceId, requestId, command: { type: 'personal_agent_get', input: {} } };
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(result.error.code); return result.data; }
+
+test('cloud relay commands deliver a request and validate the original receiver and reply', async () => {
+  const relay = new CloudDesktopRelay(), connectionId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const handle = createCloudDesktopHandler({ workspaceId, authorize: async () => ok(undefined), dispatch: async () => ok(snapshot), desktopRelay: relay });
+  const command = (type: string, input: unknown) => ({ ...envelope, command: { type, input } });
+  expect(await handle(command('cloud_desktop_attach', { connectionId }))).toEqual(ok({ connectionId }));
+  const pending = relay.request({ kind: 'list', workId: 7, itemId: 8 }, new AbortController().signal);
+  const next = need(await handle(command('cloud_desktop_next', { connectionId }))) as { event: { kind: string; id: string; request: unknown } };
+  expect(next.event).toMatchObject({ kind: 'request', request: { kind: 'list', workId: 7, itemId: 8 } });
+  const result = { ok: true as const, data: { kind: 'list' as const, windows: [] } };
+  expect(await handle(command('cloud_desktop_reply', { connectionId, id: next.event.id, result }))).toEqual(ok({ connectionId }));
+  expect(await pending).toEqual(result);
+  expect(await handle(command('cloud_desktop_detach', { connectionId }))).toEqual(ok({ connectionId }));
+});
 
 test('the cloud desktop gateway permits only the original workspace and personal-agent command schemas', async () => {
   const accepted: unknown[] = [], dispatched: unknown[] = [];

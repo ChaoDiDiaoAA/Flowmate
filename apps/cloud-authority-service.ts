@@ -20,6 +20,7 @@ import { CloudResourceUpload } from './cloud-resource-upload.ts';
 import { CloudDeliveryAuthority } from './cloud-delivery-authority.ts';
 import { createCloudRuntimeAuthorizer } from './cloud-runtime-authority.ts';
 import { listenCloudUnixRpc } from './cloud-unix-rpc.ts';
+import type { CloudDesktopRelay } from './cloud-desktop-relay.ts';
 import type { PersonalAgentRuntime } from './personal-agent.ts';
 
 type Options = { workspaceId: string; database: DbHandle; personal: PersonalAgentRuntime; runtime: DurableRuntimePort & { queue?: CloudQueuePort; delivery?: CloudRuntimeDeliveryPort };
@@ -31,6 +32,7 @@ type Options = { workspaceId: string; database: DbHandle; personal: PersonalAgen
   verifyWorkspace?: WorkspaceVerifier; validateCandidate?: InvoiceEditServiceOptions['validate'];
   resourceRoot?: string; importedResourceRoot?: string;
   desktopSocket: string; authoritySocket: string; modelSocket: string;
+  desktopRelay?: CloudDesktopRelay;
   fetch?: (url: string, init: RequestInit) => Promise<Response> };
 
 /** Runs only under the existing product owner; each socket carries a separate limited protocol. */
@@ -107,6 +109,10 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
       case 'invoice_work_continue': return works.continueWork(command.input);
       case 'invoice_work_cancel': return works.cancelWork(command.input);
       case 'invoice_work_query_operation': return works.queryOperation(command.input);
+      case 'invoice_work_desktop_list': return works.listDesktopActions(command.input);
+      case 'invoice_work_desktop_decide': return works.decideDesktopAction(command.input);
+      case 'invoice_work_desktop_discard': return works.discardDesktopAction(command.input);
+      case 'invoice_work_desktop_query_decision': return works.queryDesktopDecision(command.input);
       case 'personal_task_list': return tasks.list(command.input);
       case 'personal_task_get': return tasks.get(command.input);
       case 'personal_task_stop': return tasks.stop(command.input);
@@ -137,11 +143,12 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
   if (!model.ok) { const closed = await authority.data.close(); return closed.ok ? model : closed; }
   const desktop = await listenCloudUnixRpc({ socketPath: options.desktopSocket, allowStaleSocket: true,
     handle: createCloudDesktopHandler({ workspaceId: workspace.data, authorize: createCloudDesktopAuthorizer(options.database, workspace.data), dispatch, material, resources, queue, review, delivery,
+      desktopRelay: options.desktopRelay,
       childReport: createCloudChildReportReader(options.database, workspace.data), progress: createCloudProgressReader(options.database, workspace.data, progress) }) });
   if (!desktop.ok) { const modelClosed = await model.data.close(), authorityClosed = await authority.data.close();
     return !modelClosed.ok ? modelClosed : !authorityClosed.ok ? authorityClosed : desktop; }
   let desktopClosing: Promise<Result<void>> | undefined, closing: Promise<Result<void>> | undefined;
-  const stopDesktop = () => { progress.close(); return desktopClosing ??= desktop.data.close(); };
+  const stopDesktop = () => { progress.close(); options.desktopRelay?.close(); return desktopClosing ??= desktop.data.close(); };
   return ok({ stopDesktop, close() {
     closing ??= (async () => {
       const first = await stopDesktop(), second = await model.data.close(), third = await authority.data.close();

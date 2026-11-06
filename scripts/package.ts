@@ -11,7 +11,7 @@ import { validateWinSwExecutable } from '../packages/shared/src/service-layout.t
 const entries = [['apps/host/main.ts', 'host.js'], ['agent-eval/src/desktop/worker.ts', 'evaluation-worker.js'],
   ['apps/maintenance/main.ts', 'maintenance.js'], ['apps/service/main.ts', 'service.js'], ['scripts/service.ts', 'service-manager.js']] as const;
 const versions = { '@earendil-works/pi-ai': '1.4.0', '@earendil-works/pi-coding-agent': '1.4.0',
-  '@earendil-works/pi-tui': '1.4.0', '@tintinweb/pi-subagents': '0.19.0', zod: '3.25.76',
+  '@earendil-works/pi-mcp': '1.4.0', '@earendil-works/pi-tui': '1.4.0', '@tintinweb/pi-subagents': '0.19.0', zod: '3.25.76',
   electron: '44.4.5', 'electron-builder': '26.15.3' };
 
 function copyTree(source: string, destination: string, allowed: (path: string) => boolean = () => true): void {
@@ -162,7 +162,7 @@ export async function buildRuntime(repository: string, destination: string): Pro
   const release = PackagedReleaseSchema.parse({ version: 1, releaseId: randomUUID(), productVersion: metadata.version,
     platform: 'win32', arch: 'x64', bunVersion: Bun.version, electronVersion: versions.electron,
     sdkVersion: versions['@earendil-works/pi-coding-agent'], pluginVersion: versions['@tintinweb/pi-subagents'],
-    schemaVersion: 23, settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files: files(destination) });
+    schemaVersion: 24, settingsVersion: 7, service: { wrapperVersion: '2.12.0', framework: 'net461' }, files: files(destination) });
   writeFileSync(join(destination, 'release.json'), JSON.stringify(release, null, 2), { flag: 'wx' });
   const layout = resolveRuntimeLayout({ isPackaged: true, appPath: join(dirname(destination), 'app/app.asar'),
     resourcesPath: dirname(destination), userDataRoot: join(dirname(dirname(destination)), 'package-validation-data') });

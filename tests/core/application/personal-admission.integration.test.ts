@@ -15,6 +15,7 @@ import { CloudResourceUpload } from '../../../apps/cloud-resource-upload.ts';
 import { CloudDeliveryAuthority } from '../../../apps/cloud-delivery-authority.ts';
 import { CloudDesktopReview } from '../../../apps/cloud-desktop-review.ts';
 import { createCloudDesktopHandler } from '../../../apps/cloud-desktop-gateway.ts';
+import { PersonalAgentCommandSchema } from '../../../packages/contracts/src/personal-agent-commands.ts';
 import { CloudModelAttempts } from '../../../packages/core/src/personal-agent/cloud-model-attempts.ts';
 import { CloudDeepSeekProxy } from '../../../apps/cloud-deepseek-proxy.ts';
 import { callCloudModelSocket, listenCloudModelSocket } from '../../../apps/cloud-model-socket.ts';
@@ -307,6 +308,15 @@ test('cloud desktop authorization accepts only Workspace-owned Work and approved
   const local = await f.create('local-not-cloud'), authorize = createCloudDesktopAuthorizer(f.database, workspaceId);
   expect(await authorize({ type: 'invoice_work_get', input: { view: 'work', workId: work.workId, limit: 10 } })).toEqual({ ok: true, data: undefined });
   expect(await authorize({ type: 'invoice_work_get', input: { view: 'work', workId: local.workId, limit: 10 } })).toMatchObject({ ok: false });
+  for (const command of [
+    { type: 'invoice_work_desktop_list', input: { workId: work.workId, itemId: 1, limit: 10 } },
+    { type: 'invoice_work_desktop_decide', input: { workId: work.workId, itemId: 1, proposalId: 1, expectedRevision: 0, requestId: 'approval', decision: 'approve' } },
+    { type: 'invoice_work_desktop_query_decision', input: { workId: work.workId, itemId: 1, proposalId: 1, requestId: 'approval' } },
+  ] as const) {
+    expect(await authorize(command)).toEqual({ ok: true, data: undefined });
+    expect(await authorize(PersonalAgentCommandSchema.parse({ ...command, input: { ...command.input, workId: local.workId } })))
+      .toMatchObject({ ok: false, error: { code: 'cloud_workspace_forbidden' } });
+  }
   expect(await authorize({ type: 'invoice_work_create', input: { ...f.request('approved-upload'), documents: [{ id: 1, version: 'v1' }] } }))
     .toEqual({ ok: true, data: undefined });
   expect(await authorize({ type: 'invoice_work_create', input: { ...f.request('unapproved-upload'), documents: [{ id: 2, version: 'v1' }] } }))

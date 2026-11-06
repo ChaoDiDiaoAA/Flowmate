@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createConnection } from 'node:net';
 import { once } from 'node:events';
 import { defaultProductSettings } from '@flowmate/core';
+import { CandidateDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
 import { createCredentialStore } from '../../packages/shared/src/secure-credential-store.ts';
 import { createServiceSecureStorage } from '../../packages/shared/src/service-secure-storage.ts';
 import type { DocumentSnapshot, Result } from '@flowmate/contracts';
@@ -11,6 +12,7 @@ import { Database } from 'bun:sqlite';
 import * as P from '../../packages/contracts/src/personal-agent.ts';
 import { servicePipeName } from '../../apps/service/protocol.ts';
 import { installOwnerFixture, ownerClient, packageOwnerFixture, removeOwnerFixture, spawnOwnerFixture, waitOwner } from './owner-fixture.ts';
+import { waitFor } from '../support/resources.ts';
 
 let packaged: Awaited<ReturnType<typeof packageOwnerFixture>> | undefined;
 afterAll(() => { if (packaged) removeOwnerFixture(packaged.root); });
@@ -23,13 +25,13 @@ async function fixture(mode = '', enabled = true) {
   return { installation, process };
 }
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(result.error.code); return result.data; }
-async function foregroundFixture(mode = '', enabled = true) {
+async function foregroundFixture(mode = '', enabled = true, response?: (count: number) => Response) {
   const f = await fixture(mode, enabled), requests: unknown[] = [];
   let release!: () => void;
   let gate = new Promise<void>(resolve => { release = resolve; });
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     requests.push(await request.json()); await gate;
-    return new Response('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: 'Controlled foreground.' },
+    return response?.(requests.length) ?? new Response('data: ' + JSON.stringify({ choices: [{ index: 0, delta: { role: 'assistant', content: 'Controlled foreground.' },
       finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   } });
   const ref = 'service_foreground_key_01';
@@ -45,6 +47,167 @@ async function foregroundFixture(mode = '', enabled = true) {
     server.stop(true); removeOwnerFixture(f.installation.dataRoot);
   } };
 }
+
+it('binds the interactive desktop to one live service client and releases it on disconnect', async () => {
+  const f = await foregroundFixture('', false), other = await ownerClient(f.installation);
+  try {
+    const text = 'Controlled sample invoice';
+    const document = need(await f.client.call<DocumentSnapshot>({ type: 'import_prepared_invoice_material', input: {
+      contract: 'flowmate-prepared-invoice/v1', sample: 'desktop-owner', sourceText: text,
+      original: { name: 'source.md', base64: Buffer.from(text).toString('base64') },
+      pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text', text, sourceIndex: 0, sourceType: 'prepared-text', bbox: null }] }],
+    } }));
+    const agent = P.PersonalAgentSnapshotSchema.parse(need(await f.client.call({ type: 'personal_agent_get', input: {} })));
+    const created = P.InvoiceWorkCreateReceiptSchema.parse(need(await f.client.call({ type: 'invoice_work_create', input: {
+      personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision, requestId: 'service-desktop-work',
+      goal: 'Review the sample.', documents: [document.documentRef],
+    } })));
+    const page = P.InvoiceWorkGetResultSchema.parse(need(await f.client.call({ type: 'invoice_work_get', input: { view: 'work', workId: created.workId } })));
+    if (page.view !== 'work') throw Error('work unavailable');
+    const input = { workId: created.workId, itemId: page.items[0]!.itemId };
+    expect(await f.client.call({ type: 'desktop_bind', input })).toEqual({ ok: true, data: input });
+    expect(await other.call({ type: 'desktop_bind', input })).toMatchObject({ ok: false, error: { code: 'desktop_unavailable' } });
+    f.client.socket.destroy();
+    await waitFor(async () => (await other.call({ type: 'desktop_bind', input })).ok);
+    expect(await other.call({ type: 'desktop_bind', input })).toEqual({ ok: true, data: input });
+  } finally { other.socket.destroy(); await f.dispose(); }
+}, 90_000);
+
+it('routes a Durable desktop observation only to the bound service client', async () => {
+  const f = await foregroundFixture('', true, count => {
+    const tool = count === 1 || count === 3;
+    const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: 'service-observe-' + count, type: 'function',
+      function: { name: 'desktop_observe_window', arguments: '{}' } }] } : { role: 'assistant', content: 'Observed controlled sample.' };
+    return new Response(`data: ${JSON.stringify({ id: `service-desktop-${count}`, object: 'chat.completion.chunk', created: 1,
+      model: 'service-foreground', choices: [{ index: 0, delta, finish_reason: tool ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`,
+    { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const other = await ownerClient(f.installation);
+  try {
+    const text = 'Controlled service desktop invoice';
+    const document = need(await f.client.call<DocumentSnapshot>({ type: 'import_prepared_invoice_material', input: {
+      contract: 'flowmate-prepared-invoice/v1', sample: 'desktop-routing', sourceText: text,
+      original: { name: 'source.md', base64: Buffer.from(text).toString('base64') },
+      pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text', text, sourceIndex: 0, sourceType: 'prepared-text', bbox: null }] }],
+    } }));
+    const initial = P.PersonalAgentSnapshotSchema.parse(need(await f.client.call({ type: 'personal_agent_get', input: {} })));
+    const agent = P.PersonalAgentSnapshotSchema.parse(need(await f.client.call({ type: 'personal_agent_update', input: {
+      personalAgentId: initial.personalAgentId, expectedRevision: initial.revision, configuration: { ...initial.configuration,
+        modelId: 'service-foreground', tools: ['desktop_observe_window'], resources: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] } },
+    } })));
+    const created = P.InvoiceWorkCreateReceiptSchema.parse(need(await f.client.call({ type: 'invoice_work_create', input: {
+      personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision, requestId: 'service-desktop-route',
+      goal: 'Observe the controlled sample.', documents: [document.documentRef],
+    } })));
+    const page = P.InvoiceWorkGetResultSchema.parse(need(await f.client.call({ type: 'invoice_work_get', input: { view: 'work', workId: created.workId } })));
+    if (page.view !== 'work') throw Error('work unavailable');
+    const owner = { workId: created.workId, itemId: page.items[0]!.itemId };
+    expect(await f.client.call({ type: 'desktop_bind', input: owner })).toEqual({ ok: true, data: owner });
+    f.releaseProvider();
+    await waitOwner(() => f.client.frames.some(frame => frame.type === 'desktop_request'));
+    const request = f.client.frames.find(frame => frame.type === 'desktop_request') as { requestId: string; request: unknown };
+    expect(request.request).toMatchObject({ kind: 'observe', ...owner });
+    expect(other.frames.some(frame => frame.type === 'desktop_request')).toBe(false);
+    const value = { ok: true, data: { kind: 'observe', observationId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',
+      window: { id: 42, app: 'Controlled', title: 'Sample' }, tree: '[3] Edit sample', truncated: false } };
+    expect(await other.call({ type: 'desktop_response', requestId: request.requestId, value }))
+      .toMatchObject({ ok: false, error: { code: 'service_command_forbidden' } });
+    f.client.socket.write(JSON.stringify({ version: 1, type: 'desktop_response', requestId: request.requestId, value }) + '\n');
+    await waitFor(async () => { const tasks = await f.client.call({ type: 'personal_task_list', input: { workId: created.workId, limit: 10 } });
+      return tasks.ok && P.PersonalTaskListResultSchema.parse(tasks.data).items.some(task => task.stoppedAt !== null); }, 20000);
+    expect(f.requests).toHaveLength(2);
+    f.holdProvider();
+    const second = P.InvoiceWorkCreateReceiptSchema.parse(need(await f.client.call({ type: 'invoice_work_create', input: {
+      personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision, requestId: 'service-desktop-cancel',
+      goal: 'Observe the second controlled sample.', documents: [document.documentRef],
+    } })));
+    const secondPage = P.InvoiceWorkGetResultSchema.parse(need(await f.client.call({ type: 'invoice_work_get', input: { view: 'work', workId: second.workId } })));
+    if (secondPage.view !== 'work') throw Error('second work unavailable');
+    need(await f.client.call({ type: 'desktop_bind', input: { workId: second.workId, itemId: secondPage.items[0]!.itemId } }));
+    f.releaseProvider();
+    await waitOwner(() => f.client.frames.filter(frame => frame.type === 'desktop_request').length === 2);
+    const pending = f.client.frames.filter(frame => frame.type === 'desktop_request').at(-1) as { requestId: string };
+    await f.client.call({ type: 'service_prepare_disconnect' });
+    expect(f.client.frames.some(frame => frame.type === 'desktop_cancel' && frame.requestId === pending.requestId)).toBe(true);
+  } finally { other.socket.destroy(); await f.dispose(); }
+}, 90_000);
+
+it('routes a Durable invoice form only to its bound service client and saves the original receipt', async () => {
+  let document: DocumentSnapshot, candidateId = 0;
+  const target = { formInstanceId: 'service-personal-form', expectedRevision: 0 };
+  const f = await foregroundFixture('', true, count => {
+    let tool: { name: string; arguments: unknown } | null = null;
+    if (count === 1) {
+      const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
+      const candidate = CandidateDraftSchema.parse({ fields: { ...Object.fromEntries(invoiceHeaderFields.map(name => [name, missing])),
+        totalAmount: { raw: '113.00', normalized: '113.00', state: 'present', alternatives: [], sources: [{ documentId: document.documentRef.id,
+          version: document.documentRef.version, artifactId: document.parsedArtifactId, page: 1, blockId: 'b1', quote: 'Total 113.00' }] } }, lines: [], notes: [] });
+      tool = { name: 'save_invoice_candidate', arguments: { documentId: document.documentRef.id, candidate } };
+    } else if (count === 3) tool = { name: 'personal_observe_invoice_form', arguments: {} };
+    else if (count === 4) tool = { name: 'personal_fill_invoice_form', arguments: { candidateId, target } };
+    const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: 'service-form-' + count, type: 'function',
+      function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } }] } : { role: 'assistant', content: 'The original invoice remains for human review.' };
+    return new Response(`data: ${JSON.stringify({ id: `service-form-response-${count}`, object: 'chat.completion.chunk', created: 1,
+      model: 'service-foreground', choices: [{ index: 0, delta, finish_reason: tool ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`,
+    { headers: { 'content-type': 'text/event-stream' } });
+  });
+  const other = await ownerClient(f.installation);
+  try {
+    const text = 'Total 113.00';
+    document = need(await f.client.call<DocumentSnapshot>({ type: 'import_prepared_invoice_material', input: {
+      contract: 'flowmate-prepared-invoice/v1', sample: 'personal-form-routing', sourceText: text,
+      original: { name: 'source.md', base64: Buffer.from(text).toString('base64') },
+      pages: [{ page: 1, blocks: [{ id: 'b1', kind: 'text', text, sourceIndex: 0, sourceType: 'prepared-text', bbox: null }] }],
+    } }));
+    const initial = P.PersonalAgentSnapshotSchema.parse(need(await f.client.call({ type: 'personal_agent_get', input: {} })));
+    const agent = P.PersonalAgentSnapshotSchema.parse(need(await f.client.call({ type: 'personal_agent_update', input: {
+      personalAgentId: initial.personalAgentId, expectedRevision: initial.revision, configuration: { ...initial.configuration,
+        modelId: 'service-foreground', tools: ['save_invoice_candidate', 'personal_observe_invoice_form', 'personal_fill_invoice_form'],
+        resources: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] } },
+    } })));
+    const created = P.InvoiceWorkCreateReceiptSchema.parse(need(await f.client.call({ type: 'invoice_work_create', input: {
+      personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision, requestId: 'service-form-work',
+      goal: 'Prepare the controlled invoice for review.', documents: [document.documentRef],
+    } })));
+    f.releaseProvider();
+    await waitFor(async () => { const tasks = await f.client.call({ type: 'personal_task_list', input: { workId: created.workId, limit: 10 } });
+      return tasks.ok && P.PersonalTaskListResultSchema.parse(tasks.data).items.some(task => task.stoppedAt !== null); }, 20000);
+    const page = P.InvoiceWorkGetResultSchema.parse(need(await f.client.call({ type: 'invoice_work_get', input: { view: 'work', workId: created.workId } })));
+    if (page.view !== 'work' || !page.items[0]?.candidateRef) throw Error('Expected the original saved candidate.');
+    candidateId = page.items[0].candidateRef.id;
+    const owner = { workId: created.workId, itemId: page.items[0].itemId };
+    need(await f.client.call({ type: 'desktop_bind', input: owner }));
+    const detail = P.InvoiceWorkGetResultSchema.parse(need(await f.client.call({ type: 'invoice_work_get', input: { view: 'item', ...owner } })));
+    if (detail.view !== 'item') throw Error('Expected the original invoice item.');
+    const todo = detail.todos.find(value => value.applicable && value.actor === 'user'); if (!todo) throw Error('Expected a user Todo.');
+    f.holdProvider();
+    need(await f.client.call({ type: 'invoice_work_supplement', input: { ...owner, todoId: todo.todoId,
+      expectedRevision: detail.work.revision, requestId: 'service-form-supplement', text: 'Fill the prepared form for review.', materials: [] } }));
+    f.releaseProvider();
+    await waitOwner(() => f.client.frames.some(frame => frame.type === 'desktop_request'));
+    const observation = f.client.frames.find(frame => frame.type === 'desktop_request') as { requestId: string; request: unknown };
+    expect(observation.request).toMatchObject({ kind: 'form', ...owner });
+    const observationValue = { ok: true, data: { kind: 'form', candidateId, candidateSequence: page.items[0].candidateRef.sequence, target } };
+    expect(await other.call({ type: 'desktop_response', requestId: observation.requestId, value: observationValue }))
+      .toMatchObject({ ok: false, error: { code: 'service_command_forbidden' } });
+    f.client.socket.write(JSON.stringify({ version: 1, type: 'desktop_response', requestId: observation.requestId, value: observationValue }) + '\n');
+    await waitOwner(() => f.client.frames.some(frame => frame.type === 'invoice_form_request'));
+    const form = f.client.frames.find(frame => frame.type === 'invoice_form_request') as { requestId: string; request: {
+      runId: number; toolCallId: number; candidateId: number; candidateSequence: number; target: typeof target; invoiceWork: unknown } };
+    expect(form.request).toMatchObject({ candidateId, target, invoiceWork: owner });
+    expect(other.frames.some(frame => frame.type === 'invoice_form_request')).toBe(false);
+    const at = new Date().toISOString();
+    const receipt = { runId: form.request.runId, toolCallId: form.request.toolCallId, candidateId, candidateSequence: form.request.candidateSequence,
+      formInstanceId: target.formInstanceId, observedAt: at, outcome: 'applied', appliedAt: at, appliedRevision: 1 };
+    expect(await other.call({ type: 'invoice_form_response', requestId: form.requestId, receipt }))
+      .toMatchObject({ ok: false, error: { code: 'service_command_forbidden' } });
+    f.client.socket.write(JSON.stringify({ version: 1, type: 'invoice_form_response', requestId: form.requestId, receipt }) + '\n');
+    await waitFor(async () => { const saved = await f.client.call({ type: 'query_invoice_form_application', input: { runId: form.request.runId, toolCallId: form.request.toolCallId } });
+      return saved.ok && (saved.data as { outcome?: string }).outcome === 'applied'; }, 20000);
+    expect(await f.client.call({ type: 'query_invoice_form_application', input: { runId: form.request.runId, toolCallId: form.request.toolCallId } }))
+      .toMatchObject({ ok: true, data: { outcome: 'applied', toolCallId: form.request.toolCallId, appliedRevision: 1 } });
+  } finally { other.socket.destroy(); await f.dispose(); }
+}, 90_000);
 
 it('requires exact installation, release and data identity before service commands', async () => {
   const protocol = await import('../../apps/service/protocol.ts').catch(() => null);

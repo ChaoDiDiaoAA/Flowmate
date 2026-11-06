@@ -14,6 +14,8 @@ import type { ServiceCredentialStatus, ServiceCredentialOperationReceipt, Servic
   ServiceCredentialOperationQuery, ServiceCredentialSettingsRequest } from '../../../packages/core/src/configuration/service-credentials.ts';
 import { parseHostResponse, type HostCommandInput, type HostState } from './host-client.ts';
 import { validateProductSettings } from '../../../packages/core/src/configuration/settings.ts';
+import { createDesktopReceiver } from './desktop-receiver.ts';
+import type { DesktopBridgeRequest, DesktopBridgeResult } from '@flowmate/contracts';
 
 const maxInboundFrameBytes = 14 * 1024 * 1024 + 64 * 1024;
 const maxOutboundFrameBytes = 1_100_000;
@@ -27,7 +29,7 @@ const stateResultSchema = z.union([z.object({ ok: z.literal(true), data: stateSc
   z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]);
 type Pending = { command: HostCommand | null; parseValue?: (value: unknown) => unknown;
   resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> };
-export type ServiceCommandInput = Exclude<HostCommandInput, { type: 'close' | 'credential_response' | 'invoice_form_response' }>;
+export type ServiceCommandInput = Exclude<HostCommandInput, { type: 'close' | 'credential_response' | 'invoice_form_response' | 'desktop_response' }>;
 
 export class ServiceClient {
   private socket: Socket | null = null;
@@ -42,6 +44,8 @@ export class ServiceClient {
   private expectedDataRoot: string | null = null;
   private connectionChangeHandler: (() => void) | null = null;
   private invoiceFormHandler: ((request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>) | null = null;
+  private desktopHandler: ((request: DesktopBridgeRequest, signal: AbortSignal) => Promise<DesktopBridgeResult>) | null = null;
+  private desktopReceiver: ReturnType<typeof createDesktopReceiver> | null = null;
 
   public get state(): HostState | null { return this.currentState; }
   public get connectionEpoch(): number { return this.epoch; }
@@ -53,6 +57,7 @@ export class ServiceClient {
   public setInvoiceFormHandler(handler: (request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>): void {
     this.invoiceFormHandler = handler;
   }
+  public setDesktopHandler(handler: (request: DesktopBridgeRequest, signal: AbortSignal) => Promise<DesktopBridgeResult>): void { this.desktopHandler = handler; }
   public subscribe(listener: (event: HostEvent['event']) => void): () => void {
     this.listeners.add(listener); return () => { this.listeners.delete(listener); };
   }
@@ -68,6 +73,12 @@ export class ServiceClient {
     this.epoch++; this.status = 'connecting'; this.expectedDataRoot = expectedDataRoot; this.installationId = hello.installationId;
     const epoch = this.epoch, deadline = Date.now() + timeoutMs;
     const socket = createConnection({ path: servicePipeName(hello.installationId) }); this.socket = socket;
+    this.desktopReceiver = createDesktopReceiver((request, signal) => this.socket === socket && this.epoch === epoch
+      ? this.desktopHandler?.(request, signal) ?? Promise.resolve(fail(appError('desktop_unavailable', 'runtime', 'The desktop is unavailable.')))
+      : Promise.resolve(fail(appError('desktop_unavailable', 'runtime', 'The desktop is unavailable.'))), (requestId, value) => {
+      if (this.socket === socket && this.epoch === epoch && !socket.destroyed && socket.writable)
+        try { this.write(socket, { version: 1, type: 'desktop_response', requestId, value }); } catch { this.dropConnection(socket, 'host_write_failed'); }
+    });
     let resolveHandshake!: () => void, rejectHandshake!: (error: Error) => void;
     const handshake = new Promise<void>((resolve, reject) => { resolveHandshake = resolve; rejectHandshake = reject; });
     const failure = (code: string) => { rejectHandshake(Error(code)); this.dropConnection(socket, code); };
@@ -209,7 +220,7 @@ export class ServiceClient {
   }
 
   public async request(command: ServiceCommandInput, timeoutMs = 10_000): Promise<unknown> {
-    if (['close', 'credential_response', 'invoice_form_response'].includes(command.type)) throw Error('service_command_forbidden');
+    if (['close', 'credential_response', 'invoice_form_response', 'desktop_response'].includes(command.type)) throw Error('service_command_forbidden');
     if (!this.isConnected) throw Error('host_not_writable');
     return this.sendRequest(command, timeoutMs);
   }
@@ -256,6 +267,15 @@ export class ServiceClient {
     const output = raw as Record<string, unknown>;
     if (output.version !== 1 || typeof output.type !== 'string') throw Error('host_protocol_invalid');
     if (output.type === 'credential_request') throw Error('host_protocol_invalid');
+    if (output.type === 'desktop_request') {
+      if (Object.keys(output).some(key => !['version', 'type', 'requestId', 'request'].includes(key))
+        || typeof output.requestId !== 'string' || !this.desktopReceiver?.request(output.requestId, output.request)) throw Error('host_protocol_invalid');
+      return;
+    }
+    if (output.type === 'desktop_cancel') {
+      if (Object.keys(output).some(key => !['version', 'type', 'requestId'].includes(key)) || typeof output.requestId !== 'string') throw Error('host_protocol_invalid');
+      this.desktopReceiver?.cancel(output.requestId); return;
+    }
     if (output.type === 'response') {
       if (typeof output.requestId !== 'string' || !output.requestId || output.requestId.length > 128)
         throw Error('host_protocol_invalid');
@@ -322,6 +342,7 @@ export class ServiceClient {
   }
   private dropConnection(socket: Socket, code: string): void {
     if (this.socket !== socket) return;
+    this.desktopReceiver?.close(); this.desktopReceiver = null;
     if (this.status === 'connected' && this.connectionId) this.lastConnectionId = this.connectionId;
     this.status = 'disconnected';
     this.connectionChangeHandler?.();

@@ -2,9 +2,72 @@ import { _electron as electron } from 'playwright';
 import { expect, test } from '@playwright/test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { cleanupResources, closeDesktopFixture, mkdtemp, waitFor } from '../support/resources.ts';
 
 test.afterEach(cleanupResources);
+
+test('opening Personal Agent reconnects the previously saved cloud workspace without submitting Work', async () => {
+  test.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-cloud-reconnect-ui-'));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  const app = await electron.launch({ executablePath: resolve(import.meta.dirname, '../../node_modules/electron/dist/electron.exe'),
+    args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow();
+    await waitFor(() => page.evaluate(async () => { const state = await window.flowmate.getState(); return state.ok && state.data.ready; }));
+    const workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    await page.evaluate(workspaceId => localStorage.setItem('flowmate.personal-agent.cloud-connection.v1', JSON.stringify({ workspaceId,
+      target: { host: '127.0.0.1', port: 22, username: 'flowmate', privateKeyPath: 'C:\\test\\key', knownHostsPath: 'C:\\test\\hosts' } })), workspaceId);
+    await app.evaluate(({ ipcMain }) => {
+      let connected = false, connects = 0, workWrites = 0;
+      Reflect.set(globalThis, 'cloudReconnectCounts', () => ({ connects, workWrites }));
+      ipcMain.removeHandler('flowmate:desktop-start'); ipcMain.handle('flowmate:desktop-start', () => ({ ok: true, data: undefined }));
+      ipcMain.removeHandler('flowmate:cloud-state'); ipcMain.handle('flowmate:cloud-state', () => ({ ok: true, data: {
+        workspaceId: connected ? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' : null, ...(connected ? { desktopReady: true } : {}) } }));
+      ipcMain.removeHandler('flowmate:cloud-connect'); ipcMain.handle('flowmate:cloud-connect', (_event, input) => {
+        connects++; connected = true; return { ok: true, data: { workspaceId: input.workspaceId } };
+      });
+      ipcMain.removeHandler('flowmate:cloud-request'); ipcMain.handle('flowmate:cloud-request', (_event, input) => {
+        if (input.command.type === 'invoice_work_create') workWrites++;
+        return { ok: false, error: { code: 'storage_read_failed', category: 'storage', message: 'Controlled unavailable.', retryable: true } };
+      });
+    });
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await expect(page.getByText('Connected workspace: ' + workspaceId, { exact: true })).toBeVisible({ timeout: 5000 });
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'cloudReconnectCounts')())).toEqual({ connects: 1, workWrites: 0 });
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+});
+
+test('opening Personal Agent automatically starts the installed local KimiCU connection', async () => {
+  test.skip(process.platform !== 'win32' || !process.env.FLOWMATE_KIMICU_PLUGIN_ROOT || !process.env.KIMI_CU_WINDOWS_EXE,
+    'The installed local KimiCU plugin and runtime are required.');
+  test.setTimeout(60_000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-cloud-kimi-ui-'));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR',
+    'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  mkdirSync(join(userData, 'data'), { recursive: true });
+  writeFileSync(join(userData, 'data', 'kimi-cu.json'), JSON.stringify({ version: 1,
+    pluginRoot: process.env.FLOWMATE_KIMICU_PLUGIN_ROOT, runtimeExecutable: process.env.KIMI_CU_WINDOWS_EXE }));
+  const app = await electron.launch({ executablePath: resolve(import.meta.dirname, '../../node_modules/electron/dist/electron.exe'),
+    args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30_000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow();
+    await waitFor(() => page.evaluate(async () => { const state = await window.flowmate.getState(); return state.ok && state.data.ready; }));
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Cloud connection' })).toContainText('KimiCU is ready on this Windows desktop.', { timeout: 10_000 });
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+});
 
 test('cloud desktop preload keeps workspace and invoice identities across IPC', async () => {
   test.setTimeout(90_000);

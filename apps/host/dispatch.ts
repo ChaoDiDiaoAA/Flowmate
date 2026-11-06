@@ -33,6 +33,7 @@ import { parseHostCommand, parseRuntimeHostResult, isRuntimeHostCommand, isConte
 import type { HostCommand, HostOutput } from './protocol.ts';
 import type { ForegroundReference } from '../service/protocol.ts';
 import type { ServiceCredentialSettingsAuthority, ServiceCredentialSettingsScope } from '../../packages/core/src/configuration/service-credentials.ts';
+import { createDesktopBridge } from './desktop-bridge.ts';
 
 export type ProductCommandDispatcherOptions = {
   userDataRoot: string;
@@ -81,7 +82,7 @@ const closingReads: readonly HostCommand['type'][] = [
   'read_document_page', 'list_document_pages', 'read_document_original', 'query_native_tools',
   'list_sessions', 'query_session', 'list_session_runs', 'list_session_messages', 'query_prompt_trace',
   'personal_agent_get', 'personal_agent_open_conversation', 'invoice_work_list', 'invoice_work_get',
-  'invoice_work_query_operation', 'personal_task_list', 'personal_task_get',
+  'invoice_work_query_operation', 'invoice_work_desktop_list', 'invoice_work_desktop_query_decision', 'personal_task_list', 'personal_task_get',
   'personal_task_history', 'personal_task_history_entry', 'invoice_work_timeline',
 ];
 
@@ -160,6 +161,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
     setCredentialRecoveryHook(hook) { credentialRecoveryHook = hook; },
   };
   const pendingCredentials = new Map<string, (value: { ok: boolean; credential?: unknown }) => void>();
+  const desktopBridge = createDesktopBridge(send);
   const pendingForms = new Map<string, { request: InvoiceFormBridgeRequest; resolve(receipt: InvoiceFormApplicationReceipt): void }>();
   const invoiceFormBridge = (request: InvoiceFormBridgeRequest, signal: AbortSignal): Promise<InvoiceFormApplicationReceipt> => {
     const requestId = randomUUID();
@@ -271,6 +273,40 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         void send({ version: 1, type: 'evaluation_trace_available', traceId: trace.id, workspaceRoot: evaluationWorkspaceRoot }); } } : {}) } } : {}),
     provider: new PiProviderAdapter({ credentialsFor }),
     personalAgent: {
+      observeInvoiceForm: async (context, signal) => {
+        const owner = context.scope.invoiceWork; if (!owner) return fail(appError('form_unavailable', 'runtime', 'No invoice form is authorized.'));
+        const result = await desktopBridge.request({ kind: 'form', workId: owner.workId, itemId: owner.itemId }, signal);
+        if (!result.ok) return result;
+        return result.data.kind === 'form' ? ok({ candidateId: result.data.candidateId, candidateSequence: result.data.candidateSequence, target: result.data.target })
+          : fail(appError('form_unavailable', 'runtime', 'The form response is invalid.'));
+      },
+      desktop: {
+        listWindows: async (context, signal) => {
+          const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+          const result = await desktopBridge.request({ kind: 'list', workId: owner.workId, itemId: owner.itemId }, signal);
+          if (!result.ok) return result;
+          return result.data.kind === 'list' ? ok(result.data.windows) : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+        },
+        observe: async (context, signal) => {
+          const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+          const result = await desktopBridge.request({ kind: 'observe', workId: owner.workId, itemId: owner.itemId }, signal);
+          if (!result.ok) return result;
+          return result.data.kind === 'observe' ? ok({ observationId: result.data.observationId, window: result.data.window, tree: result.data.tree, truncated: result.data.truncated })
+            : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+        },
+        resolveTarget: async (action, context, signal) => {
+          const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+          const result = await desktopBridge.request({ kind: 'resolve', workId: owner.workId, itemId: owner.itemId, action }, signal);
+          if (!result.ok) return result;
+          return result.data.kind === 'resolve' ? ok(result.data.target) : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+        },
+        dispatch: async (action, target, context, signal) => {
+          const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+          const result = await desktopBridge.request({ kind: 'dispatch', workId: owner.workId, itemId: owner.itemId, action, target }, signal);
+          if (!result.ok) return result;
+          return result.data.kind === 'dispatch' ? ok(undefined) : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+        },
+      },
       resolveConfiguration: modelId => {
         const profile = currentSettings.models.find(model => model.id === modelId);
         if (!profile) return fail(appError('model_not_configured', 'input', 'The selected model is unavailable.'));
@@ -379,6 +415,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
   };
   const close = async (): Promise<Result<CloseReport>> => {
     closing = true;
+    desktopBridge.close();
     closeRuntimeObservations();
     return application.close();
   };
@@ -484,6 +521,10 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         case 'invoice_work_continue': value = await application.invoiceWorks.continueWork(captured.input); break;
         case 'invoice_work_cancel': value = await application.invoiceWorks.cancelWork(captured.input); break;
         case 'invoice_work_query_operation': value = await application.invoiceWorks.queryOperation(captured.input); break;
+        case 'invoice_work_desktop_list': value = await application.invoiceWorks.listDesktopActions(captured.input); break;
+        case 'invoice_work_desktop_decide': value = await application.invoiceWorks.decideDesktopAction(captured.input); break;
+        case 'invoice_work_desktop_discard': value = await application.invoiceWorks.discardDesktopAction(captured.input); break;
+        case 'invoice_work_desktop_query_decision': value = await application.invoiceWorks.queryDesktopDecision(captured.input); break;
         case 'personal_task_list': value = await application.personalTasks.list(captured.input); break;
         case 'personal_task_get': value = await application.personalTasks.get(captured.input); break;
         case 'personal_task_stop': value = await application.personalTasks.stop(captured.input); break;
@@ -586,6 +627,16 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         && receipt.formInstanceId === original.target.formInstanceId && receipt.candidateId === original.candidateId
         && receipt.candidateSequence === original.candidateSequence
         && (receipt.outcome !== 'applied' || receipt.appliedRevision === original.target.expectedRevision + 1)) pending.resolve(receipt);
+      return;
+    }
+    if (command.type === 'desktop_response') { desktopBridge.receive(command.requestId, command.value); return; }
+    if (command.type === 'desktop_bind') {
+      const page = await application.invoiceWorks.get({ view: 'item', ...command.input });
+      const local = await application.invoiceWorks.listDesktopActions({ ...command.input, limit: 1 });
+      const valid = page.ok && page.data.view === 'item' && page.data.work.status === 'open'
+        && page.data.item.disposition === 'unresolved' && local.ok;
+      await send({ version: 1, type: 'response', requestId: command.requestId,
+        value: valid ? ok(command.input) : fail(appError('desktop_unavailable', 'runtime', 'The local invoice item is not available.')) });
       return;
     }
     if (command.type === 'save_invoice_candidate') { send({ version: 1, type: 'response', requestId: command.requestId, value: await application.saveInvoiceCandidate(command.input) }); return; }
@@ -1150,7 +1201,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
       try {
         if (closing && !closingReads.includes(command.type)
           && !(command.type === 'list_model_catalog' && !command.refresh)
-          && command.type !== 'close' && command.type !== 'credential_response' && command.type !== 'invoice_form_response') {
+          && command.type !== 'close' && command.type !== 'credential_response' && command.type !== 'invoice_form_response' && command.type !== 'desktop_response') {
           await send({ version: 1, type: 'response', requestId: command.requestId,
             value: fail(appError('host_closing', 'runtime', 'The product owner is closing.', true)) });
           return;

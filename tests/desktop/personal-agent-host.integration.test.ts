@@ -16,7 +16,7 @@ import { CloudSshSession } from '../../apps/desktop/main/cloud-ssh-session.ts';
 import { CloudMaterialUpload } from '../../apps/cloud-material-upload.ts';
 import { createCloudDesktopHandler } from '../../apps/cloud-desktop-gateway.ts';
 import { listenCloudUnixRpc } from '../../apps/cloud-unix-rpc.ts';
-import { PersonalAgentSnapshotSchema, PersonalHistoryPageSchema, PersonalHistoryEntrySchema, InvoiceWorkTimelinePageSchema } from '@flowmate/contracts';
+import { DesktopActionListResultSchema, PersonalAgentSnapshotSchema, PersonalHistoryPageSchema, PersonalHistoryEntrySchema, InvoiceWorkTimelinePageSchema } from '@flowmate/contracts';
 import { parsePersonalAgentHostResult } from '../../apps/host/protocol.ts';
 import { deferCleanup, mkdtempSync, waitFor } from '../support/resources.ts';
 import { readFileSync } from 'node:fs';
@@ -166,7 +166,7 @@ it.skipIf(process.platform !== 'linux')('transfers a Host-managed invoice throug
   } finally { expect(await session.close()).toMatchObject({ ok: true }); need(await server.close()); await database.close(); await f.client.close(); }
 }, 30_000);
 
-it('routes all 17 Personal Agent commands through the actual Host with isolated local SSE and synthetic credentials', async () => {
+it('routes Personal Agent commands through the actual Host with isolated local SSE and synthetic credentials', async () => {
   const f = await controlledHost(), seen = new Set<string>();
   const call = <S extends z.ZodTypeAny>(command: Command, schema: S) => { seen.add(command.type); return invoke(f.client, command, schema); };
   const getWork = (workId: number) => call({ type: 'invoice_work_get', input: { view: 'work', workId, limit: 10 } }, P.InvoiceWorkGetResultSchema);
@@ -194,6 +194,8 @@ it('routes all 17 Personal Agent commands through the actual Host with isolated 
       stopRequestId: stopped.requestId, limit: 10 } }, P.PersonalTaskGetResultSchema)).toMatchObject({ stopReceipt: stopped });
     if (page.view !== 'work' || !page.items[0]) throw Error('Missing original invoice member.');
     const itemId = page.items[0].itemId;
+    expect(await call({ type: 'invoice_work_desktop_list', input: { workId: created.workId, itemId, limit: 10 } }, DesktopActionListResultSchema))
+      .toEqual({ workId: created.workId, itemId, items: [], nextAfterProposalId: null });
     const detail = await call({ type: 'invoice_work_get', input: { view: 'item', workId: created.workId, itemId, limit: 10 } }, P.InvoiceWorkGetResultSchema);
     if (detail.view !== 'item' || !detail.todos[0]) throw Error('The actual completed model phase must expose its rule Todo.');
     const supplement = { workId: created.workId, itemId, todoId: detail.todos[0].todoId, requestId: 'host-supplement-original',
@@ -249,7 +251,7 @@ it('routes all 17 Personal Agent commands through the actual Host with isolated 
     expect(f.wire.every(request => request.authorization === `Bearer ${f.key}`)).toBe(true);
     expect([...seen].sort()).toEqual(['personal_agent_get', 'personal_agent_update', 'personal_agent_open_conversation',
       'invoice_work_create', 'invoice_work_list', 'invoice_work_get', 'invoice_work_supplement', 'invoice_work_dispose_item',
-      'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_query_operation', 'personal_task_list', 'personal_task_get', 'personal_task_stop',
+      'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_query_operation', 'invoice_work_desktop_list', 'personal_task_list', 'personal_task_get', 'personal_task_stop',
       'personal_task_history', 'personal_task_history_entry', 'invoice_work_timeline'].sort());
   } finally { expect(await f.client.close()).toMatchObject({ ok: true, data: { closed: true, stopped: true } }); }
   const db = new Database(join(f.root, 'data/app.sqlite'), { readonly: true });

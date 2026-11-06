@@ -1,23 +1,24 @@
 import { z } from 'zod';
 import { appError, fail, ok, AcceptInvoiceCandidateRequestSchema, CloudWorkspaceIdSchema, DocumentRefSchema, InvoiceWorkCreateRequestSchema,
   WorkspaceExpectationSchema, type DesktopBridge, type InvoiceWorkOperationReceipt, type PersonalTaskStopReceipt,
-  type InvoiceWorkExecutionDecision, type InvoiceWorkQueryOperationRequest, type Result } from '@flowmate/contracts';
+  type DesktopActionDecisionQuery, type DesktopActionDecisionReceipt, type InvoiceWorkExecutionDecision,
+  type InvoiceWorkQueryOperationRequest, type Result } from '@flowmate/contracts';
 import { parsePersonalAgentCommand, matchesPersonalAgentResponse, type PersonalAgentCommand } from '../../../../packages/contracts/src/personal-agent-commands.ts';
 
 const writeTypes = new Set<string>(['invoice_work_create', 'invoice_work_continue', 'invoice_work_supplement',
-  'invoice_work_dispose_item', 'invoice_work_cancel', 'personal_task_stop']);
+  'invoice_work_dispose_item', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'personal_task_stop']);
 export type PersonalWriteCommand = Extract<PersonalAgentCommand, { type: 'invoice_work_create' | 'invoice_work_continue'
-  | 'invoice_work_supplement' | 'invoice_work_dispose_item' | 'invoice_work_cancel' | 'personal_task_stop' }>;
-export type PersonalWriteReceipt = InvoiceWorkOperationReceipt | PersonalTaskStopReceipt;
+  | 'invoice_work_supplement' | 'invoice_work_dispose_item' | 'invoice_work_cancel' | 'invoice_work_desktop_decide' | 'personal_task_stop' }>;
+export type PersonalWriteReceipt = InvoiceWorkOperationReceipt | PersonalTaskStopReceipt | DesktopActionDecisionReceipt;
 export type PersonalWriteBridge = { invoiceWorks: Pick<DesktopBridge['invoiceWorks'], 'create' | 'continueWork' | 'supplement'
-  | 'disposeItem' | 'cancelWork' | 'queryOperation'>; personalTasks: Pick<DesktopBridge['personalTasks'], 'stop' | 'get'> };
+  | 'disposeItem' | 'cancelWork' | 'queryOperation' | 'decideDesktopAction' | 'queryDesktopDecision'>; personalTasks: Pick<DesktopBridge['personalTasks'], 'stop' | 'get'> };
 function isWrite(command: PersonalAgentCommand): command is PersonalWriteCommand { return writeTypes.has(command.type); }
 export function capturePersonalWrite(raw: unknown): PersonalWriteCommand | null {
   const command = parsePersonalAgentCommand(raw);
   return command && isWrite(command) ? structuredClone(command) : null;
 }
 export function personalOperationQuery(command: PersonalWriteCommand): InvoiceWorkQueryOperationRequest
-  | { workId: number; attemptId: number; stopRequestId: string; limit: 1 } {
+  | DesktopActionDecisionQuery | { workId: number; attemptId: number; stopRequestId: string; limit: 1 } {
   const input = command.input;
   switch (command.type) {
     case 'invoice_work_create': return { operation: 'create' as const, personalAgentId: command.input.personalAgentId, requestId: input.requestId };
@@ -25,6 +26,8 @@ export function personalOperationQuery(command: PersonalWriteCommand): InvoiceWo
     case 'invoice_work_supplement': return { operation: 'supplement' as const, workId: command.input.workId, requestId: input.requestId };
     case 'invoice_work_dispose_item': return { operation: 'disposeItem' as const, workId: command.input.workId, requestId: input.requestId };
     case 'invoice_work_cancel': return { operation: 'cancelWork' as const, workId: command.input.workId, requestId: input.requestId };
+    case 'invoice_work_desktop_decide': return { workId: command.input.workId, itemId: command.input.itemId,
+      proposalId: command.input.proposalId, requestId: input.requestId };
     case 'personal_task_stop': return { workId: command.input.workId, attemptId: command.input.attemptId, stopRequestId: input.requestId, limit: 1 };
   }
 }
@@ -38,6 +41,7 @@ export async function executePersonalWrite(bridge: PersonalWriteBridge, command:
       case 'invoice_work_supplement': result = await bridge.invoiceWorks.supplement(command.input); break;
       case 'invoice_work_dispose_item': result = await bridge.invoiceWorks.disposeItem(command.input); break;
       case 'invoice_work_cancel': result = await bridge.invoiceWorks.cancelWork(command.input); break;
+      case 'invoice_work_desktop_decide': result = await bridge.invoiceWorks.decideDesktopAction(command.input); break;
       case 'personal_task_stop': result = await bridge.personalTasks.stop(command.input); break;
     }
     return matchesPersonalAgentResponse(command, result) ? result : unknownReceipt();
@@ -50,6 +54,10 @@ export async function recoverPersonalWrite(bridge: PersonalWriteBridge, command:
       const result = await bridge.personalTasks.get(query); if (!result.ok) return result;
       const receipt = result.data.stopReceipt;
       return receipt === null || matchesPersonalAgentResponse(command, ok(receipt)) ? ok(receipt) : unknownReceipt();
+    }
+    if ('proposalId' in query) {
+      const result = await bridge.invoiceWorks.queryDesktopDecision(query); if (!result.ok) return result;
+      return result.data === null || matchesPersonalAgentResponse(command, result) ? result : unknownReceipt();
     }
     const result = await bridge.invoiceWorks.queryOperation(query); if (!result.ok) return result;
     return result.data === null || matchesPersonalAgentResponse(command, result) ? result : unknownReceipt();
@@ -99,6 +107,8 @@ export function executionDecisionText(value: InvoiceWorkExecutionDecision): stri
   }
 }
 export function personalReceiptText(value: PersonalWriteReceipt): string {
+  if ('proposalId' in value) return value.decision === 'approve'
+    ? 'Desktop action approved. Execution is not yet confirmed.' : 'Desktop action rejected; it will not be dispatched.';
   if (!('operation' in value)) return value.stopConfirmed ? 'The original attempt has stopped.' : 'Stop requested. Actual execution stop is not yet confirmed.';
   if (value.operation === 'cancelWork') return 'The Work is cancelled. Check its task for actual stop confirmation.';
   if (value.operation === 'disposeItem') return `Invoice disposition saved: ${value.disposition}.`;

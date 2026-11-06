@@ -20,7 +20,7 @@ const unclassified = discovered.filter(p => /(?:\.test|\.node-test)\.ts$/.test(p
 if (unclassified.length) throw new Error(`Unclassified tests: ${unclassified.join(', ')}`);
 // Allow OS/tool paths, not developer model credentials, platform keys or .env.
 const env: Record<string, string> = {};
-for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA']) {
+for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA', 'ProgramData']) {
   if (process.env[key]) env[key] = process.env[key]!;
 }
 async function run(args: string[], executable = process.execPath) {

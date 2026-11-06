@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, resourceRefKey, type ExtensionCatalog, type ModelProfile,
+import { INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, resourceRefKey, type ExtensionCatalog, type ModelProfile,
   type PersonalAgentConfiguration, type ResourceCatalog, type ResourceRef } from '@flowmate/contracts';
 
-const tools: readonly string[] = [...INVOICE_REVIEW_TOOL_NAMES, ...SKILL_RESOURCE_TOOL_NAMES, 'Agent'];
+const baseTools: readonly string[] = [...INVOICE_REVIEW_TOOL_NAMES, ...SKILL_RESOURCE_TOOL_NAMES, 'Agent'];
 const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const label = (ref: ResourceRef) => `${ref.id} ${ref.version}`;
 type Props = { ready: boolean; hostEpoch: number; disabled: boolean; models: readonly ModelProfile[];
@@ -11,6 +11,7 @@ type Props = { ready: boolean; hostEpoch: number; disabled: boolean; models: rea
   onChange(value: PersonalAgentConfiguration): void; onSave(): void; onReload(): void; onModels(): void };
 
 export function PersonalConfiguration(props: Props) {
+  const tools: readonly string[] = props.cloud ? [...baseTools, ...PERSONAL_DESKTOP_TOOL_NAMES] : [...baseTools, ...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_INVOICE_FORM_TOOL_NAMES];
   const [expanded, setExpanded] = useState(false), [pending, setPending] = useState(false);
   const [resources, setResources] = useState<ResourceCatalog | null>(null), [extensions, setExtensions] = useState<ExtensionCatalog | null>(null);
   const [error, setError] = useState<string | null>(null), generation = useRef(0);
@@ -63,7 +64,7 @@ export function PersonalConfiguration(props: Props) {
         onChange={event => props.onChange({ ...value, preferences: event.target.value })} /></label>
       <label className="field"><span id="personal-agent-directory-label">Personal Agent working directory</span><input aria-labelledby="personal-agent-directory-label" maxLength={4096} value={value.workingDirectory ?? ''} disabled={props.disabled || props.cloud}
         placeholder="Automatic work directory" onChange={event => props.onChange({ ...value, workingDirectory: event.target.value || null })} /></label>
-      <fieldset disabled={props.disabled}><legend>Personal Agent tools</legend>{[...new Set([...tools, ...value.tools])].map(name => <label className="personal-document-option" key={name}>
+      <fieldset disabled={props.disabled}><legend>Personal Agent tools</legend><p>{props.cloud ? 'Desktop tools are off by default; enable the needed tools for a new cloud Work.' : 'Desktop and Personal Agent form tools are off by default; enable the needed tools for a new local Work.'}</p>{[...new Set([...tools, ...value.tools])].map(name => <label className="personal-document-option" key={name}>
         <input type="checkbox" aria-label={`Enable Personal Agent tool ${name}`} checked={value.tools.includes(name)} onChange={event => props.onChange({ ...value,
           tools: event.target.checked ? [...value.tools, name] : value.tools.filter(tool => tool !== name) })} />{name}{!tools.includes(name) && <small>No Durable adapter; remove this selection.</small>}</label>)}</fieldset>
       <div className="button-row"><button type="button" disabled={!props.ready || pending || props.disabled} onClick={() => void refresh()}>Refresh assistant resources</button></div>

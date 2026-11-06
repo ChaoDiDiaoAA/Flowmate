@@ -54,7 +54,7 @@ Flowmate 面向需要处理本地资料、保留工作过程并复核交付结�
 
 ![Personal Agent 配置与新建事项入口：模型、思考级别、偏好、工作目录和工具选择](docs/screenshots/Personal%20Agent.png)
 
-*Personal Agent：独立配置模型、思考级别、偏好和工具，从 New invoice work 创建持续发票事项；已保存事项沿用原配置与资源版本。*
+*Personal Agent：配置思考级别、偏好和工具，从 New invoice work 创建持续发票事项；已保存事项沿用原配置与资源版本。*
 
 ### 持续事项流程
 
@@ -401,12 +401,36 @@ Renderer 支持热更新；Main / Preload 改动触发停止、关闭与重建�
 
 ### 4. 体验 Personal Agent
 
-1. 从左侧进入 **Personal Agent**，在 **Assistant configuration** 选择已保存模型，确认思考级别、偏好、工具与 Prompt / Skill，保存配置。
+1. 从左侧进入 **Personal Agent**，默认打开云工作区并启动本机 KimiCU；已有云连接配置时会尝试自动重连。首次使用云端时，填写工作区 UUID、SSH 主机、受限用户、私钥和已验证的 known_hosts，连接已部署 Flowmate 云服务的服务器。如需本地执行，选择 **Local workspace**，并在 **Assistant configuration** 选择已保存模型。
 2. 点击 **New invoice work**，选择固定的一组已有解析发票，填写目标并明确提交，创建持久事项。
 3. 查看事项概览、逐票 Todo、候选与来源，为具体票 / Todo 补料；阅读回执，区分已保存、获执行授权、排队和受阻。用户停止或执行失败后，须明确继续。
 4. 沿复核动作回到 **Invoices**，对照原票与解析材料，明确接受结果或对该票作最终拒绝、排除；全部票最终处置且必要执行收口后，事项完成。
 
 Personal Agent 使用独立的 Pi Durable 入口；已有 Chats、Invoices、Deep Research 继续使用 AgentSession。新增票据另建事项，查看页面或重连不会自动发起执行。
+
+**可选：由本地 Personal Agent 填写 Flowmate 发票表单。** 在新事项的配置中启用 `personal_observe_invoice_form` 和 `personal_fill_invoice_form`。候选生成后，从事项打开该票复核，在 **Results** 中点击 **Prepare form for Personal Agent**；返回原事项，针对相关 Todo 明确补充填写要求并继续。再次打开原票可检查已填草稿；接受候选仍需用户明确操作，并将接受回执关联到原事项。准备的表单只属于当前桌面会话，连接或目标变化后需要重新准备；此路径不依赖 KimiCU。
+
+**可选：本机 Windows 桌面操作。** Personal Agent 可以通过独立安装的 KimiCU 观察用户选定的外部窗口，并对每次点击或输入先展示目标和内容，等待用户单独确认。云端 Work 由云端 Pi Durable 执行，桌面操作通过 SSH 中继到当前 Windows 交互桌面；本地 Work 也可使用此能力。工具默认关闭，需为新 Work 显式启用；自动启动 KimiCU 不会自动执行桌面动作或提交 Work。Flowmate 自身的发票结果继续通过产品复核与接受接口处理。
+
+使用前确保 PATH 中的 Node.js 版本至少为 24.15.0，并在 `%APPDATA%\Flowmate\data\kimi-cu.json` 写入本机插件和运行时的绝对路径，例如：
+
+```json
+{"version":1,"pluginRoot":"D:\\KimiCU\\plugin","runtimeExecutable":"D:\\KimiCU\\runtime\\kimi-cu.exe"}
+```
+
+也可以在启动 Flowmate 的 PowerShell 中同时设置以下两个环境变量，它们优先于上述配置文件：
+
+```powershell
+$env:FLOWMATE_KIMICU_PLUGIN_ROOT = 'D:\KimiCU\plugin'
+$env:KIMI_CU_WINDOWS_EXE = 'D:\KimiCU\runtime\kimi-cu.exe'
+bun run dev
+```
+
+在 **Assistant configuration** 为新事项启用 `desktop_list_windows`、`desktop_observe_window`、`desktop_propose_action` 和 `desktop_execute_approved`。进入事项的具体发票后，点击 **Find desktop windows**，选择并授权目标窗口；提议出现后逐次查看并批准或拒绝。窗口、控件或发票变化时应重新观察并确认；动作结果不确定时先检查原应用，系统不会自动重放。已批准但尚未领取的动作可以撤销。
+
+云端桌面操作要求桌面端与云端 Authority、Runtime 和 SSH 桥使用本版本的配套代码。旧版云服务仍可连接普通云工作区，但需更新后才能使用 KimiCU；部署方法见 [云端服务文件](deploy/cloud/README.zh-CN.md)。
+
+首次支持文本可读的 Windows 辅助控件，不包含截图或坐标操作；Windows 输入可能激活目标窗口并使用真实鼠标和键盘，文本输入会覆盖系统剪贴板。人与其他自动化仍可能改变界面；辅助信息可能包含敏感内容，并可能保存在工作历史中或发送给所选模型服务。[Kimi 官方建议](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/plugins.html)不要将涉及金钱、账户或发布的任务交给 KimiCU；逐次确认不能消除该风险。Flowmate 作为自定义宿主尚未获得厂商支持确认，插件和运行时需要独立安装，不随 Flowmate 分发；不同外部软件的兼容性须分别验证。
 
 ### 5. 体验 Deep Research
 

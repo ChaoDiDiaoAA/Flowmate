@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import * as invoiceContracts from '../../packages/contracts/src/invoice.ts';
 import { CandidateDraftSchema, FillInvoiceFormInputSchema, FillInvoiceFormOutputSchema, InvoiceFormApplicationReceiptSchema,
   InvoiceFormTargetSchema, InvoiceFormDraftSchema, InvoiceFormLineOriginsSchema, SaveInvoiceCandidateRequestSchema,
   INVOICE_REVIEW_TOOL_NAMES, INVOICE_TOOL_NAMES, invoiceToolSchemas, ParsedBlockSchema } from '../../packages/contracts/src/invoice.ts';
@@ -10,6 +11,17 @@ import type { BusinessEventSnapshot, ToolCallSnapshot } from '../../packages/con
 import type { P3AgentConfigFacts } from '../../packages/contracts/src/ports.ts';
 import type { InputRecordV2, UsageRecordV2 } from '../../packages/contracts/src/runtime.ts';
 import { WorkspaceContextSchema } from '../../packages/contracts/src/workspace.ts';
+
+it('a Durable form call identifies its candidate and the exact user-prepared form', () => {
+  const schema = Reflect.get(invoiceContracts, 'PersonalInvoiceFormInputSchema');
+  expect(schema).toBeDefined(); if (!schema) return;
+  const target = { formInstanceId: 'form-1', expectedRevision: 2 };
+  expect(schema.safeParse({ candidateId: 4, target }).success).toBe(true);
+  expect(schema.safeParse({ candidateId: 4, target, script: 'untrusted' }).success).toBe(false);
+  expect(schema.safeParse({ candidateId: 4, target: { ...target, expectedRevision: -1 } }).success).toBe(false);
+  const observed = Reflect.get(invoiceContracts, 'PersonalInvoiceFormObservationSchema');
+  expect(observed?.safeParse({ candidateId: 4, candidateSequence: 1, target }).success).toBe(true);
+});
 import type { WorkspaceContext, WorkspaceInput } from '../../packages/contracts/src/workspace.ts';
 import { z } from 'zod';
 

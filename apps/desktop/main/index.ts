@@ -2,8 +2,13 @@ import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesIn
 import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, researchOperations } from '../../../packages/contracts/src/research-commands.ts';
 import { isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure, personalAgentHostCommandTypes } from '../../../packages/contracts/src/personal-agent-commands.ts';
 import { ResourceRefSchema } from '@flowmate/contracts';
+import { DesktopOwnerSchema, DesktopWindowSelectionSchema, InvoiceWorkGetResultSchema, type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult } from '@flowmate/contracts';
+import { connectKimiMcp, resolveKimiPaths } from './kimi-mcp.ts';
+import { createKimiDesktop, handleKimiDesktopRequest, isOwnDesktopWindow } from './kimi-desktop.ts';
+import { createDesktopOperationLock } from './desktop-operation-lock.ts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { spawnSync } from 'node:child_process';
 import { mkdir, lstat, open, readFile, rename, rm } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
@@ -115,7 +120,7 @@ import { DesktopSessionCompactionRequestSchema } from '@flowmate/contracts';
 import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../host/protocol.ts';
 import { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure } from '../../host/protocol.ts';
 import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionResponse, compactionHostFailure, parseCompactionNotification } from '../../host/protocol.ts';
-import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
+import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, observePersonalInvoiceForm, type InvoiceFormOwner, type InvoiceFormTargetBinding } from './invoice-form-bridge.ts';
 import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import { readManagedInvoiceExport } from '../../../packages/core/src/storage/file-store.ts';
 import { publishInvoiceExportCopy } from './invoice-export.ts';
@@ -238,6 +243,65 @@ let stateBroadcastSequence = 0;
 const legacyHost = new HostClient(), serviceClient = new ServiceClient();
 let host: HostClient | ServiceClient = legacyHost;
 let transportEpoch = 0, transportGeneration = 0;
+let kimiDesktop: { desktop: ReturnType<typeof createKimiDesktop>; unlisten: () => void } | null = null;
+let kimiConnecting: Promise<Result<ReturnType<typeof createKimiDesktop>>> | null = null;
+const desktopUnavailable = () => fail(appError('desktop_unavailable', 'runtime',
+  'KimiCU is unavailable. Configure the local plugin and runtime paths, then reconnect the desktop.', true));
+async function openKimiDesktop(): Promise<Result<ReturnType<typeof createKimiDesktop>>> {
+  if (kimiDesktop) return ok(kimiDesktop.desktop);
+  if (kimiConnecting) return kimiConnecting;
+  const paths = resolveKimiPaths(userDataRoot, process.env), localData = process.env.LOCALAPPDATA, epoch = transportEpoch;
+  if (!paths || !localData) return desktopUnavailable();
+  const pending = (async () => {
+    try {
+      const session = await connectKimiMcp(paths.pluginRoot, paths.runtimeExecutable), desktop = createKimiDesktop(session.api,
+        createDesktopOperationLock(join(localData, 'Flowmate', 'kimi-desktop-operation')));
+      if (transportEpoch !== epoch) { await desktop.close(); return desktopUnavailable(); }
+      const unlisten = session.onClose(() => {
+        if (kimiDesktop?.desktop !== desktop) return;
+        kimiDesktop = null; void desktop.close().catch(() => {});
+      });
+      kimiDesktop = { desktop, unlisten }; return ok(desktop);
+    } catch { return desktopUnavailable(); }
+  })();
+  kimiConnecting = pending;
+  try { return await pending; } finally { if (kimiConnecting === pending) kimiConnecting = null; }
+}
+async function handleCloudDesktopRequest(workspaceId: string, request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult> {
+  const desktop = kimiDesktop?.desktop; if (!desktop) return desktopUnavailable();
+  const owner = { workspaceId, workId: request.workId, itemId: request.itemId };
+  return handleKimiDesktopRequest(desktop, owner, request, signal);
+}
+async function verifyCloudDesktopAction(workspaceId: string, action: DesktopActionView, signal: AbortSignal): Promise<Result<void>> {
+  const desktop = kimiDesktop?.desktop; if (!desktop) return desktopUnavailable();
+  const target = await desktop.resolveTarget({ workspaceId, workId: action.workId, itemId: action.itemId }, action.action, signal);
+  return !target.ok ? target : isDeepStrictEqual(target.data, action.target) ? ok(undefined)
+    : fail(appError('desktop_target_changed', 'runtime', 'The approved desktop target changed; observe it again.'));
+}
+async function handleDesktopRequest(request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult> {
+  const owner = { workId: request.workId, itemId: request.itemId };
+  if (request.kind === 'form') {
+    const unavailable = () => fail(appError('form_unavailable', 'runtime', 'The original prepared invoice form is unavailable.', true));
+    const binding = invoiceFormBinding, window = mainWindow, epoch = transportEpoch;
+    if (!binding || !window || window.webContents.isDestroyed()) return unavailable();
+    const original = observePersonalInvoiceForm(binding, owner, { frame: window.webContents.mainFrame, contents: window.webContents, epoch });
+    if (!original) return unavailable();
+    const [work, workspace] = await Promise.all([
+      productHostRequest<import('@flowmate/contracts').InvoiceWorkGetResult>({ type: 'invoice_work_get', input: { view: 'item', ...owner, limit: 1 } }, 'Invoice Work is unavailable.'),
+      productHostRequest<WorkspaceSnapshot>({ type: 'read_workspace' }, 'Workspace is unavailable.'),
+    ]);
+    if (signal.aborted || binding !== invoiceFormBinding || epoch !== transportEpoch || !work.ok || work.data.view !== 'item'
+      || work.data.work.status !== 'open' || work.data.item.disposition !== 'unresolved' || !workspace.ok
+      || !sameFormWorkspace(binding.workspace, workspace.data) || work.data.item.jobId !== binding.workspace.jobId
+      || work.data.item.candidateRef?.id !== original.candidateId || work.data.item.candidateRef.sequence !== original.candidateSequence
+      || work.data.item.documentRef.id !== binding.workspace.documentRef?.id
+      || work.data.item.documentRef.version !== binding.workspace.documentRef.version
+      || !observePersonalInvoiceForm(binding, owner, { frame: window.webContents.mainFrame, contents: window.webContents, epoch })) return unavailable();
+    return ok({ kind: 'form', ...original });
+  }
+  const desktop = kimiDesktop?.desktop; if (!desktop) return desktopUnavailable();
+  return handleKimiDesktopRequest(desktop, owner, request, signal);
+}
 function cloudHostOwner() {
   const original = host, epoch = transportEpoch, generation = transportGeneration;
   return { request: async (command: Parameters<HostClient['request']>[0], timeoutMs?: number) => {
@@ -246,6 +310,7 @@ function cloudHostOwner() {
   } };
 }
 const cloudDesktop = new CloudDesktopController({ connect: connectCloudSsh,
+  desktop: { execute: handleCloudDesktopRequest, verify: verifyCloudDesktopAction },
   upload: async (input, session) => !transportAvailable() ? fail(appError('cloud_material_unavailable', 'storage', 'The local material service is unavailable.', true))
     : uploadCloudMaterial(input, createHostCloudMaterialExport(cloudHostOwner()), session),
   uploadResource: async (input, session) => !transportAvailable() ? fail(appError('cloud_resource_unavailable', 'storage', 'The local resource service is unavailable.', true))
@@ -377,7 +442,7 @@ async function requestProduct(command: Parameters<HostClient['request']>[0], tim
   let result: unknown;
   if (original instanceof HostClient) result = await original.request(command, timeoutMs);
   else {
-    if (command.type === 'close' || command.type === 'credential_response' || command.type === 'invoice_form_response') throw Error('service_command_forbidden');
+    if (command.type === 'close' || command.type === 'credential_response' || command.type === 'invoice_form_response' || command.type === 'desktop_response') throw Error('service_command_forbidden');
     result = await original.request(command, timeoutMs);
   }
   if (host !== original || transportEpoch !== epoch || transportGeneration !== generation) throw Error('host_connection_changed');
@@ -385,6 +450,8 @@ async function requestProduct(command: Parameters<HostClient['request']>[0], tim
 }
 function revokeDesktopConnection(): void {
   transportEpoch++;
+  const desktop = kimiDesktop; kimiDesktop = null;
+  if (desktop) { desktop.unlisten(); void desktop.desktop.close().catch(() => {}); }
   releaseAllRuntimeOwners();
   if (invoiceFormBinding) invoiceFormBinding.valid = false;
   for (const pending of pendingInvoiceForms.values()) pending.resolve(unknownInvoiceForm(pending.request));
@@ -620,6 +687,8 @@ function installProductClient(client: HostClient | ServiceClient): void {
   legacyHost.setCredentialHandler(request => host === legacyHost && legacyAllowed ? handleHostCredentialRequest(request) : Promise.resolve({ ok: false }));
   client.setInvoiceFormHandler((request) => host === originalClient && transportGeneration === clientGeneration
     ? handleInvoiceFormRequest(request, transportEpoch) : Promise.resolve(unknownInvoiceForm(request)));
+  client.setDesktopHandler((request, signal) => host === originalClient && transportGeneration === clientGeneration
+    ? handleDesktopRequest(request, signal) : Promise.resolve(desktopUnavailable()));
   client.setConnectionChangeHandler(() => {
     if (host !== originalClient || transportGeneration !== clientGeneration) return;
     revokeDesktopConnection();
@@ -892,6 +961,43 @@ function registerIpc(): void {
     });
   };
   handle('flowmate:cloud-state', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'The cloud state request is invalid.')) : cloudDesktop.state());
+  handle('flowmate:desktop-start', async (_event, ...args) => {
+    if (args.length) return fail(appError('input_invalid', 'input', 'Desktop startup takes no arguments.'));
+    const desktop = await openKimiDesktop(); return desktop.ok ? ok(undefined) : desktop;
+  });
+  handle('flowmate:desktop-windows', async (_event, ...args) => {
+    if (args.length) return fail(appError('input_invalid', 'input', 'Window listing takes no arguments.'));
+    const desktop = await openKimiDesktop(); return desktop.ok ? desktop.data.listWindows(new AbortController().signal) : desktop;
+  });
+  handle('flowmate:desktop-select-window', async (_event, raw, ...extra) => {
+    const input = DesktopWindowSelectionSchema.safeParse(raw);
+    if (extra.length || !input.success || !kimiDesktop) return desktopUnavailable();
+    if (isOwnDesktopWindow(input.data.window.id, BrowserWindow.getAllWindows().filter(window => !window.isDestroyed())
+      .map(window => window.getNativeWindowHandle())))
+      return fail(appError('desktop_target_forbidden', 'input', 'Use the Flowmate invoice review interface for its own windows.'));
+    const desktop = kimiDesktop.desktop, owner = { workId: input.data.workId, itemId: input.data.itemId,
+      ...(input.data.workspaceId ? { workspaceId: input.data.workspaceId } : {}) };
+    desktop.revoke(owner);
+    try {
+      if (input.data.workspaceId) {
+        const result = await cloudDesktop.request({ workspaceId: input.data.workspaceId,
+          command: { type: 'invoice_work_get', input: { view: 'item', workId: owner.workId, itemId: owner.itemId, limit: 1 } } });
+        const page = result.ok ? InvoiceWorkGetResultSchema.safeParse(result.data) : null;
+        if (!page?.success || page.data.view !== 'item' || page.data.work.status !== 'open' || page.data.item.disposition !== 'unresolved'
+          || kimiDesktop?.desktop !== desktop) return desktopUnavailable();
+        const selected = await desktop.select(owner, input.data.window, new AbortController().signal);
+        return selected.ok ? ok({ workId: owner.workId, itemId: owner.itemId }) : selected;
+      }
+      const reply = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: DesktopOwnerSchema }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await requestProduct({ type: 'desktop_bind', input: { workId: owner.workId, itemId: owner.itemId } }));
+      if (reply.success && reply.data.ok && reply.data.data.workId === owner.workId && reply.data.data.itemId === owner.itemId
+        && kimiDesktop?.desktop === desktop) {
+        const selected = await desktop.select(owner, input.data.window, new AbortController().signal);
+        return selected.ok ? ok(owner) : selected;
+      }
+    } catch { /* A lost binding cannot authorize this selection. */ }
+    desktop.revoke(owner); return desktopUnavailable();
+  });
   handle('flowmate:cloud-connect', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud connection is invalid.')) : cloudDesktop.connect(input));
   handle('flowmate:cloud-disconnect', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud connection is invalid.')) : cloudDesktop.disconnect(input));
   handle('flowmate:cloud-request', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud request is invalid.')) : cloudDesktop.request(input));
@@ -1966,11 +2072,14 @@ function ownedInvoiceForm(event: Electron.IpcMainInvokeEvent, id: unknown): bool
 }
 
 async function registerInvoiceFormTarget(event: Electron.IpcMainInvokeEvent, raw: unknown) {
-  const input = z.object({ purpose: z.enum(['fill', 'edit']), formRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  const input = z.object({ purpose: z.enum(['fill', 'edit', 'personal-fill']), formRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     workspace: WorkspaceExpectationSchema.extend({ sessionId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable() }).strict(),
+    personal: DesktopOwnerSchema.optional(),
   }).strict().safeParse(raw);
   if (!input.success || !input.data.workspace.documentRef || !input.data.workspace.jobId || !input.data.workspace.candidateRef
-    || input.data.purpose === 'fill' && input.data.workspace.sessionId === null) return fail(appError('input_invalid', 'input', 'Choose a saved candidate before preparing the form.'));
+    || input.data.purpose === 'fill' && input.data.workspace.sessionId === null
+    || (input.data.purpose === 'personal-fill') !== (input.data.personal !== undefined)) return fail(appError('input_invalid', 'input', 'Choose a saved candidate before preparing the form.'));
+  const epoch = transportEpoch;
   if (invoiceFormBinding?.dirty || invoiceFormBinding?.mutationPending) return fail(appError('state_conflict', 'input', 'Keep or discard the current edits first.'));
   const expected = input.data.workspace;
   const [current, job, candidate, runtime] = await Promise.all([
@@ -1995,9 +2104,28 @@ async function registerInvoiceFormTarget(event: Electron.IpcMainInvokeEvent, raw
     if (!session.ok) return session;
     if (session.data.modelUseBlocked || session.data.availability !== 'ready') return fail(appError('session_scope_revoked', 'session', 'This Session is unavailable for model use.'));
   }
+  let personal: DesktopFormBinding['personal'];
+  if (input.data.purpose === 'personal-fill' && input.data.personal) {
+    const work = await productHostRequest<import('@flowmate/contracts').InvoiceWorkGetResult>({ type: 'invoice_work_get',
+      input: { view: 'item', ...input.data.personal, limit: 1 } }, 'The original invoice Work is unavailable.');
+    if (!work.ok || work.data.view !== 'item' || work.data.work.status !== 'open' || work.data.item.disposition !== 'unresolved'
+      || work.data.item.jobId !== expected.jobId || work.data.item.candidateRef?.id !== expected.candidateRef?.id
+      || work.data.item.candidateRef?.sequence !== expected.candidateRef?.sequence
+      || work.data.item.documentRef.id !== expected.documentRef?.id || work.data.item.documentRef.version !== expected.documentRef?.version)
+      return fail(appError('state_conflict', 'input', 'The Personal Agent invoice or candidate changed.'));
+    const bound = await requestProduct({ type: 'desktop_bind', input: input.data.personal });
+    const parsed = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: DesktopOwnerSchema }).strict(),
+      z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(bound);
+    if (!parsed.success || !parsed.data.ok || parsed.data.data.workId !== input.data.personal.workId
+      || parsed.data.data.itemId !== input.data.personal.itemId || epoch !== transportEpoch)
+      return fail(appError('form_unavailable', 'runtime', 'The original desktop connection is unavailable.'));
+    personal = { ...input.data.personal, sessionId: work.data.work.sessionId };
+  }
+  if (epoch !== transportEpoch || !isTrustedSender(event)) return fail(appError('state_conflict', 'input', 'The form owner changed.'));
   const target = { formInstanceId: randomUUID(), expectedRevision: input.data.formRevision };
   invoiceFormBinding = { frame: event.senderFrame!, contents: event.sender, epoch: transportEpoch, currentRevision: input.data.formRevision,
-    workspace: expected, purpose: input.data.purpose, target, valid: true, dirty: false, runId: null, pendingFill: false };
+    workspace: expected, purpose: input.data.purpose, target, valid: true, dirty: false, runId: null,
+    pendingFill: input.data.purpose === 'personal-fill', ...(personal ? { personal } : {}) };
   return ok(target);
 }
 
@@ -2069,6 +2197,25 @@ async function handleInvoiceFormRequest(request: InvoiceFormBridgeRequest, epoch
   const run = await productHostRequest<RunSnapshot>({ type: 'query_run', runId: request.runId }, 'Fill Run could not be confirmed.', 1500);
   if (!run.ok || !matchesInvoiceFormRun(binding, request, run.data) || invoiceFormBinding !== binding || !binding.valid
     || transportEpoch !== epoch || window.webContents.mainFrame !== binding.frame) return unknownInvoiceForm(request);
+  if (request.invoiceWork) {
+    const [work, call, workspace, currentRun] = await Promise.all([
+      productHostRequest<import('@flowmate/contracts').InvoiceWorkGetResult>({ type: 'invoice_work_get',
+        input: { view: 'item', workId: request.invoiceWork.workId, itemId: request.invoiceWork.itemId, limit: 1 } }, 'Invoice Work is unavailable.'),
+      productHostRequest<import('@flowmate/contracts').RuntimeToolView>({ type: 'query_run_tool_call',
+        input: { runId: request.runId, sessionId: request.sessionId, toolCallId: request.toolCallId } }, 'Original form call is unavailable.'),
+      productHostRequest<WorkspaceSnapshot>({ type: 'read_workspace' }, 'Workspace is unavailable.'),
+      productHostRequest<RunSnapshot>({ type: 'query_run', runId: request.runId }, 'Fill Run could not be confirmed.', 1500),
+    ]);
+    if (!work.ok || work.data.view !== 'item' || work.data.work.status !== 'open' || work.data.item.disposition !== 'unresolved'
+      || work.data.work.execution.attempt?.attemptId !== request.invoiceWork.attemptId
+      || work.data.item.jobId !== request.jobId || work.data.item.candidateRef?.id !== request.candidateId
+      || work.data.item.candidateRef.sequence !== request.candidateSequence || !call.ok || !currentRun.ok
+      || !matchesInvoiceFormRun(binding, request, currentRun.data) || call.data.toolName !== 'personal_fill_invoice_form'
+      || request.operation === 'apply' && (call.data.status !== 'running' || !workspace.ok || workspace.data.invalidReferences.length > 0
+        || !matchesInvoiceFormTarget(binding, request, { frame: window.webContents.mainFrame, contents: window.webContents, epoch }, workspace.data))
+      || binding !== invoiceFormBinding || !binding.valid || epoch !== transportEpoch || window.webContents.mainFrame !== binding.frame)
+      return unknownInvoiceForm(request);
+  }
   binding.runId = request.runId;
   return new Promise(resolve => {
     const requestId = randomUUID();

@@ -66,10 +66,15 @@ function unknownResult(): ToolExecutionResult {
 }
 
 export function createDurableProductTools(options: DurableProductToolOptions) {
+  const productResult = (call: DurableProductToolCall, result: ToolResult<unknown>): ToolExecutionResult => {
+    const native = nativeResult(result);
+    return call.name === 'desktop_propose_action' && result.status === 'succeeded'
+      ? { ...native, control: { terminate: true } } : native;
+  };
   const original = async (call: DurableProductToolCall): Promise<ToolExecutionResult> => {
     try {
       const saved = await options.read(call);
-      return saved.ok && saved.data !== null ? nativeResult(saved.data) : unknownResult();
+      return saved.ok && saved.data !== null ? productResult(call, saved.data) : unknownResult();
     } catch { return unknownResult(); }
   };
   return options.definitions.map(definition => defineTool({ name: definition.name, description: definition.description,
@@ -94,7 +99,7 @@ export function createDurableProductTools(options: DurableProductToolOptions) {
         const result = await options.execute({ ...call, signal,
           ...(definition.name === 'Agent' && !call.child && options.delegate ? { nativeDelegate: options.delegate(api, context, call) } : {}) });
         signal.throwIfAborted();
-        return result.ok ? nativeResult(result.data) : original(call);
+        return result.ok ? productResult(call, result.data) : original(call);
       } catch {
         signal.throwIfAborted();
         return original(call);

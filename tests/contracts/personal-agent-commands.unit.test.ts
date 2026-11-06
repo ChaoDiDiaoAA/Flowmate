@@ -6,6 +6,10 @@ import { PersonalAgentCommandSchema, isPersonalAgentHostCommand, matchesPersonal
   personalAgentHostCommandSchemas } from '../../packages/contracts/src/personal-agent-commands.ts';
 
 const at = '2026-10-29T00:00:00.000Z';
+it('accepts an explicit idempotent request to discard one approved desktop action', () => {
+  expect(parsePersonalAgentCommand({ type: 'invoice_work_desktop_discard', input: { workId: 7, itemId: 8, proposalId: 9 } }))
+    .toMatchObject({ type: 'invoice_work_desktop_discard' });
+});
 const configuration = { modelId: null, thinkingLevel: 'off', preferences: '', workingDirectory: null,
   resources: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] }, tools: [] } as const;
 const snapshot = { personalAgentId: 1, revision: 2, runtimeKind: 'durable', configuration, createdAt: at, updatedAt: at } as const;
@@ -22,6 +26,25 @@ const continued = { type: 'invoice_work_continue', input: { workId: 7, requestId
 const ok = <T>(data: T) => ({ ok: true as const, data });
 
 describe('P18 command protocol', () => {
+  it('binds desktop approval receipts to the original work, item, proposal and decision', () => {
+    const input = { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'confirm-1', decision: 'approve',
+      confirmedAction: { kind: 'click', observationId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', elementIndex: 4 },
+      confirmedTarget: { connectionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', window: { id: 3, app: 'Controlled', title: 'Sample' }, element: '[4] Button' } };
+    const command = { type: 'invoice_work_desktop_decide', input };
+    const accepted = { ...input, revision: 4, receivedAt: at };
+    expect(parsePersonalAgentCommand(command)).not.toBeNull();
+    expect(matchesPersonalAgentResponse(command, ok(accepted))).toBe(true);
+    for (const change of [{ workId: 8 }, { itemId: 72 }, { proposalId: 10 }, { requestId: 'other' }, { decision: 'reject' }])
+      expect(matchesPersonalAgentResponse(command, ok({ ...accepted, ...change }))).toBe(false);
+    expect(matchesPersonalAgentResponse(command, ok({ ...accepted, confirmedAction: { ...input.confirmedAction, elementIndex: 5 } }))).toBe(false);
+    expect(matchesPersonalAgentResponse(command, ok({ ...accepted, confirmedTarget: { ...input.confirmedTarget, element: '[4] Different' } }))).toBe(false);
+    expect(matchesPersonalAgentResponse(command, ok({ ...accepted, confirmedTarget: undefined }))).toBe(false);
+    const query = { type: 'invoice_work_desktop_query_decision', input: { workId: 7, itemId: 71, proposalId: 9, requestId: 'confirm-1' } };
+    expect(matchesPersonalAgentResponse(query, ok(accepted))).toBe(true);
+    expect(matchesPersonalAgentResponse(query, ok(null))).toBe(true);
+    expect(personalAgentHostFailure(command.type)).toMatchObject({ ok: false, error: { code: 'operation_result_unknown' } });
+  });
+
   it('admits exactly the product commands and rejects native authority and internal resume', () => {
     const commands = [
       { type: 'personal_agent_get', input: {} },
@@ -35,6 +58,10 @@ describe('P18 command protocol', () => {
       continued,
       { type: 'invoice_work_cancel', input: { workId: 7, requestId: 'cancel-1', expectedRevision: 3 } },
       { type: 'invoice_work_query_operation', input: { operation: 'create', personalAgentId: 1, requestId: 'create-1' } },
+      { type: 'invoice_work_desktop_list', input: { workId: 7, itemId: 71 } },
+      { type: 'invoice_work_desktop_decide', input: { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'confirm-1', decision: 'approve' } },
+      { type: 'invoice_work_desktop_discard', input: { workId: 7, itemId: 71, proposalId: 9 } },
+      { type: 'invoice_work_desktop_query_decision', input: { workId: 7, itemId: 71, proposalId: 9, requestId: 'confirm-1' } },
       { type: 'personal_task_list', input: { workId: 7 } },
       { type: 'personal_task_get', input: { workId: 7, attemptId: 21 } },
       { type: 'personal_task_stop', input: { workId: 7, attemptId: 21, requestId: 'stop-1', expectedRevision: 3 } },
@@ -42,7 +69,7 @@ describe('P18 command protocol', () => {
       { type: 'personal_task_history_entry', input: { target: { workId: 7 }, throughEntryId: 9, entryId: 8 } },
       { type: 'invoice_work_timeline', input: { workId: 7 } },
     ];
-    expect(personalAgentHostCommandSchemas({ version: z.literal(1), requestId: z.string().min(1) })).toHaveLength(17);
+    expect(personalAgentHostCommandSchemas({ version: z.literal(1), requestId: z.string().min(1) })).toHaveLength(21);
     for (const command of commands) {
       expect(PersonalAgentCommandSchema.safeParse(command).success).toBe(true);
       expect(parseHostCommand({ version: 1, requestId: 'transport-1', ...command })).not.toBeNull();

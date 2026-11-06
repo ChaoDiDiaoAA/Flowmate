@@ -4,7 +4,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import { z } from 'zod';
 import { EvaluationWorkflowRequestSchema, EvaluationWorkflowResultSchema } from '../../../packages/contracts/src/evaluation-workflow.ts';
 import { parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, isResearchHostCommand } from '../../../packages/contracts/src/research-commands.ts';
-import { appError, fail } from '../../../packages/contracts/src/errors.ts';
+import { appError, fail, ok } from '../../../packages/contracts/src/errors.ts';
 import { parseResourceCommand, parseResourceHostResult, matchesResourceResponse, resourceHostFailure } from '../../../packages/contracts/src/resources.ts';
 import { parseExtensionCommand, parseExtensionHostResult, matchesExtensionResponse, extensionHostFailure, isExtensionHostCommand } from '../../../packages/contracts/src/extensions.ts';
 import { parseSubagentCommand, parseSubagentHostResult, matchesSubagentResponse, subagentHostFailure, isSubagentHostCommand } from '../../../packages/contracts/src/subagents.ts';
@@ -18,6 +18,7 @@ import { BackgroundServiceStateSchema, BackgroundServiceConnectRequestSchema, Ba
   BackgroundServiceActivationQuerySchema, BackgroundServiceActivationViewSchema,
   type BackgroundServiceState } from '../../../packages/contracts/src/background-service.ts';
 import { AppErrorSchema } from '../../../packages/contracts/src/runtime.ts';
+import { DesktopOwnerSchema, DesktopWindowSchema, DesktopWindowSelectionSchema } from '@flowmate/contracts';
 import { CloudDesktopConnectionSchema, CloudDesktopRequestSchema, CloudDesktopStateSchema, CloudDesktopUploadResourceSchema, CloudDesktopUploadSchema, CloudDesktopWorkspaceSchema,
   CloudMaterialReceiptSchema, CloudResourceReceiptSchema, cloudDesktopFailure, parseCloudDesktopResult } from '@flowmate/contracts';
 
@@ -118,6 +119,32 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
 }
 
 const bridge: DesktopBridge = {
+  async startDesktopUse() {
+    try {
+      const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.undefined() }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:desktop-start'));
+      if (result.success) return result.data.ok ? ok(undefined) : result.data;
+    } catch { /* A lost response does not prove that the desktop is ready. */ }
+    return fail(appError('desktop_unavailable', 'runtime', 'KimiCU is unavailable on this Windows desktop.', true));
+  },
+  async desktopWindows() {
+    try {
+      const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.array(DesktopWindowSchema).max(100) }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:desktop-windows'));
+      if (result.success) return result.data;
+    } catch { /* A lost response cannot authorize a window. */ }
+    return fail(appError('desktop_unavailable', 'runtime', 'The desktop window list is unavailable.', true));
+  },
+  async selectDesktopWindow(raw) {
+    const input = DesktopWindowSelectionSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'The desktop window selection is invalid.'));
+    try {
+      const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: DesktopOwnerSchema }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:desktop-select-window', input.data));
+      if (result.success && (!result.data.ok || result.data.data.workId === input.data.workId && result.data.data.itemId === input.data.itemId)) return result.data;
+    } catch { /* A lost response cannot authorize a window. */ }
+    return fail(appError('desktop_unavailable', 'runtime', 'The desktop window selection is unavailable.', true));
+  },
   async runEvaluationWorkflow(input) {
     const request = EvaluationWorkflowRequestSchema.safeParse(input);
     if (!request.success) return fail(appError('input_invalid', 'input', '评测闭环请求无效。'));
@@ -152,6 +179,9 @@ const bridge: DesktopBridge = {
     get: input => invokeAssembly('invoice_work_get', input), supplement: input => invokeAssembly('invoice_work_supplement', input),
     disposeItem: input => invokeAssembly('invoice_work_dispose_item', input), continueWork: input => invokeAssembly('invoice_work_continue', input),
     cancelWork: input => invokeAssembly('invoice_work_cancel', input), queryOperation: input => invokeAssembly('invoice_work_query_operation', input),
+    listDesktopActions: input => invokeAssembly('invoice_work_desktop_list', input), decideDesktopAction: input => invokeAssembly('invoice_work_desktop_decide', input),
+    discardDesktopAction: input => invokeAssembly('invoice_work_desktop_discard', input),
+    queryDesktopDecision: input => invokeAssembly('invoice_work_desktop_query_decision', input),
     timeline: input => invokeAssembly('invoice_work_timeline', input) },
   personalTasks: { list: input => invokeAssembly('personal_task_list', input), get: input => invokeAssembly('personal_task_get', input),
     stop: input => invokeAssembly('personal_task_stop', input), history: input => invokeAssembly('personal_task_history', input),

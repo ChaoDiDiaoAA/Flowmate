@@ -486,7 +486,7 @@ export function createToolExecutor(input: ExecutorStorage & {
         }
         if (commitId !== null && status !== 'succeeded') budget.fatal = true;
       }
-    } else if (use.definition.name === 'fill_invoice_form') {
+    } else if (use.definition.name === 'fill_invoice_form' || use.definition.name === 'personal_fill_invoice_form') {
       const receipt = observedCall.data.formApplication;
       observation.commit = receipt?.outcome === 'applied' ? 'committed' : receipt?.outcome === 'unknown' || !stopped ? 'unknown' : 'none_confirmed';
       if (observation.commit === 'unknown') {

@@ -21,6 +21,19 @@ import { invoiceWorkToolsFixture as fixture, invoiceWorkCandidateDraft as draft 
 
 const at = '2026-10-29T00:00:00.000Z';
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
+
+test('a Durable invoice phase exposes desktop tools only when its saved configuration selected them', async () => {
+  const desktop = ['desktop_list_windows', 'desktop_observe_window', 'desktop_propose_action', 'desktop_execute_approved'];
+  const configuration = { modelId: null, thinkingLevel: 'off' as const, tools: desktop,
+    resources: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' };
+  const configured = await fixture({ configuration });
+  expect(configured.product.scope.allowedTools).toEqual(desktop);
+  const original = await fixture();
+  expect(original.product.scope.allowedTools.some(name => desktop.includes(name))).toBe(false);
+  const cloud = await fixture({ configuration, durableRuntimeId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' });
+  expect(cloud.product.scope.allowedTools).toEqual(desktop);
+});
+
 test('a genuine Durable root reuses invoice read/save/list/get and records the original candidate receipt without changing Workspace', async () => {
   const f = await fixture(), before = await f.database.read(scope => scope.db.query('SELECT * FROM workspace').get());
   expect(await f.execute('read_invoice_document', { documentId: 1, page: 1, afterBlockId: null, limit: 10 }, 'read-current-invoice'))

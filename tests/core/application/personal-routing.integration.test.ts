@@ -18,7 +18,9 @@ function fixture(assembled = true) {
     agent: { get: mock(async () => denied()), update: mock(async () => denied()), openConversation: mock(async () => denied()) },
     works: { create: mock(async () => denied()), list: mock(async () => denied()), get: mock(async () => denied()),
       supplement: mock(async () => denied()), disposeItem: mock(async () => denied()), continueWork: mock(async () => denied()),
-      cancelWork: mock(async () => denied()), queryOperation: mock(async () => denied()), timeline: mock(async () => denied()) },
+      cancelWork: mock(async () => denied()), queryOperation: mock(async () => denied()), timeline: mock(async () => denied()),
+      listDesktopActions: mock(async () => denied()), decideDesktopAction: mock(async () => denied()), discardDesktopAction: mock(async () => denied()),
+      queryDesktopDecision: mock(async () => denied()) },
     tasks: { list: mock(async () => denied()), get: mock(async () => denied()), stop: mock(async () => denied()), resume: mock(async () => ok(undefined)),
       history: mock(async () => denied()), historyEntry: mock(async () => denied()) },
   };
@@ -170,6 +172,9 @@ describe('P18 Application public routes', () => {
     expect(dispose).not.toHaveBeenCalled();
     expect(await app.invoiceWorks.continueWork(continued)).toMatchObject({ ok: false, error: { code: 'runtime_closing' } });
     expect(f.personal.works.continueWork).not.toHaveBeenCalled();
+    expect(await app.invoiceWorks.discardDesktopAction({ workId: 7, itemId: 71, proposalId: 9 }))
+      .toMatchObject({ ok: false, error: { code: 'runtime_closing' } });
+    expect(f.personal.works.discardDesktopAction).not.toHaveBeenCalled();
     expect(await app.invoiceWorks.list({ personalAgentId: 1 })).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
     expect(f.personal.works.list).toHaveBeenCalledTimes(1);
     confirmed = true;

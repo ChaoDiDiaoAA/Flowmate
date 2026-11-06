@@ -35,6 +35,18 @@ test('desktop cloud requests require the connected workspace and only expose the
   expect(closes).toBe(1); expect(await controller.request({ workspaceId, command })).toMatchObject({ ok: false });
 });
 
+test('an older cloud service stays usable when its desktop relay is unavailable', async () => {
+  const session = { request: async (request: unknown) => typeof request === 'object' && request !== null && 'type' in request
+    && request.type === 'cloud_queue_read' ? ok({ ...owner, version: 1, items: [] }) : fail(appError('input_invalid', 'input', 'Unsupported.')),
+    close: async () => ok(undefined) };
+  const controller = new CloudDesktopController({ connect: async () => ok(session), upload: async () => { throw Error('unused'); },
+    desktop: { verify: async () => ok(undefined), execute: async () => fail(appError('desktop_unavailable', 'runtime', 'Unavailable.')) } });
+  expect(await controller.connect(profile)).toEqual(ok({ workspaceId }));
+  expect(await controller.state()).toEqual(ok({ workspaceId, desktopReady: false }));
+  expect(await controller.request({ workspaceId, command })).toEqual(ok({ ...owner, version: 1, items: [] }));
+  expect(await controller.close()).toEqual(ok(undefined));
+});
+
 test('a late result cannot be presented as belonging to a reconnected workspace', async () => {
   const reply = Promise.withResolvers<ReturnType<typeof ok>>(); let closes = 0;
   const first = { request: async () => reply.promise, close: async () => { closes++; return ok(undefined); } };
@@ -59,6 +71,22 @@ test('desktop shutdown confirms the exit of an SSH process that was still connec
   const controller = new CloudDesktopController({ connect: async () => { await ready.promise; return ok(session); },
     upload: async () => { throw Error('unused'); } });
   const connecting = controller.connect(profile), closing = controller.close(); ready.resolve();
+  expect(await connecting).toMatchObject({ ok: false });
+  expect(await closing).toMatchObject({ ok: false, error: { code: 'cloud_ssh_close_unconfirmed' } });
+  expect(closes).toBe(1);
+});
+
+test('desktop shutdown reports an unconfirmed SSH exit while its desktop relay is attaching', async () => {
+  const attaching = Promise.withResolvers<void>(), finishAttach = Promise.withResolvers<void>(); let closes = 0;
+  const session = { request: async (raw: unknown) => {
+    const command = raw as { type: string; input: { connectionId: string } };
+    if (command.type === 'cloud_desktop_attach') { attaching.resolve(); await finishAttach.promise; return ok({ connectionId: command.input.connectionId }); }
+    return fail(appError('desktop_unavailable', 'runtime', 'Relay stopped.'));
+  }, close: async () => { closes++; return fail(appError('cloud_ssh_close_unconfirmed', 'runtime', 'SSH exit was not confirmed.', true)); } };
+  const controller = new CloudDesktopController({ connect: async () => ok(session), upload: async () => { throw Error('unused'); },
+    desktop: { verify: async () => ok(undefined), execute: async () => fail(appError('desktop_unavailable', 'runtime', 'Unavailable.')) } });
+  const connecting = controller.connect(profile); await attaching.promise;
+  const closing = controller.close(); finishAttach.resolve();
   expect(await connecting).toMatchObject({ ok: false });
   expect(await closing).toMatchObject({ ok: false, error: { code: 'cloud_ssh_close_unconfirmed' } });
   expect(closes).toBe(1);

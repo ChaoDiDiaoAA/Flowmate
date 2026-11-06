@@ -67,6 +67,17 @@ describe('P17 runtime layout', () => {
     expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: false, error: { code: 'installation_runtime_invalid' } });
   });
 
+  it('requires the desktop-action migration in a schema24 release while retaining older release layouts', () => {
+    const fixture = installation();
+    const migrations = ['apps/migrations/023_runtime_scopes.sql', 'apps/migrations/024_desktop_actions.sql'];
+    for (const file of migrations) writeFileSync(join(fixture.runtime, file), 'synthetic package asset');
+    const release = { ...fixture.release, schemaVersion: 24, files: [...fixture.release.files, ...migrations] };
+    writeFileSync(fixture.manifest, JSON.stringify(release));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release } });
+    writeFileSync(fixture.manifest, JSON.stringify({ ...release, files: release.files.filter(file => file !== migrations[1]) }));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: false, error: { code: 'installation_runtime_invalid' } });
+  });
+
   it.each(['1.4.0', '1.4.4'])('recognizes only an explicitly supported Bun release for original and target package lookup: %s', bunVersion => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, bunVersion }));
     expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: { bunVersion } } });
@@ -84,7 +95,7 @@ describe('P17 runtime layout', () => {
     if (!result.ok) expect(result.error.code).toBe('installation_dependency_missing');
   });
 
-  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 24 }, { settingsVersion: 8 },
+  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 25 }, { settingsVersion: 8 },
     { arch: 'arm64' }, { platform: 'linux' }, { releaseId: 'not-an-id' }, { extra: 'untrusted' }])
   ('rejects an incompatible or malformed release: %j', change => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, ...change }));

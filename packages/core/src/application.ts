@@ -200,7 +200,7 @@ export function makeApplication(
     if (!command) return fail(appError('input_invalid', 'input', 'The Personal Agent request is invalid.'));
     if (!products?.personal) return personalUnavailable();
     if (closing && ['personal_agent_update', 'invoice_work_create', 'invoice_work_supplement', 'invoice_work_dispose_item',
-      'invoice_work_continue', 'invoice_work_cancel', 'personal_task_stop'].includes(type))
+      'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_discard', 'personal_task_stop'].includes(type))
       return fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.'));
     try {
       const result = parsePersonalAgentHostResult(type, await invoke(command.input as I));
@@ -241,6 +241,10 @@ export function makeApplication(
       continueWork: raw => personalCommand('invoice_work_continue', raw, input => products?.personal?.works.continueWork(input)),
       cancelWork: raw => personalCommand('invoice_work_cancel', raw, input => products?.personal?.works.cancelWork(input)),
       queryOperation: raw => personalCommand('invoice_work_query_operation', raw, input => products?.personal?.works.queryOperation(input)),
+      listDesktopActions: raw => personalCommand('invoice_work_desktop_list', raw, input => products?.personal?.works.listDesktopActions(input)),
+      decideDesktopAction: raw => personalCommand('invoice_work_desktop_decide', raw, input => products?.personal?.works.decideDesktopAction(input)),
+      discardDesktopAction: raw => personalCommand('invoice_work_desktop_discard', raw, input => products?.personal?.works.discardDesktopAction(input)),
+      queryDesktopDecision: raw => personalCommand('invoice_work_desktop_query_decision', raw, input => products?.personal?.works.queryDesktopDecision(input)),
       timeline: raw => personalCommand('invoice_work_timeline', raw, input => products?.personal?.works.timeline(input)),
     },
     personalTasks: {

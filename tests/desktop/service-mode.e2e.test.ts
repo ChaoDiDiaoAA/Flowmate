@@ -137,7 +137,7 @@ test('service-mode Personal candidates use the original Fill bridge through an e
         baseUrl, model: 'service-fill-local', api: 'openai-completions', contextWindow: 64000, maxTokens: 8192, reasoning: false }], defaultModelId: 'service-fill' },
         { modelId: 'service-fill', apiKey: 'service-fill-synthetic-key' }); }, 'http://127.0.0.1:' + provider.port + '/v1')).toMatchObject({ ok: true });
     await holdOriginalServiceFill(app, fixture.installation.installationId);
-    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.locator('.personal-configuration > summary').click();
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click(); await page.locator('.personal-configuration > summary').click();
     await page.getByLabel('Personal Agent model', { exact: true }).selectOption('service-fill');
     await page.getByRole('button', { name: 'Save assistant configuration', exact: true }).click();
     await expect(page.getByRole('status')).toContainText('Assistant configuration saved'); await page.locator('.personal-configuration > summary').click();
@@ -171,7 +171,7 @@ test('service-mode Personal candidates use the original Fill bridge through an e
       const session = await window.flowmate.querySession(workspace.data.sessionId); return session.ok ? session.data : null; });
     if (!selected) throw Error('Expected an explicitly selected Chat Session.');
     expect(selected).toMatchObject({ runtimeKind: 'agent_session', availability: 'ready' }); expect(selected.sessionId).not.toBe(original.work.work.sessionId);
-    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.locator('.personal-items button').first().click();
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click(); await page.locator('.personal-items button').first().click();
     await app.evaluate(() => Reflect.get(globalThis, 'serviceFillConnectionGate').holdReview());
     await page.getByRole('button', { name: 'View original invoice / review', exact: true }).click();
     await expect.poll(() => app!.evaluate(() => Reflect.get(globalThis, 'serviceFillConnectionGate').reviewHeldCount)).toBe(1);
@@ -206,7 +206,7 @@ test('service-mode Personal candidates use the original Fill bridge through an e
     if (!foreground) throw Error('Expected a new explicitly selected Chat after the old NativeSession retired.');
     expect(foreground).toMatchObject({ runtimeKind: 'agent_session', availability: 'ready' }); expect(foreground.sessionId).not.toBe(selected.sessionId);
     expect(foreground.sessionId).not.toBe(original.work.work.sessionId); expect(requests).toBe(3);
-    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.locator('.personal-items button').first().click();
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click(); await page.locator('.personal-items button').first().click();
     await page.getByRole('button', { name: 'View original invoice / review', exact: true }).click(); await page.getByRole('button', { name: 'Results', exact: true }).click();
     await expect(fill).toBeEnabled(); await fill.click(); await expect.poll(() => fillRequests).toBe(2);
     const runs = await page.evaluate(sessionId => window.flowmate.listSessionRuns({ sessionId }), foreground.sessionId); if (!runs.ok) throw Error(runs.error.code);

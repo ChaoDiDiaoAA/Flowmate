@@ -1,28 +1,34 @@
+import { isDeepStrictEqual } from 'node:util';
 import { appError, CloudDesktopConnectionSchema, CloudDesktopRequestSchema, CloudDesktopUploadResourceSchema, CloudDesktopUploadSchema, CloudDesktopWorkspaceSchema,
   CloudMaterialReceiptSchema, CloudResourceReceiptSchema, cloudDesktopFailure, fail, ok, parseCloudDesktopResult, type CloudDesktopTarget,
   type CloudMaterialReceipt, type CloudResourceReceipt, type DocumentRef, type ResourceRef, type Result } from '@flowmate/contracts';
 import type { CloudSshSession } from './cloud-ssh-session.ts';
+import { CloudKimiBridge } from './cloud-kimi-bridge.ts';
+import type { DesktopActionView, DesktopBridgeRequest, DesktopBridgeResult } from '@flowmate/contracts';
 
 type Session = Pick<CloudSshSession, 'request' | 'close'>;
 type Options = { connect(target: CloudDesktopTarget, workspaceId: string): Promise<Result<Session>>;
   upload(input: { workspaceId: string; documentRef: DocumentRef }, session: Session): Promise<Result<CloudMaterialReceipt>>;
-  uploadResource?(input: { workspaceId: string; ref: ResourceRef }, session: Session): Promise<Result<CloudResourceReceipt>> };
+  uploadResource?(input: { workspaceId: string; ref: ResourceRef }, session: Session): Promise<Result<CloudResourceReceipt>>;
+  desktop?: { execute(workspaceId: string, request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult>;
+    verify(workspaceId: string, action: DesktopActionView, signal: AbortSignal): Promise<Result<void>> } };
 const invalid = () => fail(appError('input_invalid', 'input', 'The cloud workspace request is invalid.'));
 const unavailable = () => fail(appError('cloud_workspace_unavailable', 'runtime', 'The selected cloud workspace is not connected.', true));
 const unknownUpload = () => fail(appError('operation_result_unknown', 'runtime', 'The original material upload result is unknown.', true));
 
 /** Owns only a desktop transport; closing it never stops the cloud Work. */
 export class CloudDesktopController {
-  private current: { workspaceId: string; session: Session } | null = null;
+  private current: { workspaceId: string; session: Session; desktop?: CloudKimiBridge } | null = null;
   private connecting: Promise<Result<{ workspaceId: string }>> | null = null;
   private disconnecting: Promise<Result<void>> | null = null;
   private shutdownConnection: Result<void> | null = null;
   private stopped = false;
   constructor(private readonly options: Options) {}
 
-  async state(): Promise<Result<{ workspaceId: string | null }>> {
+  async state(): Promise<Result<{ workspaceId: string | null; desktopReady?: boolean }>> {
     if (this.shutdownConnection && !this.shutdownConnection.ok) return this.shutdownConnection;
-    return ok({ workspaceId: this.current?.workspaceId ?? null });
+    return ok({ workspaceId: this.current?.workspaceId ?? null,
+      ...(this.current && this.options.desktop ? { desktopReady: this.current.desktop?.isReady() === true } : {}) });
   }
 
   connect(raw: unknown): Promise<Result<{ workspaceId: string }>> {
@@ -38,7 +44,18 @@ export class CloudDesktopController {
         this.shutdownConnection = await result.data.close().catch(() => unavailable());
         return unavailable();
       }
-      this.current = { workspaceId: input.workspaceId, session: result.data };
+      let desktop = this.options.desktop ? new CloudKimiBridge(result.data, input.workspaceId, {
+        execute: (request, signal) => this.options.desktop!.execute(input.workspaceId, request, signal),
+        verify: (action, signal) => this.options.desktop!.verify(input.workspaceId, action, signal),
+      }) : undefined;
+      if (desktop) {
+        const started = await desktop.start().catch(() => unavailable());
+        if (!started.ok) { await desktop.close(); desktop = undefined; }
+        if (this.stopped) {
+          await desktop?.close(); this.shutdownConnection = await result.data.close().catch(() => unavailable()); return unavailable();
+        }
+      }
+      this.current = { workspaceId: input.workspaceId, session: result.data, ...(desktop ? { desktop } : {}) };
       return ok({ workspaceId: input.workspaceId });
     })().finally(() => { if (this.connecting === pending) this.connecting = null; });
     this.connecting = pending; return pending;
@@ -49,7 +66,7 @@ export class CloudDesktopController {
     const current = this.current;
     if (!current || current.workspaceId !== parsed.data.workspaceId || this.disconnecting) return Promise.resolve(unavailable());
     this.current = null;
-    const pending = Promise.resolve().then(() => current.session.close()).catch(() => unavailable()).then(result => {
+    const pending = Promise.resolve().then(async () => { await current.desktop?.close(); return current.session.close(); }).catch(() => unavailable()).then(result => {
       if (!result.ok) this.shutdownConnection = result;
       return result;
     })
@@ -62,9 +79,30 @@ export class CloudDesktopController {
     const input = structuredClone(parsed.data), current = this.current;
     if (!current || current.workspaceId !== input.workspaceId) return unavailable();
     try {
+      if (input.command.type === 'invoice_work_desktop_decide' && input.command.input.decision === 'approve') {
+        if (!current.desktop) return unavailable();
+        const original = input.command.input;
+        const query = { type: 'invoice_work_desktop_list' as const, input: { workId: original.workId, itemId: original.itemId,
+          ...(original.proposalId > 1 ? { afterProposalId: original.proposalId - 1 } : {}), limit: 1 } };
+        const listed = parseCloudDesktopResult(query, await current.session.request(query));
+        if (!listed?.ok || this.current !== current || !listed.data || typeof listed.data !== 'object' || !('items' in listed.data)
+          || !Array.isArray(listed.data.items)) return unavailable();
+        const action = listed.data.items[0] as DesktopActionView | undefined;
+        if (!action || action.proposalId !== original.proposalId || action.workId !== original.workId || action.itemId !== original.itemId) return unavailable();
+        if (!original.confirmedAction || !original.confirmedTarget || !isDeepStrictEqual(action.action, original.confirmedAction)
+          || !isDeepStrictEqual(action.target, original.confirmedTarget))
+          return fail(appError('state_conflict', 'input', 'The displayed desktop action changed; observe and confirm it again.'));
+        const approved = await current.desktop.approve(action); if (!approved.ok || this.current !== current) return approved.ok ? unavailable() : approved;
+      }
+      if (input.command.type === 'invoice_work_desktop_decide' && input.command.input.decision === 'reject'
+        || input.command.type === 'invoice_work_desktop_discard')
+        current.desktop?.revoke(input.command.input.workId, input.command.input.itemId, input.command.input.proposalId);
       const result = await current.session.request(input.command, input.command.type === 'cloud_progress_wait' ? 90_000 : undefined);
-      return this.current === current ? parseCloudDesktopResult(input.command, result) ?? cloudDesktopFailure(input.command)
+      const checked = this.current === current ? parseCloudDesktopResult(input.command, result) ?? cloudDesktopFailure(input.command)
         : cloudDesktopFailure(input.command);
+      if (!checked.ok && checked.error.code !== 'operation_result_unknown' && input.command.type === 'invoice_work_desktop_decide'
+        && input.command.input.decision === 'approve') current.desktop?.revoke(input.command.input.workId, input.command.input.itemId, input.command.input.proposalId);
+      return checked;
     } catch { return cloudDesktopFailure(input.command); }
   }
 

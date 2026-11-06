@@ -3,6 +3,7 @@ import { AppErrorSchema, type AppError } from './runtime.ts';
 import * as P from './personal-agent.ts';
 import * as H from './personal-history.ts';
 import * as T from './invoice-work-timeline.ts';
+import * as D from './desktop-actions.ts';
 
 const withinWireBudget = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 262_144;
 const result = <T extends z.ZodTypeAny>(data: T) => z.discriminatedUnion('ok', [
@@ -22,6 +23,10 @@ const commandSchemas = [
   z.object({ type: z.literal('invoice_work_continue'), input: P.InvoiceWorkContinueRequestSchema }).strict(),
   z.object({ type: z.literal('invoice_work_cancel'), input: P.InvoiceWorkCancelRequestSchema }).strict(),
   z.object({ type: z.literal('invoice_work_query_operation'), input: P.InvoiceWorkQueryOperationRequestSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_desktop_list'), input: D.DesktopActionListRequestSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_desktop_decide'), input: D.DesktopActionDecisionRequestSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_desktop_discard'), input: D.DesktopActionDiscardSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_desktop_query_decision'), input: D.DesktopActionDecisionQuerySchema }).strict(),
   z.object({ type: z.literal('personal_task_list'), input: P.PersonalTaskListRequestSchema }).strict(),
   z.object({ type: z.literal('personal_task_get'), input: P.PersonalTaskGetRequestSchema }).strict(),
   z.object({ type: z.literal('personal_task_stop'), input: P.PersonalTaskStopRequestSchema }).strict(),
@@ -53,6 +58,10 @@ const resultSchemas = {
   invoice_work_continue: result(P.InvoiceWorkContinueReceiptSchema),
   invoice_work_cancel: result(P.InvoiceWorkCancelReceiptSchema),
   invoice_work_query_operation: result(P.InvoiceWorkOperationReceiptSchema.nullable()),
+  invoice_work_desktop_list: result(D.DesktopActionListResultSchema),
+  invoice_work_desktop_decide: result(D.DesktopActionDecisionReceiptSchema),
+  invoice_work_desktop_discard: result(D.DesktopActionViewSchema),
+  invoice_work_desktop_query_decision: result(D.DesktopActionDecisionReceiptSchema.nullable()),
   personal_task_list: result(P.PersonalTaskListResultSchema),
   personal_task_get: result(P.PersonalTaskGetResultSchema),
   personal_task_stop: result(P.PersonalTaskStopReceiptSchema),
@@ -95,7 +104,7 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
   if (!result.ok) return result.runId === undefined && result.error.runId === undefined
     && result.error.sessionId === undefined && result.error.toolCallId === undefined;
   const data = result.data;
-  if (data === null) return captured.type === 'invoice_work_query_operation';
+  if (data === null) return captured.type === 'invoice_work_query_operation' || captured.type === 'invoice_work_desktop_query_decision';
   if ('execution' in data && 'kind' in data.execution && data.execution.kind === 'blocked') {
     const { reason, attempt } = data.execution;
     if (reason.runId !== undefined && reason.runId !== attempt?.runId || reason.toolCallId !== undefined
@@ -142,6 +151,18 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
     case 'invoice_work_query_operation': return 'operation' in data && data.operation === captured.input.operation
       && data.requestId === captured.input.requestId && (captured.input.operation === 'create'
         ? data.operation === 'create' && data.personalAgentId === captured.input.personalAgentId : data.workId === captured.input.workId);
+    case 'invoice_work_desktop_list': return 'items' in data && 'itemId' in data && data.workId === captured.input.workId
+      && data.itemId === captured.input.itemId && data.items.length <= captured.input.limit
+      && data.items.every(item => 'proposalId' in item && (captured.input.afterProposalId === undefined || item.proposalId > captured.input.afterProposalId));
+    case 'invoice_work_desktop_decide': return 'proposalId' in data && 'decision' in data && data.workId === captured.input.workId
+      && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && data.requestId === captured.input.requestId
+      && data.decision === captured.input.decision && data.expectedRevision === captured.input.expectedRevision
+      && JSON.stringify(data.confirmedAction) === JSON.stringify(captured.input.confirmedAction)
+      && JSON.stringify(data.confirmedTarget) === JSON.stringify(captured.input.confirmedTarget);
+    case 'invoice_work_desktop_discard': return 'proposalId' in data && 'status' in data && data.workId === captured.input.workId
+      && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && data.status === 'invalidated';
+    case 'invoice_work_desktop_query_decision': return 'proposalId' in data && 'decision' in data && data.workId === captured.input.workId
+      && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && data.requestId === captured.input.requestId;
     case 'invoice_work_create': return 'operation' in data && data.operation === 'create'
       && data.personalAgentId === captured.input.personalAgentId && data.requestId === captured.input.requestId;
     case 'invoice_work_continue': return 'operation' in data && data.operation === 'continueWork'
@@ -159,7 +180,7 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
 
 export function personalAgentHostFailure(type: string) {
   const write = ['personal_agent_update', 'invoice_work_create', 'invoice_work_supplement', 'invoice_work_dispose_item',
-    'invoice_work_continue', 'invoice_work_cancel', 'personal_task_stop'].includes(type);
+    'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_discard', 'personal_task_stop'].includes(type);
   return { ok: false as const, error: { code: write ? 'operation_result_unknown' : 'storage_read_failed',
     category: write ? 'runtime' as const : 'storage' as const, retryable: true,
     message: write ? 'The operation result is unknown. Refresh the original saved request before retrying.'

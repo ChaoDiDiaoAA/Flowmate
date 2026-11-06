@@ -76,12 +76,17 @@ function mixedCandidate(document: DocumentSnapshot, index: number) {
 test('the original service UI separates queued Work, active children, observed reports and a real unknown child stop without scheduling on refresh or reconnect', async () => {
   test.setTimeout(180000);
   const prepared = spawnSync(process.env.FLOWMATE_BUN_EXECUTABLE || 'bun', ['--no-env-file', '-e', `
-    import {installOwnerFixture} from './tests/service/owner-fixture.ts';
-    const input=JSON.parse(await Bun.stdin.text());console.log(JSON.stringify(await installOwnerFixture(input.runtimeRoot)));
-  `], { cwd: root, env: environment(''), input: JSON.stringify({ runtimeRoot: join(root, 'out/package/win-unpacked/resources/flowmate-runtime') }),
-    encoding: 'utf8', windowsHide: true });
-  if (prepared.status !== 0) throw Error('Existing service fixture installation failed: ' + prepared.stderr);
-  const installation = ServiceInstallationSchema.parse(JSON.parse(prepared.stdout.trim().split(/\r?\n/).at(-1)!));
+    import {packageOwnerFixture,installOwnerFixture,removeOwnerFixture} from './tests/service/owner-fixture.ts';
+    const packaged=await packageOwnerFixture();
+    try { console.log(JSON.stringify({packageRoot:packaged.root,installation:await installOwnerFixture(packaged.runtimeRoot)})); }
+    catch (error) { removeOwnerFixture(packaged.root); throw error; }
+  `], { cwd: root, env: environment(''), encoding: 'utf8', windowsHide: true });
+  if (prepared.status !== 0) throw Error('Service fixture installation failed: ' + prepared.stderr);
+  const fixture = JSON.parse(prepared.stdout.trim().split(/\r?\n/).at(-1)!) as { packageRoot: string; installation: unknown };
+  const packageRoot = realpathSync(fixture.packageRoot), packageInside = relative(realpathSync(tmpdir()), packageRoot);
+  if (!packageInside || packageInside.startsWith('..') || isAbsolute(packageInside) || !basename(packageRoot).startsWith('flowmate-service-owner-'))
+    throw Error('Expected the owned temporary package root.');
+  const installation = ServiceInstallationSchema.parse(fixture.installation);
   const userData = realpathSync(installation.dataRoot), inside = relative(realpathSync(tmpdir()), userData);
   if (!inside || inside.startsWith('..') || isAbsolute(inside) || !basename(userData).startsWith('flowmate-service-data-'))
     throw Error('Expected the existing fixture owned temporary data root.');
@@ -146,6 +151,7 @@ test('the original service UI separates queued Work, active children, observed r
     await page.getByLabel('Invoice work goal', { exact: true }).fill(goal);
     await page.locator('.personal-create input[type=checkbox]').first().check();
     await page.getByRole('button', { name: 'Submit invoice work', exact: true }).click();
+    await expect(page.locator('.personal-work-detail')).toContainText(goal);
     const original = await page.evaluate(async goal => {
       const agent = await window.flowmate.personalAgent.get(); if (!agent.ok) throw Error(agent.error.code);
       const works = await window.flowmate.invoiceWorks.list({ personalAgentId: agent.data.personalAgentId, limit: 20 });
@@ -178,7 +184,7 @@ test('the original service UI separates queued Work, active children, observed r
     await page.getByRole('tab', { name: 'Timeline', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Work evidence timeline', exact: true })).toContainText('returned to Master observed · Master received observed');
     const successfulCalls = wires.length, originalTimeline = await rpc({ type: 'invoice_work_timeline', input: { workId: successful.workId, limit: 100 } });
-    await page.reload(); await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await page.reload(); await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
     await select(page, successful.workId);
     expect(await task(successful.workId, successful.attemptId)).toEqual(complete);
     expect(await rpc({ type: 'invoice_work_timeline', input: { workId: successful.workId, limit: 100 } })).toEqual(originalTimeline);
@@ -219,7 +225,7 @@ test('the original service UI separates queued Work, active children, observed r
     await closeDesktopFixture(app, userData); app = null;
     app = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'), args: [resolve(root, 'out/main/index.js')],
       env: environment(userData), timeout: 30000 }); desktops.push(app.process()); page = await app.firstWindow();
-    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
     await showTask(page, active.workId, active.attemptId);
     await expect(page.getByText('Actual stop is not confirmed. Original ownership and results are retained.', { exact: true })).toBeVisible();
     await expect(page.locator('.personal-child')).toContainText('stop not confirmed');
@@ -235,8 +241,9 @@ test('the original service UI separates queued Work, active children, observed r
       if (!pid || !Number.isSafeInteger(pid) || pid === process.pid) throw Error('Expected the exact owned fixture process.');
       if (owner.exitCode === null && owner.signalCode === null) owner.kill('SIGKILL'); // Fixture cleanup never confirms a business stop.
       await ownerExit; lines.close(); await provider.stop();
-      if ((owner.exitCode !== null || owner.signalCode !== null) && desktops.every(desktop => desktop.exitCode !== null || desktop.signalCode !== null))
-        rmSync(userData, { recursive: true, force: true });
+      if ((owner.exitCode !== null || owner.signalCode !== null) && desktops.every(desktop => desktop.exitCode !== null || desktop.signalCode !== null)) {
+        rmSync(userData, { recursive: true, force: true }); rmSync(packageRoot, { recursive: true, force: true });
+      }
     }
   }
   if (failure) throw failure;
@@ -284,7 +291,7 @@ test('a twelve-invoice Work shows seven reviews, three material requests and two
     await expect.poll(() => page.evaluate(() => window.flowmate.getState())).toMatchObject({ ok: true,
       data: { settings: { runtime: { budget: { maxModelCalls: 32, maxToolCalls: 100 }, timeoutMs: 300000 } } } });
     expect(requests).toBe(0);
-    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
     await page.getByRole('button', { name: 'New invoice work', exact: true }).click();
     await page.getByLabel('Invoice work goal', { exact: true }).fill('Review twelve controlled original invoices; preserve missing buyer information and conflicting buyer evidence for human decisions.');
     const choices = page.locator('.personal-create input[type=checkbox]'); await expect(choices).toHaveCount(12);
@@ -353,7 +360,7 @@ test('a twelve-invoice Work shows seven reviews, three material requests and two
     expect(groups).toEqual({ review: 7, supplement: 3, conflict: 2 });
     await closeDesktopFixture(app, userData); app = null;
     app = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'), args: [resolve(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
-    page = await app.firstWindow(); await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    page = await app.firstWindow(); await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Work 1', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Refresh saved work', exact: true }).click(); await expect(page.locator('.personal-items button')).toHaveCount(12);
     expect(await page.evaluate(() => window.flowmate.invoiceWorks.get({ view: 'work', workId: 1, limit: 50 }))).toEqual({ ok: true, data: original.saved });
@@ -372,7 +379,7 @@ async function configure(page: Page, baseUrl: string) {
       api: 'openai-completions', contextWindow: 64000, maxTokens: 8192, reasoning: false }], defaultModelId: 'personal-ui' },
     { modelId: 'personal-ui', apiKey: 'synthetic-personal-ui-key' });
   }, baseUrl)).toMatchObject({ ok: true });
-  await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+  await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Personal Agent', exact: true })).toBeVisible();
   const personal = await page.evaluate(() => window.flowmate.personalAgent.get());
   expect(personal, JSON.stringify(personal)).toMatchObject({ ok: true });
@@ -385,6 +392,106 @@ async function configure(page: Page, baseUrl: string) {
   await expect(page.getByRole('status')).toContainText('Assistant configuration saved');
   await page.locator('.personal-configuration > summary').click();
 }
+
+test('an invoice without local desktop ownership remains readable without desktop controls', async () => {
+  test.setTimeout(60000);
+  const userData = await seed(), provider = await createHttpProvider(async () => stream('Review the original invoice.'));
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null, failure: Error | undefined;
+  try {
+    app = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'),
+      args: [resolve(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
+    const page = await app.firstWindow(); await configure(page, 'http://127.0.0.1:' + provider.port);
+    await page.getByRole('button', { name: 'New invoice work', exact: true }).click();
+    await page.getByLabel('Invoice work goal', { exact: true }).fill('Review this invoice.');
+    await page.locator('.personal-create input[type=checkbox]').first().check();
+    await page.getByRole('button', { name: 'Submit invoice work', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Work 1', exact: true })).toBeVisible();
+    await installReadGate(app, userData);
+    await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').fail(1, 'invoice_work_desktop_list'));
+    await page.locator('.personal-items button').first().click();
+    await expect(page.getByRole('region', { name: 'Selected Work invoice' })).toBeVisible();
+    await expect.poll(() => app!.evaluate(() => Reflect.get(globalThis, 'contextReadGate').faultCount('invoice_work_desktop_list'))).toBe(0);
+    await expect(page.getByRole('region', { name: 'Desktop window selection' })).toHaveCount(0);
+    await expect(page.locator('.personal-agent-page > [role=alert]')).toHaveCount(0);
+  } catch (cause) { failure = cause instanceof Error ? cause : new Error(String(cause)); }
+  finally { try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await provider.stop(); } }
+  if (failure) throw failure;
+});
+
+test('a local Durable Work confirms one KimiCU action against a controlled Windows sample', async () => {
+  test.skip(process.platform !== 'win32' || !process.env.FLOWMATE_KIMICU_PLUGIN_ROOT || !process.env.KIMI_CU_WINDOWS_EXE,
+    'The installed local KimiCU plugin and runtime are required.');
+  test.setTimeout(120000);
+  const userData = await seed(), gate = Promise.withResolvers<void>();
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null, sample: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let failure: Error | undefined, calls = 0, providerFault = '';
+  const provider = await createHttpProvider(async request => {
+    const body = await request.json() as { messages: Array<{ role: string; content: string }> };
+    const context = JSON.parse(body.messages.find(message => message.role === 'user' && typeof message.content === 'string'
+      && message.content.startsWith('{'))!.content) as { phase: { basis: { desktopProposalId?: number } } };
+    const toolMessages = body.messages.filter(message => message.role === 'tool').map(message => String(message.content));
+    let name: string, args: unknown;
+    if (context.phase.basis.desktopProposalId && toolMessages.some(text => text.includes('"outcome":"dispatched"')))
+      return stream('The approved input was dispatched; its business result needs review.');
+    if (context.phase.basis.desktopProposalId) { name = 'desktop_execute_approved'; args = { proposalId: context.phase.basis.desktopProposalId }; }
+    else if (toolMessages.length === 0) { await gate.promise; name = 'desktop_observe_window'; args = {}; }
+    else {
+      const text = toolMessages.at(-1)!;
+      const feedback = JSON.parse(text) as { data?: { observationId?: string; tree?: string } };
+      const observationId = feedback.data?.observationId;
+      const index = feedback.data?.tree?.split('\n').find(line => /\[\d+\].*编辑.*Sample amount/i.test(line))?.match(/\[(\d+)\]/)?.[1];
+      if (!observationId || !index) { providerFault = 'The original observed sample control was unavailable: ' + text.slice(0, 800); throw Error(providerFault); }
+      name = 'desktop_propose_action'; args = { kind: 'set_value', observationId, elementIndex: Number(index), value: '113.00' };
+    }
+    calls++;
+    return new Response('data: ' + JSON.stringify({ id: 'kimi-e2e-' + calls, object: 'chat.completion.chunk', created: 1,
+      model: 'personal-ui-model', choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'kimi-call-' + calls,
+        type: 'function', function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: 'tool_calls' }] }) + '\n\ndata: [DONE]\n\n',
+    { headers: { 'content-type': 'text/event-stream' } });
+  });
+  try {
+    sample = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'),
+      args: [resolve(root, 'tests/desktop/fixtures/kimi-sample.cjs')] });
+    const samplePage = await sample.firstWindow(); await samplePage.locator('#amount').waitFor();
+    app = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'), args: [resolve(root, 'out/main/index.js')],
+      env: { ...environment(userData), FLOWMATE_KIMICU_PLUGIN_ROOT: process.env.FLOWMATE_KIMICU_PLUGIN_ROOT!,
+        KIMI_CU_WINDOWS_EXE: process.env.KIMI_CU_WINDOWS_EXE! }, timeout: 30000 });
+    const page = await app.firstWindow(); await configure(page, 'http://127.0.0.1:' + provider.port);
+    await page.locator('.personal-configuration > summary').click();
+    for (const name of ['desktop_list_windows', 'desktop_observe_window', 'desktop_propose_action', 'desktop_execute_approved'])
+      await page.getByLabel('Enable Personal Agent tool ' + name, { exact: true }).check();
+    await page.getByRole('button', { name: 'Save assistant configuration', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Assistant configuration saved');
+    await page.locator('.personal-configuration > summary').click();
+    await page.getByRole('button', { name: 'New invoice work', exact: true }).click();
+    await page.getByLabel('Invoice work goal', { exact: true }).fill('Fill the controlled sample field and ask before input.');
+    await page.locator('.personal-create input[type=checkbox]').first().check();
+    await page.getByRole('button', { name: 'Submit invoice work', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Work 1', exact: true })).toBeVisible();
+    await page.locator('.personal-items button').first().click();
+    await page.getByRole('button', { name: 'Find desktop windows', exact: true }).click();
+    const option = page.getByLabel('Window for this invoice').locator('option').filter({ hasText: 'Flowmate KimiCU Controlled Sample' });
+    await expect(option).toHaveCount(1); await page.getByLabel('Window for this invoice').selectOption((await option.getAttribute('value'))!);
+    await page.getByRole('button', { name: 'Select this window', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Desktop window selection' })).toContainText('Selected');
+    gate.resolve();
+    await expect.poll(() => page.evaluate(async () => { const work = await window.flowmate.invoiceWorks.get({ view: 'work', workId: 1 });
+      if (!work.ok || work.data.view !== 'work') return false;
+      const actions = await window.flowmate.invoiceWorks.listDesktopActions({ workId: 1, itemId: work.data.items[0]!.itemId });
+      return actions.ok && actions.data.items.some(item => item.canDecide); }), { timeout: 30000 }).toBe(true).catch(async cause => {
+        const facts = await page.evaluate(async () => ({ work: await window.flowmate.invoiceWorks.get({ view: 'work', workId: 1 }),
+          tasks: await window.flowmate.personalTasks.list({ workId: 1, limit: 10 }), history: await window.flowmate.personalTasks.history({ target: { workId: 1 }, limit: 30 }) }));
+        throw Error(`${String(cause)}\nControlled provider calls: ${calls}; provider fault: ${providerFault}\n${JSON.stringify(facts)}`);
+      });
+    expect(await samplePage.locator('#amount').inputValue()).toBe('0.00');
+    await page.getByRole('button', { name: 'Refresh saved work', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Approve and continue', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Approve and continue', exact: true }).click();
+    await expect.poll(() => samplePage.locator('#amount').inputValue(), { timeout: 30000 }).toBe('113.00');
+  } catch (cause) { failure = cause instanceof Error ? cause : new Error(String(cause)); }
+  finally { gate.resolve(); try { if (app) await closeDesktopFixture(app, userData, failure); } finally { if (sample) await sample.close(); await provider.stop(); } }
+  if (failure) throw failure;
+});
 
 test('Personal Agent creates only from its own module, recovers a lost receipt, reviews and explicitly disposes original invoices', async () => {
   test.setTimeout(120000);
@@ -414,7 +521,7 @@ test('Personal Agent creates only from its own module, recovers a lost receipt, 
     await installReadGate(app, userData); await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').fail(1, 'invoice_work_create'));
     await page.getByRole('button', { name: 'Submit invoice work', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Original request awaiting confirmation', exact: true })).toBeVisible();
-    await page.reload(); await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await page.reload(); await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Check saved receipt', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Check saved receipt', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Work 1', exact: true })).toBeVisible();
@@ -510,7 +617,7 @@ test('a finished Work releases only a confirmed original acceptance and another 
     await release.click();
     await expect.poll(() => app!.evaluate(() => Reflect.get(globalThis, 'contextReadGate').held.length)).toBe(1);
     await page.getByRole('button', { name: 'Models', exact: true }).click();
-    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
     await page.getByRole('button', { name: 'New invoice work', exact: true }).click();
     await page.getByLabel('Invoice work goal', { exact: true }).fill('A newer draft must survive the previous page response.');
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').release(0));
@@ -603,7 +710,7 @@ test('Personal Agent configuration keeps explicit resource versions, failed draf
       await page.getByLabel('Assistant preferences', { exact: true }).fill('Use the explicitly selected invoice guidance.');
     };
     await edit();
-    await expect(page.getByLabel('Enable Skill deep-research v1', { exact: true })).toBeDisabled();
+    await expect(page.getByLabel('Enable Skill deep-research v2', { exact: true })).toBeDisabled();
     await expect(page.getByRole('group', { name: 'Personal Agent extensions', exact: true })).toContainText('No Durable phase adapter');
     await expect(page.getByLabel('Enable Personal Agent tool bash', { exact: true })).toHaveCount(0);
     await installReadGate(app, userData);
@@ -647,6 +754,87 @@ test('Personal Agent configuration keeps explicit resource versions, failed draf
     if (stored.status !== 0) throw Error('Original configuration read failed: ' + stored.stderr);
     const configurations = (JSON.parse(stored.stdout) as Array<{ id: number; configuration_json: string }>).map(row => JSON.parse(row.configuration_json) as PersonalAgentConfiguration);
     expect(configurations).toEqual([original.data.configuration, saved.data.configuration]);
+  } catch (cause) { failure = cause instanceof Error ? cause : new Error(String(cause)); }
+  finally { try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await provider.stop(); } }
+  if (failure) throw failure;
+});
+
+test('a user prepares an invoice form and resumes its original Durable Work to fill it', async () => {
+  test.setTimeout(120000);
+  const userData = await seed(); let app: Awaited<ReturnType<typeof electron.launch>> | null = null, failure: Error | undefined;
+  const documents: DocumentSnapshot[] = []; let requests = 0, continuation = false, providerFault = '';
+  const provider = await createHttpProvider(async request => {
+    const body = await request.json() as { messages: Array<{ role: string; content: string; tool_call_id?: string }> };
+    requests++;
+    if (!continuation) {
+      if (requests === 2) return stream('The original candidate is ready for human review.');
+      const context = JSON.parse(body.messages.find(message => message.role === 'user' && message.content.startsWith('{'))!.content) as { item: { documentRef: { id: number } } };
+      return stream({ document: documents.find(document => document.documentRef.id === context.item.documentRef.id)!, id: requests });
+    }
+    const observed = body.messages.find(message => message.tool_call_id === 'personal-observe');
+    if (body.messages.some(message => message.tool_call_id === 'personal-fill')) return stream('The form is ready for human review.');
+    let name = 'personal_observe_invoice_form', args: unknown = {}, callId = 'personal-observe';
+    if (observed) {
+      const result = JSON.parse(observed.content) as { data?: { candidateId?: number; target?: unknown }; error?: unknown };
+      if (!result.data?.candidateId || !result.data.target) { providerFault = observed.content; throw Error(providerFault); }
+      name = 'personal_fill_invoice_form'; args = { candidateId: result.data.candidateId, target: result.data.target }; callId = 'personal-fill';
+    }
+    return new Response('data: ' + JSON.stringify({ id: 'durable-form-' + requests, object: 'chat.completion.chunk', created: 1,
+      model: 'personal-ui-model', choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: callId,
+        type: 'function', function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: 'tool_calls' }] }) + '\n\ndata: [DONE]\n\n',
+    { headers: { 'content-type': 'text/event-stream' } });
+  });
+  try {
+    app = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'), args: [resolve(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
+    const page = await app.firstWindow();
+    const material = await page.evaluate(() => window.flowmate.listDocuments({ limit: 10 })); if (!material.ok) throw Error(material.error.code); documents.push(...material.data.items);
+    await configure(page, 'http://127.0.0.1:' + provider.port);
+    await page.locator('.personal-configuration > summary').click();
+    for (const name of ['personal_observe_invoice_form', 'personal_fill_invoice_form'])
+      await page.getByLabel('Enable Personal Agent tool ' + name, { exact: true }).check();
+    await page.getByRole('button', { name: 'Save assistant configuration', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Assistant configuration saved');
+    await page.locator('.personal-configuration > summary').click();
+    await page.getByRole('button', { name: 'New invoice work', exact: true }).click();
+    await page.getByLabel('Invoice work goal', { exact: true }).fill('Prepare this invoice for human form review.');
+    await page.locator('.personal-create input[type=checkbox]').first().check();
+    await page.getByRole('button', { name: 'Submit invoice work', exact: true }).click();
+    await expect.poll(() => page.evaluate(async () => { const tasks = await window.flowmate.personalTasks.list({ workId: 1, limit: 10 });
+      return tasks.ok && tasks.data.items.some(task => task.runStatus === 'completed' && task.stoppedAt !== null); })).toBe(true);
+    await page.getByRole('button', { name: 'Refresh saved work', exact: true }).click();
+    await page.locator('.personal-items button').first().click();
+    await page.getByRole('button', { name: 'View original invoice / review', exact: true }).click();
+    await page.getByRole('button', { name: 'Results', exact: true }).click();
+    await page.getByRole('button', { name: 'Prepare form for Personal Agent', exact: true }).click();
+    await expect(page.getByLabel('Total amount', { exact: true })).toHaveValue('');
+    await expect(page.getByRole('button', { name: 'Accept result', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: 'Return to Personal Agent Work 1', exact: true }).click();
+    await page.locator('.personal-items button').first().click();
+    await page.locator('.personal-todo form textarea').first().fill('Please fill the prepared form for this invoice so I can review it.');
+    continuation = true;
+    await page.getByRole('button', { name: /^Save supplement for Todo / }).first().click();
+    await expect.poll(() => requests, { timeout: 30000 }).toBeGreaterThanOrEqual(5);
+    await page.getByRole('button', { name: 'View original invoice / review', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Invoice form', exact: true }), providerFault).toContainText('Revision 1', { timeout: 30000 });
+    await expect(page.getByLabel('Total amount', { exact: true })).toHaveValue('113.00');
+    await expect(page.getByRole('button', { name: 'Accept result', exact: true })).toBeEnabled();
+    const saved = await page.evaluate(async () => window.flowmate.invoiceWorks.get({ view: 'work', workId: 1 }));
+    expect(saved).toMatchObject({ ok: true, data: { work: { status: 'open', counts: { accepted: 0, unresolved: 1 } }, items: [{ disposition: 'unresolved' }] } });
+    const applied = await page.evaluate(async () => {
+      const [work, tasks] = await Promise.all([window.flowmate.invoiceWorks.get({ view: 'work', workId: 1 }),
+        window.flowmate.personalTasks.list({ workId: 1, limit: 10 })]);
+      if (!work.ok || !tasks.ok) throw Error('The original Work is unavailable.');
+      for (const task of tasks.data.items) {
+        if (!task.attempt.runId) continue;
+        const calls = await window.flowmate.listRunToolCalls({ runId: task.attempt.runId, sessionId: work.data.work.sessionId, limit: 100 });
+        if (!calls.ok) throw Error(calls.error.code);
+        const call = calls.data.items.find(item => item.toolName === 'personal_fill_invoice_form');
+        if (call) return { call, receipt: await window.flowmate.queryInvoiceFormApplication({ runId: task.attempt.runId, toolCallId: call.toolCallId }) };
+      }
+      throw Error('The original Durable form call is unavailable.');
+    });
+    expect(applied.call).toMatchObject({ toolName: 'personal_fill_invoice_form', formApplicationOutcome: 'applied' });
+    expect(applied.receipt).toMatchObject({ ok: true, data: { outcome: 'applied', toolCallId: applied.call.toolCallId, appliedRevision: 1 } });
   } catch (cause) { failure = cause instanceof Error ? cause : new Error(String(cause)); }
   finally { try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await provider.stop(); } }
   if (failure) throw failure;
@@ -715,7 +903,7 @@ test('a Personal Agent candidate uses an explicitly selected AgentSession for th
       if (!workspace.ok || workspace.data.sessionId === null) throw Error('Expected an explicitly created foreground Session.');
       const session = await window.flowmate.querySession(workspace.data.sessionId); if (!session.ok) throw Error(session.error.code); return session.data; });
     expect(selected).toMatchObject({ runtimeKind: 'agent_session', availability: 'ready' }); expect(selected.sessionId).not.toBe(original.conversation.sessionId); expect(requests).toHaveLength(2);
-    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Work 1', exact: true })).toBeVisible(); await page.locator('.personal-items button').first().click();
     await page.getByRole('button', { name: 'View original invoice / review', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Personal Agent invoice review', exact: true })).toBeVisible();

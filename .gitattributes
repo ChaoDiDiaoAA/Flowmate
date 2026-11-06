@@ -1,4 +1,5 @@
 resources/** text eol=lf
+resources/service/WinSW.NET461.exe -text -eol
 patches/** text eol=lf whitespace=-blank-at-eol
 agent-eval/src/testing/fixtures/*.md text eol=lf
 agent-eval/src/testing/fixtures/*.txt text eol=lf

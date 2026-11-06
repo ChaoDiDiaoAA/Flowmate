@@ -175,6 +175,7 @@ function runtimeMessage(state: RuntimeState | null, readFailed: boolean, hostRea
 export function App() {
   const [initialFocus] = useState(() => readWorkspaceFocus(localStorage));
   const [page, setPage] = useState<Page>(initialFocus?.page ?? 'conversation');
+  const [personalMode, setPersonalMode] = useState<'local' | 'cloud'>('cloud');
   const pageRef = useRef(page); pageRef.current = page;
   const [focusRestored, setFocusRestored] = useState(false);
   const [settingsTab, setSettingsTab] = useState('General');
@@ -383,6 +384,7 @@ export function App() {
   const hostReadyRef = useRef(false);
   const invoiceFormRef = useRef<InvoiceFormState | null>(null);
   const pendingFill = useRef<DesktopInvoiceFormRunRequest | null>(null);
+  const pendingPersonalFill = useRef<{ formInstanceId: string; workId: number; itemId: number } | null>(null);
   const formLastCall = useRef<{ runId: number; toolCallId: number } | null>(null);
   const formLeaveResolve = useRef<((leave: boolean) => void) | null>(null);
   const candidateQuerySequence = useRef(0);
@@ -638,6 +640,7 @@ export function App() {
       await window.flowmate.invalidateInvoiceFormTarget(current.formInstanceId);
     }
     pendingFill.current = null;
+    pendingPersonalFill.current = null;
     formLastCall.current = null;
     publishInvoiceForm(null);
     setFormFeedback('');
@@ -721,10 +724,13 @@ export function App() {
     let receipt: InvoiceFormApplicationReceipt | null = unknown;
     if (current?.formInstanceId === request.target.formInstanceId) {
       // Main has verified the actual committed Run and the owning frame before forwarding.
+      const personal = pendingPersonalFill.current;
+      const personalMatch = request.invoiceWork && personal?.formInstanceId === current.formInstanceId
+        && request.invoiceWork.workId === personal.workId && request.invoiceWork.itemId === personal.itemId;
       if (request.operation === 'apply' && current.runId === null
-        && pendingFill.current?.target.formInstanceId === current.formInstanceId) {
+        && (pendingFill.current?.target.formInstanceId === current.formInstanceId || personalMatch)) {
         const bound = bindInvoiceFormRun(current, request.runId);
-        if (bound) { current = bound; publishInvoiceForm(bound); trackFillRun(request.runId, request.sessionId); }
+        if (bound) { current = bound; publishInvoiceForm(bound); if (!personalMatch) trackFillRun(request.runId, request.sessionId); }
       }
       if (request.operation === 'query') receipt = queryInvoiceFormApplication(current, request, stamp);
       else {
@@ -751,7 +757,7 @@ export function App() {
     setActiveAgentRunId(runId); setActiveAgentSessionId(sessionId); setRunId(runId); setBusy(true);
   }
 
-  async function prepareInvoiceForm(purpose: 'fill' | 'edit', detail = candidateDetail): Promise<InvoiceFormState | null> {
+  async function prepareInvoiceForm(purpose: 'fill' | 'edit' | 'personal-fill', detail = candidateDetail): Promise<InvoiceFormState | null> {
     if (!workspaceReady(workspaceStateRef.current) || workspacePendingRef.current) return null;
     const current = workspaceRef.current;
     const sequence = candidateQuerySequence.current, epoch = workspaceHostEpoch.current, token = workspaceStateRef.current.requestToken;
@@ -762,7 +768,20 @@ export function App() {
     if (sequence !== candidateQuerySequence.current || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return null;
     const expected = { revision: current.revision, sessionId: current.sessionId, documentRef: current.documentRef,
       jobId: current.jobId, candidateRef: current.candidateRef };
-    const target = await window.flowmate.registerInvoiceFormTarget({ purpose, workspace: expected, formRevision: 0 });
+    const review = purpose === 'personal-fill' ? personalReview : null;
+    let formSessionId = current.sessionId;
+    if (purpose === 'personal-fill') {
+      if (!review || review.jobId !== current.jobId || review.candidateRef?.id !== current.candidateRef.id
+        || review.candidateRef.sequence !== current.candidateRef.sequence || review.documentRef.id !== current.documentRef.id
+        || review.documentRef.version !== current.documentRef.version) return null;
+      const work = await window.flowmate.invoiceWorks.get({ view: 'item', workId: review.workId, itemId: review.itemId, limit: 1 });
+      if (!work.ok || work.data.view !== 'item' || work.data.work.status !== 'open' || work.data.item.disposition !== 'unresolved') {
+        setNotice({ tone: 'bad', message: 'The original Personal Agent invoice is no longer available.' }); return null;
+      }
+      formSessionId = work.data.work.sessionId;
+    }
+    const target = await window.flowmate.registerInvoiceFormTarget({ purpose, workspace: expected, formRevision: 0,
+      ...(review ? { personal: { workId: review.workId, itemId: review.itemId } } : {}) });
     if (!target.ok) { setNotice({ tone: 'bad', message: errorMessage(target) }); return null; }
     if (workspaceRef.current?.revision !== current.revision || !hostReadyRef.current || sequence !== candidateQuerySequence.current
       || epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) {
@@ -771,10 +790,18 @@ export function App() {
     const stored = StoredCandidateDraftSchema.safeParse({ fields: detail.candidate.fields, lines: detail.candidate.lines, notes: detail.candidate.notes });
     if (!stored.success) return null;
     const next = createInvoiceFormState({ formInstanceId: target.data.formInstanceId,
-      basis: { sessionId: current.sessionId, documentRef: current.documentRef, jobId: current.jobId,
+      basis: { sessionId: formSessionId, documentRef: current.documentRef, jobId: current.jobId,
         candidateId: current.candidateRef.id, candidateSequence: current.candidateRef.sequence },
-      candidate: purpose === 'fill' ? null : stored.data, editable: true });
+      candidate: purpose === 'fill' || purpose === 'personal-fill' ? null : stored.data, editable: true });
+    if (next && review) pendingPersonalFill.current = { formInstanceId: next.formInstanceId, workId: review.workId, itemId: review.itemId };
     publishInvoiceForm(next); return next;
+  }
+
+  async function beginPersonalInvoiceForm() {
+    setFormPreparing(true);
+    try {
+      if (await prepareInvoiceForm('personal-fill')) setFormFeedback('Prepared for this Personal Agent invoice. Return to its Work and explicitly continue or save a relevant supplement.');
+    } finally { setFormPreparing(false); }
   }
 
   async function beginEditInvoiceForm() {
@@ -872,7 +899,7 @@ export function App() {
 
   async function decideInvoiceResult(kind: 'accept' | 'reject', reason?: string) {
     const form = invoiceFormRef.current; const current = workspaceRef.current;
-    if (!form?.valid || form.dirty || !current || formSubmittingRef.current || humanOperationUnknown) return;
+    if (!form?.valid || form.dirty || waitingForPersonalForm(form) || !current || formSubmittingRef.current || humanOperationUnknown) return;
     if (kind === 'reject' && !reason?.trim()) { setRejectReason(''); setRejectPrompt(true); return; }
     setRejectPrompt(false);
     const base = { operationRef: crypto.randomUUID(), jobId: form.basis.jobId, candidateId: form.basis.candidateId,
@@ -905,6 +932,11 @@ export function App() {
         ? 'Result accepted. Return to Personal Agent to attach this confirmed acceptance to the original invoice Work.' : 'Result accepted.' : 'Result rejected.' });
       await loadTaskDetails(base.jobId); await loadProductLists();
     } finally { setFormSubmission(false); }
+  }
+
+  function waitingForPersonalForm(form: InvoiceFormState): boolean {
+    return pendingPersonalFill.current?.formInstanceId === form.formInstanceId
+      && ![...form.receipts.values()].some(value => value.receipt.outcome === 'applied');
   }
 
   async function exportInvoiceResult(format: 'json' | 'csv' | 'markdown') {
@@ -956,7 +988,9 @@ export function App() {
   }
 
   async function navigate(next: Page) {
-    const sharesInvoiceForm = (page === 'workspace' || page === 'workspace-detail') && (next === 'workspace' || next === 'workspace-detail');
+    const invoicePage = (value: Page) => value === 'workspace' || value === 'workspace-detail';
+    const prepared = pendingPersonalFill.current !== null && pendingPersonalFill.current.formInstanceId === invoiceFormRef.current?.formInstanceId;
+    const sharesInvoiceForm = invoicePage(page) && invoicePage(next) || prepared && (invoicePage(page) && next === 'personal' || page === 'personal' && invoicePage(next));
     if (next !== page && !sharesInvoiceForm && !await confirmFormLeave()) return false;
     cancelWorkspaceDetailReads();
     taskDetailsGeneration.current++;
@@ -1468,6 +1502,13 @@ export function App() {
       || original.data.item.documentRef.version !== target.documentRef.version || original.data.item.jobId !== target.jobId
       || original.data.item.candidateRef?.id !== target.candidateRef?.id || original.data.item.candidateRef?.sequence !== target.candidateRef?.sequence)
       throw new Error('The original Work invoice changed. Refresh it before opening review.');
+    const prepared = pendingPersonalFill.current, form = invoiceFormRef.current, workspace = workspaceRef.current;
+    if (epoch === workspaceHostEpoch.current && prepared?.workId === target.workId && prepared.itemId === target.itemId
+      && prepared.formInstanceId === form?.formInstanceId && form.valid && workspace?.jobId === target.jobId
+      && workspace.documentRef?.id === target.documentRef.id && workspace.documentRef.version === target.documentRef.version
+      && workspace.candidateRef?.id === target.candidateRef?.id && workspace.candidateRef?.sequence === target.candidateRef?.sequence) {
+      await navigate('workspace'); return;
+    }
     if (epoch !== workspaceHostEpoch.current || !await confirmFormLeave()) return;
     setFormPreparing(true);
     try {
@@ -2840,11 +2881,16 @@ export function App() {
   const invoiceFormControls = invoiceForm || candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId ? <>
               {candidateDetail && workspace?.candidateRef?.id === candidateDetail.candidate.candidateId && candidateDetail.candidate.status !== 'accepted' && <div className="button-row"><button className="secondary-button" disabled={!dependentReady || !runtimeReady || !modelReady || busy || formPreparing || formSubmitting || formOutcomeUnknown || humanOperationUnknown || invoiceForm?.dirty || !workspace?.sessionId || candidateDetail.candidate.status !== 'generated'}
                 onClick={() => void fillInvoiceForm()}>Fill form</button>
+                {personalReview && personalReview.jobId === workspace?.jobId && personalReview.documentRef.id === workspace?.documentRef?.id
+                  && personalReview.documentRef.version === workspace.documentRef.version && personalReview.candidateRef?.id === workspace.candidateRef?.id
+                  && personalReview.candidateRef?.sequence === workspace.candidateRef?.sequence && <button className="secondary-button" disabled={!dependentReady || !runtimeReady || busy || formPreparing || formSubmitting || formOutcomeUnknown || humanOperationUnknown || invoiceForm?.dirty || candidateDetail.candidate.status !== 'generated'}
+                  onClick={() => void beginPersonalInvoiceForm()}>Prepare form for Personal Agent</button>}
                 <button className="secondary-button" disabled={!dependentReady || !runtimeReady || busy || formPreparing || formSubmitting}
                   onClick={() => void beginEditInvoiceForm()}>Edit result</button></div>}
               {invoiceForm && <InvoiceFormEditor state={invoiceForm} feedback={formFeedback} disabled={!dependentReady || !invoiceForm.valid || busy || formPreparing || formSubmitting}
                 onChange={changeInvoiceFormDraft} onDiscard={() => void discardInvoiceChanges()} onQuery={() => void checkFillStatus()}
                 canQuery={invoiceForm.runId !== null || pendingFill.current !== null} canDiscard={!busy && !formPreparing && !formSubmitting && !humanOperationUnknown}
+                canDecide={!waitingForPersonalForm(invoiceForm)}
                 operationUnknown={humanOperationUnknown} onSave={() => void saveInvoiceResult()} onAccept={() => void decideInvoiceResult('accept')} onReject={() => void decideInvoiceResult('reject')} />}
               {candidateDetail?.candidate.status === 'accepted' && <div className="button-row">{(['json', 'csv', 'markdown'] as const).map(format =>
                 <button key={format} className="secondary-button" disabled={formSubmitting || humanOperationUnknown} onClick={() => void exportInvoiceResult(format)}>Export {format === 'markdown' ? 'Markdown' : format.toUpperCase()}</button>)}</div>}
@@ -3054,7 +3100,7 @@ export function App() {
             onRename={renameSession} onDelete={deleteSession} onSetStatus={setSessionStatus} onLoadMore={() => void loadMoreSessions()} />
         ) : page === 'personal' && state ? (
           <PersonalAgentPage key={`personal:${workspaceHostEpoch.current}`} ready={state.ready} hostEpoch={workspaceHostEpoch.current}
-            models={state.settings.models} onModels={() => void navigate('models')} onOpenInvoice={openPersonalInvoice} />
+            models={state.settings.models} mode={personalMode} onModeChange={setPersonalMode} onModels={() => void navigate('models')} onOpenInvoice={openPersonalInvoice} />
         ) : page === 'research' && state ? (
           <ResearchPage key={`research:${workspaceHostEpoch.current}`} ready={state.ready} documents={documents}
             canRun={canChat && researchSelected} selectedId={researchTask?.researchId ?? null} refreshToken={`${contextRefresh}:${busy}:${runId}`}
@@ -3598,9 +3644,9 @@ const invoiceFieldLabels: Record<typeof invoiceHeaderFields[number] | typeof inv
   description: 'Description', quantity: 'Quantity', unitPrice: 'Unit price', taxRate: 'Tax rate', unit: 'Unit',
 };
 
-function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, operationUnknown, onChange, onDiscard, onQuery, onSave, onAccept, onReject }: {
+function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, canDecide, operationUnknown, onChange, onDiscard, onQuery, onSave, onAccept, onReject }: {
   state: InvoiceFormState; feedback: string; disabled: boolean;
-  canQuery: boolean; canDiscard: boolean;
+  canQuery: boolean; canDiscard: boolean; canDecide: boolean;
   operationUnknown: boolean;
   onChange(value: InvoiceFormDraft, lineOrigins?: InvoiceFormState['lineOrigins']): void; onDiscard(): void; onQuery(): void;
   onSave(): void; onAccept(): void; onReject(): void;
@@ -3628,8 +3674,8 @@ function InvoiceFormEditor({ state, feedback, disabled, canQuery, canDiscard, op
     <button className="text-button" disabled={disabled || state.draft.notes.length >= MAX_INVOICE_NOTES} onClick={() => onChange({ ...state.draft, notes: [...state.draft.notes, ''] })}>Add note</button>
     <div className="button-row"><button className="secondary-button" onClick={onQuery} disabled={!canQuery}>Check Fill status</button>
       <button className="secondary-button" onClick={onSave} disabled={disabled || !state.dirty || operationUnknown}>Save result</button>
-      <button className="secondary-button" onClick={onAccept} disabled={disabled || state.dirty || operationUnknown}>Accept result</button>
-      <button className="secondary-button" onClick={onReject} disabled={disabled || state.dirty || operationUnknown}>Reject result</button>
+      <button className="secondary-button" onClick={onAccept} disabled={disabled || state.dirty || !canDecide || operationUnknown}>Accept result</button>
+      <button className="secondary-button" onClick={onReject} disabled={disabled || state.dirty || !canDecide || operationUnknown}>Reject result</button>
       <button className="danger-action" onClick={onDiscard} disabled={!canDiscard}>Discard changes</button></div>
   </section>;
 }

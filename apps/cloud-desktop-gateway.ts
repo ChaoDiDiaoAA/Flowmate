@@ -1,11 +1,12 @@
 import { AppErrorSchema, CloudDesktopEnvelopeSchema, CloudWorkspaceIdSchema, appError, cloudDesktopFailure, fail,
-  isCloudChildReportCommand, isCloudDeliveryCommand, isCloudMaterialCommand, isCloudProgressCommand, isCloudQueueCommand, isCloudResourceCommand, isCloudReviewCommand, parseCloudDesktopResult, type Result } from '@flowmate/contracts';
+  isCloudChildReportCommand, isCloudDeliveryCommand, isCloudDesktopRelayCommand, isCloudMaterialCommand, isCloudProgressCommand, isCloudQueueCommand, isCloudResourceCommand, isCloudReviewCommand, parseCloudDesktopResult, type Result } from '@flowmate/contracts';
 import type { PersonalAgentCommand } from '../packages/contracts/src/personal-agent-commands.ts';
 import type { CloudMaterialUpload } from './cloud-material-upload.ts';
 import type { CloudQueueAuthority } from './cloud-queue-authority.ts';
 import type { CloudDesktopReview } from './cloud-desktop-review.ts';
 import type { CloudResourceUpload } from './cloud-resource-upload.ts';
 import type { CloudDeliveryAuthority } from './cloud-delivery-authority.ts';
+import type { CloudDesktopRelay } from './cloud-desktop-relay.ts';
 
 /** Workspace membership and Work-specific authorization are established by the Authority. */
 export function createCloudDesktopHandler(options: {
@@ -19,6 +20,7 @@ export function createCloudDesktopHandler(options: {
   delivery?: Pick<CloudDeliveryAuthority, 'status' | 'retry'>;
   childReport?: (input: unknown) => Promise<Result<unknown>>;
   progress?: (input: unknown, signal?: AbortSignal) => Promise<Result<unknown>>;
+  desktopRelay?: CloudDesktopRelay;
 }): (raw: unknown, signal?: AbortSignal) => Promise<Result<unknown>> {
   const workspaceId = CloudWorkspaceIdSchema.parse(options.workspaceId);
   return async (raw, signal) => {
@@ -26,6 +28,15 @@ export function createCloudDesktopHandler(options: {
     if (!envelope.success) return fail(appError('input_invalid', 'input', 'The cloud desktop request is invalid.'));
     if (envelope.data.workspaceId !== workspaceId) return fail(appError('cloud_workspace_forbidden', 'input', 'The cloud workspace is unavailable.'));
     const command = envelope.data.command;
+    if (isCloudDesktopRelayCommand(command)) {
+      const relay = options.desktopRelay; if (!relay) return cloudDesktopFailure(command);
+      const input = command.input;
+      const result = command.type === 'cloud_desktop_attach' ? relay.attach(input.connectionId)
+        : command.type === 'cloud_desktop_detach' ? relay.detach(input.connectionId)
+        : command.type === 'cloud_desktop_next' ? await relay.next(input.connectionId, signal ?? new AbortController().signal)
+        : relay.reply(command.input.connectionId, command.input.id, command.input.result);
+      return parseCloudDesktopResult(command, result) ?? cloudDesktopFailure(command);
+    }
     if (isCloudProgressCommand(command)) {
       if (!options.progress) return cloudDesktopFailure(command);
       try { return parseCloudDesktopResult(command, await options.progress(structuredClone(command.input), signal)) ?? cloudDesktopFailure(command); }

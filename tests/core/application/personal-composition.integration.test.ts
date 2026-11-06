@@ -4,14 +4,77 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { createApplication } from '../../../apps/composition.ts';
-import { createFileStore } from '@flowmate/core';
+import { createFileStore, createInvoiceFormService } from '@flowmate/core';
 import { appError, fail, ok, PersonalAgentConfigurationSchema, type InvoiceWorkWorkingContext,
   type ProductPaths, type ProviderConfig, type Result } from '@flowmate/contracts';
 import { openTestDatabase } from '../../support/database.ts';
 import { deferCleanup, mkdtempSync, waitFor } from '../../support/resources.ts';
-import { invoiceWorkCandidateDraft } from '../../support/invoice-work-tools.ts';
+import { invoiceWorkCandidateDraft, invoiceWorkToolsFixture } from '../../support/invoice-work-tools.ts';
+import { createPersonalAgentRuntime } from '../../../apps/personal-agent.ts';
+import type { DurableRuntimePort } from '@flowmate/contracts';
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
+
+test('a cloud Durable runtime exposes the provided desktop adapter without enabling it in saved defaults', async () => {
+  const f = await invoiceWorkToolsFixture();
+  const desktop = { listWindows: async () => ok([]), observe: async () => ok({ observationId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',
+    window: { id: 42, app: 'Invoice', title: 'Draft' }, tree: '[3] Submit', truncated: false }),
+    resolveTarget: async () => ok({ connectionId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',
+      window: { id: 42, app: 'Invoice', title: 'Draft' }, element: '[3] Submit' }), dispatch: async () => ok(undefined) };
+  const native = { close: async () => ok(undefined) } as unknown as DurableRuntimePort;
+  const runtime = need(await createPersonalAgentRuntime({ database: f.database, definitions: f.definitions,
+    resourceRoot: f.paths.root, bundleRoot: f.paths.root, resolveConfiguration: () => fail(appError('unavailable', 'input', 'No model.')),
+    readApiKey: () => undefined, foregroundBusy: () => false, now: () => '2026-11-06T00:00:00.000Z', desktop,
+    cloud: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', runtime: native } }));
+  try {
+    expect(runtime.cloudAuthority?.tools.map(tool => tool.name)).toEqual(expect.arrayContaining([
+      'desktop_list_windows', 'desktop_observe_window', 'desktop_propose_action', 'desktop_execute_approved' ]));
+    const current = need(await runtime.personal.agent.get());
+    expect(current.configuration.tools).not.toContain('desktop_propose_action');
+    expect(await runtime.personal.agent.update({ personalAgentId: current.personalAgentId, expectedRevision: current.revision,
+      configuration: { ...current.configuration, tools: [...current.configuration.tools, 'desktop_observe_window'] } }))
+      .toMatchObject({ ok: true, data: { configuration: { tools: expect.arrayContaining(['desktop_observe_window']) } } });
+  } finally { need(await runtime.close()); }
+});
+
+test('a provided desktop adapter can be selected explicitly but is absent from the saved default', async () => {
+  const f = await invoiceWorkToolsFixture();
+  const desktop = { listWindows: async () => ok([]), observe: async () => ok({ observationId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',
+    window: { id: 42, app: 'Invoice', title: 'Draft' }, tree: '[3] Submit', truncated: false }), resolveTarget: async () => ok({ connectionId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',
+    window: { id: 42, app: 'Invoice', title: 'Draft' }, element: '[3] Submit' }), dispatch: async () => ok(undefined) };
+  const runtime = need(await createPersonalAgentRuntime({ database: f.database, definitions: f.definitions,
+    resourceRoot: f.paths.root, bundleRoot: f.paths.root, resolveConfiguration: () => fail(appError('unavailable', 'input', 'No model.')),
+    readApiKey: () => undefined, foregroundBusy: () => false, now: () => '2026-11-06T00:00:00.000Z', desktop,
+    form: { service: createInvoiceFormService({ database: f.database, now: () => '2026-11-06T00:00:00.000Z',
+      bridge: async request => ({ runId: request.runId, toolCallId: request.toolCallId, formInstanceId: request.target.formInstanceId,
+        candidateId: request.candidateId, candidateSequence: request.candidateSequence, observedAt: '2026-11-06T00:00:00.000Z', outcome: 'unknown' }) }),
+      observe: async () => ok({ candidateId: 1, candidateSequence: 1, target: { formInstanceId: 'form-1', expectedRevision: 0 } }) } }));
+  try {
+    const current = need(await runtime.personal.agent.get());
+    expect(current.configuration.tools).not.toContain('desktop_propose_action');
+    const updated = await runtime.personal.agent.update({ personalAgentId: current.personalAgentId, expectedRevision: current.revision,
+      configuration: { ...current.configuration, tools: [...current.configuration.tools, 'desktop_list_windows', 'desktop_observe_window', 'desktop_propose_action', 'desktop_execute_approved', 'personal_observe_invoice_form', 'personal_fill_invoice_form'] } });
+    expect(updated).toMatchObject({ ok: true, data: { configuration: { tools: expect.arrayContaining(['desktop_list_windows', 'desktop_observe_window', 'desktop_propose_action', 'desktop_execute_approved', 'personal_observe_invoice_form', 'personal_fill_invoice_form']) } } });
+  } finally { need(await runtime.close()); }
+}, 15_000);
+
+test('a new Personal Agent does not enable desktop tools by default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-desktop-default-'));
+  const paths: ProductPaths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
+    runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') };
+  const database = need(openTestDatabase(paths));
+  const desktop = { listWindows: async () => ok([]), observe: async () => ok({ observationId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',
+    window: { id: 42, app: 'Invoice', title: 'Draft' }, tree: '[3] Submit', truncated: false }), resolveTarget: async () => ok({ connectionId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',
+    window: { id: 42, app: 'Invoice', title: 'Draft' }, element: '[3] Submit' }), dispatch: async () => ok(undefined) };
+  const runtime = need(await createPersonalAgentRuntime({ database, definitions: [], resourceRoot: root, bundleRoot: root,
+    resolveConfiguration: () => fail(appError('unavailable', 'input', 'No model.')), readApiKey: () => undefined,
+    foregroundBusy: () => false, now: () => '2026-11-06T00:00:00.000Z', desktop }));
+  try {
+    const current = need(await runtime.personal.agent.get());
+    expect(current.configuration.tools).not.toContain('desktop_propose_action');
+    expect(current.configuration.tools).not.toContain('desktop_execute_approved');
+  } finally { need(await runtime.close()); await database.close(); }
+}, 15_000);
 
 test('the formal Application runs fixed invoice work through Durable and the original tools, then reopens without new intent', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-personal-composition-'));

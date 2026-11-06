@@ -20,6 +20,7 @@ import { readTransaction } from '../storage/reads.ts';
 import { createPersonalAgentRepository } from './agent-repository.ts';
 import { readInvoiceCandidateChildReports } from './candidate-evidence.ts';
 import { invoiceWorkPhaseItemProgress } from './tool-scope.ts';
+import { createInvoiceWorkDesktopActionRepository, desktopActionContinuationAuthorized } from './desktop-actions.ts';
 export { createPersonalAgentRepository } from './agent-repository.ts';
 export type { PersonalAgentRepository } from './agent-repository.ts';
 
@@ -30,7 +31,7 @@ export type InvoiceWorkAdmission = { kind: 'ready' | 'queued' }
 type CommandOptions = { at: string; admission: InvoiceWorkAdmission };
 export type InvoiceWorkTodoDefinition = Omit<InvoiceWorkTodoView, 'todoId' | 'workId' | 'itemId' | 'revision' | 'applicable'>;
 export type InvoiceWorkPhaseBasis = { contextSnapshotId: number | null; inputIds: readonly number[];
-  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null };
+  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null; desktopProposalId?: number; desktopRejectedProposalId?: number };
 export type InvoiceWorkPhase = { phaseId: number; workId: number; attemptId: number; itemId: number | null;
   requestId: string; kind: 'prompt'; basis: InvoiceWorkPhaseBasis; createdAt: string;
   nativeConversationId: number | null; nativeSubmissionId: number | null; consumedAt: string | null };
@@ -93,7 +94,8 @@ const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const atSchema = z.string().datetime({ offset: true });
 const basisSchema = z.object({ contextSnapshotId: id.nullable(), inputIds: z.array(id).refine(ids => new Set(ids).size === ids.length),
-  documentRefs: z.array(DocumentRefSchema), configurationRevision: revision, itemRevision: revision.nullable() }).strict();
+  documentRefs: z.array(DocumentRefSchema), configurationRevision: revision, itemRevision: revision.nullable(),
+  desktopProposalId: id.optional(), desktopRejectedProposalId: id.optional() }).strict();
 const phaseInputSchema = z.object({ workId: id, attemptId: id, itemId: id.nullable(), requestId: z.string().min(1).max(128),
   kind: z.literal('prompt'), basis: basisSchema, at: atSchema }).strict();
 const observationSchema = z.object({ workId: id, sessionId: id, attemptId: id, requestId: phaseInputSchema.shape.requestId,
@@ -288,6 +290,53 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
       .some(input => item(row.id, input.item_id).disposition === 'unresolved' && !inputConsumed(row.id, input.id)
         && !inputAuthorized(input, current));
   }
+  function savedDesktopNeedsContinuation(row: WorkRow, current: AttemptRow) {
+    const actions = db.query<{ id: number; item_id: number; status: 'approved' | 'rejected'; decision_request_id: string }, [number]>(
+      `SELECT d.id,d.item_id,d.status,d.decision_request_id FROM invoice_work_desktop_actions d
+       JOIN invoice_work_items i ON i.id=d.item_id AND i.work_id=d.work_id
+       WHERE d.work_id=? AND i.disposition='unresolved' AND d.status IN ('approved','rejected')
+       AND d.id=(SELECT max(latest.id) FROM invoice_work_desktop_actions latest WHERE latest.work_id=d.work_id AND latest.item_id=d.item_id)
+       AND (d.status!='rejected' OR NOT EXISTS (SELECT 1 FROM invoice_work_phases p WHERE p.work_id=d.work_id AND p.item_id=d.item_id
+         AND json_extract(p.basis_json,'$.desktopRejectedProposalId')=d.id)) ORDER BY d.id`).all(row.id);
+    const desktop = createInvoiceWorkDesktopActionRepository(db);
+    return actions.some(action => {
+      const receipt = requireResult(desktop.queryDecision({ workId: row.id, itemId: action.item_id,
+        proposalId: action.id, requestId: action.decision_request_id }));
+      requireFact(receipt?.decision === (action.status === 'approved' ? 'approve' : 'reject'),
+        'storage_corrupt', 'The original desktop decision is unavailable.');
+      return !desktopActionContinuationAuthorized(db, row.id, current.id, receipt.revision);
+    });
+  }
+  function desktopApproval(workId: number, itemId: number, attemptId: number, proposalId?: number) {
+    const action = proposalId === undefined
+      ? db.query<{ id: number; decision_request_id: string }, [number, number]>(
+        "SELECT id,decision_request_id FROM invoice_work_desktop_actions WHERE work_id=? AND item_id=? AND status='approved'")
+        .get(workId, itemId)
+      : db.query<{ id: number; decision_request_id: string }, [number, number, number]>(
+        'SELECT id,decision_request_id FROM invoice_work_desktop_actions WHERE work_id=? AND item_id=? AND id=?')
+        .get(workId, itemId, proposalId);
+    if (!action) return undefined;
+    const receipt = requireResult(createInvoiceWorkDesktopActionRepository(db).queryDecision({ workId, itemId,
+      proposalId: action.id, requestId: action.decision_request_id }));
+    requireFact(receipt?.decision === 'approve', 'storage_corrupt', 'The original desktop approval is unavailable.');
+    return desktopActionContinuationAuthorized(db, workId, attemptId, receipt.revision) ? action.id : undefined;
+  }
+  function desktopRejection(workId: number, itemId: number, attemptId: number, proposalId?: number) {
+    const action = proposalId === undefined
+      ? db.query<{ id: number; decision_request_id: string }, [number, number]>(`SELECT d.id,d.decision_request_id FROM invoice_work_desktop_actions d
+        WHERE d.work_id=? AND d.item_id=? AND d.status='rejected'
+        AND d.id=(SELECT max(latest.id) FROM invoice_work_desktop_actions latest WHERE latest.work_id=d.work_id AND latest.item_id=d.item_id)
+        AND NOT EXISTS (SELECT 1 FROM invoice_work_phases p WHERE p.work_id=d.work_id AND p.item_id=d.item_id
+          AND json_extract(p.basis_json,'$.desktopRejectedProposalId')=d.id)`).get(workId, itemId)
+      : db.query<{ id: number; decision_request_id: string }, [number, number, number]>(
+        'SELECT id,decision_request_id FROM invoice_work_desktop_actions WHERE work_id=? AND item_id=? AND id=? AND status=\'rejected\'')
+        .get(workId, itemId, proposalId);
+    if (!action) return undefined;
+    const receipt = requireResult(createInvoiceWorkDesktopActionRepository(db).queryDecision({ workId, itemId,
+      proposalId: action.id, requestId: action.decision_request_id }));
+    requireFact(receipt?.decision === 'reject', 'storage_corrupt', 'The original desktop rejection is unavailable.');
+    return desktopActionContinuationAuthorized(db, workId, attemptId, receipt.revision) ? action.id : undefined;
+  }
   function completeIfClosed(row: WorkRow, at: string) {
     if (row.status !== 'open' || db.query("SELECT id FROM invoice_work_items WHERE work_id=? AND disposition='unresolved' LIMIT 1").get(row.id)) return;
     const current = attempt(row);
@@ -367,7 +416,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         reason: 'Supplement saved. Explicit continue is required after stopping or failure.', todoIds: [] };
     const originalActive = kind === 'continueWork' && current && current.stopped_at === null
       && status !== 'failed' && status !== 'cancelled' && status !== 'completed';
-    if (originalActive && !savedInputNeedsApproval(row, current))
+    if (originalActive && !savedInputNeedsApproval(row, current) && !savedDesktopNeedsContinuation(row, current))
       return { kind: 'existing', authorizationAccepted: false, attempt: attemptReference(current), relation: 'original' };
     if (admission.kind === 'blocked') return { ...admission, authorizationAccepted: false, attempt: current ? attemptReference(current) : null };
     if (admission.kind === 'waiting') return { ...admission, authorizationAccepted: false, todoIds: [...admission.todoIds ?? []],
@@ -584,8 +633,12 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
             if (!documentRefs.some(saved => isDeepStrictEqual(saved, reference))) documentRefs.push(reference);
           }
         }
+        const desktopProposalId = desktopApproval(row.id, selected.id, current.id);
+        const desktopRejectedProposalId = desktopRejection(row.id, selected.id, current.id);
         return { itemId: selected.id, basis: { contextSnapshotId: null, inputIds: authorized.map(value => value.id),
-          documentRefs, configurationRevision: row.agent_revision, itemRevision: selected.revision } };
+          documentRefs, configurationRevision: row.agent_revision, itemRevision: selected.revision,
+          ...(desktopProposalId === undefined ? {} : { desktopProposalId }),
+          ...(desktopRejectedProposalId === undefined ? {} : { desktopRejectedProposalId }) } };
       });
     },
     freezePhase(raw) {
@@ -606,6 +659,10 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         requireFact(input.basis.configurationRevision === row.agent_revision);
         const selected = input.itemId === null ? null : item(row.id, input.itemId);
         requireFact(selected ? selected.disposition === 'unresolved' && selected.revision === input.basis.itemRevision : input.basis.itemRevision === null);
+        requireFact(input.basis.desktopProposalId === (selected ? desktopApproval(row.id, selected.id, current.id) : undefined),
+          'source_invalid', 'The phase does not match the approved desktop action.');
+        requireFact(input.basis.desktopRejectedProposalId === (selected ? desktopRejection(row.id, selected.id, current.id) : undefined),
+          'source_invalid', 'The phase does not match the rejected desktop action.');
         for (const reference of input.basis.documentRefs) {
           checkDocument(reference);
           const member = db.query('SELECT id FROM invoice_work_items WHERE work_id=? AND document_id=? AND document_version=?')
@@ -738,6 +795,12 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         requireFact(stored && stored.item_id !== null && stored.closed_at === null && current?.id === stored.attempt_id
           && current.stop_requested_at === null && current.stopped_at === null && row.status === 'open');
         const selected = item(row.id, stored.item_id), frozen = phase(stored), projected = view(row);
+        if (frozen.basis.desktopProposalId !== undefined)
+          requireFact(desktopApproval(row.id, selected.id, stored.attempt_id, frozen.basis.desktopProposalId) === frozen.basis.desktopProposalId,
+            'source_invalid', 'The phase desktop approval is unavailable.');
+        if (frozen.basis.desktopRejectedProposalId !== undefined)
+          requireFact(desktopRejection(row.id, selected.id, stored.attempt_id, frozen.basis.desktopRejectedProposalId) === frozen.basis.desktopRejectedProposalId,
+            'source_invalid', 'The phase desktop rejection is unavailable.');
         const original = db.query<{ context_json: string }, [number]>(
           'SELECT context_json FROM invoice_work_context_snapshots WHERE phase_id=?')
           .get(stored.id);

@@ -18,6 +18,7 @@ import { createInvoiceWorkRepository, createPersonalAgentRepository } from '../p
 import { createInvoiceWorkContextRepository } from '../personal-agent/context-repository.ts';
 import { createInvoiceWorkAttemptRepository } from '../personal-agent/attempts.ts';
 import { createInvoiceWorkModelBindingRepository } from '../personal-agent/model-bindings.ts';
+import { createInvoiceWorkDesktopActionRepository } from '../personal-agent/desktop-actions.ts';
 import { createDocumentRepository, createToolCallRepository, createBusinessEventRepository, createCandidateRepository,
   createJobRepository, createRunRepository, createSessionRepository, createWorkspaceRepository, inspectRuntimeRecovery } from './repositories.ts';
 
@@ -37,13 +38,14 @@ function createSqlStore(db: SynchronousDatabaseExecutor, listeners: Set<EventLis
     invoiceWorkContexts: createInvoiceWorkContextRepository(db),
     invoiceWorkAttempts: createInvoiceWorkAttemptRepository(db),
     invoiceWorkModelBindings: createInvoiceWorkModelBindingRepository(db),
+    invoiceWorkDesktopActions: createInvoiceWorkDesktopActionRepository(db),
     context: createContextRepository({ db, loadHistory: sessionId => sessions.loadHistory(sessionId) }),
   };
 }
 
-type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23;
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24;
 function migrationSql(version: SchemaVersion): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql'][version - 1];
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql', '024_desktop_actions.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
@@ -156,7 +158,7 @@ function runMigration(db: Database, version: SchemaVersion, paths?: ProductPaths
         || db.query('SELECT id FROM runs WHERE parent_run_id IS NOT NULL OR origin_tool_call_id IS NOT NULL OR plugin_agent_id IS NOT NULL').get())
         throw new Error('migration_preservation_failed');
       db.exec('COMMIT');
-    } else if (version === 15 || version === 16 || version === 18 || version === 19 || version === 20) {
+    } else if (version === 15 || version === 16 || version === 18 || version === 19 || version === 20 || version === 24) {
       // Trigger bodies contain semicolons: execute each explicit whole-statement boundary.
       for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
       if (version === 20 && paths) migrateLegacyMetadata(db, paths, backup);
@@ -225,16 +227,16 @@ function migrateToLatest(db: Database, paths: ProductPaths): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 23) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 24) {
     throw new Error('unsupported_schema_version');
   }
   const backup = migrationTable && versions.length < 20 ? backupLegacyStore(db, paths) : null;
-  for (let version = versions.length + 1; version <= 23; version += 1) {
+  for (let version = versions.length + 1; version <= 24; version += 1) {
     if (version === 23 && migrationTable) backupBeforeRuntimeScopes(db, paths);
     runMigration(db, version as SchemaVersion, paths, backup);
   }
   const completed = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
-  if (completed.length !== 23 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
+  if (completed.length !== 24 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
 }
 
 export function bootstrapDatabase(paths: ProductPaths): Result<DatabaseBootstrap> {
@@ -253,6 +255,8 @@ export function bootstrapDatabase(paths: ProductPaths): Result<DatabaseBootstrap
     db = new Database(paths.databaseFile, { create: true });
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 1000; PRAGMA journal_mode = DELETE; PRAGMA locking_mode = EXCLUSIVE;');
     migrateToLatest(db, paths);
+    db.transaction(() => db!.query("UPDATE invoice_work_desktop_actions SET status='unknown',updated_at=? WHERE status='claimed'")
+      .run(new Date().toISOString())).immediate();
     const listeners = new Set<EventListener>();
     const stores = createSqlStore(db, listeners);
     const interrupted = stores.runs.failInterrupted(new Date().toISOString());

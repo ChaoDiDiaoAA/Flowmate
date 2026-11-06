@@ -21,6 +21,8 @@ import { isCompactionHostCommand, parseCompactionHostResult, matchesCompactionRe
 import { isExtensionHostCommand, parseExtensionHostResult, matchesExtensionResponse, isResourceHostCommand, parseResourceHostResult, matchesResourceResponse } from '../../host/protocol.ts';
 import { isSubagentHostCommand, parseSubagentHostResult, matchesSubagentResponse } from '../../host/protocol.ts';
 import { isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse } from '../../host/protocol.ts';
+import { createDesktopReceiver } from './desktop-receiver.ts';
+import type { DesktopBridgeRequest, DesktopBridgeResult } from '@flowmate/contracts';
 
 export type HostState = { version: 1; ready: boolean; host: 'starting' | 'ready' | 'closing' | 'error'; settings?: unknown; appVersion?: string; userDataPath: string };
 const capturedTraceSchema = z.object({ version: z.literal(1), type: z.literal('evaluation_trace_available'),
@@ -49,6 +51,7 @@ export class HostClient {
   private credentialHandler: ((request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>) | null = null;
   private epoch = 0;
   private invoiceFormHandler: ((request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>) | null = null;
+  private desktopHandler: ((request: DesktopBridgeRequest, signal: AbortSignal) => Promise<DesktopBridgeResult>) | null = null;
   private connectionChangeHandler: (() => void) | null = null;
   private evaluationTraceHandler: ((value: CapturedTrace) => void) | null = null;
   private stderrTail = '';
@@ -76,6 +79,7 @@ export class HostClient {
   public setInvoiceFormHandler(handler: (request: InvoiceFormBridgeRequest, epoch: number) => Promise<InvoiceFormApplicationReceipt>): void {
     this.invoiceFormHandler = handler;
   }
+  public setDesktopHandler(handler: (request: DesktopBridgeRequest, signal: AbortSignal) => Promise<DesktopBridgeResult>): void { this.desktopHandler = handler; }
 
   public setCredentialHandler(handler: (request: HostCredentialRequest) => Promise<{ ok: boolean; credential?: unknown }>): void {
     this.credentialHandler = handler;
@@ -232,6 +236,13 @@ export class HostClient {
 
   private readProtocol(child: ChildProcessWithoutNullStreams, onReady: (output: Extract<HostOutput, { type: 'ready' }>) => void, userDataPath: string): void {
     const input = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    const epoch = this.epoch;
+    const desktop = createDesktopReceiver((request, signal) => this.child === child && this.epoch === epoch
+      ? this.desktopHandler?.(request, signal) ?? Promise.resolve(fail(appError('desktop_unavailable', 'runtime', 'The desktop is unavailable.')))
+      : Promise.resolve(fail(appError('desktop_unavailable', 'runtime', 'The desktop is unavailable.'))), (requestId, value) => {
+      if (this.child === child && this.epoch === epoch && child.stdin.writable)
+        child.stdin.write(`${JSON.stringify({ version: 1, type: 'desktop_response', requestId, value })}\n`);
+    });
     input.on('line', (line) => {
       if (this.child !== child) return;
       let output: HostOutput;
@@ -241,6 +252,8 @@ export class HostClient {
         return;
       }
       if (!output || typeof output !== 'object' || output.version !== 1 || typeof output.type !== 'string') return;
+      if (output.type === 'desktop_request') { desktop.request(output.requestId, output.request); return; }
+      if (output.type === 'desktop_cancel') { desktop.cancel(output.requestId); return; }
       if (output.type === 'ready') { onReady(output); return; }
       if (output.type === 'evaluation_trace_available') {
         const checked = capturedTraceSchema.safeParse(output);
@@ -303,6 +316,7 @@ export class HostClient {
       }
     });
     input.on('close', () => {
+      desktop.close();
       if (this.child !== child) return;
       // Exit can precede stdout draining its buffered close acknowledgement.
       this.failAll('host_exited', 'Bun Host 输出通道已关闭。');

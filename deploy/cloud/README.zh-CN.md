@@ -16,7 +16,9 @@ bun --no-env-file run scripts/package-cloud.ts /绝对路径/新目录
 
 SSH 账号只允许已核实的公钥，`authorized_keys` 应使用 `restrict` 和固定强制命令 `/opt/flowmate/bin/bun --no-env-file /opt/flowmate/cloud/cloud-desktop-bridge.js`；禁止交互 shell、PTY 和转发。桌面必须通过可信渠道核对服务器主机公钥，再配置专用私钥和 known_hosts。阿里云安全组应按确认过的可信来源限制 SSH；不开放 Authority 或 Runtime 的公网业务端口。
 
-桌面的 Personal Agent 可选择本地或云工作区。连接云工作区时填写服务端工作区 UUID、主机、受限 SSH 用户、专用私钥和已验证的 known_hosts 路径。选择本地发票后，桌面先传送原件及解析资料，再以云端资料身份创建 Work；选中的 Prompt 和 Skill 也会先按原版本及文件内容传送。创建云 Work 时可设置执行时间预算，默认 120 秒，最多 24 小时；重试保留原预算。已创建的 Work 保持原执行位置，关闭桌面不会停止云端执行。
+桌面的 Personal Agent 默认打开云工作区，尝试启动本机 Windows KimiCU，并在已有连接配置时自动重连；也可切换到本地工作区。首次连接云工作区时填写服务端工作区 UUID、主机、受限 SSH 用户、专用私钥和已验证的 known_hosts 路径。选择本地发票后，桌面先传送原件及解析资料，再以云端资料身份创建 Work；选中的 Prompt 和 Skill 也会先按原版本及文件内容传送。创建云 Work 时可设置执行时间预算，默认 120 秒，最多 24 小时；重试保留原预算。已创建的 Work 保持原执行位置，关闭桌面不会停止云端执行。
+
+云端 Work 如需操作当前 Windows 桌面，须使用配套版本的桌面端、Authority、Runtime 和 `cloud-desktop-bridge.js`，并在新 Work 的配置中启用桌面工具。操作前由用户选择目标窗口，逐次确认具体动作；启动或重连不会自动提交 Work 或执行动作。桌面观察结果会经 SSH 发送到云端，可能保存到工作历史或发送给模型服务。具体安装、工具选择及使用限制见项目根目录 README。
 
 云端队列可查看并对原输入执行 steer、follow-up、编辑、重排和取消；这些操作仍受原发票及工具授权约束。进度通知触发重读原工作区状态；父任务实时文本只是有界的内存预览，可能不完整，重连或消费落后时丢弃并重新读取快照。观察版本与业务 Work 版本分别显示。原生结果投递耗尽重试后可手动重投原结果，超过大小限制的结果保留在原生记录并显示受阻。长时间连接达到传输请求上限时，重新连接工作区后继续查看原记录。
 

@@ -66,6 +66,20 @@ async function fixture(readGate?: () => Promise<void>) {
   return { root, outputs, requests, credentialReads, call, open, owner: () => owner, document, agent };
 }
 
+it('binds a desktop only to an existing open local invoice item', async () => {
+  const f = await fixture();
+  const created = P.InvoiceWorkCreateReceiptSchema.parse(need(await f.call({ type: 'invoice_work_create', input: {
+    personalAgentId: f.agent.personalAgentId, expectedAgentRevision: f.agent.revision, requestId: 'desktop-bind-work',
+    goal: 'Review the controlled invoice.', documents: [f.document.documentRef],
+  } })));
+  const page = P.InvoiceWorkGetResultSchema.parse(need(await f.call({ type: 'invoice_work_get', input: { view: 'work', workId: created.workId } })));
+  if (page.view !== 'work') throw Error('work unavailable');
+  expect(await f.call({ type: 'desktop_bind', input: { workId: created.workId, itemId: page.items[0]!.itemId } }))
+    .toMatchObject({ ok: true, data: { workId: created.workId, itemId: page.items[0]!.itemId } });
+  expect(await f.call({ type: 'desktop_bind', input: { workId: created.workId, itemId: 999999 } }))
+    .toMatchObject({ ok: false });
+}, 15_000);
+
 it('revokes pending foreground admission after a credential wait without cancelling a saved Personal Agent authorization', async () => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });

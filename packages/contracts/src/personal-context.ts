@@ -22,6 +22,8 @@ const sources = z.array(InvoiceWorkSourceLocatorSchema).readonly();
 
 export const InvoiceWorkPhaseBasisSchema = z.object({
   contextSnapshotId: id.nullable(), inputIds, documentRefs: documents, configurationRevision: revision, itemRevision: revision.nullable(),
+  desktopProposalId: id.optional(),
+  desktopRejectedProposalId: id.optional(),
 }).strict().readonly();
 export type InvoiceWorkPhaseBasis = z.infer<typeof InvoiceWorkPhaseBasisSchema>;
 export const InvoiceWorkContextPhaseSchema = z.object({

@@ -282,6 +282,12 @@ export const InvoiceFormTargetSchema = z.object({
   expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 }).strict();
 export type InvoiceFormTarget = Readonly<z.infer<typeof InvoiceFormTargetSchema>>;
+export const PersonalInvoiceFormInputSchema = z.object({ candidateId: idSchema, target: InvoiceFormTargetSchema }).strict();
+export type PersonalInvoiceFormInput = z.infer<typeof PersonalInvoiceFormInputSchema>;
+export const PersonalInvoiceFormObservationSchema = PersonalInvoiceFormInputSchema.extend({ candidateSequence: idSchema }).strict();
+export type PersonalInvoiceFormObservation = z.infer<typeof PersonalInvoiceFormObservationSchema>;
+export const PersonalInvoiceFormOwnerSchema = z.object({ workId: idSchema, itemId: idSchema, attemptId: idSchema, phaseId: idSchema }).strict();
+export const PERSONAL_INVOICE_FORM_TOOL_NAMES = ['personal_observe_invoice_form', 'personal_fill_invoice_form'] as const;
 const invoiceFormReceiptIdentity = {
   runId: idSchema,
   toolCallId: idSchema,
@@ -302,6 +308,7 @@ const invoiceFormCallIdentity = {
   runId: idSchema, sessionId: idSchema, toolCallId: idSchema,
   nativeToolCallId: z.string().min(1).max(256), documentRef: DocumentRefSchema, jobId: idSchema,
   candidateId: idSchema, candidateSequence: idSchema, target: InvoiceFormTargetSchema,
+  invoiceWork: PersonalInvoiceFormOwnerSchema.optional(),
 };
 export const InvoiceFormBridgeRequestSchema = z.discriminatedUnion('operation', [
   z.object({ ...invoiceFormCallIdentity, operation: z.literal('apply'), candidate: StoredCandidateDraftSchema }).strict(),

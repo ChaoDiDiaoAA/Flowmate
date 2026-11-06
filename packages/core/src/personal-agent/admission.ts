@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { desktopActionContinuationAuthorized } from './desktop-actions.ts';
 import { appError, CloudRuntimeIdSchema, CloudWorkspaceIdSchema, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema, DurableWorkBudgetSchema,
   PersonalAgentConfigurationSchema, UsageRecordSchema, InvoiceWorkTodoViewSchema } from '@flowmate/contracts';
 import type { AppError, DurableAttemptIdentity, DurableProductToolCall, DurableSubagentIdentity, InvoiceWorkContextBuildInput, InvoiceWorkTodoView, Result, UsageRecord } from '@flowmate/contracts';
@@ -242,7 +243,7 @@ export class DurableInvoiceGovernor {
     };
     const items = store.db.query<{ id: number; document_id: number; document_version: string; candidate_id: number | null }, [number]>(
       "SELECT * FROM invoice_work_items WHERE work_id=? AND disposition='unresolved' ORDER BY id").all(work.id);
-    let unavailable = false;
+    let unavailable = false, desktopWaiting = false;
     const waitingTodos: number[] = [];
     for (const item of items) {
       const document = store.documents.get(item.document_id);
@@ -250,6 +251,22 @@ export class DurableInvoiceGovernor {
         || document.data.isHidden || document.data.parsedArtifactId === null) { unavailable = true; continue; }
       if (!command && attempt && store.db.query('SELECT id FROM invoice_work_phases WHERE attempt_id=? AND item_id=? AND closed_at IS NULL')
         .get(attempt.id, item.id)) return ready(item.id);
+      const desktop = store.db.query<{ id: number; status: string; decision_request_id: string | null }, [number, number]>(
+        `SELECT d.id,d.status,d.decision_request_id FROM invoice_work_desktop_actions d JOIN invoice_work_tool_calls t ON t.tool_call_id=d.proposal_tool_call_id
+        JOIN invoice_work_phases p ON p.id=t.phase_id WHERE d.work_id=? AND d.item_id=? AND p.closed_at IS NOT NULL ORDER BY d.id DESC LIMIT 1`)
+        .get(work.id, item.id);
+      const rejectionConsumed = desktop?.status === 'rejected' && store.db.query(`SELECT id FROM invoice_work_phases
+        WHERE work_id=? AND item_id=? AND json_extract(basis_json,'$.desktopRejectedProposalId')=? LIMIT 1`).get(work.id, item.id, desktop.id);
+      if (desktop && ['waiting', 'approved', 'rejected'].includes(desktop.status) && !rejectionConsumed) {
+        if (desktop.status === 'waiting') { desktopWaiting = true; continue; }
+        requireFact(desktop.decision_request_id, 'storage_corrupt', 'The original desktop approval is unavailable.');
+        const receipt = need(store.invoiceWorkDesktopActions.queryDecision({ workId: work.id, itemId: item.id,
+          proposalId: desktop.id, requestId: desktop.decision_request_id }));
+        requireFact(receipt?.decision === (desktop.status === 'approved' ? 'approve' : 'reject'),
+          'storage_corrupt', 'The original desktop decision is inconsistent.');
+        if (command?.kind === 'continueWork' || attempt && desktopActionContinuationAuthorized(store.db, work.id, attempt.id, receipt.revision)) return ready(item.id);
+        desktopWaiting = true; continue;
+      }
       if (this.hasAuthorizedInput(store, work, attempt, item.id, command)) return ready(item.id);
       const rows = store.db.query<{ id: number; revision: number; definition_json: string }, [number, number]>(
         'SELECT * FROM invoice_work_todos WHERE work_id=? AND item_id=? AND superseded_at IS NULL ORDER BY id').all(work.id, item.id);
@@ -263,9 +280,10 @@ export class DurableInvoiceGovernor {
         || (command?.kind === 'continueWork' || continued) && todos.some(todo => todo.action === 'continue')) return ready(item.id);
       waitingTodos.push(...todos.map(todo => todo.todoId));
     }
-    if (unavailable && items.length > 0 && waitingTodos.length === 0)
+    if (unavailable && items.length > 0 && waitingTodos.length === 0 && !desktopWaiting)
       return { kind: 'blocked', reason: appError('input_unavailable', 'input', 'The original invoice materials are unavailable.') };
-    return { kind: 'waiting', reason: items.length === 0 ? 'All invoices have a final disposition.' : 'Only human invoice actions remain.', todoIds: waitingTodos };
+    return { kind: 'waiting', reason: items.length === 0 ? 'All invoices have a final disposition.'
+      : desktopWaiting ? 'A desktop action awaits user confirmation.' : 'Only human invoice actions remain.', todoIds: waitingTodos };
   }
 
   private qualify(store: SqlDatabaseStore, work: WorkRow, at: string, command?: InvoiceWorkExecutionCommand,

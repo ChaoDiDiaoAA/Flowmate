@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema,
-  DurableSubagentConfigSnapshotSchema, DurableWorkBudgetSchema, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES,
+  DurableSubagentConfigSnapshotSchema, DurableWorkBudgetSchema, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES,
   InvoiceWorkPhaseBasisSchema, InvoiceWorkWorkingContextSchema, PersonalAgentConfigurationSchema, RunScopeSchema,
   InvoiceWorkSupplementRequestSchema, InvoiceWorkSupplementReceiptSchema, InvoiceWorkContinueReceiptSchema,
   type AppError, type DocumentRef, type InvoiceWorkWorkingContext, type ProductToolContext, type Result, type RunScope, type ToolResult } from '@flowmate/contracts';
@@ -70,7 +70,7 @@ export function resolveInvoiceWorkToolScope(db: SynchronousDatabaseExecutor, raw
     const row = db.query(`SELECT p.id phase_id,p.item_id,p.basis_json,p.closed_at,c.context_json,
       w.configuration_json,w.agent_revision,w.status work_status,w.current_attempt_id,
       a.stop_requested_at,a.stopped_at,r.scope_json,r.config_json,r.status run_status,r.cancel_requested_at,
-      s.status session_status,s.metadata_json,i.job_id,i.document_id,i.document_version,i.disposition,
+      s.status session_status,s.metadata_json,s.durable_runtime_id,i.job_id,i.document_id,i.document_version,i.disposition,
       i.revision item_revision,i.latest_input_id,i.candidate_id,
       j.status job_status,j.input_json job_input_json,j.document_id job_document_id,j.hidden_at job_hidden_at
       FROM invoice_work_phases p JOIN invoice_works w ON w.id=p.work_id
@@ -84,7 +84,7 @@ export function resolveInvoiceWorkToolScope(db: SynchronousDatabaseExecutor, raw
         phase_id: number; item_id: number; basis_json: string; closed_at: string | null; context_json: string;
         configuration_json: string; agent_revision: number; work_status: string; current_attempt_id: number;
         stop_requested_at: string | null; stopped_at: string | null; scope_json: string; config_json: string;
-        run_status: string; cancel_requested_at: string | null; session_status: string; metadata_json: string;
+        run_status: string; cancel_requested_at: string | null; session_status: string; metadata_json: string; durable_runtime_id: string;
         job_id: number; document_id: number; document_version: string; disposition: string; job_status: string;
         item_revision: number; latest_input_id: number | null; candidate_id: number | null;
         job_input_json: string; job_document_id: number; job_hidden_at: string | null;
@@ -124,7 +124,9 @@ export function resolveInvoiceWorkToolScope(db: SynchronousDatabaseExecutor, raw
     }
     requireFact(basis.documentRefs.some(ref => ref.id === row.document_id && ref.version === row.document_version));
     let allowedTools = scope.allowedTools.filter((name: string) => workConfig.tools.includes(name) && context.actions.tools.includes(name)
-      && (name === 'Agent' || (INVOICE_REVIEW_TOOL_NAMES as readonly string[]).includes(name) || (SKILL_RESOURCE_TOOL_NAMES as readonly string[]).includes(name)));
+      && (name === 'Agent' || (INVOICE_REVIEW_TOOL_NAMES as readonly string[]).includes(name) || (SKILL_RESOURCE_TOOL_NAMES as readonly string[]).includes(name)
+        || !input.child && ((PERSONAL_DESKTOP_TOOL_NAMES as readonly string[]).includes(name)
+          || row.durable_runtime_id === 'local' && (PERSONAL_INVOICE_FORM_TOOL_NAMES as readonly string[]).includes(name))));
     let allowedDocumentIds = basis.documentRefs.map(ref => ref.id), artifacts = [...new Set(allowedArtifactIds)], allowedResourcePaths: string[] = [];
     if (input.child) {
       const child = db.query<{ scope_json: string; config_json: string; status: string; cancel_requested_at: string | null;
@@ -227,6 +229,12 @@ function originalPhase(db: SynchronousDatabaseExecutor, input: DurableProductToo
 function readOriginalToolResult(repository: Pick<SqlDatabaseStore['toolCalls'], 'queryCandidateCommit'>,
   call: import('@flowmate/contracts').ToolCallSnapshot | null): Result<ToolResult<unknown> | null> {
   if (!call) return ok(null);
+  if (call.toolName === 'personal_fill_invoice_form') {
+    const receipt = call.formApplication;
+    if (receipt?.outcome === 'applied') return ok({ status: 'succeeded', data: { candidateId: receipt.candidateId,
+      candidateSequence: receipt.candidateSequence, applied: true } });
+    if (receipt?.outcome === 'unknown' || call.startedAt !== null && !receipt) return ok(null);
+  }
   if (call.toolName === 'save_invoice_candidate' && (call.result === null || call.runtimeObservation?.commit === 'unknown')) {
     const committed = repository.queryCandidateCommit({ toolCallId: call.toolCallId, runId: call.runId, sessionId: call.sessionId });
     if (!committed.ok) return committed;
@@ -253,7 +261,16 @@ function readOriginal(store: SqlDatabaseStore, call: DurableProductToolCall) {
 }
 
 export function readInvoiceWorkToolResult(store: SqlDatabaseStore, call: DurableProductToolCall): Result<ToolResult<unknown> | null> {
-  try { return readOriginalToolResult(store.toolCalls, readOriginal(store, call).call); }
+  try {
+    const original = readOriginal(store, call).call;
+    if (original?.toolName === 'desktop_execute_approved') {
+      const action = store.db.query<{ status: string }, [number]>('SELECT status FROM invoice_work_desktop_actions WHERE execution_tool_call_id=?')
+        .get(original.toolCallId);
+      if (action?.status === 'claimed' || action?.status === 'unknown'
+        || action?.status === 'dispatched' && original.result?.status !== 'succeeded') return ok(null);
+    }
+    return readOriginalToolResult(store.toolCalls, original);
+  }
   catch (error) { return fail(error instanceof ToolScopeFault ? error.fact : appError('storage_read_failed', 'storage', 'The original product tool receipt is unavailable.', true)); }
 }
 
@@ -294,6 +311,11 @@ export function createInvoiceWorkToolBridge(input: { database: Pick<DbHandle, 'r
       if (!prepared.ok) return prepared;
       const result = prepared.data.resume ? await input.executor.resumeDelegation(prepared.data.context)
         : await input.executor.execute(call.name, call.arguments, prepared.data.context);
+      if (call.name === 'desktop_execute_approved' || call.name === 'personal_fill_invoice_form') {
+        const original = await readToolResult(identity);
+        return !original.ok ? original : original.data !== null ? ok(original.data)
+          : fail(appError('tool_commit_unconfirmed', 'runtime', 'The original desktop input outcome is unknown.'));
+      }
       if (result.call.runtimeObservation?.commit === 'unknown') {
         const committed = await readToolResult(identity);
         return !committed.ok ? committed : committed.data !== null ? ok(committed.data)

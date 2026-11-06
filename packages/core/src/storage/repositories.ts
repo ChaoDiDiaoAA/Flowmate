@@ -114,7 +114,7 @@ import { DelegateArgsSchema, RequestContextBindingSchema, SubagentProvenanceSche
   NativeSessionHistorySchema } from '@flowmate/contracts';
 import type { DelegateArgs, SubagentOrigin, SubagentConfig, SubagentPage, SubagentDetail, QuerySubagentRequest } from '@flowmate/contracts';
 import { SubagentDetailSchema } from '@flowmate/contracts';
-import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_REVIEW_TOOL_NAMES, NATIVE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, WorkspaceSelectionSchema, InvoiceFormTargetSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, FillInvoiceFormInputSchema } from '@flowmate/contracts';
+import { AppErrorSchema, CandidateDraftSchema, CheckResultSchema, DocumentRefSchema, INVOICE_REVIEW_TOOL_NAMES, NATIVE_TOOL_NAMES, InvoiceIssueSchema, RunScopeSchema, SourceRefSchema, ToolEffectSchema, WorkspaceContextSchema, WorkspaceExpectationSchema, WorkspaceInputSchema, WorkspaceSelectionSchema, InvoiceFormTargetSchema, InvoiceFormApplicationReceiptSchema, InvoiceFormBridgeRequestSchema, FillInvoiceFormInputSchema, PersonalInvoiceFormInputSchema, InvoiceWorkWorkingContextSchema } from '@flowmate/contracts';
 import { StoredCandidateDraftSchema, SaveInvoiceCandidateRequestSchema, AcceptInvoiceCandidateRequestSchema,
   RejectInvoiceCandidateRequestSchema, ExportInvoiceCandidateRequestSchema, invoiceHeaderFields, invoiceLineFields,
   invoiceFieldDisplayValue, isLegalInvoiceNormalizedValue } from '@flowmate/contracts';
@@ -905,10 +905,39 @@ function readToolEnvelope(value: string | null): { result: StoredToolResult | nu
 
 type FormApplicationCall = {
   toolCallId: DbId; runId: DbId; sessionId: DbId; nativeToolCallId: string; toolName: string; effect: string | null;
-  args: { final: unknown }; startedAt: string | null;
+  args: { raw: unknown; final: unknown }; startedAt: string | null;
 };
 
 function deriveFormApplicationRequest(db: Database, call: FormApplicationCall): Extract<InvoiceFormBridgeRequest, { operation: 'apply' }> {
+  if (call.toolName === 'personal_fill_invoice_form' && call.effect === 'LOCAL_WRITE') {
+    const bound = db.query<{ scope_json: string; basis_json: string; phase_id: number; work_id: number; item_id: number; attempt_id: number; context_json: string }, [number, number, number]>(
+      `SELECT b.scope_json,p.basis_json,p.id phase_id,p.work_id,p.item_id,p.attempt_id,c.context_json FROM invoice_work_tool_calls b
+       JOIN invoice_work_phases p ON p.id=b.phase_id JOIN invoice_work_context_snapshots c ON c.phase_id=p.id
+       JOIN tool_calls t ON t.id=b.tool_call_id JOIN runs r ON r.id=t.run_id JOIN sessions s ON s.id=r.session_id
+       WHERE b.tool_call_id=? AND r.id=? AND s.id=? AND r.kind='agent' AND s.runtime_kind='durable' AND s.durable_runtime_id='local'`)
+      .get(call.toolCallId, call.runId, call.sessionId);
+    if (!bound) throw new Error('invalid_personal_form_binding');
+    const scope = RunScopeSchema.parse(JSON.parse(bound.scope_json)), context = InvoiceWorkWorkingContextSchema.parse(JSON.parse(bound.context_json));
+    const args = PersonalInvoiceFormInputSchema.parse(call.args.final);
+    if (!isDeepStrictEqual(call.args.raw, args) || scope.invoiceWork?.workId !== bound.work_id || scope.invoiceWork.itemId !== bound.item_id
+      || scope.invoiceWork.attemptId !== bound.attempt_id || scope.invoiceWork.phaseId !== bound.phase_id
+      || !scope.allowedTools.includes(call.toolName) || !context.actions.tools.includes(call.toolName)
+      || context.work.workId !== bound.work_id || context.work.sessionId !== call.sessionId || context.phase.phaseId !== bound.phase_id
+      || context.phase.attemptId !== bound.attempt_id || !isDeepStrictEqual(context.phase.basis, JSON.parse(bound.basis_json))
+      || context.item.workId !== bound.work_id
+      || context.item.itemId !== bound.item_id || context.item.jobId === null || context.item.candidateRef?.id !== args.candidateId)
+      throw new Error('invalid_personal_form_binding');
+    const candidate = candidateSnapshot(db, queryCandidateRow(db, args.candidateId, context.item.jobId));
+    if (candidate.snapshot.sequence !== context.item.candidateRef.sequence || !isDeepStrictEqual(candidate.documentRef, context.item.documentRef))
+      throw new Error('invalid_personal_form_candidate');
+    const request = InvoiceFormBridgeRequestSchema.parse({ operation: 'apply', runId: call.runId, sessionId: call.sessionId,
+      toolCallId: call.toolCallId, nativeToolCallId: call.nativeToolCallId, documentRef: candidate.documentRef, jobId: context.item.jobId,
+      candidateId: candidate.snapshot.candidateId, candidateSequence: candidate.snapshot.sequence, target: args.target,
+      invoiceWork: { workId: bound.work_id, itemId: bound.item_id, attemptId: bound.attempt_id, phaseId: bound.phase_id },
+      candidate: { fields: candidate.snapshot.fields, lines: candidate.snapshot.lines, notes: candidate.snapshot.notes } });
+    if (request.operation !== 'apply') throw new Error('invalid_personal_form_operation');
+    return request;
+  }
   if (call.toolName !== 'fill_invoice_form' || call.effect !== 'LOCAL_WRITE') throw new Error('invalid_form_application_identity');
   const run = db.query("SELECT session_id,job_id,scope_json,config_json FROM runs WHERE id=? AND kind='agent'")
     .get(call.runId) as { session_id: number; job_id: number | null; scope_json: string; config_json: string } | null;
@@ -992,7 +1021,7 @@ function toolCallSnapshot(db: Database, value: unknown, owners?: ContextOwnerCac
   if (row.status === 'succeeded' && (row.started_at === null || row.stopped_at === null)) throw new Error('invalid_tool_call_success');
   if (formApplication !== undefined) validateFormApplication(db, {
     toolCallId: row.id, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id, toolName: row.tool_name, effect: row.effect,
-    args: { final: args.final }, startedAt: row.started_at,
+    args: { raw: args.raw, final: args.final }, startedAt: row.started_at,
   }, formApplication);
   return {
     toolCallId: row.id, evidenceRevision: row.evidence_revision ?? 0, runId: row.run_id, sessionId: row.session_id, nativeToolCallId: row.native_tool_call_id,

@@ -1,14 +1,17 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { appError, CloudWorkspaceIdSchema, fail, ok, InvoiceWorkCreateRequestSchema, InvoiceWorkContinueRequestSchema,
   InvoiceWorkSupplementRequestSchema, InvoiceWorkDisposeItemRequestSchema, InvoiceWorkCancelRequestSchema,
   InvoiceWorkListRequestSchema, InvoiceWorkGetRequestSchema, InvoiceWorkQueryOperationRequestSchema,
+  DesktopActionDecisionQuerySchema, DesktopActionDecisionRequestSchema, DesktopActionListRequestSchema, DesktopActionDiscardSchema,
   DurableModelBindingSchema, RuntimeRequestOverridesSchema } from '@flowmate/contracts';
 import type { InvoiceWorksApi, InvoiceWorkCreateRequest, InvoiceWorkContinueRequest, InvoiceWorkSupplementRequest,
   InvoiceWorkDisposeItemRequest, InvoiceWorkCancelRequest, InvoiceWorkListRequest, InvoiceWorkGetRequest,
   InvoiceWorkQueryOperationRequest, InvoiceWorkOperationReceipt, InvoiceWorkCreateReceipt, InvoiceWorkContinueReceipt,
   InvoiceWorkSupplementReceipt, InvoiceWorkDisposeItemReceipt, InvoiceWorkCancelReceipt, InvoiceWorkListResult,
   InvoiceWorkGetResult, DurableModelBinding, PersonalAgentConfiguration, RuntimeRequestOverrides,
-  InvoiceWorkTimelineRequest, InvoiceWorkTimelinePage, Result } from '@flowmate/contracts';
+  InvoiceWorkTimelineRequest, InvoiceWorkTimelinePage, DesktopActionDecisionQuery, DesktopActionDecisionReceipt,
+  DesktopActionDecisionRequest, DesktopActionListRequest, DesktopActionListResult, DesktopActionDiscard, DesktopActionView, Result } from '@flowmate/contracts';
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { InvoiceWorkAdmission, InvoiceWorkRepository } from './repository.ts';
 import { createInvoiceWorkTimelineService } from './timeline.ts';
@@ -25,6 +28,7 @@ export type InvoiceWorkServiceOptions = {
   assessExecution: (command: InvoiceWorkExecutionCommand) => Result<InvoiceWorkAdmission> | Promise<Result<InvoiceWorkAdmission>>;
   /** Signal persisted facts; the coordinator must recheck authorization before dispatch. */
   onChanged: (receipt: InvoiceWorkOperationReceipt) => void;
+  onDesktopChanged?: () => void;
 };
 
 const invalid = () => fail(appError('input_invalid', 'input', 'Invoice Work request is invalid.'));
@@ -42,6 +46,11 @@ export class InvoiceWorkService implements InvoiceWorksApi {
     if (!this.cloudWorkspaceId) return true;
     return scope.db.query(`SELECT w.id FROM invoice_works w JOIN sessions s ON s.id=w.session_id
       WHERE w.id=? AND s.durable_runtime_id!='local' AND s.cloud_workspace_id=?`).get(workId, this.cloudWorkspaceId) !== null;
+  }
+
+  private allowedDesktop(scope: SqlDatabaseStore, workId: number): boolean {
+    return this.cloudWorkspaceId ? this.allowed(scope, workId) : scope.db.query(`SELECT w.id FROM invoice_works w
+      JOIN sessions s ON s.id=w.session_id WHERE w.id=? AND s.runtime_kind='durable' AND s.durable_runtime_id='local'`).get(workId) !== null;
   }
 
   public async timeline(input: InvoiceWorkTimelineRequest): Promise<Result<InvoiceWorkTimelinePage>> {
@@ -199,6 +208,64 @@ export class InvoiceWorkService implements InvoiceWorksApi {
     if (!parsed.success) return invalid();
     return this.command({ operation: 'cancelWork', workId: parsed.data.workId, requestId: parsed.data.requestId },
       (repository, at) => repository.cancelWork(parsed.data, { at }));
+  }
+
+  public async listDesktopActions(input: DesktopActionListRequest): Promise<Result<DesktopActionListResult>> {
+    const parsed = DesktopActionListRequestSchema.safeParse(input); if (!parsed.success) return invalid();
+    try { return await this.options.database.read(scope => this.allowedDesktop(scope, parsed.data.workId)
+      ? scope.invoiceWorkDesktopActions.list(parsed.data) : forbidden()); }
+    catch { return fail(appError('storage_read_failed', 'storage', 'Desktop action state could not be read.', true)); }
+  }
+
+  public async queryDesktopDecision(input: DesktopActionDecisionQuery): Promise<Result<DesktopActionDecisionReceipt | null>> {
+    const parsed = DesktopActionDecisionQuerySchema.safeParse(input); if (!parsed.success) return invalid();
+    try { return await this.options.database.read(scope => this.allowedDesktop(scope, parsed.data.workId)
+      ? scope.invoiceWorkDesktopActions.queryDecision(parsed.data) : forbidden()); }
+    catch { return fail(appError('storage_read_failed', 'storage', 'The original desktop decision could not be read.', true)); }
+  }
+
+  public async discardDesktopAction(input: DesktopActionDiscard): Promise<Result<DesktopActionView>> {
+    const parsed = DesktopActionDiscardSchema.safeParse(input); if (!parsed.success) return invalid();
+    try {
+      return await this.options.database.transaction(scope => {
+        if (!this.allowedDesktop(scope, parsed.data.workId)) return forbidden();
+        const local = scope.invoiceWorkDesktopActions.list({ workId: parsed.data.workId, itemId: parsed.data.itemId, limit: 1 }); if (!local.ok) return local;
+        const work = scope.invoiceWorks.get({ view: 'item', workId: parsed.data.workId, itemId: parsed.data.itemId });
+        if (!work.ok) return work;
+        if (work.data.view !== 'item' || work.data.work.status !== 'open' || work.data.item.disposition !== 'unresolved')
+          return fail(appError('state_conflict', 'input', 'The original invoice is no longer open.'));
+        const result = scope.invoiceWorkDesktopActions.invalidate({ ...parsed.data, at: this.options.now() });
+        if (result.ok && this.options.onDesktopChanged) {
+          if (!scope.db.afterCommit) throw Error('desktop_action_commit_callback_unavailable');
+          scope.db.afterCommit(() => { try { this.options.onDesktopChanged?.(); } catch { /* The saved state remains queryable. */ } });
+        }
+        return result;
+      });
+    } catch { return writeFailure(); }
+  }
+
+  public async decideDesktopAction(input: DesktopActionDecisionRequest): Promise<Result<DesktopActionDecisionReceipt>> {
+    const parsed = DesktopActionDecisionRequestSchema.safeParse(input); if (!parsed.success) return invalid();
+    const request = parsed.data, query = { workId: request.workId, itemId: request.itemId,
+      proposalId: request.proposalId, requestId: request.requestId };
+    try {
+      return await this.options.database.transaction(scope => {
+        if (!this.allowedDesktop(scope, request.workId)) return forbidden();
+        const prior = scope.invoiceWorkDesktopActions.queryDecision(query); if (!prior.ok) return prior;
+        const result = scope.invoiceWorkDesktopActions.decide(request, this.options.now());
+        if (result.ok && prior.data === null && this.options.onDesktopChanged) {
+          if (!scope.db.afterCommit) throw Error('desktop_action_commit_callback_unavailable');
+          scope.db.afterCommit(() => { try { this.options.onDesktopChanged?.(); } catch { /* The decision remains queryable. */ } });
+        }
+        return result;
+      });
+    } catch {
+      const recovered = await this.queryDesktopDecision(query);
+      if (!recovered.ok || recovered.data === null) return writeFailure();
+      const { revision: _revision, receivedAt: _receivedAt, ...original } = recovered.data;
+      return isDeepStrictEqual(original, request) ? ok(recovered.data)
+        : fail(appError('state_conflict', 'input', 'The original desktop decision belongs to a different request.'));
+    }
   }
 
   public async list(input: InvoiceWorkListRequest): Promise<Result<InvoiceWorkListResult>> {

@@ -164,6 +164,10 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
   runEvaluationWorkflow(input: import('./evaluation-workflow.ts').EvaluationWorkflowRequest): Promise<import('./runtime.ts').Result<import('./evaluation-workflow.ts').EvaluationWorkflowResult>>;
   personalAgent: import('./personal-agent.ts').PersonalAgentApi;
+  startDesktopUse(): Promise<import('./runtime.ts').Result<void>>;
+  desktopWindows(): Promise<import('./runtime.ts').Result<import('./desktop-actions.ts').DesktopActionTarget['window'][]>>;
+  selectDesktopWindow(input: import('zod').z.infer<typeof import('./desktop-actions.ts').DesktopWindowSelectionSchema>):
+    Promise<import('./runtime.ts').Result<import('zod').z.infer<typeof import('./desktop-actions.ts').DesktopOwnerSchema>>>;
   cloudDesktop: import('./cloud-desktop.ts').CloudDesktopApi;
   backgroundService: import('./background-service.ts').BackgroundServiceApi;
   invoiceWorks: import('./personal-agent.ts').InvoiceWorksApi;
@@ -202,7 +206,8 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   querySessionHistory(input: import('./memory.ts').NativeHistoryPageRequest): Promise<import('./runtime.ts').Result<import('./memory.ts').NativeHistoryPage>>;
   querySessionHistoryEntry(input: import('./memory.ts').SessionHistoryEntryRequest): Promise<import('./runtime.ts').Result<import('./memory.ts').SessionHistoryEntryDetail>>;
   forkSession(input: import('./memory.ts').ForkSessionRequest): Promise<import('./runtime.ts').Result<import('./memory.ts').ForkSessionResult>>;
-  registerInvoiceFormTarget(input: { purpose: 'fill' | 'edit'; workspace: DesktopInvoiceFormWorkspace; formRevision: number }): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceFormTarget>>;
+  registerInvoiceFormTarget(input: { purpose: 'fill' | 'edit' | 'personal-fill'; workspace: DesktopInvoiceFormWorkspace; formRevision: number;
+    personal?: { workId: number; itemId: number } }): Promise<import('./runtime.ts').Result<import('./invoice.ts').InvoiceFormTarget>>;
   invalidateInvoiceFormTarget(formInstanceId: string): Promise<import('./runtime.ts').Result<void>>;
   setInvoiceFormDirty(formInstanceId: string, dirty: boolean, formRevision: number): Promise<import('./runtime.ts').Result<void>>;
   onInvoiceFormInspect(listener: (requestId: string, formInstanceId: string) => void): () => void;

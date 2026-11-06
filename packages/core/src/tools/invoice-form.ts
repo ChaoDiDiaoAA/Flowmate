@@ -1,8 +1,10 @@
 import { z } from 'zod';
-import { appError, fail, FillInvoiceFormOutputSchema, InvoiceFormApplicationReceiptSchema, ok, WorkspaceContextSchema } from '@flowmate/contracts';
+import { appError, fail, FillInvoiceFormOutputSchema, InvoiceFormApplicationReceiptSchema, PersonalInvoiceFormInputSchema,
+  PersonalInvoiceFormObservationSchema, ToolExecutionFailure, ok, WorkspaceContextSchema } from '@flowmate/contracts';
 import type { AppError, DbId, FillInvoiceFormInput, FillInvoiceFormOutput,
   InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ProductToolContext, Result, ToolCallContext } from '@flowmate/contracts';
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
+import { verifyInvoiceWorkCandidateScope } from '../personal-agent/tool-scope.ts';
 
 export type InvoiceFormBridge = (request: InvoiceFormBridgeRequest, signal: AbortSignal) => Promise<InvoiceFormApplicationReceipt>;
 type Dependencies = { database: Pick<DbHandle, 'read' | 'transaction'>; bridge: InvoiceFormBridge; now: () => string };
@@ -79,6 +81,27 @@ export function createInvoiceFormService(dependencies: Dependencies) {
     if (call.signal.aborted || run.data.cancelRequestedAt !== null) return appError('agent_cancelled', 'runtime', 'The call was cancelled before form application.');
     if (call.deadlineAt !== undefined && performance.now() >= call.deadlineAt)
       return appError('tool_timeout', 'tool', 'The form application deadline elapsed before dispatch.', true);
+    if (request.invoiceWork) {
+      const verified = verifyInvoiceWorkCandidateScope(scope.db, context);
+      if (!verified.ok) return verified.error;
+      const item = scope.invoiceWorks.get({ view: 'item', workId: request.invoiceWork.workId, itemId: request.invoiceWork.itemId });
+      if (!item.ok) return item.error;
+      if (item.data.view !== 'item' || !context.scope.allowedTools.includes('personal_fill_invoice_form')
+        || context.scope.invoiceWork?.workId !== request.invoiceWork.workId || context.scope.invoiceWork.itemId !== request.invoiceWork.itemId
+        || context.scope.invoiceWork.attemptId !== request.invoiceWork.attemptId || context.scope.invoiceWork.phaseId !== request.invoiceWork.phaseId
+        || run.data.kind !== 'agent' || run.data.status !== 'running' || run.data.sessionId !== request.sessionId
+        || request.nativeToolCallId !== call.nativeToolCallId || item.data.work.status !== 'open' || item.data.item.disposition !== 'unresolved'
+        || item.data.item.jobId !== request.jobId || item.data.item.candidateRef?.id !== request.candidateId
+        || item.data.item.candidateRef.sequence !== request.candidateSequence
+        || item.data.item.documentRef.id !== request.documentRef.id || item.data.item.documentRef.version !== request.documentRef.version)
+        return appError('state_conflict', 'tool', 'The original Personal Agent invoice phase changed.');
+      if (session.data.status !== 'active' || session.data.modelUseBlocked || session.data.nativeUnusable
+        || document.data.status !== 'available' || document.data.isHidden || document.data.documentRef.version !== request.documentRef.version
+        || job.data.status === 'completed' || job.data.currentCandidateId !== request.candidateId
+        || candidate.data.candidate.status !== 'generated' || candidate.data.candidate.sequence !== request.candidateSequence)
+        return appError('state_conflict', 'tool', 'The original Personal Agent candidate is no longer eligible.');
+      return null;
+    }
     if (run.data.kind !== 'agent' || run.data.status !== 'running' || run.data.sessionId !== context.sessionId
       || run.data.runId !== context.runId || request.nativeToolCallId !== call.nativeToolCallId
       || context.scope.allowedTools.length !== 1 || context.scope.allowedTools[0] !== 'fill_invoice_form'
@@ -103,7 +126,7 @@ export function createInvoiceFormService(dependencies: Dependencies) {
       const prepared = unwrap(await read(scope => {
         const original = scope.toolCalls.get({ runId: context.runId, sessionId: context.sessionId, nativeToolCallId: call.nativeToolCallId });
         if (!original.ok) return original;
-        if (original.data.status !== 'running' || original.data.toolName !== 'fill_invoice_form')
+        if (original.data.status !== 'running' || !['fill_invoice_form', 'personal_fill_invoice_form'].includes(original.data.toolName))
           return fail(appError('state_conflict', 'tool', 'Fill requires the actual running ToolCall.'));
         const request = scope.toolCalls.readFormApplicationRequest(original.data.toolCallId);
         if (!request.ok) return request;
@@ -145,3 +168,38 @@ export function createInvoiceFormService(dependencies: Dependencies) {
   };
 }
 export type InvoiceFormService = ReturnType<typeof createInvoiceFormService>;
+
+export function createPersonalInvoiceFormTool(service: InvoiceFormService) {
+  return {
+    name: 'personal_fill_invoice_form', version: '1', label: 'Fill selected invoice form',
+    description: 'Apply the current invoice candidate to the exact form prepared by the user. This does not save or accept the candidate.',
+    inputSchema: PersonalInvoiceFormInputSchema, outputSchema: FillInvoiceFormOutputSchema,
+    effect: 'LOCAL_WRITE', executionMode: 'sequential',
+    execute: (input, call, context) => service.apply(input, call, context),
+  } satisfies import('@flowmate/contracts').ToolDefinition<import('@flowmate/contracts').PersonalInvoiceFormInput, FillInvoiceFormOutput>;
+}
+
+export function createPersonalInvoiceFormObserveTool(options: { database: Pick<DbHandle, 'read'>;
+  observe(context: ProductToolContext, signal: AbortSignal): Promise<Result<import('@flowmate/contracts').PersonalInvoiceFormObservation>> }) {
+  return {
+    name: 'personal_observe_invoice_form', version: '1', label: 'Observe prepared invoice form',
+    description: 'Read the exact Flowmate invoice form prepared by the user for this invoice. Form data is not acceptance.',
+    inputSchema: z.object({}).strict(), outputSchema: PersonalInvoiceFormObservationSchema, effect: 'READ', executionMode: 'sequential',
+    async execute(_input, call, context) {
+      const owner = context.scope.invoiceWork;
+      if (!owner) throw new ToolExecutionFailure(appError('tool_access_denied', 'runtime', 'The form has no original invoice phase.'));
+      const result = await options.observe(context, call.signal); if (!result.ok) throw new ToolExecutionFailure(result.error);
+      const verified = await options.database.read(scope => {
+        const authorized = verifyInvoiceWorkCandidateScope(scope.db, context); if (!authorized.ok) return authorized;
+        const item = scope.invoiceWorks.get({ view: 'item', workId: owner.workId, itemId: owner.itemId });
+        if (!item.ok) return item;
+        return item.data.view === 'item' && item.data.item.candidateRef?.id === result.data.candidateId
+          && item.data.item.candidateRef.sequence === result.data.candidateSequence ? ok(result.data)
+          : fail(appError('state_conflict', 'runtime', 'The prepared form no longer matches the original invoice candidate.'));
+      });
+      if (call.signal.aborted) throw new ToolExecutionFailure(appError('agent_cancelled', 'runtime', 'The form observation was cancelled.'));
+      if (!verified.ok) throw new ToolExecutionFailure(verified.error);
+      return verified.data;
+    },
+  } satisfies import('@flowmate/contracts').ToolDefinition<{}, import('@flowmate/contracts').PersonalInvoiceFormObservation>;
+}

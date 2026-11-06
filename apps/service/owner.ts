@@ -10,6 +10,7 @@ import { createServiceCredentialService } from '../../packages/core/src/configur
 import { parseHostCommand, type HostCommand, type HostInvoiceFormRequest, type HostOutput, type HostReady } from '../host/protocol.ts';
 import type { ProductCommandDispatcher } from '../host/dispatch.ts';
 import { createServicePipeServer, type ServicePipeConnection } from './pipe.ts';
+import { createDesktopRouting } from './desktop-routing.ts';
 import { parseServiceConnect, parseServicePrivateCommand, parseServicePrivateResult, SERVICE_DATA_VERSION, SERVICE_PROTOCOL_VERSION,
   type ForegroundDisconnectReport, type ForegroundReference, type ServiceFailure } from './protocol.ts';
 
@@ -44,6 +45,7 @@ export async function createServiceOwner(input: { installationFile: string; runt
   const clients = new Set<Client>(), retiredClients = new Map<string, Client>(), routes = new Map<string, Route>();
   const subscriptions = new Map<string, Client>(), runs = new Map<number, OwnedForeground>();
   const forms = new Map<string, { client: Client; output: HostInvoiceFormRequest }>();
+  const desktops = createDesktopRouting<Client>(client => client.live && !client.preparing);
   const compactions = new Map<string, OwnedForeground>();
   let dispatcher: ProductCommandDispatcher, ready: HostReady | undefined, closed = false;
   let credentialService: ReturnType<typeof createServiceCredentialService>, activatedOperationId: string | null = null, ownerClosing = false;
@@ -69,6 +71,11 @@ export async function createServiceOwner(input: { installationFile: string; runt
   }
   async function revokeReceivers(client: Client) {
     const revoked: Promise<void>[] = [];
+    for (const id of desktops.disconnect(client)) revoked.push((async () => {
+      await write(client, { version: 1, type: 'desktop_cancel', requestId: id });
+      await dispatcher.dispatch({ version: 1, requestId: id,
+        type: 'desktop_response', value: failure('desktop_unavailable', 'The authorized desktop disconnected.') });
+    })());
     for (const id of client.subscriptions) {
       subscriptions.delete(id);
       revoked.push(dispatcher.dispatch({ version: 1, requestId: randomUUID(), type: 'unsubscribe_runtime_events',
@@ -196,9 +203,20 @@ export async function createServiceOwner(input: { installationFile: string; runt
     // Manual trace capture is configured only by the local development Host.
     if (output.type === 'evaluation_trace_available') return;
     if (output.type === 'invoice_form_request') {
-      const client = runs.get(output.request.runId)?.client;
+      const client = output.request.invoiceWork ? desktops.recipient(output.request.invoiceWork) : runs.get(output.request.runId)?.client;
       if (client?.live && !client.preparing) { forms.set(output.requestId, { client, output }); await write(client, output); }
       else await dispatcher.dispatch({ version: 1, requestId: output.requestId, type: 'invoice_form_response', receipt: unknownForm(output) });
+      return;
+    }
+    if (output.type === 'desktop_request') {
+      const client = desktops.recipient(output.request);
+      if (client && desktops.remember(output.requestId, client, output.request)) await write(client, output);
+      else await dispatcher.dispatch({ version: 1, requestId: output.requestId, type: 'desktop_response',
+        value: failure('desktop_unavailable', 'No authorized interactive desktop is connected.') });
+      return;
+    }
+    if (output.type === 'desktop_cancel') {
+      const client = desktops.cancel(output.requestId); if (client) await write(client, output);
       return;
     }
     if (output.type === 'event') {
@@ -226,6 +244,9 @@ export async function createServiceOwner(input: { installationFile: string; runt
     }
     const route = routes.get(output.requestId); if (!route) return;
     let value = output.value;
+    if (route.command.type === 'desktop_bind' && value && typeof value === 'object' && 'ok' in value && value.ok === true
+      && !desktops.bind(route.client, route.command.input))
+      value = failure('desktop_unavailable', 'Another desktop connection owns the interactive desktop.');
     if (value && typeof value === 'object' && 'ok' in value && value.ok === true && 'data' in value
       && value.data && typeof value.data === 'object') {
       const data = value.data as Record<string, unknown>;
@@ -363,6 +384,11 @@ export async function createServiceOwner(input: { installationFile: string; runt
         || receipt.candidateSequence !== original.candidateSequence
         || receipt.outcome === 'applied' && receipt.appliedRevision !== original.target.expectedRevision + 1) { await reject(); return; }
       await dispatcher.dispatch(command); forms.delete(command.requestId); return;
+    }
+    if (command.type === 'desktop_response') {
+      const value = desktops.receive(command.requestId, client, command.value);
+      if (!value) { await reject(); return; }
+      await dispatcher.dispatch({ ...command, value }); return;
     }
     if (command.type === 'cancel_run' && runs.get(command.runId)?.client !== client
       || command.type === 'submit_session_input' && command.input.mode !== 'prompt' && runs.get(command.input.runId)?.client !== client

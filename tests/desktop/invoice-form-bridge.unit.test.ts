@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import type { AgentRunSnapshot, InvoiceFormBridgeRequest } from '@flowmate/contracts';
 import { checkedInvoiceFormInspection, matchesInvoiceFormRun, matchesInvoiceFormTarget, type InvoiceFormTargetBinding } from '../../apps/desktop/main/invoice-form-bridge.ts';
 import { InvoiceFormDraftSchema, invoiceHeaderFields } from '@flowmate/contracts';
+import * as formBridge from '../../apps/desktop/main/invoice-form-bridge.ts';
 
 const owner = { frame: {}, contents: {}, epoch: 1 };
 const workspace = { revision: 2, documentRef: { id: 4, version: 'v1' }, jobId: 7, candidateRef: { id: 9, sequence: 1 }, sessionId: 12 };
@@ -29,6 +30,28 @@ function run(): AgentRunSnapshot {
 }
 
 describe('trusted invoice form target binding', () => {
+  it('binds a Durable form to the selected Work item and its owning session', () => {
+    const personal = { ...binding(), purpose: 'personal-fill', personal: { workId: 1, itemId: 2, sessionId: 30 } } as unknown as InvoiceFormTargetBinding;
+    const input = { ...request(), sessionId: 30, invoiceWork: { workId: 1, itemId: 2, attemptId: 3, phaseId: 4 } };
+    expect(matchesInvoiceFormTarget(personal, input, owner)).toBe(true);
+    expect(matchesInvoiceFormTarget(personal, { ...input, invoiceWork: { ...input.invoiceWork, itemId: 99 } }, owner)).toBe(false);
+    expect(matchesInvoiceFormTarget(personal, { ...input, sessionId: 31 }, owner)).toBe(false);
+    expect(matchesInvoiceFormTarget(personal, input, { ...owner, epoch: 2 })).toBe(false);
+    expect(matchesInvoiceFormTarget(personal, input, owner, workspace)).toBe(true);
+    expect(matchesInvoiceFormTarget(personal, input, owner, { ...workspace, candidateRef: { id: 10, sequence: 1 } })).toBe(false);
+    expect(matchesInvoiceFormTarget(personal, input, owner, { ...workspace, revision: workspace.revision + 1 })).toBe(false);
+    const durableRun = { ...run(), jobId: null, sessionId: 30,
+      config: { runtimeKind: 'durable', durable: { workId: 1, attemptId: 3 } },
+      scope: { version: 4, workId: 1, attemptId: 3, allowedTools: ['personal_fill_invoice_form'] } } as unknown as AgentRunSnapshot;
+    expect(matchesInvoiceFormRun(personal, input, durableRun)).toBe(true);
+    expect(matchesInvoiceFormRun(personal, { ...input, invoiceWork: { ...input.invoiceWork, attemptId: 99 } }, durableRun)).toBe(false);
+    const observe = Reflect.get(formBridge, 'observePersonalInvoiceForm');
+    expect(typeof observe).toBe('function'); if (typeof observe !== 'function') return;
+    expect(observe({ ...personal, currentRevision: 0 }, { workId: 1, itemId: 2 }, owner))
+      .toEqual({ candidateId: 9, candidateSequence: 1, target: personal.target });
+    expect(observe({ ...personal, currentRevision: 0, dirty: true }, { workId: 1, itemId: 2 }, owner)).toBeNull();
+    expect(observe({ ...personal, currentRevision: 1 }, { workId: 1, itemId: 2 }, owner)).toBeNull();
+  });
   it('accepts only a complete current owner-bound manual inspection and refuses stale revision or extra fields', () => {
     const form = { ...binding(), currentRevision: 3, dirty: true };
     const inspection = { formInstanceId: 'form-1', revision: 3, dirty: true, valid: true,

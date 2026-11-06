@@ -3,6 +3,7 @@ import { createPersonalAgentRuntime, type PersonalAgentRuntime, type PersonalAge
 import { CloudMaterialExport } from './cloud-material-export.ts';
 import { CloudResourceExport } from './cloud-resource-export.ts';
 import { startCloudAuthorityEndpoints } from './cloud-authority-service.ts';
+import { CloudDesktopRelay } from './cloud-desktop-relay.ts';
 import type { InvoiceEditServiceOptions } from '../packages/core/src/invoice-edit/service.ts';
 import { createCloudRuntimeRpcClient } from './cloud-runtime-rpc.ts';
 import { parseFrontmatter, loadPromptTemplates, expandPromptTemplate } from '@flowmate/runtime-pi';
@@ -35,8 +36,9 @@ export type ApplicationOptions = {
   onCloudResourceReady?: (resource: CloudResourceExport) => void;
   cloudAuthority?: { workspaceId: string; runtimeSocket: string; desktopSocket: string; authoritySocket: string; modelSocket: string;
     readApiKey(): string | undefined | Promise<string | undefined>; fetch?: (url: string, init: RequestInit) => Promise<Response> };
-  personalAgent?: Pick<PersonalAgentRuntimeOptions, 'resolveConfiguration' | 'readApiKey' | 'defaultConfiguration'> & {
+  personalAgent?: Pick<PersonalAgentRuntimeOptions, 'resolveConfiguration' | 'readApiKey' | 'defaultConfiguration' | 'desktop'> & {
     onReady?: (control: Pick<PersonalAgentRuntime, 'start' | 'conditionsChanged'>) => void;
+    observeInvoiceForm?: NonNullable<PersonalAgentRuntimeOptions['form']>['observe'];
   };
   installedRelease?: PackagedRelease;
   resourceRoot?: string;
@@ -182,6 +184,31 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   let sessionService: SessionService;
   let personalRuntime: PersonalAgentRuntime | undefined;
   const cloudRuntime = options.cloudAuthority ? createCloudRuntimeRpcClient(options.cloudAuthority.runtimeSocket) : undefined;
+  const cloudDesktopRelay = options.cloudAuthority ? new CloudDesktopRelay() : undefined;
+  const cloudDesktop = cloudDesktopRelay ? {
+    listWindows: async (context: import('@flowmate/contracts').ProductToolContext, signal: AbortSignal) => {
+      const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+      const result = await cloudDesktopRelay.request({ kind: 'list', workId: owner.workId, itemId: owner.itemId }, signal);
+      return !result.ok ? result : result.data.kind === 'list' ? ok(result.data.windows) : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+    },
+    observe: async (context: import('@flowmate/contracts').ProductToolContext, signal: AbortSignal) => {
+      const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+      const result = await cloudDesktopRelay.request({ kind: 'observe', workId: owner.workId, itemId: owner.itemId }, signal);
+      return !result.ok ? result : result.data.kind === 'observe' ? ok({ observationId: result.data.observationId, window: result.data.window,
+        tree: result.data.tree, truncated: result.data.truncated }) : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+    },
+    resolveTarget: async (action: import('@flowmate/contracts').DesktopActionProposal, context: import('@flowmate/contracts').ProductToolContext, signal: AbortSignal) => {
+      const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+      const result = await cloudDesktopRelay.request({ kind: 'resolve', workId: owner.workId, itemId: owner.itemId, action }, signal);
+      return !result.ok ? result : result.data.kind === 'resolve' ? ok(result.data.target) : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+    },
+    dispatch: async (action: import('@flowmate/contracts').DesktopActionProposal, target: import('@flowmate/contracts').DesktopActionTarget,
+      context: import('@flowmate/contracts').ProductToolContext, signal: AbortSignal, proposalId: number) => {
+      const owner = context.scope.invoiceWork; if (!owner) return fail(appError('desktop_unavailable', 'runtime', 'No invoice desktop is authorized.'));
+      const result = await cloudDesktopRelay.request({ kind: 'dispatch', workId: owner.workId, itemId: owner.itemId, action, target, proposalId }, signal);
+      return !result.ok ? result : result.data.kind === 'dispatch' ? ok(undefined) : fail(appError('desktop_unavailable', 'runtime', 'Desktop response is invalid.'));
+    },
+  } : undefined;
   let cloudEndpoints: { stopDesktop(): Promise<Result<void>>; close(): Promise<Result<void>> } | undefined;
   const runtime = new RuntimeService({
     database: database.data,
@@ -219,6 +246,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const jobService = createJobService(database.data, now);
   if (options.personalAgent) {
     const personal = await createPersonalAgentRuntime({ ...options.personalAgent, database: database.data, definitions,
+      ...(cloudDesktop ? { desktop: cloudDesktop } : {}),
+      ...(invoiceForms && options.personalAgent.observeInvoiceForm ? { form: { service: invoiceForms, observe: options.personalAgent.observeInvoiceForm } } : {}),
       ...(options.cloudAuthority ? { cloud: { workspaceId: options.cloudAuthority.workspaceId,
         runtime: cloudRuntime! } } : {}),
       now, runtimeDefaults: options.runtimeDefaults, resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)),
@@ -487,7 +516,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     try {
       if (!existsSync(join(options.paths.root, 'data/settings.json'))) write('settings.json', installedSettings.data);
       write('installed-release.json', { version: 1, releaseId: options.installedRelease.releaseId,
-        productVersion: options.installedRelease.productVersion, schemaVersion: 23, settingsVersion: 7 });
+        productVersion: options.installedRelease.productVersion, schemaVersion: 24, settingsVersion: 7 });
     } catch {
       await application.close();
       return fail(appError('maintenance_release_record_failed', 'storage', 'The installed release could not be recorded; original data and backups were retained.', true));
@@ -496,6 +525,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   if (options.cloudAuthority && personalRuntime) {
     const cloud = options.cloudAuthority;
     const endpoints = await startCloudAuthorityEndpoints({ workspaceId: cloud.workspaceId, database: database.data, personal: personalRuntime,
+      desktopRelay: cloudDesktopRelay,
       runtime: cloudRuntime!,
       files, now, readApiKey: cloud.readApiKey, fetch: cloud.fetch, desktopSocket: cloud.desktopSocket,
       readOriginal: (documentId, page) => application.readDocumentOriginal(documentId, page),

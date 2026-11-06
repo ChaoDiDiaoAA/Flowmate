@@ -1,10 +1,11 @@
-import { appError, CloudWorkspaceIdSchema, fail, ok, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, DelegateArgsSchema, PersonalAgentConfigurationSchema, resourceRefKey,
+import { appError, CloudWorkspaceIdSchema, fail, ok, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, DelegateArgsSchema, PersonalAgentConfigurationSchema, resourceRefKey,
   type AppError, type DurableAttemptIdentity, type DurableProductToolCall, type DurableRuntimePort, type FrozenResources, type ManagedFileContents,
   type PersonalAgentConfiguration, type ProviderConfig, type RuntimeRequestOverrides, type Result } from '@flowmate/contracts';
 import { createResourceService, createToolExecutor, createInvoiceWorkToolBridge, DurableInvoiceGovernor,
   InvoiceWorkModelService, InvoiceWorkPhaseContextService, InvoiceWorkPhaseObserver, PersonalAgentService,
   InvoiceWorkService, PersonalTasksService, InvoiceWorkCoordinator, prepareInvoiceWorkInstructions, createDurableInvoiceSubagentService,
-  createPersonalHistoryService, createInvoiceWorkCompactionCallbacks } from '@flowmate/core';
+  createPersonalHistoryService, createInvoiceWorkCompactionCallbacks, createDesktopProposalTool, createDesktopExecutionTool, createDesktopReadTools,
+  createPersonalInvoiceFormTool, createPersonalInvoiceFormObserveTool, type InvoiceFormService } from '@flowmate/core';
 import type { DbHandle } from '../packages/core/src/storage/database.ts';
 import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage, prepareDurableModelBinding, DURABLE_SDK_VERSIONS,
   type DurableRuntimeOptions } from '@flowmate/runtime-durable';
@@ -27,6 +28,8 @@ export type PersonalAgentRuntimeOptions = {
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
   cloud?: { workspaceId: string; runtime: DurableRuntimePort };
   onError?: (error: AppError) => void;
+  desktop?: Pick<Parameters<typeof createDesktopExecutionTool>[0], 'resolveTarget' | 'dispatch'> & Parameters<typeof createDesktopReadTools>[0];
+  form?: { service: InvoiceFormService; observe: Parameters<typeof createPersonalInvoiceFormObserveTool>[0]['observe'] };
 };
 type OriginalFile = { owner_kind: string; owner_id: string; relative_path: string; content: Uint8Array };
 const resourceKey = (configuration: PersonalAgentConfiguration, revision: number) => JSON.stringify([
@@ -43,8 +46,12 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
   const subagents = createDurableInvoiceSubagentService({ database, now, governor,
     observeSubagent: identity => nativeRuntime?.observeSubagent(identity)
       ?? Promise.resolve(fail(appError('personal_agent_unavailable', 'runtime', 'The native child observer is not ready.'))) });
+  const desktop = options.desktop ? [...createDesktopReadTools(options.desktop), createDesktopProposalTool({ database, now, ...options.desktop }),
+    createDesktopExecutionTool({ database, now, ...options.desktop })] : [];
+  const form = options.form && !options.cloud ? [createPersonalInvoiceFormObserveTool({ database, observe: options.form.observe }),
+    createPersonalInvoiceFormTool(options.form.service)] : [];
   const definitions = options.definitions.filter(tool => (INVOICE_REVIEW_TOOL_NAMES as readonly string[]).includes(tool.name)
-    || (SKILL_RESOURCE_TOOL_NAMES as readonly string[]).includes(tool.name)).concat(subagents.tool);
+    || (SKILL_RESOURCE_TOOL_NAMES as readonly string[]).includes(tool.name)).concat(subagents.tool, ...desktop, ...form);
   const preparedResources = new Map<string, FrozenResources | null>();
   const report = (error: AppError) => { try { options.onError?.(error); } catch { /* Diagnostics do not replace committed facts. */ } };
   const prepareResources = async (configuration: PersonalAgentConfiguration, revision: number): Promise<Result<void>> => {
@@ -190,6 +197,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
   } });
   const works = new InvoiceWorkService({ database, now, runtimeDefaults: options.runtimeDefaults, cloudWorkspaceId: options.cloud?.workspaceId,
     onChanged: () => { if (activated) coordinator?.wake(); },
+    onDesktopChanged: () => { if (activated) coordinator?.wake(); },
     captureModel: async configuration => {
       if (configuration.modelId === null) return ok(null);
       const config = await options.resolveConfiguration(configuration.modelId); return config.ok ? prepareDurableModelBinding(config.data) : config;
@@ -207,7 +215,8 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       return assessment;
     } });
   const initialized = await agent.initialize(options.defaultConfiguration ?? PersonalAgentConfigurationSchema.parse({ modelId: null,
-    thinkingLevel: 'off', tools: definitions.map(tool => tool.name), resources: { prompt: null, enabledSkills: [] },
+    thinkingLevel: 'off', tools: definitions.filter(tool => !([...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_INVOICE_FORM_TOOL_NAMES] as readonly string[]).includes(tool.name)).map(tool => tool.name),
+    resources: { prompt: null, enabledSkills: [] },
     extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' }));
   if (!initialized.ok) { await runtime.close(); return initialized; }
   const callbacks: CloudAuthorityCallbacks = {

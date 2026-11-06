@@ -285,6 +285,10 @@ export interface InvoiceWorksApi extends InvoiceWorkTimelineApi {
   continueWork(input: InvoiceWorkContinueRequest): Promise<Result<InvoiceWorkContinueReceipt>>;
   cancelWork(input: InvoiceWorkCancelRequest): Promise<Result<InvoiceWorkCancelReceipt>>;
   queryOperation(input: InvoiceWorkQueryOperationRequest): Promise<Result<InvoiceWorkOperationReceipt | null>>;
+  listDesktopActions(input: import('./desktop-actions.ts').DesktopActionListRequest): Promise<Result<import('./desktop-actions.ts').DesktopActionListResult>>;
+  decideDesktopAction(input: import('./desktop-actions.ts').DesktopActionDecisionRequest): Promise<Result<import('./desktop-actions.ts').DesktopActionDecisionReceipt>>;
+  discardDesktopAction(input: import('./desktop-actions.ts').DesktopActionDiscard): Promise<Result<import('./desktop-actions.ts').DesktopActionView>>;
+  queryDesktopDecision(input: import('./desktop-actions.ts').DesktopActionDecisionQuery): Promise<Result<import('./desktop-actions.ts').DesktopActionDecisionReceipt | null>>;
 }
 export interface PersonalTasksApi extends PersonalHistoryApi {
   list(input: PersonalTaskListRequest): Promise<Result<PersonalTaskListResult>>;

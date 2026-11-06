@@ -11,7 +11,8 @@ import { CloudRuntimeRetryReceiptSchema, CloudRuntimeRetryRequestSchema, CloudRu
 import { DurableSubagentRunOutputSchema } from './durable-run.ts';
 import { CloudQueueControlQuerySchema, CloudQueueControlSchema, CloudQueueOwnerSchema, CloudQueueReceiptSchema, CloudQueueViewSchema, matchesCloudQueueReceipt } from './cloud-queue.ts';
 import { AppErrorSchema, type Result } from './runtime.ts';
-import { appError, fail } from './errors.ts';
+import { appError, fail, ok } from './errors.ts';
+import { DesktopBridgeRequestSchema, DesktopBridgeResultSchema } from './desktop-actions.ts';
 import { PersonalAgentCommandSchema, matchesPersonalAgentResponse, parsePersonalAgentHostResult,
   personalAgentHostFailure } from './personal-agent-commands.ts';
 
@@ -114,7 +115,19 @@ export const CloudDesktopTargetSchema = z.object({ host: z.string().min(1).max(2
   privateKeyPath: z.string().min(1).max(4096), knownHostsPath: z.string().min(1).max(4096) }).strict();
 export const CloudDesktopConnectionSchema = z.object({ workspaceId: CloudWorkspaceIdSchema, target: CloudDesktopTargetSchema }).strict();
 export const CloudDesktopWorkspaceSchema = z.object({ workspaceId: CloudWorkspaceIdSchema }).strict();
-export const CloudDesktopStateSchema = z.object({ workspaceId: CloudWorkspaceIdSchema.nullable() }).strict();
+export const CloudDesktopStateSchema = z.object({ workspaceId: CloudWorkspaceIdSchema.nullable(), desktopReady: z.boolean().optional() }).strict();
+const cloudDesktopConnection = z.object({ connectionId: z.string().uuid() }).strict();
+export const CloudDesktopRelayCommandSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('cloud_desktop_attach'), input: cloudDesktopConnection }).strict(),
+  z.object({ type: z.literal('cloud_desktop_next'), input: cloudDesktopConnection }).strict(),
+  z.object({ type: z.literal('cloud_desktop_detach'), input: cloudDesktopConnection }).strict(),
+  z.object({ type: z.literal('cloud_desktop_reply'), input: cloudDesktopConnection.extend({ id: z.string().uuid(), result: DesktopBridgeResultSchema }).strict() }).strict(),
+]);
+export type CloudDesktopRelayCommand = z.infer<typeof CloudDesktopRelayCommandSchema>;
+export const CloudDesktopRelayEventSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('request'), id: z.string().uuid(), request: DesktopBridgeRequestSchema }).strict(),
+  z.object({ kind: z.literal('cancel'), id: z.string().uuid() }).strict(),
+]);
 export const CloudDesktopUserCommandSchema = z.union([PersonalAgentCommandSchema, CloudQueueDesktopCommandSchema, CloudDeliveryDesktopCommandSchema, CloudChildReportCommandSchema, CloudProgressCommandSchema, CloudReviewCommandSchema]);
 export const CloudDesktopRequestSchema = CloudDesktopWorkspaceSchema.extend({ command: CloudDesktopUserCommandSchema }).strict();
 export const CloudDesktopUploadSchema = CloudDesktopWorkspaceSchema.extend({ documentRef: DocumentRefSchema }).strict();
@@ -130,8 +143,11 @@ export type CloudDesktopApi = {
   upload(input: z.infer<typeof CloudDesktopUploadSchema>): Promise<Result<z.infer<typeof CloudMaterialReceiptSchema>>>;
   uploadResource(input: z.infer<typeof CloudDesktopUploadResourceSchema>): Promise<Result<z.infer<typeof CloudResourceReceiptSchema>>>;
 };
-export const CloudDesktopCommandSchema = z.union([PersonalAgentCommandSchema, CloudMaterialCommandSchema, CloudResourceCommandSchema, CloudQueueDesktopCommandSchema, CloudDeliveryDesktopCommandSchema, CloudChildReportCommandSchema, CloudProgressCommandSchema, CloudReviewCommandSchema]);
+export const CloudDesktopCommandSchema = z.union([PersonalAgentCommandSchema, CloudMaterialCommandSchema, CloudResourceCommandSchema, CloudQueueDesktopCommandSchema, CloudDeliveryDesktopCommandSchema, CloudChildReportCommandSchema, CloudProgressCommandSchema, CloudReviewCommandSchema, CloudDesktopRelayCommandSchema]);
 export type CloudDesktopCommand = z.infer<typeof CloudDesktopCommandSchema>;
+export function isCloudDesktopRelayCommand(command: CloudDesktopCommand): command is CloudDesktopRelayCommand {
+  return command.type.startsWith('cloud_desktop_');
+}
 export function isCloudMaterialCommand(command: CloudDesktopCommand): command is CloudMaterialCommand {
   return command.type.startsWith('cloud_material_');
 }
@@ -157,6 +173,7 @@ export const CloudDesktopEnvelopeSchema = z.object({ version: z.literal(1), work
 export type CloudDesktopEnvelope = z.infer<typeof CloudDesktopEnvelopeSchema>;
 
 export function cloudDesktopFailure(command: CloudDesktopCommand): Extract<Result<never>, { ok: false }> {
+  if (isCloudDesktopRelayCommand(command)) return { ok: false, error: appError('desktop_unavailable', 'runtime', 'The original interactive desktop is unavailable.', true) };
   if (isCloudProgressCommand(command)) return { ok: false, error: appError('cloud_progress_unavailable', 'runtime', 'Cloud progress is unavailable.', true) };
   if (isCloudChildReportCommand(command)) return { ok: false, error: appError('storage_read_failed', 'storage', 'The original child report could not be read.', true) };
   if (isCloudDeliveryCommand(command)) {
@@ -188,6 +205,14 @@ export function cloudDesktopFailure(command: CloudDesktopCommand): Extract<Resul
 
 /** Validate every returned identity against the command before it crosses either transport boundary. */
 export function parseCloudDesktopResult(command: CloudDesktopCommand, value: unknown): Result<unknown> | null {
+  if (isCloudDesktopRelayCommand(command)) {
+    const schema = command.type === 'cloud_desktop_next' ? cloudDesktopConnection.extend({ event: CloudDesktopRelayEventSchema.nullable() }).strict() : cloudDesktopConnection;
+    const parsed = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: schema }).strict(),
+      z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(value);
+    if (!parsed.success) return null;
+    if (!parsed.data.ok) return cloudDesktopFailure(command);
+    return parsed.data.data.connectionId === command.input.connectionId ? ok(parsed.data.data) : null;
+  }
   if (isCloudProgressCommand(command)) {
     const parsed = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: CloudProgressEventSchema }).strict(),
       z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(value);

@@ -162,10 +162,14 @@ export async function installReadGate(app: ElectronApplication, userData: string
           if (closeGate && packet.type === 'response' && kinds.get(packet.requestId) === 'close') { closeReplies.push(Buffer.from(line)); continue; }
           if (packet.type === 'response') {
             const kind = kinds.get(packet.requestId)!;
-            if ((faults.get(kind) ?? 0) > 0) { packet.value = ['update_resource_selection', 'update_extension_selection', 'save_subagent_definition'].includes(kind)
-              ? { ok: false, error: { code: 'operation_result_unknown', category: 'runtime', retryable: true, message: 'Synthetic lost receipt after actual save.' } }
-              : kind === 'list_extensions' ? { ok: false, error: { code: 'extension_config_invalid', category: 'input', retryable: false, message: 'The trusted extension manifest is unavailable.' } }
-              : { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'PRIVATE-CONTEXT sdk credential token', sessionId: packet.value.data?.snapshot?.sessionId, runId: packet.value.data?.snapshot?.runId } };
+            if ((faults.get(kind) ?? 0) > 0) {
+              if (['update_resource_selection', 'update_extension_selection', 'save_subagent_definition'].includes(kind))
+                packet.value = { ok: false, error: { code: 'operation_result_unknown', category: 'runtime', retryable: true, message: 'Synthetic lost receipt after actual save.' } };
+              else if (kind === 'list_extensions')
+                packet.value = { ok: false, error: { code: 'extension_config_invalid', category: 'input', retryable: false, message: 'The trusted extension manifest is unavailable.' } };
+              else if (kind === 'invoice_work_desktop_list')
+                packet.value = { ok: false, error: { code: 'invoice_work_item_not_found', category: 'input', retryable: false, message: 'Not a local desktop item.' } };
+              else packet.value = { ok: false, error: { code: 'internal_error', category: 'internal', retryable: false, message: 'PRIVATE-CONTEXT sdk credential token', sessionId: packet.value.data?.snapshot?.sessionId, runId: packet.value.data?.snapshot?.runId } };
               line = Buffer.from(JSON.stringify(packet) + '\n'); faults.set(kind, faults.get(kind)! - 1); }
             if (kind === heldType && remaining > 0) { held.push(Buffer.from(line)); remaining--; continue; }
           }
@@ -177,6 +181,7 @@ export async function installReadGate(app: ElectronApplication, userData: string
     function finishClose() { closeGate = false; for (const line of closeReplies.splice(0)) Reflect.apply(emit, output, ['data', line]);
       if (heldEnd) { Reflect.apply(emit, output, ['end', ...heldEnd]); heldEnd = null; } }
     Reflect.set(globalThis, 'contextReadGate', { commands, held, closeReplies,
+      faultCount(type: string) { return faults.get(type) ?? 0; },
       hold(count: number, type = 'query_context_snapshot') { remaining = count; heldType = type; }, fail(count = 1, type = heldType) { faults.set(type, count); },
       holdHostClose() { closeGate = true; }, finishClose,
       release(index: number) { const line = held[index]; if (line) { Reflect.apply(emit, child.stdout, ['data', line]); held[index] = Buffer.alloc(0); } },

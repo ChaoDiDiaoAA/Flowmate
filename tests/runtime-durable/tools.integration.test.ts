@@ -40,6 +40,63 @@ function response(tool: boolean, calls = 1): Response {
   return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
 }
 
+test('a saved desktop proposal ends its Durable phase before another model request', async () => {
+  let requests = 0, executions = 0;
+  const server = Bun.serve({ port: 0, fetch: () => {
+    requests++;
+    const delta = requests === 1 ? { role: 'assistant', tool_calls: [{ index: 0, id: 'proposal-call', type: 'function',
+      function: { name: 'desktop_propose_action', arguments: JSON.stringify({ kind: 'click', observationId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba', elementIndex: 3 }) } }] }
+      : { role: 'assistant', content: 'The model continued without the user.' };
+    const chunk = { id: 'desktop-proposal', object: 'chat.completion.chunk', created: 1, model: 'tool-model',
+      choices: [{ index: 0, delta, finish_reason: requests === 1 ? 'tool_calls' : 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const tool = { name: 'desktop_propose_action', description: 'Request user confirmation.', executionMode: 'sequential' as const,
+    effect: 'LOCAL_WRITE' as const, inputSchema: { type: 'object', properties: { kind: { type: 'string' },
+      observationId: { type: 'string' }, elementIndex: { type: 'integer' } }, required: ['kind', 'observationId', 'elementIndex'] } };
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined), readWorkingContext: query => ok(working(query, [tool.name])),
+    verifyWorkingContext: () => ok(undefined), tools: [tool], executeTool: () => { executions++; return ok({ status: 'succeeded', data: { proposalId: 9 } }); },
+    readToolResult: () => ok(null), onToolFeedback: () => ok(undefined) }));
+  const query = { ...owner, requestId: 'desktop-proposal' };
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId }));
+    need(await runtime.submit({ ...query, text: 'Propose the observed action.', config: config(server.port!) }));
+    expect(need(await runtime.waitForSubmission(query)).status).toBe('done');
+    expect(requests).toBe(1); expect(executions).toBe(1);
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 10_000);
+
+test('a desktop proposal mixed with another tool call is not admitted', async () => {
+  const executed: string[] = [];
+  let requests = 0;
+  const server = Bun.serve({ port: 0, fetch: () => {
+    requests++;
+    const chunk = { id: 'mixed-desktop', object: 'chat.completion.chunk', created: 1, model: 'tool-model',
+      choices: [{ index: 0, delta: requests === 1 ? { role: 'assistant', tool_calls: [
+        { index: 0, id: 'proposal-mixed', type: 'function', function: { name: 'desktop_propose_action',
+          arguments: JSON.stringify({ kind: 'click', observationId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba', elementIndex: 3 }) } },
+        { index: 1, id: 'read-mixed', type: 'function', function: { name: definition.name, arguments: JSON.stringify({ documentId: 11 }) } },
+      ] } : { role: 'assistant', content: 'The mixed call was handled.' }, finish_reason: requests === 1 ? 'tool_calls' : 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const tool = { name: 'desktop_propose_action', description: 'Request user confirmation.', executionMode: 'sequential' as const,
+    effect: 'LOCAL_WRITE' as const, inputSchema: { type: 'object', properties: { kind: { type: 'string' },
+      observationId: { type: 'string' }, elementIndex: { type: 'integer' } }, required: ['kind', 'observationId', 'elementIndex'] } };
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined),
+    readWorkingContext: query => ok(working(query, [tool.name, definition.name])), verifyWorkingContext: () => ok(undefined),
+    tools: [tool, definition], executeTool: call => { executed.push(call.name); return ok({ status: 'succeeded', data: { proposalId: 9 } }); },
+    readToolResult: () => ok(null), onToolFeedback: () => ok(undefined) }));
+  const query = { ...owner, requestId: 'desktop-mixed' };
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId }));
+    need(await runtime.submit({ ...query, text: 'Propose the observed action.', config: config(server.port!) }));
+    await runtime.waitForSubmission(query);
+    expect(executed).not.toContain('desktop_propose_action');
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 10_000);
+
 test('native tools consume one product result and exact feedback per original phase despite identical input and provider call IDs', async () => {
   const calls: DurableProductToolCall[] = [], feedback: DurableProductToolFeedback[] = [], seen: string[] = [];
   const checked: string[] = [];

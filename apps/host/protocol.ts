@@ -32,6 +32,7 @@ import { InvoiceFormApplicationReceiptSchema, InvoiceFormTargetSchema, SessionIn
   NativeHistoryPageRequestSchema, SessionHistoryEntryRequestSchema, ForkSessionRequestSchema,
   NativeHistoryPageResultSchema, SessionHistoryEntryResultSchema, ForkSessionResponseSchema, BranchSessionResponseSchema } from '@flowmate/contracts';
 import type { InvoiceFormBridgeRequest } from '@flowmate/contracts';
+import { DesktopOwnerSchema, DesktopBridgeResultSchema } from '@flowmate/contracts';
 import { DesktopSessionCompactionRequestSchema, SessionCompactionQuerySchema, SessionCompactionCancelSchema,
   CompactionAcceptedResultSchema, SessionCompactionSnapshotResultSchema, CompactionCancelAcceptedResultSchema,
   CompactionNotificationSchema } from '@flowmate/contracts';
@@ -111,6 +112,8 @@ const hostCommandSchema = z.discriminatedUnion('type', [
     value: z.object({ ok: z.boolean(), credential: z.unknown().optional() }).strict() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('invoice_form_response'),
     receipt: InvoiceFormApplicationReceiptSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('desktop_bind'), input: DesktopOwnerSchema }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('desktop_response'), value: DesktopBridgeResultSchema }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('submit_invoice_form_input'), input: InvoiceFormRunInputSchema,
     expectedSettingsRevision: dbId, expectedCredentialRef: credentialRef }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_input'), input: SessionInputQuerySchema }).strict(),
@@ -264,7 +267,8 @@ export type HostEvent = {
 };
 
 export type HostEvaluationTraceAvailable = { version: 1; type: 'evaluation_trace_available'; traceId: string; workspaceRoot: string };
-export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest | HostInvoiceFormRequest | HostEvaluationTraceAvailable;
+export type HostOutput = HostReady | HostResponse | HostEvent | HostCredentialRequest | HostInvoiceFormRequest | HostEvaluationTraceAvailable
+  | import('./desktop-bridge.ts').DesktopBridgeOutput;
 
 export function parseHostCommand(value: unknown): HostCommand | null {
   const parsed = hostCommandSchema.safeParse(value);
