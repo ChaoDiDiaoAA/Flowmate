@@ -26,6 +26,20 @@ const continued = { type: 'invoice_work_continue', input: { workId: 7, requestId
 const ok = <T>(data: T) => ({ ok: true as const, data });
 
 describe('P18 command protocol', () => {
+  it('binds browser approval receipts to the displayed target and original Work', () => {
+    const input = { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'confirm-browser', decision: 'approve',
+      confirmedTarget: { connectionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', bindingId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', origin: 'https://example.test' } };
+    const command = { type: 'invoice_work_browser_decide', input }, accepted = { ...input, revision: 4, receivedAt: at };
+    expect(parsePersonalAgentCommand(command)).not.toBeNull();
+    expect(matchesPersonalAgentResponse(command, ok(accepted))).toBe(true);
+    expect(matchesPersonalAgentResponse(command, ok({ ...accepted, confirmedTarget: { ...input.confirmedTarget, origin: 'https://outside.test' } }))).toBe(false);
+    expect(matchesPersonalAgentResponse(command, ok({ ...accepted, workId: 8 }))).toBe(false);
+    const query = { type: 'invoice_work_browser_query_decision', input: { workId: 7, itemId: 71, proposalId: 9, requestId: 'confirm-browser' } };
+    expect(matchesPersonalAgentResponse(query, ok(null))).toBe(true);
+    expect(matchesPersonalAgentResponse(query, ok(accepted))).toBe(true);
+    expect(personalAgentHostFailure(command.type)).toMatchObject({ ok: false, error: { code: 'operation_result_unknown' } });
+  });
+
   it('binds desktop approval receipts to the original work, item, proposal and decision', () => {
     const input = { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'confirm-1', decision: 'approve',
       confirmedAction: { kind: 'click', observationId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', elementIndex: 4 },
@@ -62,6 +76,10 @@ describe('P18 command protocol', () => {
       { type: 'invoice_work_desktop_decide', input: { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'confirm-1', decision: 'approve' } },
       { type: 'invoice_work_desktop_discard', input: { workId: 7, itemId: 71, proposalId: 9 } },
       { type: 'invoice_work_desktop_query_decision', input: { workId: 7, itemId: 71, proposalId: 9, requestId: 'confirm-1' } },
+      { type: 'invoice_work_browser_list', input: { workId: 7, itemId: 71 } },
+      { type: 'invoice_work_browser_decide', input: { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'browser-1', decision: 'reject' } },
+      { type: 'invoice_work_browser_revoke', input: { workId: 7, itemId: 71, proposalId: 9 } },
+      { type: 'invoice_work_browser_query_decision', input: { workId: 7, itemId: 71, proposalId: 9, requestId: 'browser-1' } },
       { type: 'personal_task_list', input: { workId: 7 } },
       { type: 'personal_task_get', input: { workId: 7, attemptId: 21 } },
       { type: 'personal_task_stop', input: { workId: 7, attemptId: 21, requestId: 'stop-1', expectedRevision: 3 } },
@@ -69,7 +87,7 @@ describe('P18 command protocol', () => {
       { type: 'personal_task_history_entry', input: { target: { workId: 7 }, throughEntryId: 9, entryId: 8 } },
       { type: 'invoice_work_timeline', input: { workId: 7 } },
     ];
-    expect(personalAgentHostCommandSchemas({ version: z.literal(1), requestId: z.string().min(1) })).toHaveLength(21);
+    expect(personalAgentHostCommandSchemas({ version: z.literal(1), requestId: z.string().min(1) })).toHaveLength(commands.length);
     for (const command of commands) {
       expect(PersonalAgentCommandSchema.safeParse(command).success).toBe(true);
       expect(parseHostCommand({ version: 1, requestId: 'transport-1', ...command })).not.toBeNull();

@@ -113,6 +113,10 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
       case 'invoice_work_desktop_decide': return works.decideDesktopAction(command.input);
       case 'invoice_work_desktop_discard': return works.discardDesktopAction(command.input);
       case 'invoice_work_desktop_query_decision': return works.queryDesktopDecision(command.input);
+      case 'invoice_work_browser_list': return works.listBrowserReads(command.input);
+      case 'invoice_work_browser_decide': return works.decideBrowserRead(command.input);
+      case 'invoice_work_browser_revoke': return works.revokeBrowserRead(command.input);
+      case 'invoice_work_browser_query_decision': return works.queryBrowserDecision(command.input);
       case 'personal_task_list': return tasks.list(command.input);
       case 'personal_task_get': return tasks.get(command.input);
       case 'personal_task_stop': return tasks.stop(command.input);

@@ -18,7 +18,7 @@ import { BackgroundServiceStateSchema, BackgroundServiceConnectRequestSchema, Ba
   BackgroundServiceActivationQuerySchema, BackgroundServiceActivationViewSchema,
   type BackgroundServiceState } from '../../../packages/contracts/src/background-service.ts';
 import { AppErrorSchema } from '../../../packages/contracts/src/runtime.ts';
-import { DesktopOwnerSchema, DesktopWindowSchema, DesktopWindowSelectionSchema } from '@flowmate/contracts';
+import { BrowserOwnerSchema, BrowserSelectionSchema, BrowserTargetSchema, DesktopOwnerSchema, DesktopWindowSchema, DesktopWindowSelectionSchema } from '@flowmate/contracts';
 import { CloudDesktopConnectionSchema, CloudDesktopRequestSchema, CloudDesktopStateSchema, CloudDesktopUploadResourceSchema, CloudDesktopUploadSchema, CloudDesktopWorkspaceSchema,
   CloudMaterialReceiptSchema, CloudResourceReceiptSchema, cloudDesktopFailure, parseCloudDesktopResult } from '@flowmate/contracts';
 
@@ -119,6 +119,14 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
 }
 
 const bridge: DesktopBridge = {
+  async startBrowserUse() {
+    try {
+      const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.undefined() }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:browser-start'));
+      if (result.success) return result.data.ok ? ok(undefined) : result.data;
+    } catch { /* A lost response does not prove that WebBridge is ready. */ }
+    return fail(appError('browser_unavailable', 'runtime', 'Kimi WebBridge is unavailable on this Windows desktop.', true));
+  },
   async startDesktopUse() {
     try {
       const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.undefined() }).strict(),
@@ -144,6 +152,26 @@ const bridge: DesktopBridge = {
       if (result.success && (!result.data.ok || result.data.data.workId === input.data.workId && result.data.data.itemId === input.data.itemId)) return result.data;
     } catch { /* A lost response cannot authorize a window. */ }
     return fail(appError('desktop_unavailable', 'runtime', 'The desktop window selection is unavailable.', true));
+  },
+  async selectBrowserPage(raw) {
+    const input = BrowserSelectionSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'The browser selection is invalid.'));
+    try {
+      const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: BrowserTargetSchema }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:browser-select', input.data));
+      if (result.success && (!result.data.ok || result.data.data.origin === new URL(input.data.url).origin)) return result.data;
+    } catch { /* A lost response cannot authorize a browser target. */ }
+    return fail(appError('browser_unavailable', 'runtime', 'The browser selection is unavailable.', true));
+  },
+  async revokeBrowserPage(raw) {
+    const input = BrowserOwnerSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'The browser selection is invalid.'));
+    try {
+      const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.undefined() }).strict(),
+        z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:browser-revoke', input.data));
+      if (result.success) return result.data.ok ? ok(undefined) : result.data;
+    } catch { /* A lost response cannot confirm revocation. */ }
+    return fail(appError('browser_unavailable', 'runtime', 'The browser selection could not be revoked.', true));
   },
   async runEvaluationWorkflow(input) {
     const request = EvaluationWorkflowRequestSchema.safeParse(input);
@@ -182,6 +210,8 @@ const bridge: DesktopBridge = {
     listDesktopActions: input => invokeAssembly('invoice_work_desktop_list', input), decideDesktopAction: input => invokeAssembly('invoice_work_desktop_decide', input),
     discardDesktopAction: input => invokeAssembly('invoice_work_desktop_discard', input),
     queryDesktopDecision: input => invokeAssembly('invoice_work_desktop_query_decision', input),
+    listBrowserReads: input => invokeAssembly('invoice_work_browser_list', input), decideBrowserRead: input => invokeAssembly('invoice_work_browser_decide', input),
+    revokeBrowserRead: input => invokeAssembly('invoice_work_browser_revoke', input), queryBrowserDecision: input => invokeAssembly('invoice_work_browser_query_decision', input),
     timeline: input => invokeAssembly('invoice_work_timeline', input) },
   personalTasks: { list: input => invokeAssembly('personal_task_list', input), get: input => invokeAssembly('personal_task_get', input),
     stop: input => invokeAssembly('personal_task_stop', input), history: input => invokeAssembly('personal_task_history', input),

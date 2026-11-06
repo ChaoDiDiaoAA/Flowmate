@@ -164,10 +164,13 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
   runEvaluationWorkflow(input: import('./evaluation-workflow.ts').EvaluationWorkflowRequest): Promise<import('./runtime.ts').Result<import('./evaluation-workflow.ts').EvaluationWorkflowResult>>;
   personalAgent: import('./personal-agent.ts').PersonalAgentApi;
+  startBrowserUse(): Promise<import('./runtime.ts').Result<void>>;
   startDesktopUse(): Promise<import('./runtime.ts').Result<void>>;
   desktopWindows(): Promise<import('./runtime.ts').Result<import('./desktop-actions.ts').DesktopActionTarget['window'][]>>;
   selectDesktopWindow(input: import('zod').z.infer<typeof import('./desktop-actions.ts').DesktopWindowSelectionSchema>):
     Promise<import('./runtime.ts').Result<import('zod').z.infer<typeof import('./desktop-actions.ts').DesktopOwnerSchema>>>;
+  selectBrowserPage(input: import('./browser-actions.ts').BrowserSelection): Promise<import('./runtime.ts').Result<import('./browser-actions.ts').BrowserTarget>>;
+  revokeBrowserPage(input: import('zod').z.infer<typeof import('./browser-actions.ts').BrowserOwnerSchema>): Promise<import('./runtime.ts').Result<void>>;
   cloudDesktop: import('./cloud-desktop.ts').CloudDesktopApi;
   backgroundService: import('./background-service.ts').BackgroundServiceApi;
   invoiceWorks: import('./personal-agent.ts').InvoiceWorksApi;

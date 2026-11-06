@@ -1,11 +1,12 @@
-import { appError, CloudWorkspaceIdSchema, fail, ok, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, DelegateArgsSchema, PersonalAgentConfigurationSchema, resourceRefKey,
+import { isDeepStrictEqual } from 'node:util';
+import { appError, BrowserTargetSchema, CloudWorkspaceIdSchema, fail, ok, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_BROWSER_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, DelegateArgsSchema, PersonalAgentConfigurationSchema, resourceRefKey,
   type AppError, type DurableAttemptIdentity, type DurableProductToolCall, type DurableRuntimePort, type FrozenResources, type ManagedFileContents,
   type PersonalAgentConfiguration, type ProviderConfig, type RuntimeRequestOverrides, type Result } from '@flowmate/contracts';
 import { createResourceService, createToolExecutor, createInvoiceWorkToolBridge, DurableInvoiceGovernor,
   InvoiceWorkModelService, InvoiceWorkPhaseContextService, InvoiceWorkPhaseObserver, PersonalAgentService,
   InvoiceWorkService, PersonalTasksService, InvoiceWorkCoordinator, prepareInvoiceWorkInstructions, createDurableInvoiceSubagentService,
   createPersonalHistoryService, createInvoiceWorkCompactionCallbacks, createDesktopProposalTool, createDesktopExecutionTool, createDesktopReadTools,
-  createPersonalInvoiceFormTool, createPersonalInvoiceFormObserveTool, type InvoiceFormService } from '@flowmate/core';
+  createPersonalInvoiceFormTool, createPersonalInvoiceFormObserveTool, createBrowserRequestTool, createBrowserExecutionTool, resolveInvoiceWorkToolScope, type InvoiceFormService } from '@flowmate/core';
 import type { DbHandle } from '../packages/core/src/storage/database.ts';
 import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage, prepareDurableModelBinding, DURABLE_SDK_VERSIONS,
   type DurableRuntimeOptions } from '@flowmate/runtime-durable';
@@ -29,6 +30,7 @@ export type PersonalAgentRuntimeOptions = {
   cloud?: { workspaceId: string; runtime: DurableRuntimePort };
   onError?: (error: AppError) => void;
   desktop?: Pick<Parameters<typeof createDesktopExecutionTool>[0], 'resolveTarget' | 'dispatch'> & Parameters<typeof createDesktopReadTools>[0];
+  browser?: Pick<Parameters<typeof createBrowserExecutionTool>[0], 'resolveTarget' | 'read'>;
   form?: { service: InvoiceFormService; observe: Parameters<typeof createPersonalInvoiceFormObserveTool>[0]['observe'] };
 };
 type OriginalFile = { owner_kind: string; owner_id: string; relative_path: string; content: Uint8Array };
@@ -48,10 +50,12 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       ?? Promise.resolve(fail(appError('personal_agent_unavailable', 'runtime', 'The native child observer is not ready.'))) });
   const desktop = options.desktop ? [...createDesktopReadTools(options.desktop), createDesktopProposalTool({ database, now, ...options.desktop }),
     createDesktopExecutionTool({ database, now, ...options.desktop })] : [];
+  const browser = options.browser ? [createBrowserRequestTool({ database, now, ...options.browser }),
+    createBrowserExecutionTool({ database, now, ...options.browser })] : [];
   const form = options.form && !options.cloud ? [createPersonalInvoiceFormObserveTool({ database, observe: options.form.observe }),
     createPersonalInvoiceFormTool(options.form.service)] : [];
   const definitions = options.definitions.filter(tool => (INVOICE_REVIEW_TOOL_NAMES as readonly string[]).includes(tool.name)
-    || (SKILL_RESOURCE_TOOL_NAMES as readonly string[]).includes(tool.name)).concat(subagents.tool, ...desktop, ...form);
+    || (SKILL_RESOURCE_TOOL_NAMES as readonly string[]).includes(tool.name)).concat(subagents.tool, ...desktop, ...browser, ...form);
   const preparedResources = new Map<string, FrozenResources | null>();
   const report = (error: AppError) => { try { options.onError?.(error); } catch { /* Diagnostics do not replace committed facts. */ } };
   const prepareResources = async (configuration: PersonalAgentConfiguration, revision: number): Promise<Result<void>> => {
@@ -112,6 +116,36 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
   let cloudQueue: Pick<CloudQueueAuthority, 'currentEdit' | 'wasCancelled' | 'verifyInputs'> | undefined;
   let activated = false;
   const reader = createInvoiceWorkToolBridge({ database, executor: createToolExecutor({ database, definitions, now }) });
+  const authorizedToolResult = async (call: DurableProductToolCall, signal = new AbortController().signal) => {
+    const prior = await reader.readToolResult(call);
+    if (!prior.ok || call.name !== 'browser_read_approved' || prior.data?.status !== 'succeeded') return prior;
+    const denied = () => fail(appError('browser_target_changed', 'runtime', 'The approved browser binding is no longer available.'));
+    if (!options.browser || signal.aborted) return denied();
+    try {
+      const original = await database.read(scope => {
+        const row = scope.db.query<{ id: number; item_id: number; target_json: string; run_id: number }, [number, number, string, number, string]>(
+          `SELECT b.id,b.item_id,b.target_json,a.run_id FROM invoice_work_browser_reads b
+           JOIN tool_calls t ON t.id=b.execution_tool_call_id JOIN invoice_work_tool_calls c ON c.tool_call_id=t.id
+           JOIN invoice_work_phases p ON p.id=c.phase_id JOIN invoice_work_attempts a ON a.id=p.attempt_id
+           WHERE b.work_id=? AND p.attempt_id=? AND p.request_id=? AND t.session_id=? AND t.native_tool_call_id=?`)
+          .get(call.workId, call.attemptId, call.requestId, call.sessionId, `durable-task:${call.nativeTaskId}`);
+        if (!row) return denied();
+        const target = BrowserTargetSchema.safeParse(JSON.parse(row.target_json));
+        const resolved = resolveInvoiceWorkToolScope(scope.db, { runId: row.run_id, sessionId: call.sessionId,
+          workId: call.workId, attemptId: call.attemptId, requestId: call.requestId });
+        if (!target.success || !resolved.ok || resolved.data.scope.invoiceWork?.itemId !== row.item_id) return denied();
+        return ok({ row, target: target.data, context: { runId: row.run_id, sessionId: call.sessionId, scope: resolved.data.scope } });
+      });
+      if (!original.ok) return original;
+      const current = await options.browser.resolveTarget(original.data.context, signal);
+      if (!current.ok || signal.aborted || !isDeepStrictEqual(current.data, original.data.target)) {
+        await database.transaction(scope => scope.invoiceWorkBrowserReads.revoke({ workId: call.workId, itemId: original.data.row.item_id,
+          proposalId: original.data.row.id, at: now() }));
+        return denied();
+      }
+      return reader.readToolResult(call);
+    } catch { return denied(); }
+  };
   const executors = new Map<number, Promise<ReturnType<typeof createInvoiceWorkToolBridge>>>();
   const executionBridge = async (call: DurableProductToolCall) => {
     const task = await database.read(scope => scope.invoiceWorkAttempts.get({ workId: call.workId, attemptId: call.attemptId }));
@@ -158,9 +192,23 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     executeTool: async call => {
       if (!observer) return fail(appError('personal_agent_unavailable', 'runtime', 'The original tool phase is not ready.'));
       const linked = await observer.reconcile(callIdentity(call)); if (!linked.ok) return linked;
-      try { return await (await executionBridge(call)).executeTool(call); }
+      try {
+        const result = await (await executionBridge(call)).executeTool(call);
+        if (call.name !== 'browser_read_approved' || !result.ok || result.data.status !== 'succeeded') return result;
+        const checked = await authorizedToolResult(call, call.signal);
+        if (!checked.ok) return checked;
+        return checked.data ? ok(checked.data) : fail(appError('tool_commit_unconfirmed', 'runtime', 'The browser result is no longer available.'));
+      }
       catch { return fail(appError('tool_execution_failed', 'runtime', 'The original invoice tool execution could not be admitted.', true)); }
-    }, readToolResult: call => reader.readToolResult(call), onToolFeedback: feedback => reader.onToolFeedback(feedback),
+    }, readToolResult: call => authorizedToolResult(call), onToolFeedback: async feedback => {
+      if (feedback.name === 'browser_read_approved') {
+        const { nativeEntryId: _nativeEntryId, feedbackJson: _feedbackJson, ...call } = feedback;
+        const checked = await authorizedToolResult(call);
+        if (!checked.ok) return checked;
+        if (checked.data === null) return fail(appError('tool_commit_unconfirmed', 'runtime', 'The browser result is no longer available.'));
+      }
+      return reader.onToolFeedback(feedback);
+    },
     onChanged: () => { if (activated) coordinator?.wake(); },
   };
   const opened = options.cloud ? ok(options.cloud.runtime)
@@ -215,7 +263,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       return assessment;
     } });
   const initialized = await agent.initialize(options.defaultConfiguration ?? PersonalAgentConfigurationSchema.parse({ modelId: null,
-    thinkingLevel: 'off', tools: definitions.filter(tool => !([...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_INVOICE_FORM_TOOL_NAMES] as readonly string[]).includes(tool.name)).map(tool => tool.name),
+    thinkingLevel: 'off', tools: definitions.filter(tool => !([...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_BROWSER_TOOL_NAMES, ...PERSONAL_INVOICE_FORM_TOOL_NAMES] as readonly string[]).includes(tool.name)).map(tool => tool.name),
     resources: { prompt: null, enabledSkills: [] },
     extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' }));
   if (!initialized.ok) { await runtime.close(); return initialized; }

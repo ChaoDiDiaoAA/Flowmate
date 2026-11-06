@@ -15,6 +15,28 @@ import type { DurableRuntimePort } from '@flowmate/contracts';
 
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
 
+test('browser tools are available to the cloud authority but remain disabled by default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-browser-default-'));
+  const paths: ProductPaths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
+    runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') };
+  const database = need(openTestDatabase(paths));
+  const target = { connectionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', bindingId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', origin: 'https://example.test' };
+  const browser = { resolveTarget: async () => ok(target), read: async () => ok({ url: 'https://example.test/page', title: 'Example', text: 'page', truncated: false }) };
+  const native = { close: async () => ok(undefined) } as unknown as DurableRuntimePort;
+  const options = { database, definitions: [], resourceRoot: root, bundleRoot: root, browser,
+    resolveConfiguration: () => fail(appError('unavailable', 'input', 'No model.')), readApiKey: () => undefined,
+    foregroundBusy: () => false, now: () => '2026-11-06T00:00:00.000Z', cloud: { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', runtime: native } };
+  const runtime = need(await createPersonalAgentRuntime(options));
+  try {
+    expect(runtime.cloudAuthority?.tools.map(tool => tool.name)).toEqual(expect.arrayContaining(['browser_request_read', 'browser_read_approved']));
+    const current = need(await runtime.personal.agent.get());
+    expect(current.configuration.tools).not.toContain('browser_request_read');
+    expect(current.configuration.tools).not.toContain('browser_read_approved');
+    expect(await runtime.personal.agent.update({ personalAgentId: current.personalAgentId, expectedRevision: current.revision,
+      configuration: { ...current.configuration, tools: [...current.configuration.tools, 'browser_request_read', 'browser_read_approved'] } })).toMatchObject({ ok: true });
+  } finally { need(await runtime.close()); await database.close(); }
+});
+
 test('a cloud Durable runtime exposes the provided desktop adapter without enabling it in saved defaults', async () => {
   const f = await invoiceWorkToolsFixture();
   const desktop = { listWindows: async () => ok([]), observe: async () => ok({ observationId: '84c2bb96-6c56-48e0-aab0-f49f059cb1ba',

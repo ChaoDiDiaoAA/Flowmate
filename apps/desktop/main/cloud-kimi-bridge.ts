@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { appError, CloudDesktopRelayEventSchema, DesktopActionViewSchema, fail, ok, parseCloudDesktopResult, parseDesktopBridgeResult,
-  type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult, type Result } from '@flowmate/contracts';
+import { appError, BrowserReadViewSchema, CloudDesktopRelayEventSchema, DesktopActionViewSchema, fail, ok, parseCloudDesktopResult, parseDesktopBridgeResult,
+  type BrowserReadView, type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult, type Result } from '@flowmate/contracts';
 
 type Session = { request(command: unknown, timeoutMs?: number): Promise<Result<unknown>> };
 type Options = { execute(request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult>;
-  verify(action: DesktopActionView, signal: AbortSignal): Promise<Result<void>> };
+  verify(action: DesktopActionView, signal: AbortSignal): Promise<Result<void>>;
+  verifyBrowser?(read: BrowserReadView, signal: AbortSignal): Promise<Result<void>>;
+  onClosed?(): void };
 const unavailable = () => fail(appError('desktop_unavailable', 'runtime', 'The original interactive desktop is unavailable.', true));
 const key = (workId: number, itemId: number, proposalId: number) => `${workId}:${itemId}:${proposalId}`;
 
@@ -14,6 +16,9 @@ const key = (workId: number, itemId: number, proposalId: number) => `${workId}:$
 export class CloudKimiBridge {
   private readonly connectionId = randomUUID();
   private readonly approvals = new Map<string, DesktopActionView>();
+  private readonly browserApprovals = new Map<string, BrowserReadView>();
+  private readonly browserPending = new Map<string, AbortController>();
+  private readonly browserChecks = new Map<string, AbortController>();
   private readonly pending = new Map<string, AbortController>();
   private readonly tasks = new Set<Promise<void>>();
   private running = false;
@@ -40,6 +45,32 @@ export class CloudKimiBridge {
 
   revoke(workId: number, itemId: number, proposalId: number): void { this.approvals.delete(key(workId, itemId, proposalId)); }
 
+  async approveBrowser(raw: BrowserReadView): Promise<Result<void>> {
+    const parsed = BrowserReadViewSchema.safeParse(raw);
+    if (!this.running || !this.options.verifyBrowser || !parsed.success || !parsed.data.canDecide || parsed.data.status !== 'waiting') return unavailable();
+    const read = parsed.data, id = key(read.workId, read.itemId, read.proposalId);
+    if (this.browserPending.has(id) || this.browserChecks.has(id)) return unavailable();
+    const controller = new AbortController(); this.browserChecks.set(id, controller);
+    try {
+      const checked = await this.options.verifyBrowser(read, controller.signal);
+      if (!checked.ok || !this.running || controller.signal.aborted) return checked.ok ? unavailable() : checked;
+      this.browserApprovals.set(id, structuredClone(read)); return ok(undefined);
+    } catch { return unavailable(); }
+    finally { if (this.browserChecks.get(id) === controller) this.browserChecks.delete(id); }
+  }
+
+  revokeBrowser(workId: number, itemId: number, proposalId: number): void {
+    const id = key(workId, itemId, proposalId); this.browserApprovals.delete(id);
+    this.browserChecks.get(id)?.abort(); this.browserPending.get(id)?.abort();
+  }
+
+  revokeBrowserWork(workId: number, itemId?: number): void {
+    const prefix = itemId === undefined ? `${workId}:` : `${workId}:${itemId}:`;
+    for (const id of this.browserApprovals.keys()) if (id.startsWith(prefix)) this.browserApprovals.delete(id);
+    for (const [id, check] of this.browserChecks) if (id.startsWith(prefix)) check.abort();
+    for (const [id, pending] of this.browserPending) if (id.startsWith(prefix)) pending.abort();
+  }
+
   private async pump(): Promise<void> {
     try {
       while (this.running) {
@@ -61,7 +92,11 @@ export class CloudKimiBridge {
         this.tasks.add(task);
       }
     } catch { /* The original cloud connection is unavailable. */ }
-    this.running = false; this.approvals.clear(); for (const pending of this.pending.values()) pending.abort();
+    this.running = false; this.approvals.clear(); this.browserApprovals.clear();
+    for (const check of this.browserChecks.values()) check.abort();
+    for (const pending of this.browserPending.values()) pending.abort();
+    for (const pending of this.pending.values()) pending.abort();
+    try { this.options.onClosed?.(); } catch { /* Disconnection has already revoked the bridge. */ }
   }
 
   private async execute(request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult> {
@@ -72,12 +107,26 @@ export class CloudKimiBridge {
       if (!approval || !isDeepStrictEqual(approval.action, request.action) || !isDeepStrictEqual(approval.target, request.target)) return unavailable();
       this.approvals.delete(id);
     }
+    if (request.kind === 'browser_read') {
+      const id = key(request.workId, request.itemId, request.proposalId), approval = this.browserApprovals.get(id);
+      if (!approval || !isDeepStrictEqual(approval.target, request.target) || this.browserPending.has(id)) return unavailable();
+      this.browserApprovals.delete(id);
+      const controller = new AbortController(); this.browserPending.set(id, controller);
+      try {
+        const result = await this.options.execute(request, AbortSignal.any([signal, controller.signal]));
+        return !this.running || signal.aborted || controller.signal.aborted ? unavailable() : parseDesktopBridgeResult(request, result) ?? unavailable();
+      } catch { return unavailable(); }
+      finally { this.browserPending.delete(id); }
+    }
     try { return parseDesktopBridgeResult(request, await this.options.execute(request, signal)) ?? unavailable(); }
     catch { return unavailable(); }
   }
 
   async close(): Promise<void> {
-    this.running = false; this.approvals.clear(); for (const pending of this.pending.values()) pending.abort();
+    this.running = false; this.approvals.clear(); this.browserApprovals.clear();
+    for (const check of this.browserChecks.values()) check.abort();
+    for (const pending of this.browserPending.values()) pending.abort();
+    for (const pending of this.pending.values()) pending.abort();
     try { await this.session.request({ type: 'cloud_desktop_detach', input: { connectionId: this.connectionId } }, 2000); } catch { /* The cloud connection may already be gone. */ }
     await this.loop; await Promise.allSettled([...this.tasks]);
   }

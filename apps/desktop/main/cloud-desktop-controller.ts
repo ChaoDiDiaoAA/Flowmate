@@ -4,14 +4,16 @@ import { appError, CloudDesktopConnectionSchema, CloudDesktopRequestSchema, Clou
   type CloudMaterialReceipt, type CloudResourceReceipt, type DocumentRef, type ResourceRef, type Result } from '@flowmate/contracts';
 import type { CloudSshSession } from './cloud-ssh-session.ts';
 import { CloudKimiBridge } from './cloud-kimi-bridge.ts';
-import type { DesktopActionView, DesktopBridgeRequest, DesktopBridgeResult } from '@flowmate/contracts';
+import type { BrowserReadView, DesktopActionView, DesktopBridgeRequest, DesktopBridgeResult } from '@flowmate/contracts';
 
 type Session = Pick<CloudSshSession, 'request' | 'close'>;
 type Options = { connect(target: CloudDesktopTarget, workspaceId: string): Promise<Result<Session>>;
+  onDisconnected?(workspaceId: string): void;
   upload(input: { workspaceId: string; documentRef: DocumentRef }, session: Session): Promise<Result<CloudMaterialReceipt>>;
   uploadResource?(input: { workspaceId: string; ref: ResourceRef }, session: Session): Promise<Result<CloudResourceReceipt>>;
   desktop?: { execute(workspaceId: string, request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult>;
-    verify(workspaceId: string, action: DesktopActionView, signal: AbortSignal): Promise<Result<void>> } };
+    verify(workspaceId: string, action: DesktopActionView, signal: AbortSignal): Promise<Result<void>>;
+    verifyBrowser?(workspaceId: string, read: BrowserReadView, signal: AbortSignal): Promise<Result<void>> } };
 const invalid = () => fail(appError('input_invalid', 'input', 'The cloud workspace request is invalid.'));
 const unavailable = () => fail(appError('cloud_workspace_unavailable', 'runtime', 'The selected cloud workspace is not connected.', true));
 const unknownUpload = () => fail(appError('operation_result_unknown', 'runtime', 'The original material upload result is unknown.', true));
@@ -47,6 +49,8 @@ export class CloudDesktopController {
       let desktop = this.options.desktop ? new CloudKimiBridge(result.data, input.workspaceId, {
         execute: (request, signal) => this.options.desktop!.execute(input.workspaceId, request, signal),
         verify: (action, signal) => this.options.desktop!.verify(input.workspaceId, action, signal),
+        ...(this.options.desktop.verifyBrowser ? { verifyBrowser: (read: BrowserReadView, signal: AbortSignal) => this.options.desktop!.verifyBrowser!(input.workspaceId, read, signal) } : {}),
+        onClosed: () => this.options.onDisconnected?.(input.workspaceId),
       }) : undefined;
       if (desktop) {
         const started = await desktop.start().catch(() => unavailable());
@@ -79,6 +83,26 @@ export class CloudDesktopController {
     const input = structuredClone(parsed.data), current = this.current;
     if (!current || current.workspaceId !== input.workspaceId) return unavailable();
     try {
+      if (input.command.type === 'invoice_work_cancel' || input.command.type === 'personal_task_stop')
+        current.desktop?.revokeBrowserWork(input.command.input.workId);
+      if (input.command.type === 'invoice_work_dispose_item')
+        current.desktop?.revokeBrowserWork(input.command.input.workId, input.command.input.itemId);
+      if (input.command.type === 'invoice_work_browser_decide' && input.command.input.decision === 'approve') {
+        if (!current.desktop) return unavailable();
+        const original = input.command.input;
+        const query = { type: 'invoice_work_browser_list' as const, input: { workId: original.workId, itemId: original.itemId,
+          ...(original.proposalId > 1 ? { afterProposalId: original.proposalId - 1 } : {}), limit: 1 } };
+        const listed = parseCloudDesktopResult(query, await current.session.request(query));
+        if (!listed?.ok || this.current !== current || !listed.data || typeof listed.data !== 'object' || !('items' in listed.data)
+          || !Array.isArray(listed.data.items)) return unavailable();
+        const read = listed.data.items[0] as BrowserReadView | undefined;
+        if (!read || read.proposalId !== original.proposalId || read.workId !== original.workId || read.itemId !== original.itemId
+          || !original.confirmedTarget || !isDeepStrictEqual(read.target, original.confirmedTarget)) return unavailable();
+        const approved = await current.desktop.approveBrowser(read); if (!approved.ok || this.current !== current) return approved.ok ? unavailable() : approved;
+      }
+      if (input.command.type === 'invoice_work_browser_decide' && input.command.input.decision === 'reject'
+        || input.command.type === 'invoice_work_browser_revoke')
+        current.desktop?.revokeBrowser(input.command.input.workId, input.command.input.itemId, input.command.input.proposalId);
       if (input.command.type === 'invoice_work_desktop_decide' && input.command.input.decision === 'approve') {
         if (!current.desktop) return unavailable();
         const original = input.command.input;
@@ -102,6 +126,8 @@ export class CloudDesktopController {
         : cloudDesktopFailure(input.command);
       if (!checked.ok && checked.error.code !== 'operation_result_unknown' && input.command.type === 'invoice_work_desktop_decide'
         && input.command.input.decision === 'approve') current.desktop?.revoke(input.command.input.workId, input.command.input.itemId, input.command.input.proposalId);
+      if (!checked.ok && checked.error.code !== 'operation_result_unknown' && input.command.type === 'invoice_work_browser_decide'
+        && input.command.input.decision === 'approve') current.desktop?.revokeBrowser(input.command.input.workId, input.command.input.itemId, input.command.input.proposalId);
       return checked;
     } catch { return cloudDesktopFailure(input.command); }
   }

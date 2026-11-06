@@ -418,6 +418,8 @@ export class InvoiceWorkCoordinator {
       if (found.view !== 'item' || found.item.disposition !== 'unresolved' || found.work.execution.requiresContinue) return;
       if (scope.db.query(`SELECT d.id FROM invoice_work_desktop_actions d JOIN invoice_work_tool_calls t ON t.tool_call_id=d.proposal_tool_call_id
         WHERE d.work_id=? AND d.item_id=? AND d.status='waiting' AND t.phase_id=? LIMIT 1`).get(state.row.id, phase.itemId!, phase.phaseId)) return;
+      if (scope.db.query(`SELECT b.id FROM invoice_work_browser_reads b JOIN invoice_work_tool_calls t ON t.tool_call_id=b.proposal_tool_call_id
+        WHERE b.work_id=? AND b.item_id=? AND b.status='waiting' AND t.phase_id=? LIMIT 1`).get(state.row.id, phase.itemId!, phase.phaseId)) return;
       const input = need(scope.invoiceWorks.selectPhaseInput({ workId: state.row.id, attemptId: state.task.attempt.attemptId, itemId: phase.itemId! }));
       if (input.basis.inputIds.some(inputId => !phase.basis.inputIds.includes(inputId))) return;
       const candidate = found.item.candidateRef;

@@ -5,6 +5,8 @@ import { InvoiceCandidateFieldPathSchema, WorkspaceExpectationSchema } from './w
 import { ResourceSelectionSchema } from './resources.ts';
 import { ExtensionSelectionSchema } from './extensions.ts';
 import { RegisteredToolNameSchema } from './tools.ts';
+import { PERSONAL_DESKTOP_TOOL_NAMES } from './desktop-actions.ts';
+import { PERSONAL_BROWSER_TOOL_NAMES } from './browser-actions.ts';
 import { WorkingDirectorySchema } from './schemas.ts';
 import { SUBAGENT_ROLE } from './subagents.ts';
 import { ToolCallDeliverySchema } from './activity.ts';
@@ -118,7 +120,11 @@ export const PersonalAgentConfigurationSchema = bounded(z.object({
   modelId: z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/).nullable(),
   thinkingLevel: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
   resources: ResourceSelectionSchema, extensions: ExtensionSelectionSchema,
-  tools: z.array(RegisteredToolNameSchema).refine(values => new Set(values).size === values.length, 'Tools must be unique.').readonly(),
+  tools: z.array(RegisteredToolNameSchema).refine(values => new Set(values).size === values.length, 'Tools must be unique.').refine(values => {
+    const browser = PERSONAL_BROWSER_TOOL_NAMES.filter(name => values.includes(name));
+    return browser.length === 0 || browser.length === PERSONAL_BROWSER_TOOL_NAMES.length
+      && !PERSONAL_DESKTOP_TOOL_NAMES.some(name => values.includes(name));
+  }, 'Browser tools must be enabled together and cannot be combined with desktop tools.').readonly(),
   workingDirectory: WorkingDirectorySchema.nullable(), preferences: text,
 }).strict()).readonly();
 export type PersonalAgentConfiguration = z.infer<typeof PersonalAgentConfigurationSchema>;
@@ -289,6 +295,10 @@ export interface InvoiceWorksApi extends InvoiceWorkTimelineApi {
   decideDesktopAction(input: import('./desktop-actions.ts').DesktopActionDecisionRequest): Promise<Result<import('./desktop-actions.ts').DesktopActionDecisionReceipt>>;
   discardDesktopAction(input: import('./desktop-actions.ts').DesktopActionDiscard): Promise<Result<import('./desktop-actions.ts').DesktopActionView>>;
   queryDesktopDecision(input: import('./desktop-actions.ts').DesktopActionDecisionQuery): Promise<Result<import('./desktop-actions.ts').DesktopActionDecisionReceipt | null>>;
+  listBrowserReads(input: import('./browser-actions.ts').BrowserReadListRequest): Promise<Result<import('./browser-actions.ts').BrowserReadListResult>>;
+  decideBrowserRead(input: import('./browser-actions.ts').BrowserReadDecisionRequest): Promise<Result<import('./browser-actions.ts').BrowserReadDecisionReceipt>>;
+  revokeBrowserRead(input: import('./browser-actions.ts').BrowserReadRevoke): Promise<Result<import('./browser-actions.ts').BrowserReadView>>;
+  queryBrowserDecision(input: import('./browser-actions.ts').BrowserReadDecisionQuery): Promise<Result<import('./browser-actions.ts').BrowserReadDecisionReceipt | null>>;
 }
 export interface PersonalTasksApi extends PersonalHistoryApi {
   list(input: PersonalTaskListRequest): Promise<Result<PersonalTaskListResult>>;

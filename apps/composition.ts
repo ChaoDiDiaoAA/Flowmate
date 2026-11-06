@@ -4,6 +4,7 @@ import { CloudMaterialExport } from './cloud-material-export.ts';
 import { CloudResourceExport } from './cloud-resource-export.ts';
 import { startCloudAuthorityEndpoints } from './cloud-authority-service.ts';
 import { CloudDesktopRelay } from './cloud-desktop-relay.ts';
+import { createBrowserBridge } from './browser-bridge.ts';
 import type { InvoiceEditServiceOptions } from '../packages/core/src/invoice-edit/service.ts';
 import { createCloudRuntimeRpcClient } from './cloud-runtime-rpc.ts';
 import { parseFrontmatter, loadPromptTemplates, expandPromptTemplate } from '@flowmate/runtime-pi';
@@ -36,7 +37,7 @@ export type ApplicationOptions = {
   onCloudResourceReady?: (resource: CloudResourceExport) => void;
   cloudAuthority?: { workspaceId: string; runtimeSocket: string; desktopSocket: string; authoritySocket: string; modelSocket: string;
     readApiKey(): string | undefined | Promise<string | undefined>; fetch?: (url: string, init: RequestInit) => Promise<Response> };
-  personalAgent?: Pick<PersonalAgentRuntimeOptions, 'resolveConfiguration' | 'readApiKey' | 'defaultConfiguration' | 'desktop'> & {
+  personalAgent?: Pick<PersonalAgentRuntimeOptions, 'resolveConfiguration' | 'readApiKey' | 'defaultConfiguration' | 'desktop' | 'browser'> & {
     onReady?: (control: Pick<PersonalAgentRuntime, 'start' | 'conditionsChanged'>) => void;
     observeInvoiceForm?: NonNullable<PersonalAgentRuntimeOptions['form']>['observe'];
   };
@@ -247,6 +248,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   if (options.personalAgent) {
     const personal = await createPersonalAgentRuntime({ ...options.personalAgent, database: database.data, definitions,
       ...(cloudDesktop ? { desktop: cloudDesktop } : {}),
+      ...(cloudDesktopRelay ? { browser: createBrowserBridge((request, signal) => cloudDesktopRelay.request(request, signal)) } : {}),
       ...(invoiceForms && options.personalAgent.observeInvoiceForm ? { form: { service: invoiceForms, observe: options.personalAgent.observeInvoiceForm } } : {}),
       ...(options.cloudAuthority ? { cloud: { workspaceId: options.cloudAuthority.workspaceId,
         runtime: cloudRuntime! } } : {}),
@@ -516,7 +518,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     try {
       if (!existsSync(join(options.paths.root, 'data/settings.json'))) write('settings.json', installedSettings.data);
       write('installed-release.json', { version: 1, releaseId: options.installedRelease.releaseId,
-        productVersion: options.installedRelease.productVersion, schemaVersion: 24, settingsVersion: 7 });
+        productVersion: options.installedRelease.productVersion, schemaVersion: 25, settingsVersion: 7 });
     } catch {
       await application.close();
       return fail(appError('maintenance_release_record_failed', 'storage', 'The installed release could not be recorded; original data and backups were retained.', true));

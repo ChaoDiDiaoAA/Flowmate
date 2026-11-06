@@ -78,6 +78,7 @@ export function createCloudDesktopAuthorizer(database: Pick<DbHandle, 'read'>, r
         const command = parsed.data;
         switch (command.type) {
           case 'invoice_work_desktop_list': case 'invoice_work_desktop_decide': case 'invoice_work_desktop_discard': case 'invoice_work_desktop_query_decision':
+          case 'invoice_work_browser_list': case 'invoice_work_browser_decide': case 'invoice_work_browser_revoke': case 'invoice_work_browser_query_decision':
             return work(command.input.workId) ? ok(undefined) : denied();
           case 'personal_agent_get': case 'invoice_work_list': return ok(undefined);
           case 'personal_agent_update': return command.input.configuration.workingDirectory === null && resources(command.input.configuration.resources) ? ok(undefined) : denied();

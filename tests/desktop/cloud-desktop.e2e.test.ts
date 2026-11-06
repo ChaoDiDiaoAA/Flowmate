@@ -24,9 +24,13 @@ test('opening Personal Agent reconnects the previously saved cloud workspace wit
     await page.evaluate(workspaceId => localStorage.setItem('flowmate.personal-agent.cloud-connection.v1', JSON.stringify({ workspaceId,
       target: { host: '127.0.0.1', port: 22, username: 'flowmate', privateKeyPath: 'C:\\test\\key', knownHostsPath: 'C:\\test\\hosts' } })), workspaceId);
     await app.evaluate(({ ipcMain }) => {
-      let connected = false, connects = 0, workWrites = 0;
-      Reflect.set(globalThis, 'cloudReconnectCounts', () => ({ connects, workWrites }));
+      let connected = false, connects = 0, workWrites = 0, browserStarts = 0;
+      Reflect.set(globalThis, 'cloudReconnectCounts', () => ({ connects, workWrites, browserStarts }));
       ipcMain.removeHandler('flowmate:desktop-start'); ipcMain.handle('flowmate:desktop-start', () => ({ ok: true, data: undefined }));
+      ipcMain.removeHandler('flowmate:browser-start'); ipcMain.handle('flowmate:browser-start', () => {
+        browserStarts++; return browserStarts === 1 ? { ok: true, data: undefined }
+          : { ok: false, error: { code: 'browser_extension_disconnected', category: 'runtime', message: 'Connect the browser extension.', retryable: true } };
+      });
       ipcMain.removeHandler('flowmate:cloud-state'); ipcMain.handle('flowmate:cloud-state', () => ({ ok: true, data: {
         workspaceId: connected ? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' : null, ...(connected ? { desktopReady: true } : {}) } }));
       ipcMain.removeHandler('flowmate:cloud-connect'); ipcMain.handle('flowmate:cloud-connect', (_event, input) => {
@@ -39,7 +43,36 @@ test('opening Personal Agent reconnects the previously saved cloud workspace wit
     });
     await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
     await expect(page.getByText('Connected workspace: ' + workspaceId, { exact: true })).toBeVisible({ timeout: 5000 });
-    expect(await app.evaluate(() => Reflect.get(globalThis, 'cloudReconnectCounts')())).toEqual({ connects: 1, workWrites: 0 });
+    await expect(page.getByText('Kimi WebBridge started on this Windows desktop.', { exact: true })).toBeVisible();
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'cloudReconnectCounts')())).toEqual({ connects: 1, workWrites: 0, browserStarts: 1 });
+    await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'cloudReconnectCounts')())).toEqual({ connects: 1, workWrites: 0, browserStarts: 1 });
+    await page.getByRole('button', { name: 'Cloud workspace', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'cloudReconnectCounts')().browserStarts)).toBe(2);
+    await expect(page.getByText('Connect the browser extension.', { exact: true })).toBeVisible();
+    await expect(page.getByText('Connected workspace: ' + workspaceId, { exact: true })).toBeVisible();
+  } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
+  finally { await closeDesktopFixture(app, userData, failure); }
+});
+
+test('cloud workspace starts the configured local WebBridge without an environment override', async () => {
+  test.skip(process.platform !== 'win32' || !process.env.FLOWMATE_LIVE_WEBBRIDGE_EXE, 'A connected Windows WebBridge is required.');
+  test.setTimeout(60000);
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-cloud-webbridge-ui-'));
+  const env: Record<string, string> = {};
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+    if (process.env[key]) env[key] = process.env[key]!;
+  env.FLOWMATE_TEST_MODE = '1'; env.FLOWMATE_TEST_USER_DATA_ROOT = userData;
+  mkdirSync(join(userData, 'data'), { recursive: true });
+  writeFileSync(join(userData, 'data', 'kimi-webbridge.json'), JSON.stringify({ version: 1, executable: process.env.FLOWMATE_LIVE_WEBBRIDGE_EXE }));
+  const app = await electron.launch({ executablePath: resolve(import.meta.dirname, '../../node_modules/electron/dist/electron.exe'),
+    args: [resolve(import.meta.dirname, '../../out/main/index.js')], env, timeout: 30000 });
+  let failure: Error | undefined;
+  try {
+    const page = await app.firstWindow();
+    await waitFor(() => page.evaluate(async () => { const state = await window.flowmate.getState(); return state.ok && state.data.ready; }));
+    await page.getByRole('button', { name: 'Personal Agent', exact: true }).click();
+    await expect(page.getByText('Kimi WebBridge started on this Windows desktop.', { exact: true })).toBeVisible({ timeout: 30000 });
   } catch (error) { failure = error instanceof Error ? error : new Error(String(error)); throw failure; }
   finally { await closeDesktopFixture(app, userData, failure); }
 });

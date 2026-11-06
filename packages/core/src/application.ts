@@ -200,7 +200,8 @@ export function makeApplication(
     if (!command) return fail(appError('input_invalid', 'input', 'The Personal Agent request is invalid.'));
     if (!products?.personal) return personalUnavailable();
     if (closing && ['personal_agent_update', 'invoice_work_create', 'invoice_work_supplement', 'invoice_work_dispose_item',
-      'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_discard', 'personal_task_stop'].includes(type))
+      'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_discard',
+      'invoice_work_browser_decide', 'invoice_work_browser_revoke', 'personal_task_stop'].includes(type))
       return fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.'));
     try {
       const result = parsePersonalAgentHostResult(type, await invoke(command.input as I));
@@ -245,6 +246,10 @@ export function makeApplication(
       decideDesktopAction: raw => personalCommand('invoice_work_desktop_decide', raw, input => products?.personal?.works.decideDesktopAction(input)),
       discardDesktopAction: raw => personalCommand('invoice_work_desktop_discard', raw, input => products?.personal?.works.discardDesktopAction(input)),
       queryDesktopDecision: raw => personalCommand('invoice_work_desktop_query_decision', raw, input => products?.personal?.works.queryDesktopDecision(input)),
+      listBrowserReads: raw => personalCommand('invoice_work_browser_list', raw, input => products?.personal?.works.listBrowserReads(input)),
+      decideBrowserRead: raw => personalCommand('invoice_work_browser_decide', raw, input => products?.personal?.works.decideBrowserRead(input)),
+      revokeBrowserRead: raw => personalCommand('invoice_work_browser_revoke', raw, input => products?.personal?.works.revokeBrowserRead(input)),
+      queryBrowserDecision: raw => personalCommand('invoice_work_browser_query_decision', raw, input => products?.personal?.works.queryBrowserDecision(input)),
       timeline: raw => personalCommand('invoice_work_timeline', raw, input => products?.personal?.works.timeline(input)),
     },
     personalTasks: {

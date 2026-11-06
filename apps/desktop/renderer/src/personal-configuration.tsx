@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, resourceRefKey, type ExtensionCatalog, type ModelProfile,
+import { INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_BROWSER_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, resourceRefKey, type ExtensionCatalog, type ModelProfile,
   type PersonalAgentConfiguration, type ResourceCatalog, type ResourceRef } from '@flowmate/contracts';
 
 const baseTools: readonly string[] = [...INVOICE_REVIEW_TOOL_NAMES, ...SKILL_RESOURCE_TOOL_NAMES, 'Agent'];
@@ -11,7 +11,8 @@ type Props = { ready: boolean; hostEpoch: number; disabled: boolean; models: rea
   onChange(value: PersonalAgentConfiguration): void; onSave(): void; onReload(): void; onModels(): void };
 
 export function PersonalConfiguration(props: Props) {
-  const tools: readonly string[] = props.cloud ? [...baseTools, ...PERSONAL_DESKTOP_TOOL_NAMES] : [...baseTools, ...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_INVOICE_FORM_TOOL_NAMES];
+  const tools: readonly string[] = props.cloud ? [...baseTools, ...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_BROWSER_TOOL_NAMES]
+    : [...baseTools, ...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_BROWSER_TOOL_NAMES, ...PERSONAL_INVOICE_FORM_TOOL_NAMES];
   const [expanded, setExpanded] = useState(false), [pending, setPending] = useState(false);
   const [resources, setResources] = useState<ResourceCatalog | null>(null), [extensions, setExtensions] = useState<ExtensionCatalog | null>(null);
   const [error, setError] = useState<string | null>(null), generation = useRef(0);
@@ -27,6 +28,7 @@ export function PersonalConfiguration(props: Props) {
   }
   useEffect(() => { if (props.ready && expanded) void refresh(); return () => { generation.current++; }; }, [props.ready, props.hostEpoch, expanded]);
   const value = props.configuration?.value;
+  const browserEnabled = PERSONAL_BROWSER_TOOL_NAMES.every(name => value?.tools.includes(name));
   const selected = (ref: ResourceRef) => value?.resources.enabledSkills.some(item => resourceRefKey(item) === resourceRefKey(ref)) === true;
   function resourceProblem(item: ResourceCatalog['items'][number], visiting: readonly string[] = []): string | null {
     const key = resourceRefKey(item.ref);
@@ -64,8 +66,14 @@ export function PersonalConfiguration(props: Props) {
         onChange={event => props.onChange({ ...value, preferences: event.target.value })} /></label>
       <label className="field"><span id="personal-agent-directory-label">Personal Agent working directory</span><input aria-labelledby="personal-agent-directory-label" maxLength={4096} value={value.workingDirectory ?? ''} disabled={props.disabled || props.cloud}
         placeholder="Automatic work directory" onChange={event => props.onChange({ ...value, workingDirectory: event.target.value || null })} /></label>
-      <fieldset disabled={props.disabled}><legend>Personal Agent tools</legend><p>{props.cloud ? 'Desktop tools are off by default; enable the needed tools for a new cloud Work.' : 'Desktop and Personal Agent form tools are off by default; enable the needed tools for a new local Work.'}</p>{[...new Set([...tools, ...value.tools])].map(name => <label className="personal-document-option" key={name}>
-        <input type="checkbox" aria-label={`Enable Personal Agent tool ${name}`} checked={value.tools.includes(name)} onChange={event => props.onChange({ ...value,
+      <fieldset disabled={props.disabled}><legend>Personal Agent tools</legend><p>Desktop and browser tools are off by default and apply to new Work. Browser reading and desktop tools cannot be enabled together.</p>
+        <label className="personal-document-option"><input type="checkbox" aria-label="Enable browser page reading" checked={browserEnabled}
+          onChange={event => props.onChange({ ...value, tools: event.target.checked
+            ? [...value.tools.filter(name => !([...PERSONAL_BROWSER_TOOL_NAMES, ...PERSONAL_DESKTOP_TOOL_NAMES] as readonly string[]).includes(name)), ...PERSONAL_BROWSER_TOOL_NAMES]
+            : value.tools.filter(name => !(PERSONAL_BROWSER_TOOL_NAMES as readonly string[]).includes(name)) })} />Browser page reading</label>
+        {[...new Set([...tools.filter(name => !(PERSONAL_BROWSER_TOOL_NAMES as readonly string[]).includes(name)),
+          ...value.tools.filter(name => !(PERSONAL_BROWSER_TOOL_NAMES as readonly string[]).includes(name))])].map(name => <label className="personal-document-option" key={name}>
+        <input type="checkbox" aria-label={`Enable Personal Agent tool ${name}`} checked={value.tools.includes(name)} disabled={browserEnabled && (PERSONAL_DESKTOP_TOOL_NAMES as readonly string[]).includes(name)} onChange={event => props.onChange({ ...value,
           tools: event.target.checked ? [...value.tools, name] : value.tools.filter(tool => tool !== name) })} />{name}{!tools.includes(name) && <small>No Durable adapter; remove this selection.</small>}</label>)}</fieldset>
       <div className="button-row"><button type="button" disabled={!props.ready || pending || props.disabled} onClick={() => void refresh()}>Refresh assistant resources</button></div>
       {pending && <p role="status">Loading local resource versions…</p>}{error && <p role="alert">{error}</p>}

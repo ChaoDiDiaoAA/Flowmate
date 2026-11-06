@@ -21,6 +21,7 @@ import { createPersonalAgentRepository } from './agent-repository.ts';
 import { readInvoiceCandidateChildReports } from './candidate-evidence.ts';
 import { invoiceWorkPhaseItemProgress } from './tool-scope.ts';
 import { createInvoiceWorkDesktopActionRepository, desktopActionContinuationAuthorized } from './desktop-actions.ts';
+import { createInvoiceWorkBrowserReadRepository } from './browser-reads.ts';
 export { createPersonalAgentRepository } from './agent-repository.ts';
 export type { PersonalAgentRepository } from './agent-repository.ts';
 
@@ -31,7 +32,7 @@ export type InvoiceWorkAdmission = { kind: 'ready' | 'queued' }
 type CommandOptions = { at: string; admission: InvoiceWorkAdmission };
 export type InvoiceWorkTodoDefinition = Omit<InvoiceWorkTodoView, 'todoId' | 'workId' | 'itemId' | 'revision' | 'applicable'>;
 export type InvoiceWorkPhaseBasis = { contextSnapshotId: number | null; inputIds: readonly number[];
-  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null; desktopProposalId?: number; desktopRejectedProposalId?: number };
+  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null; desktopProposalId?: number; desktopRejectedProposalId?: number; browserProposalId?: number; browserRejectedProposalId?: number };
 export type InvoiceWorkPhase = { phaseId: number; workId: number; attemptId: number; itemId: number | null;
   requestId: string; kind: 'prompt'; basis: InvoiceWorkPhaseBasis; createdAt: string;
   nativeConversationId: number | null; nativeSubmissionId: number | null; consumedAt: string | null };
@@ -95,7 +96,7 @@ const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const atSchema = z.string().datetime({ offset: true });
 const basisSchema = z.object({ contextSnapshotId: id.nullable(), inputIds: z.array(id).refine(ids => new Set(ids).size === ids.length),
   documentRefs: z.array(DocumentRefSchema), configurationRevision: revision, itemRevision: revision.nullable(),
-  desktopProposalId: id.optional(), desktopRejectedProposalId: id.optional() }).strict();
+  desktopProposalId: id.optional(), desktopRejectedProposalId: id.optional(), browserProposalId: id.optional(), browserRejectedProposalId: id.optional() }).strict();
 const phaseInputSchema = z.object({ workId: id, attemptId: id, itemId: id.nullable(), requestId: z.string().min(1).max(128),
   kind: z.literal('prompt'), basis: basisSchema, at: atSchema }).strict();
 const observationSchema = z.object({ workId: id, sessionId: id, attemptId: id, requestId: phaseInputSchema.shape.requestId,
@@ -307,6 +308,35 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
       return !desktopActionContinuationAuthorized(db, row.id, current.id, receipt.revision);
     });
   }
+  function savedBrowserNeedsContinuation(row: WorkRow, current: AttemptRow) {
+    const reads = db.query<{ id: number; item_id: number; status: 'approved' | 'rejected'; decision_request_id: string }, [number]>(`
+      SELECT b.id,b.item_id,b.status,b.decision_request_id FROM invoice_work_browser_reads b
+      JOIN invoice_work_items i ON i.id=b.item_id AND i.work_id=b.work_id
+      WHERE b.work_id=? AND i.disposition='unresolved' AND b.status IN ('approved','rejected')
+      AND b.id=(SELECT max(latest.id) FROM invoice_work_browser_reads latest WHERE latest.work_id=b.work_id AND latest.item_id=b.item_id)
+      AND (b.status!='rejected' OR NOT EXISTS (SELECT 1 FROM invoice_work_phases p WHERE p.work_id=b.work_id AND p.item_id=b.item_id
+        AND json_extract(p.basis_json,'$.browserRejectedProposalId')=b.id)) ORDER BY b.id`).all(row.id);
+    const browser = createInvoiceWorkBrowserReadRepository(db);
+    return reads.some(read => {
+      const receipt = requireResult(browser.queryDecision({ workId: row.id, itemId: read.item_id, proposalId: read.id, requestId: read.decision_request_id }));
+      requireFact(receipt?.decision === (read.status === 'approved' ? 'approve' : 'reject'), 'storage_corrupt', 'The original browser decision is unavailable.');
+      return !desktopActionContinuationAuthorized(db, row.id, current.id, receipt.revision);
+    });
+  }
+  function browserDecision(workId: number, itemId: number, attemptId: number, status: 'approved' | 'rejected', proposalId?: number) {
+    const selected = proposalId === undefined
+      ? db.query<{ id: number; decision_request_id: string }, [number, number, string]>(`SELECT b.id,b.decision_request_id FROM invoice_work_browser_reads b
+        WHERE b.work_id=? AND b.item_id=? AND b.status=? AND b.id=(SELECT max(latest.id) FROM invoice_work_browser_reads latest
+          WHERE latest.work_id=b.work_id AND latest.item_id=b.item_id)
+        AND (b.status!='rejected' OR NOT EXISTS (SELECT 1 FROM invoice_work_phases p WHERE p.work_id=b.work_id AND p.item_id=b.item_id
+          AND json_extract(p.basis_json,'$.browserRejectedProposalId')=b.id))`).get(workId, itemId, status)
+      : db.query<{ id: number; decision_request_id: string }, [number, number, number]>(`SELECT id,decision_request_id FROM invoice_work_browser_reads
+        WHERE work_id=? AND item_id=? AND id=? AND status IN ('approved','claimed','completed','rejected')`).get(workId, itemId, proposalId);
+    if (!selected) return undefined;
+    const receipt = requireResult(createInvoiceWorkBrowserReadRepository(db).queryDecision({ workId, itemId, proposalId: selected.id, requestId: selected.decision_request_id }));
+    requireFact(receipt?.decision === (status === 'approved' ? 'approve' : 'reject'), 'storage_corrupt', 'The original browser decision is inconsistent.');
+    return desktopActionContinuationAuthorized(db, workId, attemptId, receipt.revision) ? selected.id : undefined;
+  }
   function desktopApproval(workId: number, itemId: number, attemptId: number, proposalId?: number) {
     const action = proposalId === undefined
       ? db.query<{ id: number; decision_request_id: string }, [number, number]>(
@@ -416,7 +446,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         reason: 'Supplement saved. Explicit continue is required after stopping or failure.', todoIds: [] };
     const originalActive = kind === 'continueWork' && current && current.stopped_at === null
       && status !== 'failed' && status !== 'cancelled' && status !== 'completed';
-    if (originalActive && !savedInputNeedsApproval(row, current) && !savedDesktopNeedsContinuation(row, current))
+    if (originalActive && !savedInputNeedsApproval(row, current) && !savedDesktopNeedsContinuation(row, current) && !savedBrowserNeedsContinuation(row, current))
       return { kind: 'existing', authorizationAccepted: false, attempt: attemptReference(current), relation: 'original' };
     if (admission.kind === 'blocked') return { ...admission, authorizationAccepted: false, attempt: current ? attemptReference(current) : null };
     if (admission.kind === 'waiting') return { ...admission, authorizationAccepted: false, todoIds: [...admission.todoIds ?? []],
@@ -603,6 +633,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         if (existing) return existing;
         requireFact(row.status === 'open' && row.revision === input.expectedRevision);
         const changed = bump(row, at);
+        requireResult(createInvoiceWorkBrowserReadRepository(db).revokeWork({ workId: row.id, at }));
         db.query("UPDATE invoice_works SET status='cancelled',ended_at=? WHERE id=?").run(at, row.id);
         const current = attempt(changed);
         if (current) {
@@ -635,10 +666,14 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         }
         const desktopProposalId = desktopApproval(row.id, selected.id, current.id);
         const desktopRejectedProposalId = desktopRejection(row.id, selected.id, current.id);
+        const browserProposalId = browserDecision(row.id, selected.id, current.id, 'approved');
+        const browserRejectedProposalId = browserDecision(row.id, selected.id, current.id, 'rejected');
         return { itemId: selected.id, basis: { contextSnapshotId: null, inputIds: authorized.map(value => value.id),
           documentRefs, configurationRevision: row.agent_revision, itemRevision: selected.revision,
           ...(desktopProposalId === undefined ? {} : { desktopProposalId }),
-          ...(desktopRejectedProposalId === undefined ? {} : { desktopRejectedProposalId }) } };
+          ...(desktopRejectedProposalId === undefined ? {} : { desktopRejectedProposalId }),
+          ...(browserProposalId === undefined ? {} : { browserProposalId }),
+          ...(browserRejectedProposalId === undefined ? {} : { browserRejectedProposalId }) } };
       });
     },
     freezePhase(raw) {
@@ -663,6 +698,10 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
           'source_invalid', 'The phase does not match the approved desktop action.');
         requireFact(input.basis.desktopRejectedProposalId === (selected ? desktopRejection(row.id, selected.id, current.id) : undefined),
           'source_invalid', 'The phase does not match the rejected desktop action.');
+        requireFact(input.basis.browserProposalId === (selected ? browserDecision(row.id, selected.id, current.id, 'approved') : undefined),
+          'source_invalid', 'The phase does not match the approved browser read.');
+        requireFact(input.basis.browserRejectedProposalId === (selected ? browserDecision(row.id, selected.id, current.id, 'rejected') : undefined),
+          'source_invalid', 'The phase does not match the rejected browser read.');
         for (const reference of input.basis.documentRefs) {
           checkDocument(reference);
           const member = db.query('SELECT id FROM invoice_work_items WHERE work_id=? AND document_id=? AND document_version=?')
@@ -801,6 +840,12 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         if (frozen.basis.desktopRejectedProposalId !== undefined)
           requireFact(desktopRejection(row.id, selected.id, stored.attempt_id, frozen.basis.desktopRejectedProposalId) === frozen.basis.desktopRejectedProposalId,
             'source_invalid', 'The phase desktop rejection is unavailable.');
+        if (frozen.basis.browserProposalId !== undefined)
+          requireFact(browserDecision(row.id, selected.id, stored.attempt_id, 'approved', frozen.basis.browserProposalId) === frozen.basis.browserProposalId,
+            'source_invalid', 'The phase browser approval is unavailable.');
+        if (frozen.basis.browserRejectedProposalId !== undefined)
+          requireFact(browserDecision(row.id, selected.id, stored.attempt_id, 'rejected', frozen.basis.browserRejectedProposalId) === frozen.basis.browserRejectedProposalId,
+            'source_invalid', 'The phase browser rejection is unavailable.');
         const original = db.query<{ context_json: string }, [number]>(
           'SELECT context_json FROM invoice_work_context_snapshots WHERE phase_id=?')
           .get(stored.id);
@@ -892,7 +937,8 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
           current: { work: projected, item: selectedView, configurationRevision: row.agent_revision, documentRefs: frozen.basis.documentRefs },
           authorizedInputs: frozen.basis.inputIds.map(inputId => originalInput(inputId, current.id)), historicalInputReferences, todos,
           confirmedBusinessReferences, conflicts, modelReports, evidenceRefs: todos.flatMap(todo => todo.basis.sourceRefs),
-          allowedTools: PersonalAgentConfigurationSchema.parse(JSON.parse(row.configuration_json)).tools, remainingBudget: input.remainingBudget });
+          allowedTools: PersonalAgentConfigurationSchema.parse(JSON.parse(row.configuration_json)).tools.filter(name =>
+            name !== (frozen.basis.browserProposalId === undefined ? 'browser_read_approved' : 'browser_request_read')), remainingBudget: input.remainingBudget });
       });
     },
     replaceTodos(input) {
@@ -999,6 +1045,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         }
         db.query('UPDATE invoice_work_items SET disposition=?,decision_json=?,disposed_at=? WHERE id=?')
           .run(decision.kind, JSON.stringify(decision), at, selected.id);
+        requireResult(createInvoiceWorkBrowserReadRepository(db).revokeWork({ workId: row.id, itemId: selected.id, at }));
         db.query('UPDATE invoice_work_todos SET superseded_at=? WHERE item_id=? AND superseded_at IS NULL').run(at, selected.id);
         bumpItem(selected, at);
         const changed = bump(row, at);

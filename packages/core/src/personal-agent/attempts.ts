@@ -9,6 +9,7 @@ import { appError, fail, ok, PersonalTaskStopRequestSchema, PersonalTaskStopRece
 import type { SynchronousDatabaseExecutor } from '../storage/write-coordinator.ts';
 import { readTransaction } from '../storage/reads.ts';
 import { createRunRepository, createToolCallRepository } from '../storage/repositories.ts';
+import { createInvoiceWorkBrowserReadRepository } from './browser-reads.ts';
 
 export type InvoiceWorkAttemptFinishRequest = { workId: number; attemptId: number; runId: number | null; at: string;
   effectsReconciled: boolean; stopResult?: DurableAttemptStopResult };
@@ -141,6 +142,7 @@ export function createInvoiceWorkAttemptRepository(db: SynchronousDatabaseExecut
         const accepted = row.stopped_at === null;
         if (accepted && row.stop_requested_at === null) {
           requireFact(owner.revision < Number.MAX_SAFE_INTEGER);
+          need(createInvoiceWorkBrowserReadRepository(db).revokeWork({ workId: owner.id, at }));
           db.query('UPDATE invoice_work_attempts SET stop_requested_at=? WHERE id=?').run(at, row.id);
           db.query('UPDATE invoice_works SET revision=revision+1,updated_at=? WHERE id=? AND revision=?').run(at, owner.id, owner.revision);
         }

@@ -1,4 +1,4 @@
-import { AppErrorSchema, FillInvoiceFormOutputSchema, NativeToolOutputSchema, RuntimeStrategySnapshotSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, ToolExecutionFailure, NATIVE_TOOL_NAMES, INVOICE_REVIEW_TOOL_NAMES, TOOL_CONFIG, RUNTIME_CONFIG, appError, fail, ok } from '@flowmate/contracts';
+import { AppErrorSchema, BrowserPageSchema, FillInvoiceFormOutputSchema, NativeToolOutputSchema, RuntimeStrategySnapshotSchema, ToolEffectSchema, ToolExecutionContextSchema, ToolExecutionModeSchema, ToolExecutionFailure, NATIVE_TOOL_NAMES, INVOICE_REVIEW_TOOL_NAMES, TOOL_CONFIG, RUNTIME_CONFIG, appError, fail, ok } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import type { AppError, DbId, Result, ToolCallDelivery, ToolDefinition, ToolExecutionContext, ToolResult, ToolCallSnapshot, ToolRuntimeObservation, RuntimeStrategySnapshot, ResolvedRuntimeBudget, RuntimeStrategyPolicy } from '@flowmate/contracts';
 import { RegisteredToolNameSchema, MAX_TOOL_VERSION_CHARS } from '@flowmate/contracts';
@@ -438,7 +438,7 @@ export function createToolExecutor(input: ExecutorStorage & {
     const settlement = { use, context, budget, data, status, error, startedMs, endedMs, timedOut, afterStructure };
     if (!input.database) return afterToolUse(settlement);
     const ended = await writeStorage(input.database, store => {
-      const result = afterToolUse(settlement, store.toolCalls);
+      const result = afterToolUse(settlement, store.toolCalls, store);
       return result.call.result ? ok(result) : fail(result.result.status === 'succeeded'
         ? appError('storage_write_failed', 'storage', 'Tool terminal was not saved.') : result.result.error);
     });
@@ -449,10 +449,10 @@ export function createToolExecutor(input: ExecutorStorage & {
 
   function afterToolUse(settlement: { use: PreparedToolUse; context: ToolExecutionContext; budget: RunBudget; data: unknown;
     status: 'succeeded' | 'failed' | 'cancelled'; error?: AppError; startedMs: number; endedMs: number; timedOut: boolean;
-    afterStructure: ToolRuntimeObservation['afterStructure'] }, repository?: ToolCallRepository): ToolExecution {
+    afterStructure: ToolRuntimeObservation['afterStructure'] }, repository?: ToolCallRepository, store?: SqlDatabaseStore): ToolExecution {
     const recorder = recorderFor(repository);
-    const { use, context, budget, data, startedMs, endedMs, timedOut, afterStructure } = settlement;
-    let { status, error } = settlement;
+    const { use, context, budget, startedMs, endedMs, timedOut, afterStructure } = settlement;
+    let { data, status, error } = settlement;
     const observedCall = recorder.queryById(use.call.toolCallId);
     if (observedCall.ok && observedCall.data.result?.status === 'failed'
       && observedCall.data.result.error.code === 'stop_not_confirmed' && !observedCall.data.cleanup.stopped
@@ -518,6 +518,26 @@ export function createToolExecutor(input: ExecutorStorage & {
     if (!stopped && status === 'succeeded') { status = 'failed'; error = appError('stop_not_confirmed', 'runtime', 'Execution stop has not been confirmed.'); budget.fatal = true; }
     const feedbackError = acceptFeedback(use.call, budget, data, error);
     if (feedbackError) { status = 'failed'; error = feedbackError; observation.failureStage = 'validation'; }
+    if (use.definition.name === 'browser_read_approved') {
+      const work = context.scope.invoiceWork;
+      const read = store?.db.query<{ id: number; status: string }, [number]>(
+        'SELECT id,status FROM invoice_work_browser_reads WHERE execution_tool_call_id=?').get(use.call.toolCallId);
+      const page = BrowserPageSchema.safeParse(data);
+      if (status === 'succeeded' && work && store && read && page.success && !context.signal.aborted) {
+        const accepted = store.invoiceWorkBrowserReads.accept({ workId: work.workId, itemId: work.itemId,
+          proposalId: read.id, executionToolCallId: use.call.toolCallId, page: page.data, at: input.now() });
+        if (!accepted.ok) { status = 'failed'; error = accepted.error; }
+      } else if (status === 'succeeded') {
+        status = 'failed'; error = appError('browser_read_unconfirmed', 'runtime', 'The browser read is no longer authorized.');
+      }
+      if (status !== 'succeeded') {
+        data = undefined;
+        if (work && store && read?.status === 'claimed') {
+          const revoked = store.invoiceWorkBrowserReads.revoke({ workId: work.workId, itemId: work.itemId, proposalId: read.id, at: input.now() });
+          if (!revoked.ok) return { call: use.call, result: { status: 'failed', error: revoked.error }, fatal: true };
+        }
+      }
+    }
     observation.diagnosticCode = error?.code ?? null;
     budget.fatal ||= !stopped || observation.commit === 'unknown'
       || timedOut && (!['PURE', 'READ'].includes(use.definition.effect) || observation.runDeadlineTruncated);

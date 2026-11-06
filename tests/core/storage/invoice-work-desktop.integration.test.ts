@@ -31,7 +31,7 @@ test.each(['success', 'registration failure'] as const)('schema24 migration pres
     entries: scope.db.query('SELECT * FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(session.sessionId) }));
   await f.database.close();
   const old = new Database(f.paths.databaseFile);
-  old.exec(`DROP TRIGGER invoice_work_desktop_action_immutable; DROP TRIGGER invoice_work_desktop_action_preserved;
+  old.exec(`DROP TABLE invoice_work_browser_reads; DELETE FROM schema_migrations WHERE version=25; DROP TRIGGER invoice_work_desktop_action_immutable; DROP TRIGGER invoice_work_desktop_action_preserved;
     DROP TABLE invoice_work_desktop_actions; DELETE FROM schema_migrations WHERE version=24;`);
   if (mode === 'registration failure') old.exec("CREATE TRIGGER reject_schema24 BEFORE INSERT ON schema_migrations WHEN NEW.version=24 BEGIN SELECT RAISE(ABORT,'controlled schema24 failure'); END");
   old.close();
@@ -50,7 +50,7 @@ test.each(['success', 'registration failure'] as const)('schema24 migration pres
     } finally { after.close(); }
   } else {
     const current = need(opened);
-    expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 24 });
+    expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 25 });
     expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_works').all())).toEqual(before.works);
     expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_work_items').all())).toEqual(before.items);
     expect(await current.read(scope => scope.sessions.get(session.sessionId))).toMatchObject({ ok: true,

@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema,
-  DurableSubagentConfigSnapshotSchema, DurableWorkBudgetSchema, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES,
+  DurableSubagentConfigSnapshotSchema, DurableWorkBudgetSchema, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, PERSONAL_BROWSER_TOOL_NAMES,
   InvoiceWorkPhaseBasisSchema, InvoiceWorkWorkingContextSchema, PersonalAgentConfigurationSchema, RunScopeSchema,
   InvoiceWorkSupplementRequestSchema, InvoiceWorkSupplementReceiptSchema, InvoiceWorkContinueReceiptSchema,
   type AppError, type DocumentRef, type InvoiceWorkWorkingContext, type ProductToolContext, type Result, type RunScope, type ToolResult } from '@flowmate/contracts';
@@ -125,7 +125,7 @@ export function resolveInvoiceWorkToolScope(db: SynchronousDatabaseExecutor, raw
     requireFact(basis.documentRefs.some(ref => ref.id === row.document_id && ref.version === row.document_version));
     let allowedTools = scope.allowedTools.filter((name: string) => workConfig.tools.includes(name) && context.actions.tools.includes(name)
       && (name === 'Agent' || (INVOICE_REVIEW_TOOL_NAMES as readonly string[]).includes(name) || (SKILL_RESOURCE_TOOL_NAMES as readonly string[]).includes(name)
-        || !input.child && ((PERSONAL_DESKTOP_TOOL_NAMES as readonly string[]).includes(name)
+        || !input.child && ((PERSONAL_DESKTOP_TOOL_NAMES as readonly string[]).includes(name) || (PERSONAL_BROWSER_TOOL_NAMES as readonly string[]).includes(name)
           || row.durable_runtime_id === 'local' && (PERSONAL_INVOICE_FORM_TOOL_NAMES as readonly string[]).includes(name))));
     let allowedDocumentIds = basis.documentRefs.map(ref => ref.id), artifacts = [...new Set(allowedArtifactIds)], allowedResourcePaths: string[] = [];
     if (input.child) {
@@ -262,7 +262,21 @@ function readOriginal(store: SqlDatabaseStore, call: DurableProductToolCall) {
 
 export function readInvoiceWorkToolResult(store: SqlDatabaseStore, call: DurableProductToolCall): Result<ToolResult<unknown> | null> {
   try {
-    const original = readOriginal(store, call).call;
+    const { phase, call: original } = readOriginal(store, call);
+    if (original?.toolName === 'browser_read_approved') {
+      if (original.result?.status === 'succeeded') {
+        const read = store.db.query<{ id: number; item_id: number }, [number]>(
+          'SELECT id,item_id FROM invoice_work_browser_reads WHERE execution_tool_call_id=?').get(original.toolCallId);
+        requireFact(read && !call.child, 'tool_access_denied', 'The browser result has no original approval.');
+        const scope = resolveInvoiceWorkToolScope(store.db, { runId: phase.parent_run_id, sessionId: call.sessionId,
+          workId: call.workId, attemptId: call.attemptId, requestId: call.requestId });
+        if (!scope.ok) return scope;
+        requireFact(scope.data.scope.invoiceWork?.itemId === read.item_id && scope.data.scope.allowedTools.includes(call.name));
+        const verified = store.invoiceWorkBrowserReads.verifyDelivery({ workId: call.workId, itemId: read.item_id,
+          proposalId: read.id, executionToolCallId: original.toolCallId });
+        if (!verified.ok) return verified;
+      } else if (original.result) return ok({ status: original.result.status, error: original.result.error });
+    }
     if (original?.toolName === 'desktop_execute_approved') {
       const action = store.db.query<{ status: string }, [number]>('SELECT status FROM invoice_work_desktop_actions WHERE execution_tool_call_id=?')
         .get(original.toolCallId);
@@ -311,7 +325,7 @@ export function createInvoiceWorkToolBridge(input: { database: Pick<DbHandle, 'r
       if (!prepared.ok) return prepared;
       const result = prepared.data.resume ? await input.executor.resumeDelegation(prepared.data.context)
         : await input.executor.execute(call.name, call.arguments, prepared.data.context);
-      if (call.name === 'desktop_execute_approved' || call.name === 'personal_fill_invoice_form') {
+      if (call.name === 'desktop_execute_approved' || call.name === 'personal_fill_invoice_form' || call.name === 'browser_read_approved') {
         const original = await readToolResult(identity);
         return !original.ok ? original : original.data !== null ? ok(original.data)
           : fail(appError('tool_commit_unconfirmed', 'runtime', 'The original desktop input outcome is unknown.'));
@@ -329,11 +343,11 @@ export function createInvoiceWorkToolBridge(input: { database: Pick<DbHandle, 'r
     } catch (error) { return fail(error instanceof ToolScopeFault ? error.fact : appError('tool_commit_unconfirmed', 'runtime', 'The original product tool result could not be confirmed.', true)); }
   }
   return { executeTool, readToolResult,
-    onToolFeedback: (feedback: DurableProductToolFeedback) => input.database.transaction(store => recordInvoiceWorkToolFeedback(store.db, feedback, store.toolCalls)) };
+    onToolFeedback: (feedback: DurableProductToolFeedback) => input.database.transaction(store => recordInvoiceWorkToolFeedback(store.db, feedback, store.toolCalls, store)) };
 }
 
 export function recordInvoiceWorkToolFeedback(db: SynchronousDatabaseExecutor, input: DurableProductToolFeedback,
-  repository: Pick<SqlDatabaseStore['toolCalls'], 'getById' | 'queryCandidateCommit' | 'recordDelivery'>): Result<void> {
+  repository: Pick<SqlDatabaseStore['toolCalls'], 'getById' | 'queryCandidateCommit' | 'recordDelivery'>, store?: SqlDatabaseStore): Result<void> {
   try {
     requireFact(db.inTransaction, 'state_conflict', 'Native tool feedback requires the product transaction.');
     return db.transaction(() => {
@@ -350,7 +364,10 @@ export function recordInvoiceWorkToolFeedback(db: SynchronousDatabaseExecutor, i
     requireFact(message.toolCallId === call.nativeToolCallId && message.toolName === call.name);
     const original = repository.getById(row.tool_call_id);
     if (!original.ok) return original;
-    const result = readOriginalToolResult(repository, original.data);
+    let result: Result<ToolResult<unknown> | null>;
+    if (call.name === 'browser_read_approved') result = store ? readInvoiceWorkToolResult(store, call)
+      : fail(appError('tool_access_denied', 'runtime', 'Browser feedback needs its original authorization.'));
+    else result = readOriginalToolResult(repository, original.data);
     if (!result.ok) return result;
     requireFact(result.data !== null, 'tool_commit_unconfirmed', 'The original product tool result is still unknown.');
     requireFact(message.isError === (result.data.status !== 'succeeded') && isDeepStrictEqual(message.details, result.data), 'tool_invalid_output');

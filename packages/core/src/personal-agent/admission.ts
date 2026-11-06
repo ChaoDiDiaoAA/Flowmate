@@ -243,7 +243,7 @@ export class DurableInvoiceGovernor {
     };
     const items = store.db.query<{ id: number; document_id: number; document_version: string; candidate_id: number | null }, [number]>(
       "SELECT * FROM invoice_work_items WHERE work_id=? AND disposition='unresolved' ORDER BY id").all(work.id);
-    let unavailable = false, desktopWaiting = false;
+    let unavailable = false, desktopWaiting = false, browserWaiting = false;
     const waitingTodos: number[] = [];
     for (const item of items) {
       const document = store.documents.get(item.document_id);
@@ -267,6 +267,22 @@ export class DurableInvoiceGovernor {
         if (command?.kind === 'continueWork' || attempt && desktopActionContinuationAuthorized(store.db, work.id, attempt.id, receipt.revision)) return ready(item.id);
         desktopWaiting = true; continue;
       }
+      const browser = store.db.query<{ id: number; status: string; decision_request_id: string | null }, [number, number]>(`
+        SELECT b.id,b.status,b.decision_request_id FROM invoice_work_browser_reads b JOIN invoice_work_tool_calls t ON t.tool_call_id=b.proposal_tool_call_id
+        JOIN invoice_work_phases p ON p.id=t.phase_id WHERE b.work_id=? AND b.item_id=? AND p.closed_at IS NOT NULL ORDER BY b.id DESC LIMIT 1`)
+        .get(work.id, item.id);
+      const browserRejectionConsumed = browser?.status === 'rejected' && store.db.query(`SELECT id FROM invoice_work_phases
+        WHERE work_id=? AND item_id=? AND json_extract(basis_json,'$.browserRejectedProposalId')=? LIMIT 1`).get(work.id, item.id, browser.id);
+      if (browser && ['waiting', 'approved', 'rejected'].includes(browser.status) && !browserRejectionConsumed) {
+        if (browser.status === 'waiting') { browserWaiting = true; continue; }
+        requireFact(browser.decision_request_id, 'storage_corrupt', 'The original browser approval is unavailable.');
+        const receipt = need(store.invoiceWorkBrowserReads.queryDecision({ workId: work.id, itemId: item.id,
+          proposalId: browser.id, requestId: browser.decision_request_id }));
+        requireFact(receipt?.decision === (browser.status === 'approved' ? 'approve' : 'reject'),
+          'storage_corrupt', 'The original browser decision is inconsistent.');
+        if (command?.kind === 'continueWork' || attempt && desktopActionContinuationAuthorized(store.db, work.id, attempt.id, receipt.revision)) return ready(item.id);
+        browserWaiting = true; continue;
+      }
       if (this.hasAuthorizedInput(store, work, attempt, item.id, command)) return ready(item.id);
       const rows = store.db.query<{ id: number; revision: number; definition_json: string }, [number, number]>(
         'SELECT * FROM invoice_work_todos WHERE work_id=? AND item_id=? AND superseded_at IS NULL ORDER BY id').all(work.id, item.id);
@@ -280,10 +296,13 @@ export class DurableInvoiceGovernor {
         || (command?.kind === 'continueWork' || continued) && todos.some(todo => todo.action === 'continue')) return ready(item.id);
       waitingTodos.push(...todos.map(todo => todo.todoId));
     }
-    if (unavailable && items.length > 0 && waitingTodos.length === 0 && !desktopWaiting)
+    if (unavailable && items.length > 0 && waitingTodos.length === 0 && !desktopWaiting && !browserWaiting)
       return { kind: 'blocked', reason: appError('input_unavailable', 'input', 'The original invoice materials are unavailable.') };
-    return { kind: 'waiting', reason: items.length === 0 ? 'All invoices have a final disposition.'
-      : desktopWaiting ? 'A desktop action awaits user confirmation.' : 'Only human invoice actions remain.', todoIds: waitingTodos };
+    let reason = 'Only human invoice actions remain.';
+    if (items.length === 0) reason = 'All invoices have a final disposition.';
+    else if (desktopWaiting) reason = 'A desktop action awaits user confirmation.';
+    else if (browserWaiting) reason = 'A browser read awaits user confirmation.';
+    return { kind: 'waiting', reason, todoIds: waitingTodos };
   }
 
   private qualify(store: SqlDatabaseStore, work: WorkRow, at: string, command?: InvoiceWorkExecutionCommand,
@@ -341,6 +360,8 @@ export class DurableInvoiceGovernor {
           AND document_version=?`).get(owner.workspaceId, reference.id, reference.version),
         'cloud_workspace_forbidden', 'The invoice version is not authorized for this cloud workspace.');
       }
+      if (agent.configuration.tools.includes('browser_request_read')) return { kind: 'waiting',
+        reason: 'Select the dedicated browser tab for the invoice, then continue the Work.' };
     }
     const work = typeof input === 'number' ? this.work(store, input)
       : input.kind === 'create' ? null : this.work(store, input.request.workId);

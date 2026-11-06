@@ -97,6 +97,37 @@ test('a desktop proposal mixed with another tool call is not admitted', async ()
   } finally { need(await runtime.close()); server.stop(true); }
 }, 10_000);
 
+test.each(['single', 'mixed'] as const)('a browser request ends its phase and cannot be mixed with other tools: %s', async mode => {
+  const executed: string[] = []; let requests = 0;
+  const server = Bun.serve({ port: 0, fetch: () => {
+    requests++;
+    const calls = [{ index: 0, id: 'browser-proposal', type: 'function',
+      function: { name: 'browser_request_read', arguments: '{}' } }];
+    if (mode === 'mixed') calls.push({ index: 1, id: 'other-read', type: 'function',
+      function: { name: definition.name, arguments: JSON.stringify({ documentId: 11 }) } });
+    const delta = requests === 1 ? { role: 'assistant', tool_calls: calls }
+      : { role: 'assistant', content: 'The model continued without approval.' };
+    const chunk = { id: 'browser-proposal', object: 'chat.completion.chunk', created: 1, model: 'tool-model',
+      choices: [{ index: 0, delta, finish_reason: requests === 1 ? 'tool_calls' : 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const tool = { name: 'browser_request_read', description: 'Request a page read.', executionMode: 'sequential' as const,
+    effect: 'LOCAL_WRITE' as const, inputSchema: { type: 'object', properties: {}, additionalProperties: false } };
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined),
+    readWorkingContext: query => ok(working(query, [tool.name, definition.name])), verifyWorkingContext: () => ok(undefined),
+    tools: [tool, definition], executeTool: call => { executed.push(call.name); return ok({ status: 'succeeded', data: { proposalId: 9 } }); },
+    readToolResult: () => ok(null), onToolFeedback: () => ok(undefined) }));
+  const query = { ...owner, requestId: 'browser-' + mode };
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId }));
+    need(await runtime.submit({ ...query, text: 'Request the selected page.', config: config(server.port!) }));
+    await runtime.waitForSubmission(query);
+    if (mode === 'single') { expect(executed).toEqual(['browser_request_read']); expect(requests).toBe(1); }
+    else expect(executed).not.toContain('browser_request_read');
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 10_000);
+
 test('native tools consume one product result and exact feedback per original phase despite identical input and provider call IDs', async () => {
   const calls: DurableProductToolCall[] = [], feedback: DurableProductToolFeedback[] = [], seen: string[] = [];
   const checked: string[] = [];

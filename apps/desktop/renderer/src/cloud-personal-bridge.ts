@@ -51,6 +51,8 @@ Pick<DesktopBridge, 'personalAgent' | 'invoiceWorks' | 'personalTasks'> {
       listDesktopActions: input => call({ type: 'invoice_work_desktop_list', input }), decideDesktopAction: input => call({ type: 'invoice_work_desktop_decide', input }),
       discardDesktopAction: input => call({ type: 'invoice_work_desktop_discard', input }),
       queryDesktopDecision: input => call({ type: 'invoice_work_desktop_query_decision', input }),
+      listBrowserReads: input => call({ type: 'invoice_work_browser_list', input }), decideBrowserRead: input => call({ type: 'invoice_work_browser_decide', input }),
+      revokeBrowserRead: input => call({ type: 'invoice_work_browser_revoke', input }), queryBrowserDecision: input => call({ type: 'invoice_work_browser_query_decision', input }),
       timeline: input => call({ type: 'invoice_work_timeline', input }) },
     personalTasks: { list: input => call({ type: 'personal_task_list', input }), get: input => call({ type: 'personal_task_get', input }),
       stop: input => call({ type: 'personal_task_stop', input }), history: input => call({ type: 'personal_task_history', input }),

@@ -174,6 +174,16 @@ describe('P18 public business command contracts', () => {
     expect(contracts.PersonalAgentOpenConversationRequestSchema.safeParse({ workId: 7, expectedRevision: 3 }).success).toBe(false);
   });
 
+  it('requires both browser tools and prevents their use with desktop tools', () => {
+    const browser = ['browser_request_read', 'browser_read_approved'];
+    expect(contracts.PersonalAgentConfigurationSchema.safeParse({ ...configuration, tools: [...configuration.tools, ...browser] }).success).toBe(true);
+    for (const tool of browser)
+      expect(contracts.PersonalAgentConfigurationSchema.safeParse({ ...configuration, tools: [tool] }).success).toBe(false);
+    for (const tool of contracts.PERSONAL_DESKTOP_TOOL_NAMES)
+      expect(contracts.PersonalAgentConfigurationSchema.safeParse({ ...configuration, tools: [...browser, tool] }).success).toBe(false);
+    expect(contracts.PersonalAgentConfigurationSchema.safeParse({ ...configuration, tools: ['desktop_observe_window'] }).success).toBe(true);
+  });
+
   it('projects work and item facts without treating cancellation, a candidate reference or an enabled action as authority', () => {
     expect(contracts.InvoiceWorkViewSchema).toBeDefined(); expect(contracts.InvoiceWorkItemViewSchema).toBeDefined();
     expect(contracts.InvoiceWorkViewSchema.parse(work)).toEqual(work);

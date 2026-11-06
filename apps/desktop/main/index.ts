@@ -2,9 +2,10 @@ import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesIn
 import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, researchOperations } from '../../../packages/contracts/src/research-commands.ts';
 import { isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure, personalAgentHostCommandTypes } from '../../../packages/contracts/src/personal-agent-commands.ts';
 import { ResourceRefSchema } from '@flowmate/contracts';
-import { DesktopOwnerSchema, DesktopWindowSelectionSchema, InvoiceWorkGetResultSchema, type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult } from '@flowmate/contracts';
+import { BrowserOwnerSchema, BrowserSelectionSchema, CloudDesktopWorkspaceSchema, DesktopOwnerSchema, DesktopWindowSelectionSchema, InvoiceWorkGetResultSchema, type BrowserReadView, type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult } from '@flowmate/contracts';
 import { connectKimiMcp, resolveKimiPaths } from './kimi-mcp.ts';
 import { createKimiDesktop, handleKimiDesktopRequest, isOwnDesktopWindow } from './kimi-desktop.ts';
+import { createKimiWebBridgeManager, handleKimiBrowserRequest, readKimiWebBridgeStatus, resolveKimiWebBridgeExecutable, startKimiWebBridge } from './kimi-webbridge.ts';
 import { createDesktopOperationLock } from './desktop-operation-lock.ts';
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
@@ -13,6 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdir, lstat, open, readFile, rename, rm } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { resolveRuntimeLayout, type RuntimeLayout } from '../../../packages/shared/src/runtime-layout.ts';
 import { createRuntimeLogBuffer } from '../../../packages/logging/src/runtime-log.ts';
@@ -99,7 +101,7 @@ import { defaultProductSettings, validateProductSettings } from '../../../packag
 import { createCredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import type { CredentialStore } from '../../../packages/shared/src/secure-credential-store.ts';
 import { systemSecureStorage } from './secure-storage.ts';
-import { HostClient } from './host-client.ts';
+import { HostClient, safeChildEnvironment } from './host-client.ts';
 import { ServiceClient, type ServiceCommandInput } from './service-client.ts';
 import { createServiceActivation } from './service-activation.ts';
 import { readDesktopServiceSelection, type ServiceInstallation } from '../../../packages/shared/src/service-layout.ts';
@@ -244,7 +246,13 @@ const legacyHost = new HostClient(), serviceClient = new ServiceClient();
 let host: HostClient | ServiceClient = legacyHost;
 let transportEpoch = 0, transportGeneration = 0;
 let kimiDesktop: { desktop: ReturnType<typeof createKimiDesktop>; unlisten: () => void } | null = null;
+const kimiBrowser = createKimiWebBridgeManager(async () => {
+  const executable = resolveKimiWebBridgeExecutable(userDataRoot, process.env);
+  if (!executable) throw Error('WebBridge executable must be an absolute path.');
+  return readKimiWebBridgeStatus(executable, homedir(), safeChildEnvironment(false));
+});
 let kimiConnecting: Promise<Result<ReturnType<typeof createKimiDesktop>>> | null = null;
+let browserStarting: Promise<Result<void>> | null = null;
 const desktopUnavailable = () => fail(appError('desktop_unavailable', 'runtime',
   'KimiCU is unavailable. Configure the local plugin and runtime paths, then reconnect the desktop.', true));
 async function openKimiDesktop(): Promise<Result<ReturnType<typeof createKimiDesktop>>> {
@@ -268,6 +276,8 @@ async function openKimiDesktop(): Promise<Result<ReturnType<typeof createKimiDes
   try { return await pending; } finally { if (kimiConnecting === pending) kimiConnecting = null; }
 }
 async function handleCloudDesktopRequest(workspaceId: string, request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult> {
+  if (request.kind === 'browser_target' || request.kind === 'browser_read')
+    return handleKimiBrowserRequest(kimiBrowser, { workspaceId, workId: request.workId, itemId: request.itemId }, request, signal);
   const desktop = kimiDesktop?.desktop; if (!desktop) return desktopUnavailable();
   const owner = { workspaceId, workId: request.workId, itemId: request.itemId };
   return handleKimiDesktopRequest(desktop, owner, request, signal);
@@ -278,8 +288,16 @@ async function verifyCloudDesktopAction(workspaceId: string, action: DesktopActi
   return !target.ok ? target : isDeepStrictEqual(target.data, action.target) ? ok(undefined)
     : fail(appError('desktop_target_changed', 'runtime', 'The approved desktop target changed; observe it again.'));
 }
+async function verifyCloudBrowserRead(workspaceId: string, read: BrowserReadView, signal: AbortSignal): Promise<Result<void>> {
+  const opened = await kimiBrowser.open(); if (!opened.ok) return opened;
+  if (signal.aborted) return fail(appError('browser_unavailable', 'runtime', 'The browser selection is unavailable.', true));
+  const target = opened.data.selectedTarget({ workspaceId, workId: read.workId, itemId: read.itemId });
+  return target.ok && isDeepStrictEqual(target.data, read.target) ? ok(undefined)
+    : fail(appError('browser_target_changed', 'runtime', 'The browser tab changed. Bind it and request a new read.', true));
+}
 async function handleDesktopRequest(request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult> {
   const owner = { workId: request.workId, itemId: request.itemId };
+  if (request.kind === 'browser_target' || request.kind === 'browser_read') return handleKimiBrowserRequest(kimiBrowser, owner, request, signal);
   if (request.kind === 'form') {
     const unavailable = () => fail(appError('form_unavailable', 'runtime', 'The original prepared invoice form is unavailable.', true));
     const binding = invoiceFormBinding, window = mainWindow, epoch = transportEpoch;
@@ -310,7 +328,8 @@ function cloudHostOwner() {
   } };
 }
 const cloudDesktop = new CloudDesktopController({ connect: connectCloudSsh,
-  desktop: { execute: handleCloudDesktopRequest, verify: verifyCloudDesktopAction },
+  onDisconnected: workspaceId => kimiBrowser.revokeWorkspace(workspaceId),
+  desktop: { execute: handleCloudDesktopRequest, verify: verifyCloudDesktopAction, verifyBrowser: verifyCloudBrowserRead },
   upload: async (input, session) => !transportAvailable() ? fail(appError('cloud_material_unavailable', 'storage', 'The local material service is unavailable.', true))
     : uploadCloudMaterial(input, createHostCloudMaterialExport(cloudHostOwner()), session),
   uploadResource: async (input, session) => !transportAvailable() ? fail(appError('cloud_resource_unavailable', 'storage', 'The local resource service is unavailable.', true))
@@ -450,6 +469,7 @@ async function requestProduct(command: Parameters<HostClient['request']>[0], tim
 }
 function revokeDesktopConnection(): void {
   transportEpoch++;
+  kimiBrowser.reset();
   const desktop = kimiDesktop; kimiDesktop = null;
   if (desktop) { desktop.unlisten(); void desktop.desktop.close().catch(() => {}); }
   releaseAllRuntimeOwners();
@@ -965,6 +985,14 @@ function registerIpc(): void {
     if (args.length) return fail(appError('input_invalid', 'input', 'Desktop startup takes no arguments.'));
     const desktop = await openKimiDesktop(); return desktop.ok ? ok(undefined) : desktop;
   });
+  handle('flowmate:browser-start', async (_event, ...args) => {
+    if (args.length) return fail(appError('input_invalid', 'input', 'Browser startup takes no arguments.'));
+    if (browserStarting) return browserStarting;
+    const executable = resolveKimiWebBridgeExecutable(userDataRoot, process.env);
+    if (!executable) return fail(appError('browser_executable_unavailable', 'runtime', 'Configure an absolute WebBridge executable path.', true));
+    const pending = startKimiWebBridge(executable, homedir(), safeChildEnvironment(false)); browserStarting = pending;
+    try { return await pending; } finally { if (browserStarting === pending) browserStarting = null; }
+  });
   handle('flowmate:desktop-windows', async (_event, ...args) => {
     if (args.length) return fail(appError('input_invalid', 'input', 'Window listing takes no arguments.'));
     const desktop = await openKimiDesktop(); return desktop.ok ? desktop.data.listWindows(new AbortController().signal) : desktop;
@@ -998,8 +1026,51 @@ function registerIpc(): void {
     } catch { /* A lost binding cannot authorize this selection. */ }
     desktop.revoke(owner); return desktopUnavailable();
   });
+  handle('flowmate:browser-select', async (_event, raw, ...extra) => {
+    const parsed = BrowserSelectionSchema.safeParse(raw);
+    if (extra.length || !parsed.success) return fail(appError('input_invalid', 'input', 'The browser selection is invalid.'));
+    const { url, ...owner } = parsed.data, epoch = transportEpoch;
+    const unavailable = () => fail(appError('browser_unavailable', 'runtime', 'The original invoice or browser connection is unavailable.', true));
+    kimiBrowser.revoke(owner);
+    try {
+      if (owner.workspaceId) {
+        const state = await cloudDesktop.state();
+        if (!state.ok || state.data.workspaceId !== owner.workspaceId || !state.data.desktopReady) return unavailable();
+        const result = await cloudDesktop.request({ workspaceId: owner.workspaceId,
+          command: { type: 'invoice_work_get', input: { view: 'item', workId: owner.workId, itemId: owner.itemId, limit: 1 } } });
+        const page = result.ok ? InvoiceWorkGetResultSchema.safeParse(result.data) : null;
+        if (!page?.success || page.data.view !== 'item' || page.data.work.status !== 'open' || page.data.item.disposition !== 'unresolved') return unavailable();
+      } else {
+        const reply = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: DesktopOwnerSchema }).strict(),
+          z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await requestProduct({ type: 'desktop_bind', input: owner }));
+        if (!reply.success || !reply.data.ok || reply.data.data.workId !== owner.workId || reply.data.data.itemId !== owner.itemId) return unavailable();
+      }
+      const opened = await kimiBrowser.open();
+      if (!opened.ok) return opened;
+      if (epoch !== transportEpoch) return fail(appError('browser_unavailable', 'runtime', 'The browser selection is unavailable.', true));
+      const selected = await opened.data.bind(owner, url, new AbortController().signal);
+      const current = await kimiBrowser.open();
+      const state = owner.workspaceId ? await cloudDesktop.state() : null;
+      if (!selected.ok) return selected;
+      if (!current.ok) return current;
+      if (current.data !== opened.data || epoch !== transportEpoch
+        || owner.workspaceId && (!state?.ok || state.data.workspaceId !== owner.workspaceId || !state.data.desktopReady)) {
+        kimiBrowser.revoke(owner); return unavailable();
+      }
+      return selected;
+    } catch { kimiBrowser.revoke(owner); return unavailable(); }
+  });
+  handle('flowmate:browser-revoke', async (_event, raw, ...extra) => {
+    const owner = BrowserOwnerSchema.safeParse(raw);
+    if (extra.length || !owner.success) return fail(appError('input_invalid', 'input', 'The browser selection is invalid.'));
+    kimiBrowser.revoke(owner.data); return ok(undefined);
+  });
   handle('flowmate:cloud-connect', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud connection is invalid.')) : cloudDesktop.connect(input));
-  handle('flowmate:cloud-disconnect', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud connection is invalid.')) : cloudDesktop.disconnect(input));
+  handle('flowmate:cloud-disconnect', async (_event, input, ...extra) => {
+    const parsed = CloudDesktopWorkspaceSchema.safeParse(input);
+    if (extra.length || !parsed.success) return fail(appError('input_invalid', 'input', 'The cloud connection is invalid.'));
+    kimiBrowser.revokeWorkspace(parsed.data.workspaceId); return cloudDesktop.disconnect(parsed.data);
+  });
   handle('flowmate:cloud-request', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud request is invalid.')) : cloudDesktop.request(input));
   handle('flowmate:cloud-upload', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud upload is invalid.')) : cloudDesktop.upload(input));
   handle('flowmate:cloud-upload-resource', async (_event, input, ...extra) => extra.length ? fail(appError('input_invalid', 'input', 'The cloud resource upload is invalid.')) : cloudDesktop.uploadResource(input));

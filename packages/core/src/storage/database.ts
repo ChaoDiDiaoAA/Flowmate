@@ -16,6 +16,7 @@ import type { InvoiceWorkContextRepository } from '../personal-agent/context-rep
 import type { InvoiceWorkAttemptRepository } from '../personal-agent/attempts.ts';
 import type { InvoiceWorkModelBindingRepository } from '../personal-agent/model-bindings.ts';
 import type { InvoiceWorkDesktopActionRepository } from '../personal-agent/desktop-actions.ts';
+import type { InvoiceWorkBrowserReadRepository } from '../personal-agent/browser-reads.ts';
 import type { DocumentRepository, ToolCallRepository, BusinessEventRepository, JobRepository, RunRepository,
   SessionRepository, WorkspaceRepository, InvoiceEditRepository } from './repositories.ts';
 
@@ -40,6 +41,7 @@ export type SqlDatabaseStore = {
   invoiceWorkAttempts: InvoiceWorkAttemptRepository;
   invoiceWorkModelBindings: InvoiceWorkModelBindingRepository;
   invoiceWorkDesktopActions: InvoiceWorkDesktopActionRepository;
+  invoiceWorkBrowserReads: InvoiceWorkBrowserReadRepository;
   runtimeEventStore: RuntimeEventStore;
 };
 

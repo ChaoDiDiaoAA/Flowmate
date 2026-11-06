@@ -68,7 +68,7 @@ function unknownResult(): ToolExecutionResult {
 export function createDurableProductTools(options: DurableProductToolOptions) {
   const productResult = (call: DurableProductToolCall, result: ToolResult<unknown>): ToolExecutionResult => {
     const native = nativeResult(result);
-    return call.name === 'desktop_propose_action' && result.status === 'succeeded'
+    return (call.name === 'desktop_propose_action' || call.name === 'browser_request_read') && result.status === 'succeeded'
       ? { ...native, control: { terminate: true } } : native;
   };
   const original = async (call: DurableProductToolCall): Promise<ToolExecutionResult> => {

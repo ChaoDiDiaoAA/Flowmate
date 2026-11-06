@@ -18,6 +18,24 @@ Personal Agent is a separate workspace for continuing work on a fixed group of i
 
 Every invoice needs an explicit final disposition. Work completes only after the required business writes and execution have settled; a generated candidate or finished child is not itself an accepted invoice. The [workflow guide](workflows.md#personal-agent) summarizes the operations alongside the other invoice paths.
 
+## Controlled page reading
+
+On Windows, local or cloud Work can read a Chrome tab selected by the user. Install the official Kimi WebBridge and enable the [Kimi Browser Extension](https://www.kimi.com/en/help/kimi-webbridge/kimi-webbridge-introduction). Entering the cloud workspace attempts to start WebBridge and reuses a healthy running service. Startup failures are shown without blocking the cloud connection. Local Work still requires WebBridge to be started manually if the cloud workspace has not been opened.
+
+The executable path comes from `FLOWMATE_WEBBRIDGE_EXE`, then `%APPDATA%\Flowmate\data\kimi-webbridge.json`, then the official user-directory default. A custom D: drive configuration looks like:
+
+```json
+{ "version": 1, "executable": "D:\\KimiWebBridge\\bin\\kimi-webbridge.exe" }
+```
+
+The path must be absolute; WebBridge keeps its default configuration and logs. Automatic startup only permits a `127.0.0.1` listener and does not install additional Agent Skills. Before binding a page it opens two synthetic pages to check tab targeting and closes that check session; a failed check prevents user-page binding. Cloud Work also requires matching desktop, Authority, Runtime and SSH Bridge versions.
+
+Enable **Browser page reading** in **Assistant configuration**, save it, and create new Work. Browser reading and KimiCU desktop tools are mutually exclusive within that Work; existing Work keeps its original configuration. The new Work waits initially. Select an invoice, enter an HTTP(S) address in **Page URL for this invoice**, choose **Open dedicated tab**, then select **Continue work**. Bind each invoice separately; a request for an unbound invoice fails and needs a binding and a new continuation. The user opens the page; the model cannot select a URL, tab, script or selector, or navigate, click, fill forms or take screenshots.
+
+When the model requests a read, the interface shows the Work, invoice, dedicated tab and origin. **Approve one read and continue** allows one read; the request can also be rejected or revoked. Approval covers paths in that tab with the same scheme, host and port, including other paths on that origin. The browser can still navigate on its own, but page text from a different origin is refused. A disconnect, rebinding, cancellation or uncertain outcome requires a new confirmation. Revocation cannot recall data already read, saved or sent.
+
+The result contains the URL, title and up to 22,000 UTF-8 bytes of text, with a truncation marker. It may be retained in local or cloud Work history and sent to the selected model provider. Page text remains untrusted tool output and cannot grant authority or become a system instruction; compaction summaries are also marked as model-generated. Page content can still mislead the model or affect its answer, and later tools retain their own permission and confirmation rules.
+
 ## Work, attempts and evidence
 
 | Object | Purpose |

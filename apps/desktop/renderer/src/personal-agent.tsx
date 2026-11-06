@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { CLOUD_WORK_TIMEOUT_MS_MAX, CloudChildReportSchema, CloudDesktopConnectionSchema, CloudProgressEventSchema, CloudReviewAcceptReceiptSchema, compareInvoiceWorkTimelineCursor, ok, type CloudDesktopConnection, type DesktopBridge, type DocumentSnapshot, type InvoiceWorkView, type InvoiceWorkItemView,
-  type DesktopActionView, type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
+  type BrowserReadView, type DesktopActionView, type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
   type PersonalAgentSnapshot, type PersonalHistoryPage, type PersonalHistoryEntry, type PersonalHistoryTarget,
   type PersonalTaskView, type PersonalTaskGetResult, type Result } from '@flowmate/contracts';
 import { capturePersonalWrite, emptyPersonalDraft, executePersonalWrite, readPersonalDraft, recoverPersonalWrite,
@@ -8,6 +8,7 @@ import { capturePersonalWrite, emptyPersonalDraft, executePersonalWrite, readPer
   type PersonalWriteReceipt } from './personal-state.ts';
 import { PersonalConfiguration } from './personal-configuration.tsx';
 import { PersonalDesktopActions, PersonalDesktopWindow } from './personal-desktop-actions.tsx';
+import { PersonalBrowserReads, PersonalBrowserWindow } from './personal-browser-actions.tsx';
 import { createCloudPersonalBridge, prepareCloudPersonalWrite } from './cloud-personal-bridge.ts';
 import { CLOUD_CONNECTION_KEY, readCloudConnection, saveCloudConnection } from './cloud-connection-state.ts';
 import { CloudInvoiceReview } from './cloud-invoice-review.tsx';
@@ -43,6 +44,7 @@ function CloudPersonalWorkspace(props: Props) {
   const [connected, setConnected] = useState<string | null>(null), [busy, setBusy] = useState(false);
   const [reviewTarget, setReviewTarget] = useState<PersonalReviewTarget | null>(null);
   const [desktopStatus, setDesktopStatus] = useState('Starting KimiCU on this Windows desktop…');
+  const [browserStatus, setBrowserStatus] = useState('Starting Kimi WebBridge on this Windows desktop…');
   const [cloudDesktopReady, setCloudDesktopReady] = useState(false);
   const connecting = useRef(false), autoConnectStarted = useRef(false);
   const personal = useMemo(() => connected ? createCloudPersonalBridge(window.flowmate.cloudDesktop, connected) : null, [connected]);
@@ -58,6 +60,9 @@ function CloudPersonalWorkspace(props: Props) {
   useEffect(() => { let live = true; void window.flowmate.startDesktopUse().then(result => {
     if (live) setDesktopStatus(result.ok ? 'KimiCU is ready on this Windows desktop.' : result.error.message);
   }).catch(() => { if (live) setDesktopStatus('KimiCU is unavailable on this Windows desktop.'); }); return () => { live = false; }; }, []);
+  useEffect(() => { let live = true; void window.flowmate.startBrowserUse().then(result => {
+    if (live) setBrowserStatus(result.ok ? 'Kimi WebBridge started on this Windows desktop.' : result.error.message);
+  }).catch(() => { if (live) setBrowserStatus('Kimi WebBridge is unavailable on this Windows desktop.'); }); return () => { live = false; }; }, []);
   async function connect() {
     if (busy || connecting.current || unreadable) return;
     const parsed = CloudDesktopConnectionSchema.safeParse(profile);
@@ -82,6 +87,7 @@ function CloudPersonalWorkspace(props: Props) {
     if (!unreadable) setProfileError(null); };
   return <><section className="page-content" aria-label="Cloud connection"><div className="panel"><h2>Cloud connection</h2>
     <p role="status">{desktopStatus}</p>
+    <p role="status">{browserStatus}</p>
     {connected && !cloudDesktopReady && <p role="status">The cloud desktop bridge is unavailable. Update the cloud service before using KimiCU.</p>}
     <p>Use a dedicated non-root SSH account and a known_hosts file whose server key you have verified. Passwords are not stored here.</p>
     {profileError && <p role="alert" className="notice bad">{profileError}</p>}
@@ -133,6 +139,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   useEffect(() => { selectedItemRef.current = selectedItem; }, [selectedItem]);
   const [todos, setTodos] = useState<readonly InvoiceWorkTodoView[]>([]), [todoCursor, setTodoCursor] = useState<number | null>(null);
   const [desktopActions, setDesktopActions] = useState<readonly DesktopActionView[]>([]), [desktopCursor, setDesktopCursor] = useState<number | null>(null);
+  const [browserReads, setBrowserReads] = useState<readonly BrowserReadView[]>([]), [browserCursor, setBrowserCursor] = useState<number | null>(null);
   const [desktopOwner, setDesktopOwner] = useState<{ workId: number; itemId: number } | null>(null);
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]), [documentCursor, setDocumentCursor] = useState<number | null>(null);
   const [tasks, setTasks] = useState<readonly PersonalTaskView[]>([]), [taskCursor, setTaskCursor] = useState<number | null>(null);
@@ -157,7 +164,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   async function readItem(itemId: number, append = false) {
     const workId = draftRef.current.selectedWorkId; if (workId === null) return;
     const token = ++itemGeneration.current;
-    if (!append) { setDesktopActions([]); setDesktopCursor(null);
+    if (!append) { setDesktopActions([]); setDesktopCursor(null); setBrowserReads([]); setBrowserCursor(null);
       setDesktopOwner(previous => previous?.workId === workId && previous.itemId === itemId ? previous : null); }
     try {
       const page = need(await personal.invoiceWorks.get({ view: 'item', workId, itemId,
@@ -167,11 +174,13 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
       if (!cloud || selectedItemRef.current?.workId !== workId || selectedItemRef.current.itemId !== itemId) setDecision('');
       setTodos(previous => append ? [...previous, ...page.todos] : page.todos); setTodoCursor(page.nextAfterTodoId);
       if (!append && (!cloud || props.cloudDesktopReady)) {
-        const result = await personal.invoiceWorks.listDesktopActions({ workId, itemId, limit: 50 });
+        const [result, browser] = await Promise.all([personal.invoiceWorks.listDesktopActions({ workId, itemId, limit: 50 }),
+          personal.invoiceWorks.listBrowserReads({ workId, itemId, limit: 50 })]);
         if (token !== itemGeneration.current || workId !== draftRef.current.selectedWorkId) return;
         if (!result.ok && result.error.code === 'invoice_work_item_not_found') { setDesktopOwner(null); return; }
         const actions = need(result);
         setDesktopOwner({ workId, itemId }); setDesktopActions(actions.items); setDesktopCursor(actions.nextAfterProposalId);
+        const reads = need(browser); setBrowserReads(reads.items); setBrowserCursor(reads.nextAfterProposalId);
       }
     } catch (cause) { if (token === itemGeneration.current) setError(cause instanceof Error ? cause.message : 'The original invoice could not be read.'); }
   }
@@ -181,6 +190,13 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
     const page = need(await personal.invoiceWorks.listDesktopActions({ workId, itemId, afterProposalId: cursor, limit: 50 }));
     if (token !== itemGeneration.current || workId !== draftRef.current.selectedWorkId || selectedItemRef.current?.itemId !== itemId) return;
     setDesktopActions(previous => [...previous, ...page.items]); setDesktopCursor(page.nextAfterProposalId);
+  }
+  async function readMoreBrowserReads(itemId: number) {
+    const workId = draftRef.current.selectedWorkId, cursor = browserCursor, token = itemGeneration.current;
+    if (workId === null || cursor === null) return;
+    const page = need(await personal.invoiceWorks.listBrowserReads({ workId, itemId, afterProposalId: cursor, limit: 50 }));
+    if (token !== itemGeneration.current || workId !== draftRef.current.selectedWorkId || selectedItemRef.current?.itemId !== itemId) return;
+    setBrowserReads(previous => [...previous, ...page.items]); setBrowserCursor(page.nextAfterProposalId);
   }
   async function readTask(attemptId: number, append = false) {
     const workId = draftRef.current.selectedWorkId; if (workId === null) return;
@@ -268,7 +284,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
     if (!persist({ pending: null, selectedWorkId: receipt.workId, supplements, review })) return false;
     if (originalWorkId !== receipt.workId) {
       itemGeneration.current++; taskGeneration.current++; historyGeneration.current++;
-      setSelectedItem(null); setTodos([]); setDesktopActions([]); setDesktopCursor(null); setDesktopOwner(null); setTask(null); setHistory(null); setHistoryDetail(null); setReport(null); setView('Invoices');
+      setSelectedItem(null); setTodos([]); setDesktopActions([]); setDesktopCursor(null); setBrowserReads([]); setBrowserCursor(null); setDesktopOwner(null); setTask(null); setHistory(null); setHistoryDetail(null); setReport(null); setView('Invoices');
     }
     setReceiptMissing(false); setMessage(personalReceiptText(receipt)); setCreating(false);
     await refresh(receipt.workId);
@@ -297,6 +313,18 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
     await submit({ type: 'invoice_work_continue', input: { workId: action.workId, expectedRevision: current.work.revision,
       expectedAttemptId: current.work.execution.attempt?.attemptId ?? null, requestId: requestId() } });
   }
+  async function decideBrowserRead(read: BrowserReadView, decision: 'approve' | 'reject') {
+    if (!work || !selectedItem || (decision === 'approve' ? !read.canDecide : !read.canReject)
+      || read.workId !== work.workId || read.itemId !== selectedItem.itemId) return;
+    const receipt = await submit({ type: 'invoice_work_browser_decide', input: { workId: read.workId, itemId: read.itemId,
+      proposalId: read.proposalId, expectedRevision: work.revision, requestId: requestId(), decision,
+      ...(decision === 'approve' ? { confirmedTarget: read.target } : {}) } });
+    if (decision !== 'approve' || !receipt || !('proposalId' in receipt)) return;
+    const current = need(await personal.invoiceWorks.get({ view: 'work', workId: read.workId, limit: 1 }));
+    if (draftRef.current.selectedWorkId !== read.workId || current.work.status !== 'open') return;
+    await submit({ type: 'invoice_work_continue', input: { workId: read.workId, expectedRevision: current.work.revision,
+      expectedAttemptId: current.work.execution.attempt?.attemptId ?? null, requestId: requestId() } });
+  }
   async function recover(retry = false) {
     const original = draftRef.current.pending; if (!original) return;
     const receipt = await recoverPersonalWrite(personal, original);
@@ -308,7 +336,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   async function selectWork(workId: number) {
     if (!persist({ selectedWorkId: workId })) return;
     itemGeneration.current++; taskGeneration.current++; historyGeneration.current++;
-    setSelectedItem(null); setTodos([]); setDesktopActions([]); setDesktopCursor(null); setDesktopOwner(null); setTask(null); setHistory(null); setHistoryDetail(null); setCreating(false); setReport(null); setMessage(null);
+    setSelectedItem(null); setTodos([]); setDesktopActions([]); setDesktopCursor(null); setBrowserReads([]); setBrowserCursor(null); setDesktopOwner(null); setTask(null); setHistory(null); setHistoryDetail(null); setCreating(false); setReport(null); setMessage(null);
     await refresh(workId);
   }
   async function readHistory(target: PersonalHistoryTarget, append = false) {
@@ -481,6 +509,16 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
                 onDiscard={action => void operate(async () => { need(await personal.invoiceWorks.discardDesktopAction({
                   workId: action.workId, itemId: action.itemId, proposalId: action.proposalId })); await readItem(action.itemId); })} />
               {desktopCursor !== null && <button type="button" onClick={() => void operate(() => readMoreDesktopActions(selectedItem.itemId))}>More desktop actions</button>}
+              {desktopOwner?.workId === work.workId && desktopOwner.itemId === selectedItem.itemId && <PersonalBrowserWindow workId={work.workId} itemId={selectedItem.itemId} hostEpoch={props.hostEpoch} workspaceId={cloud}
+                disabled={!props.ready || writeDisabled || work.status !== 'open' || selectedItem.disposition !== 'unresolved' || !!cloud && !props.cloudDesktopReady} />}
+              <PersonalBrowserReads reads={browserReads} cloud={!!cloud} disabled={writeDisabled || work.status !== 'open' || !!cloud && !props.cloudDesktopReady}
+                onDecision={(read, choice) => void operate(() => decideBrowserRead(read, choice))}
+                onRevoke={read => void operate(async () => {
+                  need(await window.flowmate.revokeBrowserPage({ workId: read.workId, itemId: read.itemId, ...(cloud ? { workspaceId: cloud } : {}) }));
+                  need(await personal.invoiceWorks.revokeBrowserRead({ workId: read.workId, itemId: read.itemId, proposalId: read.proposalId }));
+                  await readItem(read.itemId);
+                })} />
+              {browserCursor !== null && <button type="button" onClick={() => void operate(() => readMoreBrowserReads(selectedItem.itemId))}>More browser reads</button>}
               {selectedItem.disposition === 'unresolved' && work.status === 'open' && <fieldset disabled={writeDisabled}><legend>Explicit final disposition</legend>
                 <p>Rejecting a candidate in Invoices does not end this item. These actions end this Work's processing of this invoice.</p>
                 <label className="field"><span>Disposition reason</span><input maxLength={2048} value={decision} onChange={event => setDecision(event.target.value)} /></label>

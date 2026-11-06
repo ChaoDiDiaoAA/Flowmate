@@ -18,6 +18,24 @@ Personal Agent 是持续处理一组固定发票的独立工作区，保存用�
 
 每张票都需要明确最终处置；必要业务写入和执行收口后事项才能完成。产生候选或子任务结束不等于发票已经接受。[业务流程](workflows.zh-CN.md#personal-agent)将上述操作与其他发票路径放在一起说明。
 
+## 受控网页读取
+
+Windows 桌面可为本地或云端 Work 读取用户选择的 Chrome 标签页。先安装官方 Kimi WebBridge 并启用 [Kimi 浏览器扩展](https://www.kimi.com/en/help/kimi-webbridge/kimi-webbridge-introduction)。进入云端工作区时，Flowmate 会尝试启动 WebBridge，已有服务可用时直接复用；启动失败会显示原因，不影响云端连接。本地 Work 未经过云端工作区时仍需先手动启动 WebBridge。
+
+程序路径优先使用进程环境变量 `FLOWMATE_WEBBRIDGE_EXE`，其次读取 `%APPDATA%\Flowmate\data\kimi-webbridge.json`，均未设置时使用官方用户目录。自定义 D 盘位置的配置示例：
+
+```json
+{ "version": 1, "executable": "D:\\KimiWebBridge\\bin\\kimi-webbridge.exe" }
+```
+
+路径必须为绝对路径；官方程序的配置和日志仍保留在默认用户目录。自动启动只允许本机 `127.0.0.1` 监听，不安装其他 Agent Skill。绑定页面前会使用两张合成页面检查标签页定位，并关闭检查会话；检查不通过时不能绑定用户页面。云端 Work 还需要与桌面配套版本的 Authority、Runtime 和 SSH Bridge。
+
+在 **Assistant configuration** 中开启 **Browser page reading** 并保存，再创建新 Work。网页读取和 KimiCU 桌面工具在同一个新 Work 中互斥；旧 Work 保留原配置。新 Work 会先等待，选择其中一张发票，在 **Page URL for this invoice** 输入 HTTP(S) 地址并点击 **Open dedicated tab**，再点击 **Continue work** 启动。多张发票需要分别绑定；未绑定发票的读取请求会失败，需要绑定后重新继续。用户发起开页；模型不能选择地址、标签页、脚本或选择器，也不能导航、点击、填表或截图。
+
+模型提出读取后，界面显示 Work、发票、专用标签页和来源。选择 **Approve one read and continue** 才会读取一次；也可以拒绝或撤销。批准覆盖该标签页中协议、主机和端口相同的路径，包括同源的其他路径。浏览器本身仍可能跳转；跨来源页面正文会被拒绝。断线、重新绑定、取消或结果不确定后，需要重新确认；撤销无法收回已经读取、保存或发送的数据。
+
+结果包含 URL、标题和最多 22,000 UTF-8 字节的正文，超出时标记截断。正文可能进入本地或云端 Work 历史，并发送给所选模型服务。网页文字作为不可信工具结果传递，不能自行成为系统指令或授权；压缩摘要也标记为模型生成内容。网页仍可能误导模型或影响回答，后续工具按各自的权限和确认规则运行。
+
 ## 事项、尝试与证据
 
 | 对象 | 作用 |

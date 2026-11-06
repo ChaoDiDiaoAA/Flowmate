@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AppErrorSchema } from './runtime.ts';
 import { PersonalInvoiceFormObservationSchema } from './invoice.ts';
+import { BrowserPageSchema, BrowserTargetSchema } from './browser-actions.ts';
 
 export const PERSONAL_DESKTOP_TOOL_NAMES = [
   'desktop_list_windows', 'desktop_observe_window', 'desktop_propose_action', 'desktop_execute_approved',
@@ -39,6 +40,8 @@ export const DesktopBridgeRequestSchema = z.discriminatedUnion('kind', [
   DesktopOwnerSchema.extend({ kind: z.literal('form') }).strict(),
   DesktopOwnerSchema.extend({ kind: z.literal('resolve'), action: DesktopActionProposalSchema }).strict(),
   DesktopOwnerSchema.extend({ kind: z.literal('dispatch'), action: DesktopActionProposalSchema, target: DesktopActionTargetSchema, proposalId: id.optional() }).strict(),
+  DesktopOwnerSchema.extend({ kind: z.literal('browser_target') }).strict(),
+  DesktopOwnerSchema.extend({ kind: z.literal('browser_read'), target: BrowserTargetSchema, proposalId: id }).strict(),
 ]);
 export type DesktopBridgeRequest = z.infer<typeof DesktopBridgeRequestSchema>;
 const bridgeData = z.discriminatedUnion('kind', [
@@ -48,6 +51,8 @@ const bridgeData = z.discriminatedUnion('kind', [
   PersonalInvoiceFormObservationSchema.extend({ kind: z.literal('form') }).strict(),
   z.object({ kind: z.literal('resolve'), target: DesktopActionTargetSchema }).strict(),
   z.object({ kind: z.literal('dispatch') }).strict(),
+  z.object({ kind: z.literal('browser_target'), target: BrowserTargetSchema }).strict(),
+  z.object({ kind: z.literal('browser_read'), page: BrowserPageSchema }).strict(),
 ]);
 export const DesktopBridgeResultSchema = z.discriminatedUnion('ok', [
   z.object({ ok: z.literal(true), data: bridgeData }).strict(),
@@ -59,6 +64,8 @@ export function parseDesktopBridgeResult(request: DesktopBridgeRequest, value: u
   if (!result.success || result.data.ok && result.data.data.kind !== request.kind) return null;
   if (result.data.ok && request.kind === 'resolve' && result.data.data.kind === 'resolve'
     && !result.data.data.target.element.trimStart().startsWith(`[${request.action.elementIndex}]`)) return null;
+  if (result.data.ok && request.kind === 'browser_read' && result.data.data.kind === 'browser_read'
+    && new URL(result.data.data.page.url).origin !== request.target.origin) return null;
   return result.data;
 }
 

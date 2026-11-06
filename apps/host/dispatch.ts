@@ -19,6 +19,7 @@ import { PI_SDK_VERSION } from '@flowmate/runtime-pi';
 import { PiAgentAdapter, PiProviderAdapter, createPiModelCatalog, loginPiProvider, logoutPiProvider } from '@flowmate/runtime-pi';
 import { resolveProductPaths, resolveRuntimeLayout } from '@flowmate/shared';
 import { createApplication } from '../composition.ts';
+import { createBrowserBridge } from '../browser-bridge.ts';
 import type { PersonalAgentRuntime } from '../personal-agent.ts';
 import type { CloudMaterialExport } from '../cloud-material-export.ts';
 import type { CloudResourceExport } from '../cloud-resource-export.ts';
@@ -82,7 +83,8 @@ const closingReads: readonly HostCommand['type'][] = [
   'read_document_page', 'list_document_pages', 'read_document_original', 'query_native_tools',
   'list_sessions', 'query_session', 'list_session_runs', 'list_session_messages', 'query_prompt_trace',
   'personal_agent_get', 'personal_agent_open_conversation', 'invoice_work_list', 'invoice_work_get',
-  'invoice_work_query_operation', 'invoice_work_desktop_list', 'invoice_work_desktop_query_decision', 'personal_task_list', 'personal_task_get',
+  'invoice_work_query_operation', 'invoice_work_desktop_list', 'invoice_work_desktop_query_decision', 'invoice_work_browser_list',
+  'invoice_work_browser_query_decision', 'personal_task_list', 'personal_task_get',
   'personal_task_history', 'personal_task_history_entry', 'invoice_work_timeline',
 ];
 
@@ -273,6 +275,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         void send({ version: 1, type: 'evaluation_trace_available', traceId: trace.id, workspaceRoot: evaluationWorkspaceRoot }); } } : {}) } } : {}),
     provider: new PiProviderAdapter({ credentialsFor }),
     personalAgent: {
+      browser: createBrowserBridge((request, signal) => desktopBridge.request(request, signal)),
       observeInvoiceForm: async (context, signal) => {
         const owner = context.scope.invoiceWork; if (!owner) return fail(appError('form_unavailable', 'runtime', 'No invoice form is authorized.'));
         const result = await desktopBridge.request({ kind: 'form', workId: owner.workId, itemId: owner.itemId }, signal);
@@ -525,6 +528,10 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         case 'invoice_work_desktop_decide': value = await application.invoiceWorks.decideDesktopAction(captured.input); break;
         case 'invoice_work_desktop_discard': value = await application.invoiceWorks.discardDesktopAction(captured.input); break;
         case 'invoice_work_desktop_query_decision': value = await application.invoiceWorks.queryDesktopDecision(captured.input); break;
+        case 'invoice_work_browser_list': value = await application.invoiceWorks.listBrowserReads(captured.input); break;
+        case 'invoice_work_browser_decide': value = await application.invoiceWorks.decideBrowserRead(captured.input); break;
+        case 'invoice_work_browser_revoke': value = await application.invoiceWorks.revokeBrowserRead(captured.input); break;
+        case 'invoice_work_browser_query_decision': value = await application.invoiceWorks.queryBrowserDecision(captured.input); break;
         case 'personal_task_list': value = await application.personalTasks.list(captured.input); break;
         case 'personal_task_get': value = await application.personalTasks.get(captured.input); break;
         case 'personal_task_stop': value = await application.personalTasks.stop(captured.input); break;

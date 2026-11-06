@@ -41,6 +41,7 @@ export * from './personal-agent/tasks.ts';
 export * from './personal-agent/tool-scope.ts';
 export * from './personal-agent/desktop-actions.ts';
 export * from './personal-agent/desktop-tools.ts';
+export * from './personal-agent/browser-tools.ts';
 export * from './personal-agent/coordination.ts';
 export * from './personal-agent/instructions.ts';
 export * from './personal-agent/subagents.ts';

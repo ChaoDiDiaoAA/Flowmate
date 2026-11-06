@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { appError, AppErrorSchema, CloudNativeResultReceiptSchema, CloudNativeResultSchema, CloudQueueInstructionSchema, CloudQueueVerifyInputsSchema, CloudRuntimeBindingSchema, CloudRuntimeNoticeSchema, DurableCompactionPlanSchema, DurableCompactionRequestSchema, DurableModelBindingSchema, InvoiceWorkWorkingContextSchema,
-  INVOICE_REVIEW_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PersonalAgentConfigurationSchema, RegisteredToolNameSchema, SKILL_RESOURCE_TOOL_NAMES, SUBAGENT_ROLE, ToolEffectSchema, fail, ok,
+  INVOICE_REVIEW_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_BROWSER_TOOL_NAMES, PersonalAgentConfigurationSchema, RegisteredToolNameSchema, SKILL_RESOURCE_TOOL_NAMES, SUBAGENT_ROLE, ToolEffectSchema, fail, ok,
   type CloudNativeResult, type CloudNativeResultReceipt, type CloudQueueInstruction, type CloudQueueVerifyInputs, type CloudRuntimeBinding, type CloudRuntimeNotice, type DurableAttemptIdentity, type DurableConversationIdentity, type DurableProductToolCall, type DurableProductToolDefinition, type DurableWorkingContextQuery,
   type DurableCompactionCallbacks, type DurableCompactionPlan, type DurableProductToolExecution, type DurableProductToolFeedback,
   type DurableSubagentCallbacks, type DurableSubagentObservation, type DurableSubagentPlan,
@@ -28,7 +28,7 @@ const childOutcome = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true),
 const toolResult = z.discriminatedUnion('status', [z.object({ status: z.literal('succeeded'), data: z.unknown() }).strict(),
   z.object({ status: z.literal('failed'), error: AppErrorSchema, data: z.unknown().optional() }).strict(),
   z.object({ status: z.literal('cancelled'), error: AppErrorSchema, data: z.unknown().optional() }).strict()]);
-const allowedTools = new Set<string>([...INVOICE_REVIEW_TOOL_NAMES, ...SKILL_RESOURCE_TOOL_NAMES, ...PERSONAL_DESKTOP_TOOL_NAMES, 'Agent']);
+const allowedTools = new Set<string>([...INVOICE_REVIEW_TOOL_NAMES, ...SKILL_RESOURCE_TOOL_NAMES, ...PERSONAL_DESKTOP_TOOL_NAMES, ...PERSONAL_BROWSER_TOOL_NAMES, 'Agent']);
 export const CloudRuntimeToolsSchema = z.array(z.object({ name: RegisteredToolNameSchema.refine(name => allowedTools.has(name)),
   description: z.string().min(1).max(65000), inputSchema: z.record(z.unknown()), executionMode: z.enum(['parallel', 'sequential']),
   effect: ToolEffectSchema.optional() }).strict()).max(128).refine(tools => new Set(tools.map(tool => tool.name)).size === tools.length);

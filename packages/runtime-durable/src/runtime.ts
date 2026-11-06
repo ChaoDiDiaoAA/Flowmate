@@ -576,9 +576,10 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
       const call = message?.role === 'assistant' ? message.content.find(block => block.type === 'toolCall' && block.id === input.callId) : undefined;
       if (assistant?.conversationId !== nativeConversationId || assistant.kind !== AssistantEntry.kind || assistant.byTaskId !== task.owner || call?.type !== 'toolCall')
         throw Error('storage_corrupt');
-      if (call.name === 'desktop_propose_action' && message?.role === 'assistant'
+      if ((call.name === 'desktop_propose_action' || call.name === 'browser_request_read') && message?.role === 'assistant'
         && message.content.filter(block => block.type === 'toolCall').length !== 1)
-        throw new ProductFailure(appError('desktop_action_requires_single_call', 'runtime', 'A desktop proposal must be the only tool call in its model response.'));
+        throw new ProductFailure(appError(call.name === 'desktop_propose_action' ? 'desktop_action_requires_single_call' : 'browser_read_requires_single_call',
+          'runtime', 'A user confirmation request must be the only tool call in its model response.'));
       const existing = phase.calls.find(item => item.nativeTaskId === nativeTaskId);
       let args: unknown = existing ? JSON.parse(existing.argumentsJson) : call.arguments;
       if ('checkpoint' in task.state) {

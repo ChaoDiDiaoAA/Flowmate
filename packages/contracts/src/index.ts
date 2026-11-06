@@ -30,6 +30,7 @@ export * from './trace-observation.ts';
 export * from './evaluation-workflow.ts';
 export * from './personal-agent.ts';
 export * from './desktop-actions.ts';
+export * from './browser-actions.ts';
 export * from './durable-runtime.ts';
 export * from './cloud-desktop.ts';
 export * from './cloud-model.ts';

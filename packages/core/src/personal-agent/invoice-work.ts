@@ -4,6 +4,7 @@ import { appError, CloudWorkspaceIdSchema, fail, ok, InvoiceWorkCreateRequestSch
   InvoiceWorkSupplementRequestSchema, InvoiceWorkDisposeItemRequestSchema, InvoiceWorkCancelRequestSchema,
   InvoiceWorkListRequestSchema, InvoiceWorkGetRequestSchema, InvoiceWorkQueryOperationRequestSchema,
   DesktopActionDecisionQuerySchema, DesktopActionDecisionRequestSchema, DesktopActionListRequestSchema, DesktopActionDiscardSchema,
+  BrowserReadDecisionQuerySchema, BrowserReadDecisionRequestSchema, BrowserReadListRequestSchema, BrowserReadRevokeSchema,
   DurableModelBindingSchema, RuntimeRequestOverridesSchema } from '@flowmate/contracts';
 import type { InvoiceWorksApi, InvoiceWorkCreateRequest, InvoiceWorkContinueRequest, InvoiceWorkSupplementRequest,
   InvoiceWorkDisposeItemRequest, InvoiceWorkCancelRequest, InvoiceWorkListRequest, InvoiceWorkGetRequest,
@@ -12,6 +13,8 @@ import type { InvoiceWorksApi, InvoiceWorkCreateRequest, InvoiceWorkContinueRequ
   InvoiceWorkGetResult, DurableModelBinding, PersonalAgentConfiguration, RuntimeRequestOverrides,
   InvoiceWorkTimelineRequest, InvoiceWorkTimelinePage, DesktopActionDecisionQuery, DesktopActionDecisionReceipt,
   DesktopActionDecisionRequest, DesktopActionListRequest, DesktopActionListResult, DesktopActionDiscard, DesktopActionView, Result } from '@flowmate/contracts';
+import type { BrowserReadDecisionQuery, BrowserReadDecisionReceipt, BrowserReadDecisionRequest, BrowserReadListRequest,
+  BrowserReadListResult, BrowserReadRevoke, BrowserReadView } from '@flowmate/contracts';
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { InvoiceWorkAdmission, InvoiceWorkRepository } from './repository.ts';
 import { createInvoiceWorkTimelineService } from './timeline.ts';
@@ -215,6 +218,54 @@ export class InvoiceWorkService implements InvoiceWorksApi {
     try { return await this.options.database.read(scope => this.allowedDesktop(scope, parsed.data.workId)
       ? scope.invoiceWorkDesktopActions.list(parsed.data) : forbidden()); }
     catch { return fail(appError('storage_read_failed', 'storage', 'Desktop action state could not be read.', true)); }
+  }
+
+  public async listBrowserReads(input: BrowserReadListRequest): Promise<Result<BrowserReadListResult>> {
+    const parsed = BrowserReadListRequestSchema.safeParse(input); if (!parsed.success) return invalid();
+    try { return await this.options.database.read(scope => this.allowedDesktop(scope, parsed.data.workId)
+      ? scope.invoiceWorkBrowserReads.list(parsed.data) : forbidden()); }
+    catch { return fail(appError('storage_read_failed', 'storage', 'Browser read state could not be read.', true)); }
+  }
+
+  public async queryBrowserDecision(input: BrowserReadDecisionQuery): Promise<Result<BrowserReadDecisionReceipt | null>> {
+    const parsed = BrowserReadDecisionQuerySchema.safeParse(input); if (!parsed.success) return invalid();
+    try { return await this.options.database.read(scope => this.allowedDesktop(scope, parsed.data.workId)
+      ? scope.invoiceWorkBrowserReads.queryDecision(parsed.data) : forbidden()); }
+    catch { return fail(appError('storage_read_failed', 'storage', 'The original browser decision could not be read.', true)); }
+  }
+
+  public async revokeBrowserRead(input: BrowserReadRevoke): Promise<Result<BrowserReadView>> {
+    const parsed = BrowserReadRevokeSchema.safeParse(input); if (!parsed.success) return invalid();
+    try { return await this.options.database.transaction(scope => {
+      if (!this.allowedDesktop(scope, parsed.data.workId)) return forbidden();
+      const result = scope.invoiceWorkBrowserReads.revoke({ ...parsed.data, at: this.options.now() });
+      if (result.ok && this.options.onDesktopChanged) {
+        if (!scope.db.afterCommit) throw Error('browser_read_commit_callback_unavailable');
+        scope.db.afterCommit(() => { try { this.options.onDesktopChanged?.(); } catch { /* The saved state remains queryable. */ } });
+      }
+      return result;
+    }); } catch { return writeFailure(); }
+  }
+
+  public async decideBrowserRead(input: BrowserReadDecisionRequest): Promise<Result<BrowserReadDecisionReceipt>> {
+    const parsed = BrowserReadDecisionRequestSchema.safeParse(input); if (!parsed.success) return invalid();
+    const request = parsed.data, query = { workId: request.workId, itemId: request.itemId, proposalId: request.proposalId, requestId: request.requestId };
+    try { return await this.options.database.transaction(scope => {
+      if (!this.allowedDesktop(scope, request.workId)) return forbidden();
+      const prior = scope.invoiceWorkBrowserReads.queryDecision(query); if (!prior.ok) return prior;
+      const result = scope.invoiceWorkBrowserReads.decide(request, this.options.now());
+      if (result.ok && prior.data === null && this.options.onDesktopChanged) {
+        if (!scope.db.afterCommit) throw Error('browser_read_commit_callback_unavailable');
+        scope.db.afterCommit(() => { try { this.options.onDesktopChanged?.(); } catch { /* The decision remains queryable. */ } });
+      }
+      return result;
+    }); } catch {
+      const recovered = await this.queryBrowserDecision(query);
+      if (!recovered.ok || recovered.data === null) return writeFailure();
+      const { revision: _revision, receivedAt: _receivedAt, ...original } = recovered.data;
+      return isDeepStrictEqual(original, request) ? ok(recovered.data)
+        : fail(appError('state_conflict', 'input', 'The original browser decision belongs to a different request.'));
+    }
   }
 
   public async queryDesktopDecision(input: DesktopActionDecisionQuery): Promise<Result<DesktopActionDecisionReceipt | null>> {

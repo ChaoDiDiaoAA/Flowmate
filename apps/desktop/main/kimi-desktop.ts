@@ -132,5 +132,6 @@ export async function handleKimiDesktopRequest(desktop: ReturnType<typeof create
   if (request.kind === 'list') { const result = await desktop.selectedWindows(owner, signal); return result.ok ? ok({ kind: 'list', windows: result.data }) : result; }
   if (request.kind === 'observe') { const result = await desktop.observe(owner, signal); return result.ok ? ok({ kind: 'observe', ...result.data }) : result; }
   if (request.kind === 'resolve') { const result = await desktop.resolveTarget(owner, request.action, signal); return result.ok ? ok({ kind: 'resolve', target: result.data }) : result; }
-  const result = await desktop.dispatch(owner, request.action, request.target, signal); return result.ok ? ok({ kind: 'dispatch' }) : result;
+  if (request.kind === 'dispatch') { const result = await desktop.dispatch(owner, request.action, request.target, signal); return result.ok ? ok({ kind: 'dispatch' }) : result; }
+  return unavailable();
 }
