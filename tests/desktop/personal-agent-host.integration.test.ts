@@ -239,10 +239,11 @@ it('routes Personal Agent commands through the actual Host with isolated local S
       .toMatchObject({ items: [{ workId: blocked.workId, status: 'cancelled' }, { workId: created.workId, status: 'completed' }] });
     await getTask(created.workId, thirdAttempt); await getWork(created.workId);
     await call({ type: 'personal_agent_open_conversation', input: { workId: created.workId } }, P.PersonalAgentConversationSchema);
-    const history = await call({ type: 'personal_task_history', input: { target: { workId: created.workId }, limit: 10 } }, PersonalHistoryPageSchema);
-    expect(history.owner).toMatchObject({ workId: created.workId, childRunId: null }); expect(history.entries.length).toBeGreaterThan(0);
+    const target = { workId: created.workId, itemId };
+    const history = await call({ type: 'personal_task_history', input: { target, limit: 10 } }, PersonalHistoryPageSchema);
+    expect(history.owner).toMatchObject({ ...target, childRunId: null }); expect(history.entries.length).toBeGreaterThan(0);
     const entry = history.entries[0]!;
-    expect(await call({ type: 'personal_task_history_entry', input: { target: { workId: created.workId },
+    expect(await call({ type: 'personal_task_history_entry', input: { target,
       throughEntryId: history.throughEntryId, entryId: entry.entryId, offset: 0, limit: 100 } }, PersonalHistoryEntrySchema))
       .toMatchObject({ entryId: entry.entryId, totalBytes: entry.byteLength, owner: history.owner });
     const timeline = await call({ type: 'invoice_work_timeline', input: { workId: created.workId, limit: 100 } }, InvoiceWorkTimelinePageSchema);

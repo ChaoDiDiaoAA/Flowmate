@@ -8,7 +8,7 @@ import { appError, CloudRuntimeBindingSchema, CloudRuntimeRetryReceiptSchema, Cl
   type DurableRuntimePort, type Result } from '@flowmate/contracts';
 import { createDurableRuntime, type DurableRuntimeOptions } from '@flowmate/runtime-durable';
 import { createDurableHistoryReader } from '../packages/runtime-durable/src/history.ts';
-import type { CloudRuntimeSession, CloudRuntimeStore } from './cloud-runtime-storage.ts';
+import { cloudNativeLane, type CloudRuntimeSession, type CloudRuntimeStore } from './cloud-runtime-storage.ts';
 
 export type CloudRuntimeOperation = Exclude<keyof DurableRuntimePort, 'close'> | 'readQueue' | 'controlQueue' | 'queryQueueControl' | 'resultStatus' | 'retryResult';
 export type CloudRuntimeGrant = { binding: CloudRuntimeBinding; state: 'allocated' } |
@@ -26,7 +26,7 @@ type Options = {
   onResultRetry?(binding: CloudRuntimeBinding, session: CloudRuntimeSession): Promise<Result<void>>;
 };
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const identitySchema = z.object({ workId: id, sessionId: id }).passthrough();
+const identitySchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), participant: z.literal('reviewer').optional() }).passthrough();
 const scheduledSchema = identitySchema.extend({ attemptId: id, requestId: z.string().min(1).max(128).optional() });
 const scheduling = new Set<Operation>(['submit', 'waitForSubmission', 'resumeAttempt', 'compact', 'controlQueue']);
 const grantSchema = z.discriminatedUnion('state', [
@@ -120,7 +120,8 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
     const action = (async (): Promise<Result<O>> => {
       try {
         const request = structuredClone(input), identity = identitySchema.safeParse(request);
-        if (!identity.success) return fault('input_invalid', 'The original cloud Session identity is invalid.');
+        if (!identity.success || identity.data.participant && identity.data.itemId === undefined)
+          return fault('input_invalid', 'The original cloud Session identity is invalid.');
         const authorized = await authorization(operation, identity.data);
         if (!authorized.ok) return authorized;
         const grant = authorized.data;
@@ -214,7 +215,8 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
     const action = (async (): Promise<Result<O>> => {
       try {
         const request = structuredClone(input), identity = identitySchema.safeParse(request);
-        if (!identity.success) return fault('input_invalid', 'The original cloud Session identity is invalid.');
+        if (!identity.success || identity.data.participant && identity.data.itemId === undefined)
+          return fault('input_invalid', 'The original cloud Session identity is invalid.');
         const authorized = await authorization(operation, identity.data); if (!authorized.ok) return authorized;
         const grant = authorized.data;
         if (grant.state !== 'ready') return fault('cloud_runtime_not_ready', 'The original cloud Session has not been confirmed by the Authority.');
@@ -242,8 +244,9 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
         const document = await session.storage.findDocument({ kind: 'flowmate.runtime.binding',
           scope: { kind: 'conversation', conversationId: conversation.id } }, 'current', BACKGROUND_CONTEXT);
         const state = document && await session.storage.document(document.id, 'current', BACKGROUND_CONTEXT);
-        if (state?.version !== 2 || state.value.workId !== input.workId || state.value.sessionId !== input.sessionId
-          || state.value.itemId !== input.itemId) continue;
+        const lane = state && cloudNativeLane(state);
+        if (!state || !lane || state.value.workId !== input.workId || state.value.sessionId !== input.sessionId
+          || lane.itemId !== input.itemId || lane.participant !== input.participant) continue;
         if (found !== undefined) throw Error('state_conflict');
         found = conversation.id;
       }
@@ -255,7 +258,8 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
   function reader(session: CloudRuntimeSession, root: ConversationId) {
     return createDurableHistoryReader({ storage: session.storage, read: action => action(), resolveOwner: async input => ({
       owner: { runtimeKind: 'durable', workId: input.workId, sessionId: input.child?.childSessionId ?? input.sessionId,
-        childRunId: input.child?.childRunId ?? null, ...(input.itemId === undefined ? {} : { itemId: input.itemId }) },
+        childRunId: input.child?.childRunId ?? null, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
+        ...(input.participant ? { participant: input.participant } : {}) },
       conversationId: input.child ? await (async () => {
         const parent = input.child!.itemId === undefined ? root : await invoiceConversation(session, { workId: input.workId,
           sessionId: input.sessionId, itemId: input.child!.itemId });
@@ -284,7 +288,8 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
       retry: input => history('retryResult', input, async (session, _root, raw, binding) => {
         const parsed = CloudRuntimeRetryRequestSchema.safeParse(raw); if (!parsed.success) return fault('input_invalid', 'The cloud result retry request is invalid.');
         const original = await session.retryResultByIdentity({ attemptId: parsed.data.attemptId, requestId: parsed.data.requestId,
-          ...(parsed.data.itemId === undefined ? {} : { itemId: parsed.data.itemId }), nativeSubmissionId: parsed.data.nativeSubmissionId });
+          ...(parsed.data.itemId === undefined ? {} : { itemId: parsed.data.itemId }),
+          ...(parsed.data.participant ? { participant: parsed.data.participant } : {}), nativeSubmissionId: parsed.data.nativeSubmissionId });
         if (!original.ok) return original;
         if (!options.onResultRetry) return fault('cloud_result_unavailable', 'The original result retry could not be scheduled.');
         const scheduled = await options.onResultRetry(binding, session); if (!scheduled.ok) return scheduled;
@@ -307,7 +312,7 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
     stopAttempt: input => invoke('stopAttempt', input, (runtime, request) => runtime.stopAttempt(request)),
     resumeAttempt: input => invoke('resumeAttempt', input, (runtime, request) => runtime.resumeAttempt(request)),
     queryHistory: input => history('queryHistory', input, async (session, root, raw) => {
-      const parsed = z.object({ workId: id, sessionId: id, itemId: id.optional(), limit: z.number().int().min(1).max(100).default(50), beforeEntryId: id.optional() }).strict().safeParse(raw);
+      const parsed = z.object({ workId: id, sessionId: id, itemId: id.optional(), participant: z.literal('reviewer').optional(), limit: z.number().int().min(1).max(100).default(50), beforeEntryId: id.optional() }).strict().safeParse(raw);
       if (!parsed.success) return fault('input_invalid', 'The native history request is invalid.');
       const request = parsed.data, before = request.beforeEntryId;
       const conversationId = request.itemId === undefined ? root : await invoiceConversation(session, request);
@@ -320,7 +325,7 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
         ...(before === undefined ? {} : { maxEntryId: before as EntryId }) }, request.limit + (before === undefined ? 0 : 1), undefined, BACKGROUND_CONTEXT);
       const entries = page.items.filter(entry => entry.id !== before).map(entry => ({ nativeEntryId: entry.id, kind: entry.kind, json: JSON.stringify(entry) }));
       return ok({ workId: request.workId, sessionId: request.sessionId, ...(request.itemId === undefined ? {} : { itemId: request.itemId }),
-        nativeConversationId: conversationId, entries,
+        ...(request.participant ? { participant: request.participant } : {}), nativeConversationId: conversationId, entries,
         nextBeforeEntryId: page.next && entries.length ? entries.at(-1)!.nativeEntryId : null });
     }),
     queryHistoryPage: input => history('queryHistoryPage', input, (session, root, request) => reader(session, root).queryHistoryPage(request)),

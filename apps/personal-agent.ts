@@ -308,7 +308,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     subagents: subagents.callbacks,
     readWorkingContext: async query => {
       const saved = query.child ? await subagents.readWorkingContext(query) : await contexts.get(query);
-      if (!saved.ok || !options.cloud) return saved;
+      if (!saved.ok || !options.cloud || query.participant === 'reviewer') return saved;
       if (!cloudQueue) return fail(appError('cloud_queue_unavailable', 'runtime', 'The cloud queue authority is unavailable.', true));
       const edit = await cloudQueue.currentEdit({ workId: query.workId, sessionId: query.sessionId,
         ...(query.itemId === undefined ? {} : { itemId: query.itemId }), attemptId: query.attemptId, requestId: query.requestId });
@@ -316,7 +316,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       return edit.data ? ok({ ...saved.data, queueInstruction: { provenance: 'user-provided' as const, ...edit.data } }) : saved;
     },
     ...(options.memory ? { readMemory: async (query: import('@flowmate/contracts').DurableWorkingContextQuery) => {
-      if (query.child) return ok({ status: 'disabled' as const, items: [] });
+      if (query.child || query.participant === 'reviewer') return ok({ status: 'disabled' as const, items: [] });
       const allowed = await governor.verifyModelUse({ workId: query.workId, sessionId: query.sessionId, attemptId: query.attemptId });
       if (!allowed.ok) return allowed;
       const saved = await contexts.get(query); if (!saved.ok) return saved;
@@ -369,11 +369,13 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     reconcileChildren: identity => subagents.reconcileAttempt(identity),
     verifyModelUse: identity => governor.verifyModelUse(identity), onChanged: () => { if (activated) coordinator?.wake(); },
     restoreAttempt: async (identity: DurableAttemptIdentity) => {
-      const phases = await database.read(scope => scope.db.query<{ request_id: string; item_id: number | null; scheduler_state: string }, [number, number]>(
-        'SELECT request_id,item_id,scheduler_state FROM invoice_work_phases WHERE work_id=? AND attempt_id=? AND native_submission_id IS NOT NULL ORDER BY id')
+      const phases = await database.read(scope => scope.db.query<{ request_id: string; item_id: number | null; scheduler_state: string; participant: 'reviewer' | null }, [number, number]>(
+        `SELECT request_id,item_id,scheduler_state,json_extract(basis_json,'$.participant') participant FROM invoice_work_phases
+          WHERE work_id=? AND attempt_id=? AND native_submission_id IS NOT NULL ORDER BY id`)
         .all(identity.workId, identity.attemptId));
       for (const phase of phases) { const restored = await modelService.restore({ ...identity, requestId: phase.request_id,
-        ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}) }); if (!restored.ok) return restored; }
+        ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}),
+        ...(phase.participant ? { participant: phase.participant } : {}) }); if (!restored.ok) return restored; }
       return ok(undefined);
     } });
   coordinator = new InvoiceWorkCoordinator({ database, runtime, modelService, contexts, phaseObserver: observer,

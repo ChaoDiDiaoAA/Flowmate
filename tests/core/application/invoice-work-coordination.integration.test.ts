@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -49,7 +50,7 @@ const sdk = { durable: installedVersion('@earendil-works/pi-durable'), ai: insta
 async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | 'mixed' | 'child' | 'child-retryable' | 'compaction' | 'compaction-retryable' | 'oversize' | 'retryable' = 'candidate', thinkingLevel: 'off' | 'high' = 'off',
   runtimeScope: 'local' | 'cloud' = 'local', isolated = false, throughProxy = false, socketTransport = false, runtimeSocket = false,
   authoritySocket = false, authorityCallbacks = false, authorityTools = false, authoritySubagents = false, authorityCompactions = false,
-  useRuntimeService = false) {
+  useRuntimeService = false, peerFixture = false) {
   const childMode = mode === 'child' || mode === 'child-retryable', compactionMode = mode === 'compaction' || mode === 'compaction-retryable';
   const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-work-coordination-'));
   const paths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
@@ -107,6 +108,12 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
       summaryRequests++; if (mode === 'compaction-retryable' && summaryRequests === 1) return new Response('Controlled summary failure.', { status: 503 });
       const chunk = { id: 'controlled-cloud-summary', object: 'chat.completion.chunk', created: 1, model: 'coordination-local-model',
         choices: [{ index: 0, delta: { role: 'assistant', content: 'Original invoice evidence summary.' }, finish_reason: 'stop' }] };
+      return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    }
+    if (body.messages.some(message => message.role === 'system' && message.content.includes('Review only the confirmed invoice data'))) {
+      if (held) { const original = held; held = null; original.entered.resolve(); await original.release.promise; }
+      const chunk = { id: 'controlled-peer-review', object: 'chat.completion.chunk', created: 1, model: 'coordination-local-model',
+        choices: [{ index: 0, delta: { role: 'assistant', content: 'Controlled peer review advice.' }, finish_reason: 'stop' }] };
       return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
     }
     const context = JSON.parse(body.messages.find(message => message.role === 'user')!.content) as InvoiceWorkWorkingContext;
@@ -247,7 +254,7 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
   const modelServer = socketTransport && proxy ? need(await listenCloudModelSocket({ socketPath: modelSocketPath, proxy,
     prepare: async input => {
       const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
-        attemptId: input.attemptId, requestId: input.requestId });
+        ...(input.participant ? { participant: input.participant } : {}), attemptId: input.attemptId, requestId: input.requestId });
       return linked.ok ? ok(undefined) : linked;
     } })) : null;
   const authoritySocketPath = join(authoritySocketDir, 'authority.sock');
@@ -284,14 +291,14 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
       send: async (input, signal) => {
         if (modelServer) return callCloudModelSocket(modelSocketPath, input, signal);
         const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
-          attemptId: input.attemptId, requestId: input.requestId });
+          ...(input.participant ? { participant: input.participant } : {}), attemptId: input.attemptId, requestId: input.requestId });
         if (!linked.ok) return linked;
         if (proxy) return proxy.send(input, signal);
         try { return ok(await fetch(`${provider.connection!.baseUrl}/chat/completions`, { method: 'POST',
           headers: { 'content-type': 'application/json', authorization: 'Bearer controlled-local-key' }, body: input.body, signal })); }
         catch { return fail(appError('cloud_model_result_unknown', 'runtime', 'Controlled transport failed.', true)); }
       } } }),
-    authorize: authorityServer ? createCloudAuthorityRpcClient(authoritySocketPath) : (_operation, input) => database.read(scope => {
+    authorize: authorityServer ? createCloudAuthorityRpcClient(authoritySocketPath) : peerFixture ? createCloudRuntimeAuthorizer(database) : (_operation, input) => database.read(scope => {
       const work = scope.db.query<{ session_id: number }, [number]>('SELECT session_id FROM invoice_works WHERE id=?').get(input.workId);
       const session = scope.sessions.get(input.sessionId);
       if (!work || work.session_id !== input.sessionId || !session.ok || session.data.runtimeKind !== 'durable'
@@ -1639,3 +1646,158 @@ test('confirmed stopping of an originally failed frozen phase permits real Gover
   expect(need(await f.database.read(scope => scope.runs.get(runId)))).toMatchObject({ status: 'failed', error: originalFailure,
     stoppedAt: null, cleanup: { stopped: false, errors: [cleanupError], lateObservationRequired: true } });
 }, 15_000);
+
+
+const peerCloudBinding = { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111' };
+
+async function peerReviewFixture(scope: 'local' | 'cloud', requestId: string, maxModelCalls?: number) {
+  const cloud = scope === 'cloud', sockets = cloud && process.platform === 'linux';
+  const f = await fixture('candidate', 'off', scope, cloud, cloud, sockets, sockets, sockets, sockets, sockets, false, false, false, cloud);
+  const created = need(await f.database.transaction(owner => {
+    if (cloud) owner.db.query(`INSERT INTO cloud_workspace_documents(workspace_id,upload_id,document_id,document_version)
+      VALUES(?,'controlled',1,'v1')`).run(peerCloudBinding.workspaceId);
+    return owner.invoiceWorks.create({ personalAgentId: 1, expectedAgentRevision: 0, requestId,
+      goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
+      { at: now(), admission: { kind: 'queued' }, ...(cloud ? { runtimeOwner: peerCloudBinding } : {}),
+        ...(maxModelCalls === undefined ? {} : { runtimeDefaults: { budget: { maxModelCalls } } }) });
+  }));
+  return { f, created };
+}
+
+test.each(['local', 'cloud'] as const)('approved %s peer review consumes only its preview and returns one advisory result', async scope => {
+  const cloud = scope === 'cloud', binding = peerCloudBinding;
+  const { f, created } = await peerReviewFixture(scope, 'peer-review-invoice');
+  await f.start();
+  const initial = await f.work(created.workId), item = initial.items[0]!;
+  if (!cloud) {
+    const owner = { workId: created.workId, sessionId: created.sessionId, itemId: item.itemId };
+    const history = need(await f.runtime.queryHistory(owner));
+    expect(history.entries.length).toBeGreaterThan(0);
+    await f.restart(async () => {
+      const old = new Database(f.paths.databaseFile);
+      try { old.exec('DROP TABLE invoice_work_peer_reviews; DELETE FROM schema_migrations WHERE version=28;'); }
+      finally { old.close(); }
+    });
+    expect(await f.work(created.workId)).toEqual(initial);
+    expect(need(await f.runtime.queryHistory(owner))).toEqual(history);
+    expect(await f.database.read(owner => owner.db.query('SELECT MAX(version) version FROM schema_migrations').get())).toEqual({ version: 28 });
+  }
+  const preview = need(await f.service.get({ view: 'item', workId: created.workId, itemId: item.itemId, includePeerReview: true }));
+  if (preview.view !== 'item') throw Error('Expected invoice item');
+  if (preview.peerReview?.kind !== 'available') throw Error(`Expected peer review preview, got ${JSON.stringify(preview.peerReview)}`);
+  const before = f.wireRequests.length, approval = { workId: created.workId, expectedRevision: initial.work.revision,
+    expectedAttemptId: initial.work.execution.attempt!.attemptId, requestId: 'approved-peer-review',
+    peerReview: preview.peerReview.approval };
+  expect(await f.service.continueWork({ ...approval, peerReview: { ...approval.peerReview, shared: '{"changed":true}' } })).toMatchObject({ ok: false });
+  expect(f.wireRequests).toHaveLength(before);
+  const held = cloud ? f.holdNext() : null;
+  const waiting = Promise.withResolvers<void>();
+  if (cloud) {
+    const waitForSubmission = f.runtime.waitForSubmission.bind(f.runtime);
+    f.runtime.waitForSubmission = async input => {
+      if (input.participant !== 'reviewer') return waitForSubmission(input);
+      f.runtime.waitForSubmission = waitForSubmission;
+      waiting.resolve();
+      const result = await waitForSubmission(input);
+      if (!result.ok) return result;
+      return fail(appError('cloud_transport_result_unknown', 'runtime', 'Controlled loss of the reviewer wait reply.', true));
+    };
+  }
+  const receipt = need(await f.service.continueWork(approval));
+  expect(need(await f.service.continueWork(approval))).toEqual(receipt);
+  const queued = await f.work(created.workId);
+  expect(await f.service.continueWork({ workId: created.workId, requestId: 'ordinary-continue-during-peer-review',
+    expectedRevision: queued.work.revision, expectedAttemptId: queued.work.execution.attempt!.attemptId }))
+    .toMatchObject({ ok: false, error: { code: 'invoice_work_busy' } });
+  const execution = f.start();
+  if (held) {
+    await Promise.all([held.entered.promise, waiting.promise]);
+    held.release.resolve();
+  }
+  await execution;
+  if (cloud) {
+    const first = need(await f.service.get({ view: 'item', workId: created.workId, itemId: item.itemId, includePeerReview: true }));
+    expect(first).toMatchObject({ peerReview: { kind: 'pending' } });
+    await f.restart();
+    const native = need(await f.cloudStore!.openSession({ ...binding, workId: created.workId, sessionId: created.sessionId }, false));
+    const original = need(await native.pendingResults()).find(result => result.event.participant === 'reviewer');
+    if (!original) throw Error('Missing reviewer outbox event');
+    const primary = need(await native.pendingResults()).find(result => result.event.participant === undefined);
+    if (!primary || primary.event.nativeAnswerEntryId === null) throw Error('Missing primary outbox answer');
+    expect(original.event.nativeConversationId).not.toBe(primary.event.nativeConversationId);
+    const receiver = new CloudNativeResultReceiver(f.database, f.runtime, now);
+    expect(await receiver.receive({ ...original.event, participant: undefined })).toMatchObject({ ok: false });
+    expect(await receiver.receive({ ...original.event, workId: original.event.workId + 1 })).toMatchObject({ ok: false });
+    expect(await receiver.receive({ ...original.event, nativeConversationId: primary.event.nativeConversationId })).toMatchObject({ ok: false });
+    expect(await receiver.receive({ ...original.event, nativeAnswerEntryId: primary.event.nativeAnswerEntryId })).toMatchObject({ ok: false });
+    const accepted = need(await receiver.receive(original.event));
+    await f.restart();
+    const reopened = need(await f.cloudStore!.openSession({ ...binding, workId: created.workId, sessionId: created.sessionId }, false));
+    const redelivery = need(await reopened.pendingResults()).find(result => result.event.participant === 'reviewer');
+    expect(redelivery?.event).toEqual(original.event);
+    const replayed = need(await new CloudNativeResultReceiver(f.database, f.runtime, now).receive(redelivery?.event));
+    expect(replayed).toEqual(accepted);
+    need(await reopened.acknowledgeResult(original.event, replayed));
+    await f.start();
+  }
+  const result = need(await f.service.get({ view: 'item', workId: created.workId, itemId: item.itemId, includePeerReview: true }));
+  if (result.view !== 'item') throw Error('Expected invoice item');
+  expect(result.peerReview).toMatchObject({ kind: 'completed', answer: 'Controlled peer review advice.' });
+  expect(result.item.candidateRef).toEqual(item.candidateRef);
+  expect(result.item.disposition).toBe('unresolved');
+  expect(f.wireRequests).toHaveLength(before + 1);
+  expect(f.wireRequests.at(-1)?.tools ?? []).toEqual([]);
+  await f.database.transaction(owner => owner.db.query("UPDATE sessions SET status='archived' WHERE id=?").run(created.sessionId));
+  expect(need(await f.service.get({ view: 'item', workId: created.workId, itemId: item.itemId, includePeerReview: true })))
+    .toMatchObject({ peerReview: { kind: 'closed', reason: 'The reviewed invoice is no longer current.' } });
+}, 30000);
+
+
+test.each(['local', 'cloud'] as const)('a %s candidate with no remaining Work model budget cannot schedule a reviewer', async scope => {
+  const { f, created: work } = await peerReviewFixture(scope, 'peer-review-at-budget', 3);
+  await f.start();
+  const current = await f.work(work.workId);
+  const result = need(await f.service.get({ view: 'item', workId: work.workId, itemId: current.items[0]!.itemId, includePeerReview: true }));
+  if (result.view !== 'item' || result.peerReview?.kind !== 'available') throw Error('Expected the saved initial candidate and preview');
+  const receipt = need(await f.service.continueWork({ workId: work.workId, requestId: 'peer-review-no-budget',
+    expectedRevision: current.work.revision, expectedAttemptId: current.work.execution.attempt!.attemptId, peerReview: result.peerReview.approval }));
+  expect(receipt.execution).toMatchObject({ kind: 'blocked', reason: { code: 'agent_model_call_budget' } });
+  await f.start();
+  expect(f.wireRequests).toHaveLength(3);
+  expect(await f.database.read(owner => owner.db.query('SELECT COUNT(*) count FROM invoice_work_peer_reviews').get())).toEqual({ count: 0 });
+}, 15000);
+
+
+test.each(['local', 'cloud'] as const)('a %s reviewer stop stays unconfirmed until native closure and suppresses the late answer', async scope => {
+  const { f, created } = await peerReviewFixture(scope, 'peer-review-stop');
+  await f.start();
+  const initial = await f.work(created.workId), itemId = initial.items[0]!.itemId;
+  const request = { view: 'item' as const, workId: created.workId, itemId, includePeerReview: true as const };
+  const preview = need(await f.service.get(request));
+  if (preview.view !== 'item' || preview.peerReview?.kind !== 'available') throw Error('Expected peer review preview');
+  const held = f.holdNext();
+  const approved = need(await f.service.continueWork({ workId: created.workId, expectedRevision: initial.work.revision,
+    expectedAttemptId: initial.work.execution.attempt!.attemptId, requestId: 'peer-review-stop-approved', peerReview: preview.peerReview.approval }));
+  if (!approved.execution.authorizationAccepted) throw Error('Expected review admission');
+  const attemptId = approved.execution.attempt.attemptId;
+  const execution = f.start();
+  await held.entered.promise;
+  const stop = f.runtime.stopAttempt.bind(f.runtime);
+  f.runtime.stopAttempt = async ({ stopGraceMs: _grace, ...identity }) => ok({ ...identity, stopped: false, reason: 'stop-unconfirmed' });
+  try {
+    const current = await f.work(created.workId);
+    const receipt = need(await f.tasks.stop({ workId: created.workId, attemptId, expectedRevision: current.work.revision, requestId: 'peer-review-stop-command' }));
+    expect(receipt).toMatchObject({ accepted: true, stopConfirmed: false });
+    held.release.resolve();
+    await execution;
+    expect(need(await f.service.get(request))).toMatchObject({ peerReview: { kind: 'pending' } });
+  } finally { held.release.resolve(); f.runtime.stopAttempt = stop; }
+  expect(need(await f.tasks.reconcileStop({ workId: created.workId, attemptId })).closed).toBe(true);
+  if (scope === 'cloud') {
+    const native = need(await f.cloudStore!.openSession({ ...peerCloudBinding, workId: created.workId, sessionId: created.sessionId }, false));
+    const late = need(await native.pendingResults()).find(result => result.event.attemptId === attemptId);
+    expect(late?.event).toMatchObject({ participant: 'reviewer', status: 'done', answer: 'Controlled peer review advice.' });
+    need(await new CloudNativeResultReceiver(f.database, f.runtime, now).receive(late?.event));
+  }
+  expect(need(await f.service.get(request))).toMatchObject({ peerReview: { kind: 'closed', reason: 'The review was stopped.' } });
+}, 15000);

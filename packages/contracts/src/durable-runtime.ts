@@ -15,7 +15,7 @@ export const CloudRuntimeBindingSchema = z.object({ workspaceId: CloudWorkspaceI
   workId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), sessionId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict();
 export type CloudRuntimeBinding = z.infer<typeof CloudRuntimeBindingSchema>;
 
-export type DurableConversationIdentity = { workId: DbId; sessionId: DbId; itemId?: DbId };
+export type DurableConversationIdentity = { workId: DbId; sessionId: DbId; itemId?: DbId; participant?: 'reviewer' };
 export type DurableAttemptIdentity = DurableConversationIdentity & { attemptId: DbId };
 export type DurableSubmissionQuery = DurableAttemptIdentity & { requestId: string };
 /** Existing product tool schemas, projected by composition without native runtime types. */
@@ -95,6 +95,7 @@ export type DurableSubmissionObservation = DurableSubmissionQuery & {
   nativeConversationId: number;
   nativeSubmissionId: number;
   nativeEntryId: number | null;
+  nativeAnswerEntryId?: number;
   status: DurableSubmissionView['status'];
   consumedAt: string | null;
   execution: 'active' | 'closed' | 'unknown';

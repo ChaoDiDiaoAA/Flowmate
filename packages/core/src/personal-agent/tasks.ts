@@ -20,7 +20,7 @@ export type PersonalTasksServiceOptions = {
   reconcileChildren?: (identity: DurableAttemptIdentity) => Promise<Result<void>>;
   history?: PersonalHistoryApi;
 };
-type PhaseRow = { request_id: string; item_id: number | null; scheduler_state: string };
+type PhaseRow = { request_id: string; item_id: number | null; scheduler_state: string; participant: 'reviewer' | null };
 const cleanupSchema = z.object({ version: z.literal(1), stopped: z.boolean(), stopReason: z.string().nullable(),
   errors: z.array(AppErrorSchema), lateObservationRequired: z.boolean() }).strict();
 const invalid = () => fail(appError('input_invalid', 'input', 'The personal task request is invalid.'));
@@ -72,7 +72,8 @@ export class PersonalTasksService implements PersonalTasksApi {
       if (!original) return readFailure();
       const budget = DurableWorkBudgetSchema.parse(JSON.parse(original.budget_json));
       const phases = scope.db.query<PhaseRow, [number, number]>(
-        'SELECT request_id,item_id,scheduler_state FROM invoice_work_phases WHERE work_id=? AND attempt_id=? ORDER BY id').all(input.workId, input.attemptId);
+        `SELECT request_id,item_id,scheduler_state,json_extract(basis_json,'$.participant') participant
+        FROM invoice_work_phases WHERE work_id=? AND attempt_id=? ORDER BY id`).all(input.workId, input.attemptId);
       return ok({ task: task.data.task, work: work.data.work, phases, stopGraceMs: budget.limits.stopGraceMs,
         identity: { ...input, sessionId: task.data.task.sessionId } });
     });
@@ -126,9 +127,11 @@ export class PersonalTasksService implements PersonalTasksApi {
       if (task.stopRequestedAt === null && current.data.work.status !== 'cancelled') return conflict();
       let stopResult: DurableAttemptStopResult | undefined;
       if (task.stoppedAt === null && phases.length > 0) {
-        for (const phase of phases) {
-          const observed = await this.options.phaseObserver.reconcile({ ...identity, requestId: phase.request_id,
-            ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}) });
+        const queries = phases.map(phase => ({ ...identity, requestId: phase.request_id,
+          ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}),
+          ...(phase.participant ? { participant: phase.participant } : {}) }));
+        for (const query of queries) {
+          const observed = await this.options.phaseObserver.reconcile(query);
           if (!observed.ok) return observed;
         }
         const stopped = await this.options.runtime.stopAttempt({ ...identity, stopGraceMs });
@@ -137,15 +140,13 @@ export class PersonalTasksService implements PersonalTasksApi {
         if (stopResult.workId !== identity.workId || stopResult.sessionId !== identity.sessionId || stopResult.attemptId !== identity.attemptId)
           return fail(appError('source_invalid', 'runtime', 'The native stop belongs to another attempt.'));
         if (!stopResult.stopped) return ok({ closed: false, task, reason: 'root-stop-unconfirmed' });
-        for (const phase of phases) {
-          const query = { ...identity, requestId: phase.request_id,
-            ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}) };
+        for (const query of queries) {
           if (stopResult.reason === 'not-started') {
             const submitted = await this.options.runtime.getSubmission(query); if (!submitted.ok) return submitted;
             if (submitted.data !== null)
               return fail(appError('source_invalid', 'runtime', 'The native not-started proof conflicts with its original submission.'));
             const closed = await this.options.database.transaction(scope => scope.invoiceWorks.closeUnsubmittedPhase({
-              ...input.data, requestId: phase.request_id, stopResult: stopResult!, at: this.options.now() }));
+              ...input.data, requestId: query.requestId, stopResult: stopResult!, at: this.options.now() }));
             if (!closed.ok) return closed;
             continue;
           }

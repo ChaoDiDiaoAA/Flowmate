@@ -21,6 +21,9 @@ export class CloudNativeResultReceiver {
     if (!row || row.session_id !== event.sessionId || session.runtimeKind !== 'durable'
       || session.durableRuntimeId !== event.cloudRuntimeId || session.cloudWorkspaceId !== event.workspaceId) conflict();
     const phase = need(store.invoiceWorks.getPhase({ workId: event.workId, attemptId: event.attemptId, requestId: event.requestId }));
+    const reviewer = phase && store.db.query('SELECT 1 FROM invoice_work_peer_reviews WHERE phase_id=? AND attempt_id=? AND work_id=? AND item_id=?')
+      .get(phase.phaseId, event.attemptId, event.workId, phase.itemId);
+    if ((event.participant === 'reviewer') !== Boolean(reviewer)) conflict();
     if (!phase || (phase.basis.executionMode === 'item-lane-approval-v1'
       ? phase.itemId === null || phase.itemId !== event.itemId
       : event.itemId !== undefined || session.durableConversationId !== event.nativeConversationId)
@@ -36,6 +39,7 @@ export class CloudNativeResultReceiver {
     if (!isDeepStrictEqual(CloudNativeResultSchema.parse(JSON.parse(row.event_json)), event)) conflict();
     return CloudNativeResultReceiptSchema.parse({ receiptId: row.receipt_id, cloudRuntimeId: event.cloudRuntimeId,
       workId: event.workId, sessionId: event.sessionId, ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
+      ...(event.participant ? { participant: event.participant } : {}),
       nativeConversationId: event.nativeConversationId, nativeSubmissionId: event.nativeSubmissionId });
   }
 
@@ -43,12 +47,20 @@ export class CloudNativeResultReceiver {
     const parsed = CloudNativeResultSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'The cloud native result is invalid.'));
     const event = parsed.data, query = { workId: event.workId, sessionId: event.sessionId,
-      ...(event.itemId === undefined ? {} : { itemId: event.itemId }), attemptId: event.attemptId, requestId: event.requestId };
+      ...(event.itemId === undefined ? {} : { itemId: event.itemId }), ...(event.participant ? { participant: event.participant } : {}),
+      attemptId: event.attemptId, requestId: event.requestId };
     try {
       const saved = await this.database.read(store => { this.owner(store, event); return this.prior(store, event); });
       if (saved) return ok(saved);
       const view = need(await this.runtime.getSubmission(query)), observed = need(await this.runtime.observeSubmission(query));
-      if (!view || !observed || view.nativeConversationId !== event.nativeConversationId || view.nativeSubmissionId !== event.nativeSubmissionId
+      if (!view || !observed || view.workId !== event.workId || observed.workId !== event.workId
+        || view.sessionId !== event.sessionId || observed.sessionId !== event.sessionId
+        || view.attemptId !== event.attemptId || observed.attemptId !== event.attemptId
+        || view.requestId !== event.requestId || observed.requestId !== event.requestId
+        || view.itemId !== event.itemId || observed.itemId !== event.itemId
+        || view.participant !== event.participant || observed.participant !== event.participant
+        || event.participant === 'reviewer' && event.status === 'done' && observed.nativeAnswerEntryId !== event.nativeAnswerEntryId
+        || view.nativeConversationId !== event.nativeConversationId || view.nativeSubmissionId !== event.nativeSubmissionId
         || view.status !== event.status || view.answer !== event.answer || view.reason !== event.reason
         || observed.nativeConversationId !== event.nativeConversationId || observed.nativeSubmissionId !== event.nativeSubmissionId
         || observed.nativeEntryId !== event.nativeInputEntryId || observed.consumedAt !== event.consumedAt
@@ -58,9 +70,10 @@ export class CloudNativeResultReceiver {
         let offset = 0, total: number | undefined; const pieces: string[] = [];
         for (;;) {
           const entry = PersonalHistoryEntrySchema.parse(need(await this.runtime.queryHistoryEntry({ workId: event.workId, sessionId: event.sessionId,
-            ...(event.itemId === undefined ? {} : { itemId: event.itemId }), entryId: answerEntryId, throughEntryId: answerEntryId, offset, limit: 16384 })));
+            ...(event.itemId === undefined ? {} : { itemId: event.itemId }), ...(event.participant ? { participant: event.participant } : {}),
+            entryId: answerEntryId, throughEntryId: answerEntryId, offset, limit: 16384 })));
           if (entry.owner.workId !== event.workId || entry.owner.sessionId !== event.sessionId || entry.owner.childRunId !== null
-            || entry.owner.itemId !== event.itemId
+            || entry.owner.itemId !== event.itemId || entry.owner.participant !== event.participant
             || entry.entryId !== answerEntryId || entry.throughEntryId !== answerEntryId || entry.offset !== offset || entry.kind !== 'pi.assistant'
             || entry.totalBytes > 14 * 1024 * 1024 || total !== undefined && entry.totalBytes !== total) conflict();
           total = entry.totalBytes; pieces.push(entry.text);
@@ -87,6 +100,7 @@ export class CloudNativeResultReceiver {
           event.nativeConversationId, event.nativeSubmissionId, JSON.stringify(event), at);
         return ok(CloudNativeResultReceiptSchema.parse({ receiptId, cloudRuntimeId: event.cloudRuntimeId, workId: event.workId,
           sessionId: event.sessionId, ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
+          ...(event.participant ? { participant: event.participant } : {}),
           nativeConversationId: event.nativeConversationId, nativeSubmissionId: event.nativeSubmissionId }));
       });
     } catch (error) {

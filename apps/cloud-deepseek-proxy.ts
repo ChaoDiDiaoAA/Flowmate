@@ -120,7 +120,7 @@ export class CloudDeepSeekProxy {
       return saved.ok && contentType !== 'text/event-stream' ? ok(new Response(null, { status, headers })) : unknown();
     }
     const reader = upstream.body.getReader(), terminal = deepSeekTerminal(); let cancelled = false, complete = false;
-    const preview = contentType === 'text/event-stream' && status === 200 && original.kind !== 'compaction' && !original.child && this.options.onText
+    const preview = contentType === 'text/event-stream' && status === 200 && original.kind !== 'compaction' && !original.child && !original.participant && this.options.onText
       ? deepSeekText(text => this.options.onText!(original, text), () => this.options.onTextGap?.(original)) : null;
     const body = new ReadableStream<Uint8Array>({
       async pull(controller) {

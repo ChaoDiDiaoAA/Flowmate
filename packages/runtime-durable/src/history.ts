@@ -7,10 +7,10 @@ import { appError, fail, ok, PersonalHistoryEntryRequestSchema, PersonalHistoryE
 
 const context = BACKGROUND_CONTEXT;
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const ownerSchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), child: z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id,
+const ownerSchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), participant: z.literal('reviewer').optional(), child: z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id,
   requestId: z.string().min(1).max(128), childRunId: id, childSessionId: id, originToolCallId: id, nativeToolTaskId: id }).strict().optional(),
-}).strict().refine(value => !value.child || value.itemId === undefined
-  && value.child.workId === value.workId && value.child.sessionId === value.sessionId);
+}).strict().refine(value => value.participant ? value.itemId !== undefined && !value.child
+  : !value.child || value.itemId === undefined && value.child.workId === value.workId && value.child.sessionId === value.sessionId);
 const bytes = (text: string) => new TextEncoder().encode(text);
 const decoder = new TextDecoder('utf-8', { fatal: true });
 function prefix(value: Uint8Array, start: number, limit: number): string {
@@ -48,7 +48,7 @@ export function createDurableHistoryReader(options: {
     if (!parsed.success || parsed.data.workId !== input.workId
       || parsed.data.sessionId !== (input.child?.childSessionId ?? input.sessionId)
       || parsed.data.childRunId !== (input.child?.childRunId ?? null)
-      || parsed.data.itemId !== input.itemId
+      || parsed.data.itemId !== input.itemId || parsed.data.participant !== input.participant
       || resolved.conversationId !== undefined && !id.safeParse(resolved.conversationId).success) throw Error('state_conflict');
     return { owner: parsed.data, conversationId: resolved.conversationId };
   };
@@ -65,8 +65,9 @@ export function createDurableHistoryReader(options: {
   };
   return {
     queryHistoryPage: (raw: DurablePublicHistoryQuery): Promise<Result<PersonalHistoryPage>> => safe(async () => {
-      const { workId, sessionId, child, itemId, ...paging } = raw;
-      const input = parseOwner({ workId, sessionId, ...(child === undefined ? {} : { child }), ...(itemId === undefined ? {} : { itemId }) });
+      const { workId, sessionId, child, itemId, participant, ...paging } = raw;
+      const input = parseOwner({ workId, sessionId, ...(child === undefined ? {} : { child }), ...(itemId === undefined ? {} : { itemId }),
+        ...(participant === undefined ? {} : { participant }) });
       const parsed = PersonalHistoryRequestSchema.safeParse({ target: { workId, ...(child ? { childRunId: child.childRunId } : {}),
         ...(itemId === undefined ? {} : { itemId }) }, ...paging });
       if (!parsed.success) throw Error('input_invalid');
@@ -83,8 +84,9 @@ export function createDurableHistoryReader(options: {
         nextBeforeEntryId: records.length > parsed.data.limit ? entries.at(-1)!.entryId : null });
     }),
     queryHistoryEntry: (raw: DurablePublicHistoryEntryQuery): Promise<Result<PersonalHistoryEntry>> => safe(async () => {
-      const { workId, sessionId, child, itemId, ...paging } = raw;
-      const input = parseOwner({ workId, sessionId, ...(child === undefined ? {} : { child }), ...(itemId === undefined ? {} : { itemId }) });
+      const { workId, sessionId, child, itemId, participant, ...paging } = raw;
+      const input = parseOwner({ workId, sessionId, ...(child === undefined ? {} : { child }), ...(itemId === undefined ? {} : { itemId }),
+        ...(participant === undefined ? {} : { participant }) });
       const parsed = PersonalHistoryEntryRequestSchema.safeParse({ target: { workId, ...(child ? { childRunId: child.childRunId } : {}),
         ...(itemId === undefined ? {} : { itemId }) }, ...paging });
       if (!parsed.success) throw Error('input_invalid');

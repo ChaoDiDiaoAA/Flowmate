@@ -10,7 +10,7 @@ import type { InvoiceWorkPhaseInstructions } from '../../../contracts/src/person
 const id = InvoiceWorkContinueRequestSchema.shape.workId;
 const requestId = InvoiceWorkContinueRequestSchema.shape.requestId;
 const phaseKey = z.object({ workId: id, attemptId: id, requestId }).strict();
-const querySchema = phaseKey.extend({ sessionId: id, itemId: id.optional() });
+const querySchema = phaseKey.extend({ sessionId: id, itemId: id.optional(), participant: z.literal('reviewer').optional() });
 const freezeSchema = phaseKey.extend({ itemId: id, kind: z.literal('prompt'), basis: InvoiceWorkPhaseBasisSchema,
   remainingBudget: InvoiceWorkContextBuildInputSchema.unwrap().shape.remainingBudget });
 export type InvoiceWorkFreezeContextRequest = z.infer<typeof freezeSchema>;
@@ -97,7 +97,8 @@ export class InvoiceWorkPhaseContextService {
   async get(raw: DurableSubmissionQuery): Promise<Result<InvoiceWorkWorkingContext>> {
     const parsed = querySchema.safeParse(raw);
     if (!parsed.success) return invalid();
-    try { return await this.options.database.read(scope => this.current(scope, parsed.data)); }
+    try { return await this.options.database.read(scope => parsed.data.participant === 'reviewer'
+      ? scope.invoiceWorks.readPeerReviewContext(parsed.data) : this.current(scope, parsed.data)); }
     catch { return fail(appError('storage_read_failed', 'storage', 'The invoice phase context could not be read.', true)); }
   }
 
@@ -124,6 +125,7 @@ export class InvoiceWorkPhaseObserver {
       });
       if (!original.ok || original.data === null) return original;
       const originalPhase = original.data;
+      if (originalPhase.basis.participant !== input.data.participant) return missing();
       if (originalPhase.basis.executionMode === 'item-lane-approval-v1'
         ? originalPhase.itemId !== input.data.itemId : input.data.itemId !== undefined) return missing();
       const observed = await this.options.runtime.observeSubmission(input.data);
@@ -131,7 +133,7 @@ export class InvoiceWorkPhaseObserver {
       if (observed.data === null) return ok(null);
       const observation = observed.data;
       if (observation.workId !== input.data.workId || observation.sessionId !== input.data.sessionId
-        || observation.itemId !== input.data.itemId || observation.attemptId !== input.data.attemptId || observation.requestId !== input.data.requestId)
+        || observation.itemId !== input.data.itemId || observation.participant !== input.data.participant || observation.attemptId !== input.data.attemptId || observation.requestId !== input.data.requestId)
         return fail(appError('source_invalid', 'runtime', 'The native receipt belongs to another invoice phase.'));
       let rejected: Result<never> | undefined;
       try {

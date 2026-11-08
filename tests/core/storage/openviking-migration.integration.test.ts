@@ -42,7 +42,7 @@ test('schema 27 keeps existing Sessions and a waiting invoice phase while memory
   expect(opened.ok).toBe(true);
   if (!opened.ok) throw new Error(opened.error.code);
   try {
-    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 27 });
+    expect(opened.data.db.query('SELECT MAX(version) AS version FROM schema_migrations').get()).toEqual({ version: 28 });
     expect(opened.data.db.query('SELECT * FROM sessions ORDER BY id').all()).toEqual(sessions);
     expect(opened.data.db.query('SELECT * FROM invoice_work_phases WHERE id=1').get()).toEqual(phase);
     expect(opened.data.db.query('SELECT provider,recall_enabled,capture_mode FROM memory_config WHERE id=1').get())

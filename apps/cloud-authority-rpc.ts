@@ -14,6 +14,8 @@ const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const identity = z.object({ workId: id, sessionId: id, attemptId: id }).strict();
 const child = z.object({ childRunId: id, childSessionId: id, originToolCallId: id }).strict();
 const query = identity.extend({ itemId: id.optional(), requestId: z.string().min(1).max(128), child: child.optional() }).strict();
+const contextQuery = query.extend({ participant: z.literal('reviewer').optional() }).strict()
+  .refine(value => !value.participant || value.itemId !== undefined && value.child === undefined);
 const jsonValue = z.union([z.null(), z.boolean(), z.number().finite(), z.string(), z.array(z.unknown()), z.record(z.unknown())]);
 const tool = query.extend({ nativeConversationId: id, nativeTaskId: id, nativeToolCallId: z.string().min(1).max(256),
   name: z.string().min(1).max(128), arguments: jsonValue, parentNativeTaskId: id.optional() }).strict();
@@ -35,12 +37,12 @@ export const CloudRuntimeToolsSchema = z.array(z.object({ name: RegisteredToolNa
 const requestSchema = z.discriminatedUnion('method', [
   z.object({ version: z.literal(1), method: z.literal('authorize'), operation: z.enum(CLOUD_RUNTIME_RPC_METHODS), request: z.record(z.unknown()) }).strict(),
   z.object({ version: z.literal(1), method: z.literal('runtimeTools'), request: z.object({}).strict() }).strict(),
-  z.object({ version: z.literal(1), method: z.literal('readWorkingContext'), request: query }).strict(),
+  z.object({ version: z.literal(1), method: z.literal('readWorkingContext'), request: contextQuery }).strict(),
   z.object({ version: z.literal(1), method: z.literal('readMemory'), request: query }).strict(),
   z.object({ version: z.literal(1), method: z.literal('beginApprovalWait'), request: DurableApprovalWaitIdentitySchema }).strict(),
   z.object({ version: z.literal(1), method: z.literal('readApprovalWait'), request: DurableApprovalWaitIdentitySchema }).strict(),
   z.object({ version: z.literal(1), method: z.literal('verifyQueueInputs'), request: CloudQueueVerifyInputsSchema }).strict(),
-  z.object({ version: z.literal(1), method: z.literal('verifyWorkingContext'), request: query }).strict(),
+  z.object({ version: z.literal(1), method: z.literal('verifyWorkingContext'), request: contextQuery }).strict(),
   z.object({ version: z.literal(1), method: z.literal('verifyModelUse'), request: identity }).strict(),
   z.object({ version: z.literal(1), method: z.literal('verifySchedulingUse'), request: z.object({ identity, pendingFeedback: z.array(tool).max(128) }).strict() }).strict(),
   z.object({ version: z.literal(1), method: z.literal('executeTool'), request: tool }).strict(),
@@ -221,13 +223,14 @@ export function createCloudAuthorityCallbacksClient(socketPath: string): CloudAu
   return {
     runtimeTools: () => call('runtimeTools', {}, CloudRuntimeToolsSchema),
     async readWorkingContext(input) {
-      const captured = query.safeParse(input); if (!captured.success) return fail(appError('input_invalid', 'input', 'The cloud context request is invalid.'));
+      const captured = contextQuery.safeParse(input); if (!captured.success) return fail(appError('input_invalid', 'input', 'The cloud context request is invalid.'));
       const result = await call<InvoiceWorkWorkingContext>('readWorkingContext', captured.data, InvoiceWorkWorkingContextSchema);
       if (!result.ok) return result;
       const value = result.data, expected = captured.data;
       if (value.work.workId !== expected.workId || value.work.sessionId !== expected.sessionId || value.phase.attemptId !== expected.attemptId
         || value.phase.requestId !== expected.requestId || value.item.workId !== expected.workId
         || expected.itemId !== undefined && value.item.itemId !== expected.itemId
+        || (expected.participant === 'reviewer') !== (value.peerReview !== undefined)
         || (expected.child ? value.delegation?.childRunId !== expected.child.childRunId
           || value.delegation.childSessionId !== expected.child.childSessionId || value.delegation.originToolCallId !== expected.child.originToolCallId
           : value.delegation !== undefined)) return unavailable();
@@ -295,7 +298,7 @@ export function createCloudAuthorityCallbacksClient(socketPath: string): CloudAu
       if (!result.ok) return result;
       const event = captured.data, receipt = result.data;
       return receipt.cloudRuntimeId === event.cloudRuntimeId && receipt.workId === event.workId && receipt.sessionId === event.sessionId
-        && receipt.itemId === event.itemId
+        && receipt.itemId === event.itemId && receipt.participant === event.participant
         && receipt.nativeConversationId === event.nativeConversationId && receipt.nativeSubmissionId === event.nativeSubmissionId ? result : unavailable();
     },
     subagents: {

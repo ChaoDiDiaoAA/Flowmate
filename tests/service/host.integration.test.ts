@@ -358,16 +358,18 @@ it('keeps original receipts and history readable while real Application close is
     const work = P.InvoiceWorkGetResultSchema.parse(need(await f.call({ type: 'invoice_work_get',
       input: { view: 'work', workId: created.workId, limit: 10 } })));
     expect(work.work.workId).toBe(created.workId);
+    if (work.view !== 'work' || !work.items[0]) throw Error('The original invoice item is unavailable.');
+    const historyTarget = { workId: created.workId, itemId: work.items[0].itemId };
     need(await f.call({ type: 'personal_agent_get', input: {} }));
     expect(await f.call({ type: 'personal_agent_open_conversation', input: { workId: created.workId } }))
       .toMatchObject({ ok: true, data: { workId: created.workId, sessionId: created.sessionId } });
     need(await f.call({ type: 'invoice_work_list', input: { personalAgentId: f.agent.personalAgentId, limit: 10 } }));
     need(await f.call({ type: 'personal_task_get', input: { workId: created.workId, attemptId, limit: 10 } }));
     const history = PersonalHistoryPageSchema.parse(need(await f.call({ type: 'personal_task_history',
-      input: { target: { workId: created.workId }, limit: 10 } })));
+      input: { target: historyTarget, limit: 10 } })));
     expect(history.entries.length).toBeGreaterThan(0);
     PersonalHistoryEntrySchema.parse(need(await f.call({ type: 'personal_task_history_entry', input: {
-      target: { workId: created.workId }, throughEntryId: history.throughEntryId, entryId: history.entries[0]!.entryId, limit: 100 } })));
+      target: historyTarget, throughEntryId: history.throughEntryId, entryId: history.entries[0]!.entryId, limit: 100 } })));
     InvoiceWorkTimelinePageSchema.parse(need(await f.call({ type: 'invoice_work_timeline', input: { workId: created.workId, limit: 10 } })));
     for (const query of [
       { type: 'get_state' }, { type: 'list_documents', input: { limit: 10 } }, { type: 'query_session', sessionId: legacy.sessionId },

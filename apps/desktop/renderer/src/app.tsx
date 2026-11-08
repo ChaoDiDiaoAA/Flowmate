@@ -349,14 +349,14 @@ export function App() {
   const eventSequences = useRef(new Map<number, number>());
   const messageStates = useRef(new Map<number, MessageViewState>());
   const messageCursors = useRef(new Map<number, string | null>());
-  const inputReadTokens = useRef(new Map<number, number>());
+  const inputReads = useRef(new Map<number, { epoch: number; selection: number; pending: boolean; promise: Promise<void> }>());
   const unknownInputs = useRef(new Map<number, DesktopSessionInputRequest & { submittedDraft?: string }>());
   const inputSubmittingRef = useRef(false);
   const historyPositions = useRef(new Map<number, HistoryCommitState>());
   const historyForkRequests = useRef(new Map<number, ForkSessionRequest>());
   const nativeSessionIds = useRef(new Map<number, string>());
   const knownRunSessions = useRef(new Map<number, number>());
-  const historyQueries = useRef(new Map<number, { inFlight: boolean; refreshPending: boolean; beforeEntryId?: string }>());
+  const historyQueries = useRef(new Map<number, { epoch: number; selection: number; refreshPending: boolean; beforeEntryId?: string }>());
   const activeAgentRunIdRef = useRef<number | null>(null);
   const agentStopRequested = useRef(false);
   const selectedSessionIdRef = useRef<number | null>(null);
@@ -1296,8 +1296,13 @@ export function App() {
     }
   }
 
-  async function restoreWorkspace() {
-    if (workspacePendingRef.current) return;
+  async function restoreWorkspace(refreshOnFailure = false) {
+    const selected = selectedSessionIdRef.current;
+    if (workspacePendingRef.current) {
+      if (refreshOnFailure && selected !== null) void loadSession(selected);
+      return;
+    }
+    let restored = false;
     const epoch = workspaceHostEpoch.current, token = ++workspaceToken.current;
     publishWorkspaceState(beginWorkspaceRequest(workspaceStateRef.current, token, 'loading'));
     try {
@@ -1310,9 +1315,11 @@ export function App() {
         return;
       }
       if (!acceptWorkspace(result.data.workspace, epoch, token)) return;
+      restored = true;
       const snapshot = result.data.workspace;
       // Restore the saved chat before lists can render; null is an intentional saved choice.
-      selectSession(snapshot.sessionId);
+      if (snapshot.sessionId !== null && selectedSessionIdRef.current === snapshot.sessionId) void loadSession(snapshot.sessionId);
+      else selectSession(snapshot.sessionId);
       selectHistoryJob(snapshot.jobId);
       await Promise.all([loadSessionList(), loadProductLists()]);
       if (epoch !== workspaceHostEpoch.current || token !== workspaceStateRef.current.requestToken) return;
@@ -1333,6 +1340,8 @@ export function App() {
       publishWorkspaceState(failWorkspaceRequest(workspaceStateRef.current, epoch, token,
         'Workspace recovery could not be confirmed. Refresh to try again.', 'error'));
     } finally {
+      if (refreshOnFailure && !restored && selected !== null && selectedSessionIdRef.current === selected
+        && epoch === workspaceHostEpoch.current) void loadSession(selected);
       if (!focusRestored && epoch === workspaceHostEpoch.current && hostReadyRef.current) {
         const selection = sessionLoadSequence.current;
         if (initialFocus?.page === 'research' && initialFocus.researchId !== undefined && pageRef.current === 'research') {
@@ -1631,11 +1640,32 @@ export function App() {
     setChatTurns((turns) => turns.filter((turn) => turn.clientSequence !== undefined || turn.runId === null || !userRuns.has(turn.runId)));
   }
 
-  async function loadSessionInputs(sessionId: number) {
+  function loadSessionInputs(sessionId: number, changed = false): Promise<void> {
     const epoch = workspaceHostEpoch.current, selection = sessionLoadSequence.current;
-    const request = (inputReadTokens.current.get(sessionId) ?? 0) + 1; inputReadTokens.current.set(sessionId, request);
+    if (!hostReadyRef.current || selectedSessionIdRef.current !== sessionId) return Promise.resolve();
+    const existing = inputReads.current.get(sessionId);
+    if (existing?.epoch === epoch && existing.selection === selection) {
+      existing.pending ||= changed;
+      return existing.promise;
+    }
+    const read = { epoch, selection, pending: false, promise: Promise.resolve() };
+    const current = () => epoch === workspaceHostEpoch.current && selection === sessionLoadSequence.current
+      && selectedSessionIdRef.current === sessionId;
+    inputReads.current.set(sessionId, read);
+    read.promise = (async () => {
+      do {
+        read.pending = false;
+        await readSessionInputs(sessionId, current);
+      } while (read.pending && current());
+    })().finally(() => {
+      if (inputReads.current.get(sessionId) === read) inputReads.current.delete(sessionId);
+    });
+    return read.promise;
+  }
+
+  async function readSessionInputs(sessionId: number, current: () => boolean) {
     const result = await window.flowmate.listSessionInputs({ sessionId, limit: 50 }).catch(() => null);
-    if (inputReadTokens.current.get(sessionId) !== request || epoch !== workspaceHostEpoch.current || selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
+    if (!current()) return;
     if (!result?.ok) { setInputReadError('Saved inputs are unavailable.'); return; }
     if (result.data.items.some(input => input.sessionId !== sessionId)) { setInputReadError('Saved inputs do not match this chat.'); return; }
     setInputReadError(null);
@@ -1686,24 +1716,51 @@ export function App() {
     if (selectedSessionIdRef.current === sessionId) setUnknownInput(null);
     knownRunSessions.current.set(result.data.input.runId, sessionId);
     setNotice({ tone: 'info', message: `Input ${result.data.input.inputId}: ${result.data.input.status} · ${result.data.input.processingStatus}` });
-    await loadSessionInputs(sessionId);
+    await loadSessionInputs(sessionId, true);
     void refreshRuntimeState();
     void queryChatMessages(sessionId);
     } finally { inputSubmittingRef.current = false; setInputSubmitting(false); }
   }
 
-  async function queryChatMessages(sessionId: number, beforeEntryId?: string) {
-    if (selectedSessionIdRef.current !== sessionId) return;
-    void loadSessionInputs(sessionId);
-    const coordinator = historyQueries.current.get(sessionId) ?? { inFlight: false, refreshPending: false };
-    historyQueries.current.set(sessionId, coordinator);
-    if (coordinator.inFlight) {
-      coordinator.refreshPending = true;
-      coordinator.beforeEntryId = beforeEntryId;
+  function settleTrackedRun(tracked: RunSnapshot) {
+    if (activeAgentRunIdRef.current !== tracked.runId || activeChatSessionId.current !== tracked.sessionId
+      || selectedSessionIdRef.current !== tracked.sessionId
+      || !['completed', 'failed', 'cancelled'].includes(tracked.status)
+      || tracked.stoppedAt === null || !tracked.cleanup.stopped || tracked.cleanup.lateObservationRequired) return;
+    const turnId = activeChatTurnId.current;
+    activeAgentRunIdRef.current = null; activeChatSessionId.current = null; activeChatTurnId.current = null;
+    setActiveAgentRunId(null); setActiveAgentSessionId(null); setActiveRunModel(null);
+    agentStopRequested.current = false; setCancelPending(false); setBusy(false);
+    if (turnId) setChatTurns(turns => turns.filter(turn => turn.id !== turnId));
+    setRun(tracked); setRunId(tracked.runId);
+  }
+
+  async function refreshTrackedChatRun() {
+    const sessionId = selectedSessionIdRef.current, tracked = activeAgentRunIdRef.current;
+    if (sessionId === null || tracked === null || activeChatSessionId.current !== sessionId) return;
+    const current = captureHistorySelection();
+    const result = await window.flowmate.queryRun(tracked).catch(() => null);
+    if (!current() || activeAgentRunIdRef.current !== tracked || activeChatSessionId.current !== sessionId) return;
+    if (!result?.ok || result.data.runId !== tracked || result.data.sessionId !== sessionId) {
+      setNotice({ tone: 'info', message: 'The original Run status could not be verified. Your draft is preserved.' });
       return;
     }
-    coordinator.inFlight = true;
+    setRun(result.data);
+    settleTrackedRun(result.data);
+  }
+
+  async function queryChatMessages(sessionId: number, beforeEntryId?: string) {
+    if (!hostReadyRef.current || selectedSessionIdRef.current !== sessionId) return;
     const selection = sessionLoadSequence.current, epoch = workspaceHostEpoch.current;
+    const pending = historyQueries.current.get(sessionId);
+    if (pending?.epoch === epoch && pending.selection === selection) {
+      pending.refreshPending = true;
+      pending.beforeEntryId = beforeEntryId;
+      return;
+    }
+    const coordinator: NonNullable<typeof pending> = { epoch, selection, refreshPending: false };
+    historyQueries.current.set(sessionId, coordinator);
+    if (beforeEntryId === undefined) void loadSessionInputs(sessionId);
     const historyQuery = beforeEntryId !== undefined ? { beforeEntryId }
       : { afterEntryId: [...(messageStates.current.get(sessionId)?.byEntryId.keys() ?? [])].at(-1) ?? null };
     setHistoryLoading(true);
@@ -1741,15 +1798,7 @@ export function App() {
       }
       const tracked = activeChatSessionId.current === sessionId
         ? runsResult.data.items.find(item => item.runId === activeAgentRunIdRef.current) : undefined;
-      if (tracked && (tracked.status === 'completed' || tracked.status === 'failed' || tracked.status === 'cancelled')
-        && tracked.stoppedAt !== null && tracked.cleanup.stopped && !tracked.cleanup.lateObservationRequired) {
-        const turnId = activeChatTurnId.current;
-        activeAgentRunIdRef.current = null; activeChatSessionId.current = null; activeChatTurnId.current = null;
-        setActiveAgentRunId(null); setActiveAgentSessionId(null); setActiveRunModel(null);
-        agentStopRequested.current = false; setCancelPending(false); setBusy(false);
-        if (turnId) setChatTurns(turns => turns.filter(turn => turn.id !== turnId));
-        setRun(tracked); setRunId(tracked.runId);
-      }
+      if (tracked) settleTrackedRun(tracked);
       const merged = mergeSavedHistory({ ...base, closedRuns }, messagesResult.data, historyQuery);
       publishMessages(merged.state);
       setSelectedSession(sessionResult.data);
@@ -1778,14 +1827,11 @@ export function App() {
         setHistoryError('History could not be loaded. Refresh history to try again.');
       }
     } finally {
-      coordinator.inFlight = false;
-      const stale = selection !== sessionLoadSequence.current || epoch !== workspaceHostEpoch.current;
-      const followUp = coordinator.refreshPending && (!failed || stale) && hostReadyRef.current && selectedSessionIdRef.current === sessionId;
-      const pendingBefore = coordinator.beforeEntryId;
-      coordinator.refreshPending = false;
-      delete coordinator.beforeEntryId;
-      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId && epoch === workspaceHostEpoch.current) setHistoryLoading(false);
-      if (followUp) void queryChatMessages(sessionId, pendingBefore);
+      if (historyQueries.current.get(sessionId) === coordinator) historyQueries.current.delete(sessionId);
+      if (selection === sessionLoadSequence.current && selectedSessionIdRef.current === sessionId && epoch === workspaceHostEpoch.current) {
+        setHistoryLoading(false);
+        if (coordinator.refreshPending && !failed) void queryChatMessages(sessionId, coordinator.beforeEntryId);
+      }
     }
   }
 
@@ -2107,6 +2153,7 @@ export function App() {
         return;
       }
       if (event.type === 'host_state') {
+        const reconnected = !hostReadyRef.current && event.state.ready;
         if (!receiveDesktopState(event.state)) return;
         hostStateSequence.current += 1;
         runtimeQuerySequence.current += 1;
@@ -2114,7 +2161,10 @@ export function App() {
         setRuntimeReadFailed(false);
         if (!event.state.ready) for (const observation of eventObservations.current.values()) releaseEventObservation(observation);
         if (!event.state.ready && invoiceFormRef.current) publishInvoiceForm(invalidateInvoiceForm(invoiceFormRef.current));
-        if (event.state.ready) void refreshRuntimeState();
+        if (event.state.ready) {
+          void refreshRuntimeState();
+          if (reconnected) void refreshTrackedChatRun();
+        }
         return;
       }
       if (event.type === 'model_auth_notice' || event.type === 'model_auth_prompt') return;
@@ -2124,7 +2174,7 @@ export function App() {
           || knownRunSessions.current.get(event.runId) !== event.sessionId) return;
         const merged = applyMessageUpsert(messageStates.current.get(event.sessionId) ?? emptyMessageState(event.sessionId), event);
         publishMessages(merged.state);
-        if (event.message.persistence === 'saved' && event.message.phase === 'ended') void loadSessionInputs(event.sessionId);
+        if (event.message.persistence === 'saved' && event.message.phase === 'ended') void loadSessionInputs(event.sessionId, true);
         if (event.message.persistence === 'failed') {
           setSelectedSession((current) => current?.sessionId === event.sessionId ? { ...current, availability: 'unusable' } : current);
         }
@@ -2230,7 +2280,7 @@ export function App() {
   useEffect(() => {
     if (state?.ready) {
       void loadNativeTools();
-      void restoreWorkspace();
+      void restoreWorkspace(true);
     }
   }, [state?.ready]);
 

@@ -2,7 +2,7 @@ import { _electron as electron } from 'playwright';
 import { expect, test } from '@playwright/test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { cleanupResources, closeDesktopFixture, mkdtemp, waitFor } from '../support/resources.ts';
 
 test.afterEach(cleanupResources);
@@ -71,18 +71,17 @@ test('P6 Refresh activity retries failed request and invoice lists without an ex
     await expect(page.getByTestId('activity-page').getByRole('alert')).toHaveCount(0);
     const after = await app.evaluate(() => ({ ...Reflect.get(globalThis, 'activityRefresh') }));
     expect(after.requests).toBe(before.requests + 1); expect(after.actions).toBe(before.actions + 1); expect(after.executions).toBe(0);
-    const traceId = '00000000-0000-4000-8000-000000000006', traceRoot = join(userData, 'evaluation-fixture/agent-eval/traces', traceId);
+    const traceId = '00000000-0000-4000-8000-000000000006', traceRoot = join(userData, 'evaluation-fixture/agent-eval/traces');
     mkdirSync(traceRoot, { recursive: true });
-    writeFileSync(join(traceRoot, 'trace.json'), JSON.stringify({ id: traceId, revision: 1, source: { kind: 'product', productRoot: userData, runId: '101', sessionId: '12' }, entry: 'chats',
+    const trace = { id: traceId, revision: 1, source: { kind: 'product', productRoot: userData, runId: '101', sessionId: '12' }, entry: 'chats',
       startedAt: '2026-10-28T00:00:00.000Z', endedAt: '2026-10-28T00:00:01.000Z', input: { prompt: 'Recovered saved request' }, output: 'Controlled captured answer',
-      status: 'completed', complete: true, gaps: [], configuration: {}, events: [], facts: {}, materials: [] }));
-    const isolatedTraceId = '00000000-0000-4000-8000-000000000007', isolatedRoot = join(userData, 'evaluation-fixture/agent-eval/traces', isolatedTraceId);
-    mkdirSync(isolatedRoot, { recursive: true });
-    writeFileSync(join(isolatedRoot, 'trace.json'), JSON.stringify({ ...JSON.parse(readFileSync(join(traceRoot, 'trace.json'), 'utf8')),
+      status: 'completed', complete: true, gaps: [], configuration: {}, events: [], facts: {}, materials: [] };
+    writeFileSync(join(traceRoot, 'Trace-01.json'), JSON.stringify(trace));
+    const isolatedTraceId = '00000000-0000-4000-8000-000000000007';
+    writeFileSync(join(traceRoot, 'Trace-02.json'), JSON.stringify({ ...trace,
       id: isolatedTraceId, source: { kind: 'evaluation', runId: '101', sessionId: '12', executionId: 'isolated-execution', trialId: 'isolated-trial' } }));
-    const foreignTraceId = '00000000-0000-4000-8000-000000000008', foreignRoot = join(userData, 'evaluation-fixture/agent-eval/traces', foreignTraceId);
-    mkdirSync(foreignRoot, { recursive: true });
-    writeFileSync(join(foreignRoot, 'trace.json'), JSON.stringify({ ...JSON.parse(readFileSync(join(traceRoot, 'trace.json'), 'utf8')),
+    const foreignTraceId = '00000000-0000-4000-8000-000000000008';
+    writeFileSync(join(traceRoot, 'Trace-03.json'), JSON.stringify({ ...trace,
       id: foreignTraceId, source: { kind: 'product', productRoot: join(userData, 'isolated-host'), runId: '101', sessionId: '12' } }));
     await page.getByLabel('Processing request', { exact: true }).selectOption('101');
     await expect(page.getByRole('button', { name: 'Open evaluation trace', exact: true })).toBeVisible();

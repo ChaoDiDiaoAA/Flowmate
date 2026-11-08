@@ -310,6 +310,16 @@ export class DurableInvoiceGovernor {
       requireFact(!requireRequestBudget || remaining.modelCalls > 0, 'agent_model_call_budget', 'The shared Work model request budget is exhausted.');
       return { kind: 'ready' as const, itemId };
     };
+    if (command?.kind === 'continueWork' && command.request.peerReview) return ready(command.request.peerReview.itemId);
+    if (attempt) {
+      const peer = store.db.query<{ item_id: number; request_id: string }, [number]>(`SELECT r.item_id,p.request_id FROM invoice_work_peer_reviews r
+        JOIN invoice_work_phases p ON p.id=r.phase_id WHERE r.attempt_id=? AND p.closed_at IS NULL`).get(attempt.id);
+      if (peer) {
+        need(store.invoiceWorks.readPeerReviewContext({ workId: work.id, sessionId: work.session_id, attemptId: attempt.id,
+          itemId: peer.item_id, requestId: peer.request_id, participant: 'reviewer' }));
+        return ready(peer.item_id);
+      }
+    }
     const items = store.db.query<{ id: number; document_id: number; document_version: string; candidate_id: number | null }, [number]>(
       "SELECT * FROM invoice_work_items WHERE work_id=? AND disposition='unresolved' ORDER BY id").all(work.id);
     const priority = !command && attempt ? store.db.query<{ item_id: number | null }, [number]>(`SELECT item_id FROM invoice_work_phases

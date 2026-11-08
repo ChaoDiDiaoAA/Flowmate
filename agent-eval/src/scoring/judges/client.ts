@@ -3,7 +3,7 @@ import { REPO_ROOT } from '../../dataset-loader/local.ts';
 import { evaluationEnv, agentApiSchema, agentModelCapabilitiesSchema, resolveModelCapabilities, localAgentCredential } from '../../configuration.ts';
 import { registerSecrets } from '../../execution/evidence-safety.ts';
 import type { PreparedModelRuntime } from '../../../../packages/runtime-pi/src/model-runtime.ts';
-import packageJson from '../../../../package.json';
+import packageJson from '../../../../package.json' with { type: 'json' };
 import { generateJSON, NativeJSONError, nativeTextModelConfigSchema, runProcess, type NativeTextModelConfig, type ProcessRunner } from '../../text-model/codex.ts';
 import { encodeSharedTextInput, nativeJudgeMaxInputChars, sharedTextEncoding } from './shared-text.ts';
 

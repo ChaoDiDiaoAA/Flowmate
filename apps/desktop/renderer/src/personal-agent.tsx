@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { CLOUD_WORK_TIMEOUT_MS_MAX, CloudChildReportSchema, CloudDesktopConnectionSchema, CloudProgressEventSchema, CloudReviewAcceptReceiptSchema, compareInvoiceWorkTimelineCursor, ok, type CloudDesktopConnection, type DesktopBridge, type DocumentSnapshot, type InvoiceWorkView, type InvoiceWorkItemView,
-  type BrowserReadView, type BrowserTarget, type DesktopActionView, type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
+  type BrowserReadView, type BrowserTarget, type DesktopActionView, type InvoicePeerReviewView, type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
   type PersonalAgentSnapshot, type PersonalHistoryPage, type PersonalHistoryEntry, type PersonalHistoryTarget,
   type PersonalTaskView, type PersonalTaskGetResult, type Result } from '@flowmate/contracts';
 import { capturePersonalWrite, emptyPersonalDraft, executePersonalWrite, readPersonalDraft, recoverPersonalWrite,
@@ -137,6 +137,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   const [itemCursor, setItemCursor] = useState<number | null>(null), [selectedItem, setSelectedItem] = useState<InvoiceWorkItemView | null>(null);
   const selectedItemRef = useRef(selectedItem);
   useEffect(() => { selectedItemRef.current = selectedItem; }, [selectedItem]);
+  const [peerReview, setPeerReview] = useState<{ workId: number; itemId: number; itemRevision: number; view: InvoicePeerReviewView } | null>(null);
   const [todos, setTodos] = useState<readonly InvoiceWorkTodoView[]>([]), [todoCursor, setTodoCursor] = useState<number | null>(null);
   const [desktopActions, setDesktopActions] = useState<readonly DesktopActionView[]>([]), [desktopCursor, setDesktopCursor] = useState<number | null>(null);
   const [selectedDesktop, setSelectedDesktop] = useState<{ workId: number; itemId: number; hostEpoch: number; workspaceId?: string; window: DesktopActionView['target']['window'] } | null>(null);
@@ -172,9 +173,10 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
       setDesktopOwner(previous => previous?.workId === workId && previous.itemId === itemId ? previous : null); }
     try {
       const page = need(await personal.invoiceWorks.get({ view: 'item', workId, itemId,
-        ...(append && todoCursor !== null ? { afterTodoId: todoCursor } : {}), limit: 50 }));
+        ...(append && todoCursor !== null ? { afterTodoId: todoCursor } : { includePeerReview: true }), limit: 50 }));
       if (token !== itemGeneration.current || workId !== draftRef.current.selectedWorkId || page.view !== 'item') return;
       setWork(page.work); setSelectedItem(page.item);
+      if (page.peerReview) setPeerReview({ workId, itemId, itemRevision: page.item.revision, view: page.peerReview });
       if (!cloud || selectedItemRef.current?.workId !== workId || selectedItemRef.current.itemId !== itemId) setDecision('');
       setTodos(previous => append ? [...previous, ...page.todos] : page.todos); setTodoCursor(page.nextAfterTodoId);
       if (!append) {
@@ -241,6 +243,11 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   const refreshRef = useRef(refresh);
   useEffect(() => { refreshRef.current = refresh; });
   useEffect(() => {
+    if (cloud || !props.ready || peerReview?.view.kind !== 'pending' || peerReview.itemId !== selectedItem?.itemId) return;
+    const timer = window.setInterval(() => void refreshRef.current(peerReview.workId), 2000);
+    return () => window.clearInterval(timer);
+  }, [cloud, props.ready, peerReview?.workId, peerReview?.itemId, peerReview?.view.kind, selectedItem?.itemId]);
+  useEffect(() => {
     if (!cloud || !props.ready || !work) return;
     let active = true, cursor: { generation: string; sequence: number } | null = null, idle = 0;
     const owner = { workId: work.workId, sessionId: work.sessionId }, attemptId = work.execution.attempt?.attemptId;
@@ -301,7 +308,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
     if (!persist({ pending: command })) return null;
     const result = await executePersonalWrite(personal, command);
     if (result.ok) return await acceptReceipt(result.data) ? result.data : null;
-    if (['input_invalid', 'state_conflict', 'source_invalid', 'invoice_work_closed'].includes(result.error.code)) persist({ pending: null });
+    if (['input_invalid', 'state_conflict', 'source_invalid', 'invoice_work_closed', 'invoice_work_busy'].includes(result.error.code)) persist({ pending: null });
     setError(result.error.message); setReceiptMissing(false);
     return null;
   }
@@ -500,6 +507,28 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
               <button type="button" onClick={() => void readHistory({ workId: work.workId, itemId: selectedItem.itemId })}>View invoice history</button>
               <button type="button" disabled={!props.ready || saving} onClick={() => void operate(() => props.onOpenInvoice({ workId: work.workId, itemId: selectedItem.itemId,
                 documentRef: selectedItem.documentRef, jobId: selectedItem.jobId, candidateRef: selectedItem.candidateRef }))}>View original invoice / review</button>
+              {peerReview?.itemId === selectedItem.itemId && peerReview.workId === work.workId
+                && peerReview.itemRevision === selectedItem.revision && <section aria-label="Independent invoice review">
+                <h4>Independent invoice review</h4>
+                {peerReview.view.kind === 'available' ? <details key={selectedItem.revision}>
+                  <summary>Invite reviewer</summary>
+                  <p>The reviewer receives these invoice fields and evidence and returns advice for your decision.</p>
+                  <p>Initial review phase {peerReview.view.approval.sourcePhaseId}</p>
+                  <pre>{peerReview.view.approval.shared}</pre>
+                  <button type="button" disabled={writeDisabled} onClick={() => {
+                    const preview = peerReview.view;
+                    if (preview.kind !== 'available') return;
+                    void operate(() => submit({ type: 'invoice_work_continue', input: {
+                      workId: work.workId, expectedRevision: work.revision,
+                      expectedAttemptId: work.execution.attempt?.attemptId ?? null, requestId: requestId(), peerReview: preview.approval,
+                    } }));
+                  }}>Confirm and run review</button>
+                </details> : <>
+                  {'sourcePhaseId' in peerReview.view && <p>Initial review phase {peerReview.view.sourcePhaseId}</p>}
+                  {peerReview.view.kind === 'completed' ? <pre>{peerReview.view.answer}</pre>
+                    : <p role="status">{peerReview.view.kind === 'pending' ? 'Review accepted. Waiting for a verified result.' : peerReview.view.reason}</p>}
+                </>}
+              </section>}
               {todos.map(todo => { const key = supplementKey(work.workId, selectedItem.itemId, todo.todoId), value = draft.supplements[key] ?? { text: '', materials: [] };
                 return <article key={todo.todoId} className="personal-todo"><h4>{todo.fieldPath ?? 'Invoice review'} · {todo.actor} · {todo.action}</h4><p>{todo.problem}</p><p>Needed: {todo.needed}</p><p>Satisfied by: {todo.satisfiedBy}</p>
                   <p>Basis: {todo.basis.origin}; {todo.basis.documentRefs.map(ref => `${ref.id}/${ref.version}`).join(', ')}{todo.basis.candidateRef ? `; candidate ${todo.basis.candidateRef.id}/${todo.basis.candidateRef.sequence}` : ''}</p>

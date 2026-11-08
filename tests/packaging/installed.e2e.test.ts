@@ -1,7 +1,8 @@
 import { _electron as electron, type ElectronApplication } from 'playwright';
 import { expect, test } from '@playwright/test';
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { closeDesktopFixture, Database } from '../support/resources.ts';
 
 const executable = process.env.FLOWMATE_P17_INSTALLED_EXECUTABLE;
@@ -10,10 +11,16 @@ test('explicit installed executable uses standard data and preserves a session a
   test.setTimeout(90_000);
   if (!executable || process.platform !== 'win32' || !isAbsolute(executable) || basename(executable) !== 'Flowmate.exe'
     || !existsSync(executable) || !process.env.APPDATA || !process.env.SystemRoot) throw Error('Installed Windows target is unavailable');
-  const root = join(process.env.APPDATA, 'Flowmate'), program = dirname(executable);
+  const system = join(process.env.SystemRoot, 'System32');
+  const appData = execFileSync(join(system, 'WindowsPowerShell/v1.0/powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command',
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Environment]::GetFolderPath('ApplicationData')"],
+  { encoding: 'utf8', windowsHide: true, timeout: 5_000 }).trim();
+  if (!isAbsolute(appData) || resolve(appData).toLowerCase() !== resolve(process.env.APPDATA).toLowerCase())
+    throw Error('Cold-install acceptance requires the real Windows account AppData path.');
+  const root = join(appData, 'Flowmate'), program = dirname(executable);
   // The cold-install check must never open an existing account's business database.
   if (existsSync(join(root, 'data/app.sqlite'))) throw Error('Cold-install acceptance requires a fresh dedicated account data root');
-  const env: Record<string, string> = { PATH: join(process.env.SystemRoot, 'System32') };
+  const env: Record<string, string> = { PATH: system };
   for (const name of ['SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA'])
     if (process.env[name]) env[name] = process.env[name]!;
   const launch = () => electron.launch({ executablePath: executable, args: [], env });

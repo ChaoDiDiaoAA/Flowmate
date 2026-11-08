@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { cpSync, existsSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { cleanupResources, Database, mkdtemp } from '../support/resources.ts';
 
 it.afterEach(cleanupResources);
@@ -15,7 +15,7 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
   const repo = resolve(import.meta.dirname, '../..');
   const root = await mkdtemp(join(tmpdir(), 'flowmate-dev-e2e-'));
   for (const path of ['apps', 'packages', 'scripts', 'agent-eval/src', 'package.json', 'electron.vite.config.ts']) {
-    cpSync(join(repo, path), join(root, path), { recursive: true });
+    cpSync(join(repo, path), join(root, path), { recursive: true, filter: source => basename(source) !== 'node_modules' });
   }
   symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'), 'junction');
   const mainFile = join(root, 'apps/desktop/main/index.ts');
@@ -71,6 +71,7 @@ it('dev rebuilds Main and Preload only after stopping the real Host, and SIGINT 
   const connect = async () => {
     browserRef.current = await chromium.connectOverCDP(`http://127.0.0.1:${address.port}`);
     const page = browserRef.current.contexts()[0]!.pages()[0]!;
+    await page.getByRole('button', { name: 'New chat', exact: true }).click();
     await expect(page.getByRole('main', { name: 'Assistant', exact: true })).toBeVisible();
     const input = page.getByRole('textbox', { name: 'Message to model', exact: true });
     await input.click(); await expect(input).toBeFocused();

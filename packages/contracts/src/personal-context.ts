@@ -23,6 +23,7 @@ const sources = z.array(InvoiceWorkSourceLocatorSchema).readonly();
 export const InvoiceWorkPhaseBasisSchema = z.object({
   contextSnapshotId: id.nullable(), inputIds, documentRefs: documents, configurationRevision: revision, itemRevision: revision.nullable(),
   executionMode: z.literal('item-lane-approval-v1').optional(),
+  participant: z.literal('reviewer').optional(),
   desktopProposalId: id.optional(),
   desktopRejectedProposalId: id.optional(),
   browserProposalId: id.optional(),
@@ -109,6 +110,7 @@ const provenance = z.enum(['business-rule', 'model-self-report', 'user-provided'
 export const InvoiceWorkWorkingContextSchema = z.object({
   version: z.literal(1), runtimeKind: z.literal('durable'), inputUse: z.literal('phase-bound-only'),
   instructions: InvoiceWorkPhaseInstructionsSchema.optional(),
+  peerReview: z.object({ shared: z.string().min(1).max(8192).refine(value => new TextEncoder().encode(value).byteLength <= 8192) }).strict().optional(),
   queueInstruction: z.object({ provenance: z.literal('user-provided'), controlRequestId: requestId,
     content: text.refine(value => value.trim().length > 0) }).strict().readonly().optional(),
   queueInstructions: z.array(CloudQueueInstructionSchema).max(100).readonly().optional(),

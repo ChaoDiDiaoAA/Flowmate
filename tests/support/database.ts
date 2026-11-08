@@ -8,9 +8,10 @@ import type { DbHandle, SqlDatabaseStore } from '../../packages/core/src/storage
 
 export type TestDbHandle = DbHandle & Omit<SqlDatabaseStore, 'db'> & { db: Database };
 
-/** Remove only the new memory schema from an isolated fixture before testing an older migration. */
+/** Recreate a pre-memory schema in an isolated migration fixture. */
 export function removeMemorySchemaFromFixture(db: Database): void {
-  db.exec(`DROP TRIGGER memory_grants_remove_session;
+  db.exec(`DROP TABLE invoice_work_peer_reviews; DELETE FROM schema_migrations WHERE version=28;
+    DROP TRIGGER memory_grants_remove_session;
     DROP TABLE memory_forget_requests; DROP TABLE memory_remember_requests; DROP TABLE memory_grants; DROP TABLE memory_entries; DROP TABLE memory_sync;
     DROP TABLE memory_recalls; DROP TABLE memory_input_bindings; DROP TABLE memory_bindings; DROP TABLE memory_identities;
     DROP TABLE memory_config; DELETE FROM schema_migrations WHERE version=27;`);

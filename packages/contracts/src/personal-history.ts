@@ -9,8 +9,8 @@ export const PersonalHistoryTargetSchema = z.object({ workId: id, itemId: id.opt
   .refine(value => value.itemId === undefined || value.childRunId === undefined);
 export type PersonalHistoryTarget = z.infer<typeof PersonalHistoryTargetSchema>;
 export const PersonalHistoryOwnerSchema = z.object({ runtimeKind: z.literal('durable'), workId: id,
-  sessionId: id, childRunId: id.nullable(), itemId: id.optional() }).strict()
-  .refine(value => value.itemId === undefined || value.childRunId === null);
+  sessionId: id, childRunId: id.nullable(), itemId: id.optional(), participant: z.literal('reviewer').optional() }).strict()
+  .refine(value => (value.itemId === undefined || value.childRunId === null) && (!value.participant || value.itemId !== undefined));
 export type PersonalHistoryOwner = z.infer<typeof PersonalHistoryOwnerSchema>;
 export const PersonalHistoryRequestSchema = z.object({ target: PersonalHistoryTargetSchema,
   throughEntryId: position.optional(), beforeEntryId: id.optional(), limit: z.number().int().min(1).max(100).default(50),

@@ -3,14 +3,14 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { cpSync, existsSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { mkdtemp } from '../support/resources.ts';
 
 for (const failure of ['unconfirmed-close', 'startup-failure'] as const) it(`dev rejects ${failure} and releases its launcher resources`, async () => {
   const repo = resolve(import.meta.dir, '../..');
   const root = await mkdtemp(join(tmpdir(), 'flowmate-dev-protocol-'));
   for (const path of ['apps', 'packages', 'scripts', 'agent-eval/src', 'package.json', 'electron.vite.config.ts'])
-    cpSync(join(repo, path), join(root, path), { recursive: true });
+    cpSync(join(repo, path), join(root, path), { recursive: true, filter: source => basename(source) !== 'node_modules' });
   symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'), 'junction');
   const mainFile = join(root, 'apps/desktop/main/index.ts');
   const source = readFileSync(mainFile, 'utf8');

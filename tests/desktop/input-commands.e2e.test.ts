@@ -2,7 +2,6 @@ import { _electron as electron } from 'playwright';
 import { expect, test } from '@playwright/test';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdirSync } from 'node:fs';
 import { cleanupResources, closeDesktopFixture, createHttpProvider, installReadGate, mkdtemp } from '../support/resources.ts';
 
 test.afterEach(cleanupResources);
@@ -17,7 +16,6 @@ function environment() {
 test('four command groups, keyboard and IME, role overrides, themes and real concurrent Assistant cards', async () => {
   test.setTimeout(90000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-input-ui-'));
-  const pictures = join(repository, '.superpowers/sdd/skills-input-subagent/ui'); mkdirSync(pictures, { recursive: true });
   const payloads: any[] = []; let parent = 0, release!: () => void;
   const barrier = new Promise<void>(resolve => release = resolve);
   const provider = await createHttpProvider(async request => {
@@ -99,7 +97,7 @@ test('four command groups, keyboard and IME, role overrides, themes and real con
         const saved = await window.flowmate.saveSettings({ ...state.data.settings, profile: { ...state.data.settings.profile, theme } });
         if (!saved.ok) throw Error(saved.error.code); }, theme);
       await page.setViewportSize({ width: theme === 'light' ? 920 : 1450, height: 950 });
-      await page.screenshot({ path: join(pictures, 'input-agents-'+theme+'.png') });
+      await page.screenshot({ path: test.info().outputPath('input-agents-'+theme+'.png') });
     }
     // Remove author resources for this ordinary-chat Run; no invoice scope is granted.
     await page.evaluate(async () => { const catalog = await window.flowmate.listResources(); if (!catalog.ok) throw Error(catalog.error.code);
@@ -118,7 +116,7 @@ test('four command groups, keyboard and IME, role overrides, themes and real con
     await expect(input).toHaveValue('Draft during parallel execution.');
     expect(await activeComposer!.evaluate(element => element.isConnected)).toBe(true);
     await expect(cards).toHaveCount(2); expect(payloads).toHaveLength(requestCount);
-    await page.screenshot({ path: join(pictures, 'assistant-parallel.png') });
+    await page.screenshot({ path: test.info().outputPath('assistant-parallel.png') });
     release(); await expect(cards.first()).toContainText('completed', { timeout: 20000 });
     await expect(cards.first()).toContainText('Independent UI finding.');
     const children = await page.evaluate(async sessionId => { const roots = await window.flowmate.listSessionRuns({ sessionId });

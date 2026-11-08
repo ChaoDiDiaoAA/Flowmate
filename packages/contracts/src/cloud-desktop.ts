@@ -320,7 +320,8 @@ export function parseCloudDesktopResult(command: CloudDesktopCommand, value: unk
     const input = command.input, data = parsed.data.data;
     if (data.workId !== input.workId || data.sessionId !== input.sessionId || data.attemptId !== input.attemptId) return null;
     if (command.type === 'cloud_delivery_retry') return 'requestId' in data && data.requestId === command.input.requestId
-      && data.itemId === command.input.itemId && data.nativeSubmissionId === command.input.nativeSubmissionId ? { ok: true, data } : null;
+      && data.itemId === command.input.itemId && data.participant === command.input.participant
+      && data.nativeSubmissionId === command.input.nativeSubmissionId ? { ok: true, data } : null;
     return 'results' in data && data.results.items.length <= command.input.limit && (command.input.afterSubmissionId === undefined
       || data.results.items.every(item => item.nativeSubmissionId > command.input.afterSubmissionId!)) ? { ok: true, data } : null;
   }

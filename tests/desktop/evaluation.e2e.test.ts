@@ -511,7 +511,7 @@ test('an active Worker crash preserves partial evidence and stopping uncertainty
   const server = await createHttpProvider(async () => { requests++; await held; return Response.json({ error: 'Synthetic interrupted request' }, { status: 503 }); });
   const app = await electron.launch({ executablePath: join(repository, 'node_modules/electron/dist/electron.exe'),
     args: [join(repository, 'out/main/index.js')], env: desktopEnvironment(userData), timeout: 30_000 });
-  let failure: Error | undefined, closed = false;
+  let failure: Error | undefined, closeAttempted = false;
   try {
     const page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor();
     await expect.poll(async () => { const state = await page.evaluate(() => window.flowmate.getState()); return state.ok && state.data.ready; }).toBe(true);
@@ -541,11 +541,18 @@ test('an active Worker crash preserves partial evidence and stopping uncertainty
     expect(await page.evaluate(() => window.flowmate.startEvaluation({ previewId: 'synthetic-unaccepted-preview', requestId: 'synthetic-after-crash' })))
       .toMatchObject({ ok: false, error: { code: 'evaluation_busy' } });
     expect(requests).toBe(1); expect(JSON.stringify(readReport(reportPath(root, executionId)))).toBe(original);
-    // The fixture forces only its own process out after verifying that normal product quit remains unconfirmed.
-    await expect(closeDesktopFixture(app, userData)).rejects.toThrow('Desktop fixture normal close'); closed = true;
+    const desktop = app.process();
+    closeAttempted = true;
+    await closeDesktopFixture(app, userData);
+    expect(desktop.exitCode).toBe(0);
+    expect(requests).toBe(1);
     expect(JSON.stringify(readReport(reportPath(root, executionId)))).toBe(original);
   } catch (error) { failure = error as Error; throw error; }
-  finally { release(); if (!closed) await closeDesktopFixture(app, userData, failure); await server.stop(); }
+  finally {
+    release();
+    try { if (!closeAttempted) await closeDesktopFixture(app, userData, failure); }
+    finally { await server.stop(); }
+  }
 });
 
 test('P16 Main and Preload save dedicated credentials without model calls and retain them through business settings saves', async () => {

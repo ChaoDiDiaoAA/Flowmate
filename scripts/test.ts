@@ -1,4 +1,5 @@
-import { readdirSync } from 'node:fs';
+import { mkdtempSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const root = resolve(import.meta.dir, '..');
@@ -37,6 +38,8 @@ for (const layer of selected === 'all' ? layers : [selected]) {
   if (layer === 'e2e') {
     const node = Bun.which('node');
     if (!node) throw new Error('Electron E2E requires the installed Node.js runtime.');
-    await run([require.resolve('@playwright/test/cli'), 'test', '--workers=1', '--reporter=line', ...tests], node);
+    const output = mkdtempSync(join(tmpdir(), 'flowmate-e2e-'));
+    console.log(`E2E artifacts: ${output}`);
+    await run([require.resolve('@playwright/test/cli'), 'test', '--workers=1', '--reporter=line', '--output', output, ...tests], node);
   } else await run(['test', '--isolate', '--timeout', '15000', ...tests.map(p => './' + p)]);
 }

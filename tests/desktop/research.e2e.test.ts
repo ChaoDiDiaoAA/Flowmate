@@ -100,7 +100,7 @@ test('research restores unfinished steps after relaunch and acquires them only a
   } finally { if (app) await closeDesktopFixture(app, userData); }
 });
 
-test('research desktop creates and confirms a plan, reads local evidence, exports and reopens without replay', async () => {
+test('research desktop creates and confirms a plan, reads local evidence, exports and reopens without replay', async ({}, testInfo) => {
   test.setTimeout(90000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p15-ui-')), text = 'Team policy: deployments must run locally.';
   let page!: Page, requests = 0, holdNext = false, releaseHeld: () => void = () => {};
@@ -182,7 +182,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     });
     await expect(page.getByRole('alert')).toHaveCount(0);
     await page.locator('.research-scope > summary').click();
-    await page.screenshot({ path: join(root, '.superpowers/sdd/research-ui-refinement/new-research.png') });
+    await page.screenshot({ path: testInfo.outputPath('new-research.png') });
     await page.getByRole('button', { name: 'Create research', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Close Assistant', exact: true })).toBeVisible();
     const send = page.getByRole('button', { name: 'Send', exact: true }); await expect(send).toBeEnabled(); await send.click();
@@ -211,7 +211,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.getByRole('button', { name: 'Save report', exact: true }).click(); await expect(page.getByRole('status')).toContainText(output);
     await expect(page.getByRole('status')).toBeInViewport();
     expect(readFileSync(output, 'utf8')).toContain(text); expect(readFileSync(output, 'utf8')).toContain('ToolCall');
-    await page.screenshot({ path: join(root, '.superpowers/sdd/research-ui-refinement/research-report.png') });
+    await page.screenshot({ path: testInfo.outputPath('research-report.png') });
     // The existing no-overwrite publication failure must preserve both reports and external content.
     const conflictPath = join(userData, 'different-content.md'); writeFileSync(conflictPath, 'Keep my existing file.');
     await app.evaluate(({ dialog }, destination) => { dialog.showSaveDialog = (async () => ({ canceled: false, filePath: destination })) as typeof dialog.showSaveDialog; }, conflictPath);
@@ -260,12 +260,12 @@ test('research desktop creates and confirms a plan, reads local evidence, export
         if (theme === 'system') await page.emulateMedia({ colorScheme: width === 800 ? 'dark' : 'light' });
         await expect(page.locator('.research-report-toolbar')).toBeVisible();
         await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-        await page.screenshot({ path: join(root, '.superpowers/sdd/research-ui-refinement/report-' + theme + '-' + width + '.png') });
+        await page.screenshot({ path: testInfo.outputPath(`report-${theme}-${width}.png`) });
         if (width === 800) {
           await page.getByRole('button', { name: 'New research', exact: true }).click();
           await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
           await expect(page.getByRole('button', { name: 'Create research', exact: true })).toBeVisible();
-          await page.screenshot({ path: join(root, '.superpowers/sdd/research-ui-refinement/new-narrow-' + theme + '.png') });
+          await page.screenshot({ path: testInfo.outputPath(`new-narrow-${theme}.png`) });
           await page.getByRole('button', { name: 'Cancel', exact: true }).click();
           await expect(page.getByRole('button', { name: 'New research', exact: true })).toBeFocused();
         }
@@ -274,7 +274,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
       await page.getByRole('button', { name: 'New research', exact: true }).click();
       await expect(page.locator('.research-scope')).not.toHaveAttribute('open');
       await expect(page.getByLabel('Research question', { exact: true })).toBeFocused();
-      await page.screenshot({ path: join(root, '.superpowers/sdd/research-ui-refinement/new-' + theme + '.png') });
+      await page.screenshot({ path: testInfo.outputPath(`new-${theme}.png`) });
       await page.getByRole('button', { name: 'Cancel', exact: true }).click();
     }
     expect(await page.evaluate(() => window.flowmate.readWorkspace())).toEqual(before); const count = requests;
@@ -283,7 +283,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
     await page.getByRole('button', { name: 'Refresh research', exact: true }).click(); expect(requests).toBe(count);
     await page.setViewportSize({ width: 800, height: 700 }); await expect(page.getByRole('heading', { name: 'Deep Research', exact: true })).toBeVisible();
-    await page.screenshot({ path: join(root, '.superpowers/sdd/research-ui-refinement/research-narrow.png') });
+    await page.screenshot({ path: testInfo.outputPath('research-narrow.png') });
     const task = await page.evaluate(async () => { const result = await window.flowmate.listResearchTasks(); if (!result.ok) throw new Error(result.error.code); return result.data.items[0]!; });
     await closeDesktopFixture(app, userData); app = null;
     app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'), args: [join(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });

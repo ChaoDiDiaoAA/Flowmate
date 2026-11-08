@@ -4,7 +4,7 @@ import type { DbHandle } from '../packages/core/src/storage/database.ts';
 import type { CloudRuntimeGrant, CloudRuntimeOperation } from './cloud-runtime-router.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const request = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id.optional(), requestId: z.string().min(1).max(128).optional(),
+const request = z.object({ workId: id, sessionId: id, itemId: id.optional(), participant: z.literal('reviewer').optional(), attemptId: id.optional(), requestId: z.string().min(1).max(128).optional(),
   childRunId: id.optional(), childSessionId: id.optional(), originToolCallId: id.optional(), nativeToolTaskId: id.optional(),
   child: z.object({ childRunId: id, childSessionId: id, originToolCallId: id, nativeToolTaskId: id, itemId: id.optional(),
     workId: id, sessionId: id, attemptId: id, requestId: z.string().min(1).max(128) }).strict().optional() }).passthrough();
@@ -14,6 +14,10 @@ const attemptMethods = new Set<CloudRuntimeOperation>(['prepareModel', 'restoreM
 const phaseMethods = new Set<CloudRuntimeOperation>(['restoreModel', 'submit', 'getSubmission', 'observeSubmission', 'observeSubagent',
   'waitForSubmission', 'compact', 'queryCompaction', 'cancelCompaction', 'retryResult']);
 const scheduling = new Set<CloudRuntimeOperation>(['openConversation', 'prepareModel', 'submit', 'waitForSubmission', 'resumeAttempt', 'compact', 'controlQueue']);
+const reviewerHistory = new Set<CloudRuntimeOperation>(['queryHistory', 'queryHistoryPage', 'queryHistoryEntry']);
+const reviewerAttemptWide = new Set<CloudRuntimeOperation>(['stopAttempt', 'resumeAttempt', 'resultStatus']);
+const reviewerPhase = new Set<CloudRuntimeOperation>(['openConversation', 'prepareModel', 'restoreModel', 'submit',
+  'getSubmission', 'observeSubmission', 'waitForSubmission', 'retryResult']);
 const denied = () => fail(appError('cloud_runtime_forbidden', 'runtime', 'The original cloud operation is not authorized.'));
 
 /** The Runtime receives only the owner and readiness facts for the original product Work. */
@@ -38,6 +42,22 @@ export function createCloudRuntimeAuthorizer(database: Pick<DbHandle, 'read'>):
           stop_requested_at: string | null; stopped_at: string | null }, [number, number]>(
           'SELECT id,run_id,stop_requested_at,stopped_at FROM invoice_work_attempts WHERE id=? AND work_id=?').get(input.attemptId, input.workId);
         if (attemptMethods.has(operation) && !original) return denied();
+        const reviewAttempt = original ?? (operation === 'openConversation' ? current : null);
+        const review = reviewAttempt && scope.db.query<{ item_id: number; request_id: string }, [number, number]>(`
+          SELECT r.item_id,p.request_id FROM invoice_work_peer_reviews r JOIN invoice_work_phases p
+            ON p.id=r.phase_id AND p.work_id=r.work_id AND p.attempt_id=r.attempt_id AND p.item_id=r.item_id
+          WHERE r.work_id=? AND r.attempt_id=?`).get(input.workId, reviewAttempt.id);
+        if (reviewerHistory.has(operation)) {
+          if (input.participant && (input.itemId === undefined || !scope.db.query(
+            'SELECT 1 FROM invoice_work_peer_reviews WHERE work_id=? AND item_id=? LIMIT 1').get(input.workId, input.itemId))) return denied();
+        } else if (review) {
+          if (reviewerAttemptWide.has(operation)) {
+            if (input.participant || input.itemId !== undefined) return denied();
+          } else if (!reviewerPhase.has(operation) || input.participant !== 'reviewer' || input.itemId !== review.item_id
+            || operation !== 'openConversation' && input.requestId !== review.request_id) return denied();
+        } else if (input.participant) return denied();
+        if (input.participant && (input.child !== undefined || input.childRunId !== undefined
+          || input.childSessionId !== undefined || input.originToolCallId !== undefined || input.nativeToolTaskId !== undefined)) return denied();
         if (phaseMethods.has(operation)) {
           if (input.requestId === undefined || input.attemptId === undefined) return denied();
           const phase = scope.db.query<{ item_id: number | null; scheduler_state: string }, [number, number, string]>(

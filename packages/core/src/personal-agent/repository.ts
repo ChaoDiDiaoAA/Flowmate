@@ -7,13 +7,14 @@ import { CloudRuntimeBindingSchema, CloudWorkspaceIdSchema, appError, fail, ok, 
   InvoiceWorkSupplementRequestSchema, InvoiceWorkSupplementReceiptSchema, InvoiceWorkDispositionDecisionSchema,
   InvoiceWorkDisposeItemRequestSchema, InvoiceWorkDisposeItemReceiptSchema, PersonalAgentConfigurationSchema, RunStatusSchema,
   RUNTIME_CONFIG, RuntimeRequestOverridesSchema, DurableWorkBudgetSchema, InvoiceWorkContextBuildInputSchema,
-  InvoiceWorkWorkingContextSchema, invoiceToolSchemas } from '@flowmate/contracts';
+  InvoiceWorkWorkingContextSchema, InvoicePeerReviewApprovalSchema, invoiceToolSchemas } from '@flowmate/contracts';
 import type { AppError, DocumentRef, InvoiceWorkCancelReceipt, InvoiceWorkCancelRequest,
   InvoiceWorkContinueReceipt, InvoiceWorkContinueRequest, InvoiceWorkCreateReceipt, InvoiceWorkCreateRequest,
   InvoiceWorkDisposeItemReceipt, InvoiceWorkDisposeItemRequest, InvoiceWorkGetRequest, InvoiceWorkGetResult,
   InvoiceWorkListRequest, InvoiceWorkListResult, InvoiceWorkOperationReceipt, InvoiceWorkQueryOperationRequest,
   InvoiceWorkSupplementReceipt, InvoiceWorkSupplementRequest, InvoiceWorkTodoView, InvoiceWorkContextBuildInput,
-  InvoiceWorkAuthorizedContextInput, DurableAttemptStopResult, DurableSubmissionObservation, JobSnapshot, RuntimeRequestOverrides, Result } from '@flowmate/contracts';
+  InvoiceWorkAuthorizedContextInput, DurableAttemptStopResult, DurableSubmissionObservation, JobSnapshot, RuntimeRequestOverrides, Result,
+  InvoicePeerReviewView, DurableSubmissionQuery, InvoiceWorkWorkingContext } from '@flowmate/contracts';
 import type { SynchronousDatabaseExecutor } from '../storage/write-coordinator.ts';
 import { createSessionRepository, createDocumentRepository, createCandidateRepository, createJobRepository } from '../storage/repositories.ts';
 import { readTransaction } from '../storage/reads.ts';
@@ -32,7 +33,7 @@ export type InvoiceWorkAdmission = { kind: 'ready' | 'queued' }
 type CommandOptions = { at: string; admission: InvoiceWorkAdmission };
 export type InvoiceWorkTodoDefinition = Omit<InvoiceWorkTodoView, 'todoId' | 'workId' | 'itemId' | 'revision' | 'applicable'>;
 export type InvoiceWorkPhaseBasis = { contextSnapshotId: number | null; inputIds: readonly number[];
-  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null; executionMode?: 'item-lane-approval-v1';
+  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null; executionMode?: 'item-lane-approval-v1'; participant?: 'reviewer';
   desktopProposalId?: number; desktopRejectedProposalId?: number; browserProposalId?: number; browserRejectedProposalId?: number };
 export type InvoiceWorkPhase = { phaseId: number; workId: number; attemptId: number; itemId: number | null;
   requestId: string; kind: 'prompt'; basis: InvoiceWorkPhaseBasis; createdAt: string;
@@ -54,6 +55,7 @@ export interface InvoiceWorkRepository {
   linkPhase(input: { workId: number; attemptId: number; phaseId: number; nativeConversationId: number;
     nativeSubmissionId: number; at: string }): Result<InvoiceWorkPhase>;
   getPhase(input: { workId: number; attemptId: number; requestId: string }): Result<InvoiceWorkPhase | null>;
+  readPeerReviewContext(input: DurableSubmissionQuery): Result<InvoiceWorkWorkingContext>;
   readContextInput(input: { workId: number; attemptId: number; requestId: string;
     remainingBudget: InvoiceWorkContextBuildInput['remainingBudget'] }): Result<InvoiceWorkContextBuildInput>;
   selectPhaseInput(input: { workId: number; attemptId: number; itemId: number }): Result<{ itemId: number; basis: InvoiceWorkPhaseBasis }>;
@@ -75,6 +77,8 @@ type AttemptRow = { id: number; work_id: number; previous_attempt_id: number | n
 type PhaseRow = { id: number; work_id: number; attempt_id: number; item_id: number | null; request_id: string; kind: 'prompt';
   basis_json: string; native_conversation_id: number | null; native_submission_id: number | null;
   created_at: string; consumed_at: string | null; closed_at: string | null };
+type PeerReviewRow = { attempt_id: number; phase_id: number; work_id: number; item_id: number; candidate_id: number;
+  candidate_sequence: number; item_revision: number; source_phase_id: number; shared: string };
 type TodoRow = { id: number; work_id: number; item_id: number; revision: number; definition_json: string;
   created_at: string; superseded_at: string | null };
 type InputRow = { id: number; work_id: number; item_id: number; todo_id: number; request_id: string;
@@ -97,12 +101,13 @@ const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const atSchema = z.string().datetime({ offset: true });
 const basisSchema = z.object({ contextSnapshotId: id.nullable(), inputIds: z.array(id).refine(ids => new Set(ids).size === ids.length),
   documentRefs: z.array(DocumentRefSchema), configurationRevision: revision, itemRevision: revision.nullable(),
-  executionMode: z.literal('item-lane-approval-v1').optional(),
+  executionMode: z.literal('item-lane-approval-v1').optional(), participant: z.literal('reviewer').optional(),
   desktopProposalId: id.optional(), desktopRejectedProposalId: id.optional(), browserProposalId: id.optional(), browserRejectedProposalId: id.optional() }).strict();
 const phaseInputSchema = z.object({ workId: id, attemptId: id, itemId: id.nullable(), requestId: z.string().min(1).max(128),
   kind: z.literal('prompt'), basis: basisSchema, at: atSchema }).strict();
 const observationSchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId: phaseInputSchema.shape.requestId,
   nativeConversationId: id, nativeSubmissionId: id, nativeEntryId: id.nullable(),
+  participant: z.literal('reviewer').optional(), nativeAnswerEntryId: id.optional(),
   status: z.enum(['queued', 'placed', 'done', 'unanswered']), consumedAt: atSchema.nullable(),
   execution: z.enum(['active', 'closed', 'unknown']) }).strict();
 const sourceSnapshotSchema = z.object({ workId: id, items: z.array(z.object({ itemId: id, documentRef: DocumentRefSchema,
@@ -236,6 +241,87 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
       { kind: 'stop', enabled: stopReason === null, reason: stopReason, itemId: null, todoId: null },
       ...(open ? [{ kind: 'cancel', enabled: true, reason: null, itemId: null, todoId: null }] : [])] });
   }
+  function requireIdlePeerReview(row: WorkRow) {
+    requireFact(!db.query(`SELECT r.attempt_id FROM invoice_work_peer_reviews r
+      JOIN invoice_work_attempts a ON a.id=r.attempt_id WHERE r.work_id=? AND a.stopped_at IS NULL`).get(row.id),
+    'invoice_work_busy', 'Wait for the independent review to close or stop it first.');
+  }
+
+  function peerReviewView(row: WorkRow, selected: ItemRow): InvoicePeerReviewView {
+    const unavailable = (reason: string): InvoicePeerReviewView => ({ kind: 'unavailable', reason });
+    if (selected.candidate_id === null || selected.candidate_sequence === null || selected.job_id === null)
+      return unavailable('A saved initial candidate is required.');
+    const prior = db.query<PeerReviewRow, [number, number, number, number]>(`SELECT * FROM invoice_work_peer_reviews
+      WHERE work_id=? AND item_id=? AND candidate_id=? AND candidate_sequence=?`)
+      .get(row.id, selected.id, selected.candidate_id, selected.candidate_sequence);
+    const document = requireResult(documents.get(selected.document_id));
+    const materialAvailable = document.status === 'available' && !document.isHidden
+      && document.documentRef.version === selected.document_version && document.parsedArtifactId !== null;
+    const session = requireResult(sessions.get(row.session_id));
+    const authorized = session.runtimeKind === 'durable' && session.status === 'active' && !session.deletePending && !session.modelUseBlocked
+      && (session.durableRuntimeId === 'local' || Boolean(db.query(`SELECT document_id FROM cloud_workspace_documents
+        WHERE workspace_id=? AND document_id=? AND document_version=?`).get(session.cloudWorkspaceId, selected.document_id, selected.document_version)));
+    if (prior) {
+      const source = { attemptId: prior.attempt_id, sourcePhaseId: prior.source_phase_id };
+      if (!authorized || !materialAvailable || selected.revision !== prior.item_revision || selected.disposition !== 'unresolved')
+        return { kind: 'closed', ...source, reason: 'The reviewed invoice is no longer current.' };
+      const original = db.query<AttemptRow, [number, number]>('SELECT * FROM invoice_work_attempts WHERE id=? AND work_id=?')
+        .get(prior.attempt_id, row.id);
+      requireFact(original, 'storage_corrupt');
+      if (original.stopped_at === null) return { kind: 'pending', ...source };
+      const run = original.run_id === null ? null : db.query<{ status: string; output_json: string | null }, [number]>(
+        'SELECT status,output_json FROM runs WHERE id=?').get(original.run_id);
+      const answer: unknown = run?.output_json ? JSON.parse(run.output_json).text : null;
+      if (original.stop_requested_at === null && run?.status === 'completed' && typeof answer === 'string' && answer.trim()
+        && Buffer.byteLength(answer, 'utf8') <= 8192) return { kind: 'completed', ...source, answer };
+      return { kind: 'closed', ...source, reason: original.stop_requested_at === null
+        ? 'No review answer was verified. The original outcome could not be confirmed.' : 'The review was stopped.' };
+    }
+    if (row.status !== 'open' || selected.disposition !== 'unresolved' || !materialAvailable)
+      return unavailable('The invoice or its original material is no longer available for review.');
+    if (!authorized) return unavailable('The original Session or its material authorization is unavailable.');
+    const current = attempt(row);
+    if (!current || current.stopped_at === null) return unavailable('Wait for the initial Work attempt to close.');
+    const { candidate, documentRef } = requireResult(candidates.readByJob({ jobId: selected.job_id, candidateId: selected.candidate_id }));
+    const source = db.query<{ id: number }, [number, number, number]>(`SELECT p.id FROM invoice_work_phases p
+      JOIN invoice_work_tool_calls b ON b.phase_id=p.id JOIN tool_calls t ON t.id=b.tool_call_id
+      JOIN invoice_work_attempts a ON a.id=p.attempt_id JOIN runs r ON r.id=a.run_id
+      WHERE p.work_id=? AND p.item_id=? AND t.id=? AND t.run_id=a.run_id AND t.tool_name='save_invoice_candidate'
+        AND t.status='succeeded' AND r.status='completed' AND a.stopped_at IS NOT NULL AND a.stop_requested_at IS NULL
+        AND p.consumed_at IS NOT NULL AND p.closed_at IS NOT NULL`).get(row.id, selected.id, candidate.toolCallId ?? 0);
+    if (!source || candidate.sequence !== selected.candidate_sequence || documentRef.id !== selected.document_id
+      || documentRef.version !== selected.document_version) return unavailable('The candidate has no verified initial review source.');
+    const fields = [];
+    for (const [field, value] of Object.entries(candidate.fields)) {
+      const evidence = value.sources[0] ?? null;
+      if (evidence && (evidence.documentId !== documentRef.id || evidence.version !== documentRef.version
+        || evidence.artifactId !== document.parsedArtifactId))
+        return unavailable('A candidate field refers to material outside the original invoice.');
+      fields.push({ field, raw: value.raw, normalized: value.normalized, state: value.state,
+        origin: value.valueOrigin ?? (evidence ? 'document' : 'candidate'), evidence });
+    }
+    const approval = InvoicePeerReviewApprovalSchema.safeParse({ itemId: selected.id, expectedItemRevision: selected.revision,
+      candidateRef: { id: selected.candidate_id, sequence: selected.candidate_sequence }, sourcePhaseId: source.id,
+      shared: JSON.stringify({ fields }) });
+    return approval.success ? { kind: 'available', approval: approval.data }
+      : unavailable('The invoice preview exceeds the review limit.');
+  }
+
+  function savePeerReview(row: WorkRow, attemptId: number, input: InvoiceWorkContinueRequest, at: string) {
+    const approved = input.peerReview!;
+    const selected = item(row.id, approved.itemId), session = requireResult(sessions.get(row.session_id));
+    requireFact(session.runtimeKind === 'durable');
+    const basis: InvoiceWorkPhaseBasis = { contextSnapshotId: null, inputIds: [], documentRefs: [{ id: selected.document_id,
+      version: selected.document_version }], configurationRevision: row.agent_revision, itemRevision: selected.revision,
+      executionMode: 'item-lane-approval-v1', participant: 'reviewer' };
+    const inserted = db.query(`INSERT INTO invoice_work_phases(work_id,attempt_id,item_id,request_id,kind,basis_json,durable_runtime_id,created_at,scheduler_state)
+      VALUES(?,?,?,?,'prompt',?,?,?,'active')`).run(row.id, attemptId, selected.id, input.requestId,
+      JSON.stringify(basis), session.durableRuntimeId, at);
+    db.query(`INSERT INTO invoice_work_peer_reviews(attempt_id,phase_id,work_id,item_id,candidate_id,candidate_sequence,item_revision,source_phase_id,shared)
+      VALUES(?,?,?,?,?,?,?,?,?)`).run(attemptId, Number(inserted.lastInsertRowid), row.id, selected.id, approved.candidateRef.id,
+      approved.candidateRef.sequence, selected.revision, approved.sourcePhaseId, approved.shared);
+  }
+
   function checkDocument(reference: DocumentRef) {
     const doc = requireResult(documents.get(reference.id));
     requireFact(doc.documentRef.version === reference.version && doc.status === 'available' && !doc.isHidden
@@ -607,17 +693,18 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         const rows = db.query<TodoRow, [number, number, number, number]>(
           'SELECT * FROM invoice_work_todos WHERE work_id=? AND item_id=? AND id>? AND superseded_at IS NULL ORDER BY id LIMIT ?')
           .all(row.id, selected.id, input.afterTodoId ?? 0, input.limit + 1);
+        const peer = input.includePeerReview ? { peerReview: peerReviewView(row, selected) } : {};
         const selectedView = itemView(selected), todos: InvoiceWorkTodoView[] = [];
         for (const original of rows.slice(0, input.limit)) {
           const next = todoView(original);
-          if (!InvoiceWorkGetResultSchema.safeParse({ view: 'item', work: projected, item: selectedView, todos: [...todos, next],
+          if (!InvoiceWorkGetResultSchema.safeParse({ view: 'item', work: projected, item: selectedView, ...peer, todos: [...todos, next],
             nextAfterTodoId: original.id }).success) {
             requireFact(todos.length > 0, 'input_too_large', 'The Todo cannot fit its public query page.');
             break;
           }
           todos.push(next);
         }
-        return InvoiceWorkGetResultSchema.parse({ view: 'item', work: projected, item: selectedView, todos,
+        return InvoiceWorkGetResultSchema.parse({ view: 'item', work: projected, item: selectedView, ...peer, todos,
           nextAfterTodoId: rows.length > todos.length ? todos.at(-1)?.todoId ?? null : null });
       });
     },
@@ -627,7 +714,14 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         const existing = prior<InvoiceWorkContinueReceipt>({ workId: row.id }, 'continueWork', input.requestId, input);
         if (existing) return existing;
         requireFact(row.status === 'open' && row.revision === input.expectedRevision && row.current_attempt_id === input.expectedAttemptId);
+        requireIdlePeerReview(row);
+        if (input.peerReview) {
+          const preview = peerReviewView(row, item(row.id, input.peerReview.itemId));
+          requireFact(preview.kind === 'available' && isDeepStrictEqual(preview.approval, input.peerReview),
+            'state_conflict', preview.kind === 'unavailable' ? preview.reason : 'The original peer review preview has changed.');
+        }
         const execution = decision(row, 'continueWork', input.requestId, options.admission, at);
+        if (input.peerReview && execution.authorizationAccepted) savePeerReview(row, execution.attempt.attemptId, input, at);
         const changed = execution.authorizationAccepted ? bump(work(row.id), at) : row;
         const receipt: InvoiceWorkContinueReceipt = { operation: 'continueWork', workId: row.id, requestId: input.requestId,
           revision: changed.revision, receivedAt: at, execution };
@@ -757,11 +851,16 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
           requireFact(session.runtimeKind === 'durable' && stored.item_id !== null);
           requireFact(!db.query('SELECT id FROM sessions WHERE durable_runtime_id=? AND durable_conversation_id=? LIMIT 1')
             .get(session.durableRuntimeId, input.nativeConversationId), 'state_conflict', 'The item conversation already belongs to a product Session.');
-          const owners = db.query<{ work_id: number; item_id: number | null; native_conversation_id: number }, [string, number, number, number]>(
-            `SELECT work_id,item_id,native_conversation_id FROM invoice_work_phases WHERE durable_runtime_id=? AND native_conversation_id IS NOT NULL
-             AND (native_conversation_id=? OR (work_id=? AND item_id=? AND scheduler_state!='legacy'))`).all(session.durableRuntimeId, input.nativeConversationId, row.id, stored.item_id);
+          const participant = basis.participant ?? '';
+          const owners = db.query<{ work_id: number; item_id: number | null; native_conversation_id: number; participant: string },
+            [string, number, number, number, string]>(`SELECT work_id,item_id,native_conversation_id,
+            COALESCE(json_extract(basis_json,'$.participant'),'') participant FROM invoice_work_phases
+            WHERE durable_runtime_id=? AND native_conversation_id IS NOT NULL AND (native_conversation_id=?
+              OR (work_id=? AND item_id=? AND scheduler_state!='legacy' AND COALESCE(json_extract(basis_json,'$.participant'),'')=?))`)
+            .all(session.durableRuntimeId, input.nativeConversationId, row.id, stored.item_id, participant);
           requireFact(owners.every(owner => owner.work_id === row.id && owner.item_id === stored.item_id
-            && owner.native_conversation_id === input.nativeConversationId), 'state_conflict', 'The item conversation belongs to another invoice.');
+            && owner.participant === participant && owner.native_conversation_id === input.nativeConversationId),
+          'state_conflict', 'The item conversation belongs to another invoice participant.');
         } else requireResult(sessions.bindDurableConversation(row.session_id, input.nativeConversationId, input.at));
         if (stored.native_submission_id !== null) {
           requireFact(stored.native_submission_id === input.nativeSubmissionId && stored.native_conversation_id === input.nativeConversationId);
@@ -792,6 +891,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         requireFact(row.session_id === observed.sessionId && session.runtimeKind === 'durable' && stored
           && (basisSchema.parse(JSON.parse(stored.basis_json)).executionMode === 'item-lane-approval-v1'
             ? stored.item_id === observed.itemId : observed.itemId === undefined && session.durableConversationId === observed.nativeConversationId)
+          && basisSchema.parse(JSON.parse(stored.basis_json)).participant === observed.participant
           && stored.native_conversation_id === observed.nativeConversationId && stored.native_submission_id === observed.nativeSubmissionId,
         'source_invalid', 'The native observation is not bound to this original invoice phase.');
         if (observed.consumedAt !== null) {
@@ -800,7 +900,9 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
             && (stored.consumed_at !== null || Date.parse(observed.consumedAt) >= Date.parse(stored.created_at)
               && Date.parse(observed.consumedAt) <= Date.parse(at)),
           'source_invalid', 'The native observation does not prove consumption of this submitted input.');
-          requireFact(db.query('SELECT id FROM invoice_work_context_snapshots WHERE phase_id=?').get(stored.id),
+          requireFact(observed.participant === 'reviewer'
+            ? db.query('SELECT phase_id FROM invoice_work_peer_reviews WHERE phase_id=?').get(stored.id)
+            : db.query('SELECT id FROM invoice_work_context_snapshots WHERE phase_id=?').get(stored.id),
             'source_invalid', 'The observed phase has no committed working context.');
           requireFact(stored.consumed_at === null || stored.consumed_at === observed.consumedAt,
             'source_invalid', 'The original successful consumption receipt cannot be replaced.');
@@ -846,6 +948,39 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         requireFact(db.query(`UPDATE invoice_work_phases SET closed_at=? WHERE id=? AND closed_at IS NULL
           AND native_conversation_id IS NULL AND native_submission_id IS NULL AND consumed_at IS NULL`).run(at, stored.id).changes === 1);
         return phase(db.query<PhaseRow, [number]>('SELECT * FROM invoice_work_phases WHERE id=?').get(stored.id)!);
+      });
+    },
+    readPeerReviewContext(input) {
+      return operation(false, () => {
+        const row = work(input.workId), current = attempt(row);
+        const saved = db.query<PeerReviewRow & { request_id: string; basis_json: string; closed_at: string | null },
+          [number, number, number, string]>(`SELECT r.*,p.request_id,p.basis_json,p.closed_at FROM invoice_work_peer_reviews r
+            JOIN invoice_work_phases p ON p.id=r.phase_id WHERE r.work_id=? AND r.attempt_id=? AND r.item_id=? AND p.request_id=?`)
+          .get(input.workId, input.attemptId, input.itemId ?? 0, input.requestId);
+        const session = requireResult(sessions.get(row.session_id));
+        requireFact(saved && saved.closed_at === null && row.status === 'open' && row.session_id === input.sessionId
+          && input.participant === 'reviewer' && current?.id === saved.attempt_id && current.stop_requested_at === null
+          && current.stopped_at === null && session.runtimeKind === 'durable' && session.status === 'active'
+          && !session.deletePending && !session.modelUseBlocked, 'source_invalid', 'The independent review is no longer authorized.');
+        const selected = item(row.id, saved.item_id), basis = parse(basisSchema, JSON.parse(saved.basis_json));
+        requireFact(selected.revision === saved.item_revision && selected.candidate_id === saved.candidate_id
+          && selected.candidate_sequence === saved.candidate_sequence && selected.disposition === 'unresolved'
+          && basis.participant === 'reviewer', 'source_invalid', 'The reviewed candidate changed.');
+        const ref = { id: selected.document_id, version: selected.document_version };
+        checkDocument(ref);
+        if (session.durableRuntimeId !== 'local') requireFact(db.query(`SELECT document_id FROM cloud_workspace_documents
+          WHERE workspace_id=? AND document_id=? AND document_version=?`).get(session.cloudWorkspaceId, ref.id, ref.version),
+        'source_invalid', 'The reviewed invoice is no longer available to this workspace.');
+        return parse(InvoiceWorkWorkingContextSchema, {
+          version: 1, runtimeKind: 'durable', inputUse: 'phase-bound-only', peerReview: { shared: saved.shared },
+          work: { workId: row.id, personalAgentId: row.personal_agent_id, sessionId: row.session_id,
+            goal: 'Review the confirmed invoice fields.', status: row.status, counts: { total: 1, unresolved: 1, accepted: 0, rejected: 0, excluded: 0 } },
+          phase: { phaseId: saved.phase_id, attemptId: saved.attempt_id, requestId: saved.request_id, basis }, item: itemView(selected),
+          userInputs: [], historicalInputReferences: [], confirmedBusinessReferences: [], todos: [], conflicts: [], modelReports: [],
+          actions: { authorizesExecution: false, tools: [], available: [], remainingBudget: { modelCalls: 1, toolCalls: 0,
+            toolFeedbackBytes: 0, timeoutMs: 0, childSlots: 0 } },
+          waitingReason: null, evidenceRefs: [],
+        });
       });
     },
     readContextInput(input) {
@@ -1012,6 +1147,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         const input = parse(InvoiceWorkSupplementRequestSchema, raw), row = work(input.workId), at = parse(atSchema, options.at);
         const existing = prior<InvoiceWorkSupplementReceipt>({ workId: row.id }, 'supplement', input.requestId, input);
         if (existing) return existing;
+        requireIdlePeerReview(row);
         requireFact(row.status === 'open' && row.revision === input.expectedRevision);
         const selected = item(row.id, input.itemId);
         requireFact(selected.disposition === 'unresolved');
@@ -1054,6 +1190,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         const input = parse(InvoiceWorkDisposeItemRequestSchema, raw), row = work(input.workId), at = parse(atSchema, options.at);
         const existing = prior<InvoiceWorkDisposeItemReceipt>({ workId: row.id }, 'disposeItem', input.requestId, input);
         if (existing) return existing;
+        requireIdlePeerReview(row);
         requireFact(row.status === 'open' && row.revision === input.expectedRevision);
         const selected = item(row.id, input.itemId), decision = parse(InvoiceWorkDispositionDecisionSchema, input.decision);
         requireFact(selected.disposition === 'unresolved');

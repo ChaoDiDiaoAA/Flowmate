@@ -877,6 +877,9 @@ test('Authority checks invoice and phase ownership for item-scoped cloud operati
     expect(await authorize('submit', phase)).toMatchObject({ ok: false });
     expect(await authorize('submit', { ...phase, itemId })).toMatchObject({ ok: true });
     expect(await authorize('submit', { ...phase, itemId: 999999 })).toMatchObject({ ok: false });
+    expect(await authorize('submit', { ...phase, itemId, participant: 'reviewer' })).toMatchObject({ ok: false });
+    expect(await authorize('openConversation', { ...root, itemId, participant: 'reviewer' })).toMatchObject({ ok: false });
+    expect(await authorize('queryHistoryPage', { ...root, itemId, participant: 'reviewer' })).toMatchObject({ ok: false });
   } finally { await f.database.close(); }
 });
 

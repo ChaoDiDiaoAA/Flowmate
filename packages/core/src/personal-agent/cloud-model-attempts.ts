@@ -1,11 +1,16 @@
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { appError, CloudModelAttemptRequestSchema, DurableRunConfigSnapshotSchema, fail, isRetryableCloudModelStatus, ok,
+import { appError, CloudModelAttemptRequestSchema, DURABLE_REVIEWER_INSTRUCTIONS, DurableRunConfigSnapshotSchema, fail, isRetryableCloudModelStatus, ok,
   type AppError, type CloudModelAttempt, type DurableAttemptIdentity, type DurableSubagentIdentity, type Result } from '@flowmate/contracts';
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { DurableInvoiceGovernor } from './admission.ts';
 
 const requestSchema = CloudModelAttemptRequestSchema;
+const reviewerBody = z.object({
+  messages: z.tuple([z.object({ role: z.enum(['system', 'developer']), content: z.literal(DURABLE_REVIEWER_INSTRUCTIONS) }).strict(),
+    z.object({ role: z.literal('user'), content: z.string() }).strict()]),
+  tools: z.tuple([]).optional(), tool_choice: z.literal('none').optional(),
+});
 type Request = CloudModelAttempt;
 type State = 'reserved' | 'sending' | 'confirmed' | 'uncertain';
 type Row = { request_json: string; state: State; http_status: number | null };
@@ -36,8 +41,9 @@ export class CloudModelAttempts {
 
   private original(store: SqlDatabaseStore, input: Request): void {
     const row = store.db.query<{ durable_runtime_id: string; cloud_workspace_id: string | null; native_conversation_id: number | null;
-      native_submission_id: number | null; run_id: number | null; item_id: number | null; scheduler_state: string }, [number, number, number, number, string]>(`SELECT s.durable_runtime_id,
-      s.cloud_workspace_id,p.native_conversation_id,p.native_submission_id,p.item_id,p.scheduler_state,a.run_id FROM invoice_work_phases p
+      native_submission_id: number | null; run_id: number | null; item_id: number | null; scheduler_state: string; shared: string | null }, [number, number, number, number, string]>(`SELECT s.durable_runtime_id,
+      s.cloud_workspace_id,p.native_conversation_id,p.native_submission_id,p.item_id,p.scheduler_state,a.run_id,r.shared FROM invoice_work_phases p
+      LEFT JOIN invoice_work_peer_reviews r ON r.phase_id=p.id AND r.attempt_id=p.attempt_id AND r.work_id=p.work_id AND r.item_id=p.item_id
       JOIN invoice_work_attempts a ON a.id=p.attempt_id AND a.work_id=p.work_id
       JOIN invoice_works w ON w.id=p.work_id JOIN sessions s ON s.id=w.session_id
       WHERE p.id=? AND p.work_id=? AND p.attempt_id=? AND w.session_id=? AND p.request_id=?`)
@@ -46,6 +52,13 @@ export class CloudModelAttempts {
       || row.native_submission_id !== input.nativeSubmissionId || row.run_id === null
       || (row.scheduler_state === 'legacy' ? input.itemId !== undefined : row.item_id !== input.itemId))
       reject('source_invalid', 'The model attempt does not belong to its original cloud phase.');
+    if ((input.participant === 'reviewer') !== (row.shared !== null))
+      reject('source_invalid', 'The model attempt does not belong to its original participant.');
+    if (input.participant === 'reviewer') {
+      const body = reviewerBody.safeParse(JSON.parse(input.body));
+      if (!body.success || body.data.messages[1].content !== row.shared)
+        reject('source_invalid', 'The reviewer payload differs from its confirmed invoice material.');
+    }
     const session = need(store.sessions.get(input.child?.childSessionId ?? input.sessionId));
     if (session.runtimeKind !== 'durable' || session.durableRuntimeId !== input.cloudRuntimeId
       || session.cloudWorkspaceId !== input.workspaceId

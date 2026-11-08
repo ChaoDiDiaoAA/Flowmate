@@ -119,6 +119,7 @@ test('duplicate feedback identities are faults rather than usable history and ca
 
 test('a broken linked feedback sidecar is a fault rather than empty history', () => {
   const { repo, service } = setup(), file = join(feedbackDirectory(repo), 'feedback.json');
-  mkdirSync(join(file, '..'), { recursive: true }); symlinkSync(join(repo, 'missing-synthetic-feedback'), file, 'file');
+  mkdirSync(join(file, '..'), { recursive: true });
+  symlinkSync(join(repo, 'missing-synthetic-feedback'), file, process.platform === 'win32' ? 'junction' : 'file');
   expect(invoke(service, 'feedback', { target }).ok).toBe(false);
 });

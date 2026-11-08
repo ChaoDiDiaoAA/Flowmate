@@ -9,7 +9,7 @@ export const PACKAGED_MIGRATIONS = ['001_provider.sql', '002_agent_sessions.sql'
   '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql',
   '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql',
   '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql',
-  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql', '024_desktop_actions.sql', '025_browser_reads.sql', '026_personal_item_lanes.sql', '027_openviking_memory.sql'] as const;
+  '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql', '024_desktop_actions.sql', '025_browser_reads.sql', '026_personal_item_lanes.sql', '027_openviking_memory.sql', '028_invoice_peer_reviews.sql'] as const;
 
 export const PACKAGED_NATIVE_TOOLS = { rg: { name: 'ripgrep', version: '15.2.0' }, fd: { name: 'fd', version: '10.4.2' } } as const;
 export const PACKAGED_BUN_VERSION = '1.4.4' as const;
@@ -35,16 +35,17 @@ export const PackagedReleaseSchema = z.object({
   version: z.literal(1), releaseId: z.string().uuid(), productVersion: z.string().regex(/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/),
   platform: z.literal('win32'), arch: z.literal('x64'),
   bunVersion: z.enum(['1.4.0', PACKAGED_BUN_VERSION]), electronVersion: z.literal('44.4.5'), sdkVersion: z.literal('1.4.0'),
-  pluginVersion: z.literal('0.19.0'), schemaVersion: z.union([z.literal(22), z.literal(23), z.literal(24), z.literal(25), z.literal(26), z.literal(27)]), settingsVersion: z.literal(7),
+  pluginVersion: z.literal('0.19.0'), schemaVersion: z.union([z.literal(22), z.literal(23), z.literal(24), z.literal(25), z.literal(26), z.literal(27), z.literal(28)]), settingsVersion: z.literal(7),
   service: z.object({ wrapperVersion: z.literal('2.12.0'), framework: z.literal('net461') }).strict().optional(),
-  files: z.array(z.string().refine(isRuntimeMember)).min(PACKAGED_REQUIRED_FILES.length - 5).max(20_000),
+  files: z.array(z.string().refine(isRuntimeMember)).min(PACKAGED_REQUIRED_FILES.length - 6).max(20_000),
 }).strict().superRefine((release, ctx) => {
   if (new Set(release.files).size !== release.files.length || PACKAGED_REQUIRED_FILES.some(file =>
     (release.schemaVersion >= 23 || file !== 'apps/migrations/023_runtime_scopes.sql')
       && (release.schemaVersion >= 24 || file !== 'apps/migrations/024_desktop_actions.sql')
       && (release.schemaVersion >= 25 || file !== 'apps/migrations/025_browser_reads.sql')
       && (release.schemaVersion >= 26 || file !== 'apps/migrations/026_personal_item_lanes.sql')
-      && (release.schemaVersion >= 27 || file !== 'apps/migrations/027_openviking_memory.sql') && !release.files.includes(file)))
+      && (release.schemaVersion >= 27 || file !== 'apps/migrations/027_openviking_memory.sql')
+      && (release.schemaVersion >= 28 || file !== 'apps/migrations/028_invoice_peer_reviews.sql') && !release.files.includes(file)))
     ctx.addIssue({ code: 'custom', message: 'Incomplete or duplicate runtime inventory.' });
   if (release.service && PACKAGED_SERVICE_FILES.some(file => !release.files.includes(file)))
     ctx.addIssue({ code: 'custom', message: 'Service declaration and installed assets disagree.' });

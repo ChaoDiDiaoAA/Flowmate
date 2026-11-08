@@ -569,7 +569,14 @@ test('Personal Agent creates only from its own module, recovers a lost receipt, 
   const userData = await seed(); let app: Awaited<ReturnType<typeof electron.launch>> | null = null, failure: Error | undefined;
   const documents: DocumentSnapshot[] = [], perInvoice = new Map<number, number>(); let requests = 0;
   const provider = await createHttpProvider(async request => {
-    const body = await request.json() as { messages: Array<{ role: string; content: string }> };
+    const body = await request.json() as { messages: Array<{ role: string; content: string }>; tools?: unknown[] };
+    if (body.messages.some(message => message.role === 'system' && message.content.includes('Review only the confirmed invoice data'))) {
+      requests++;
+      expect(body.messages.map(message => message.role)).toEqual(['system', 'user']);
+      expect(body.messages[1]?.content).toContain('Total 113.00');
+      expect(body.tools ?? []).toEqual([]);
+      return stream('Independent advice: verify the missing invoice number.');
+    }
     const context = JSON.parse(body.messages.find(message => message.role === 'user' && message.content.startsWith('{'))!.content) as { item: { documentRef: { id: number } } };
     requests++; const count = perInvoice.get(context.item.documentRef.id) ?? 0; perInvoice.set(context.item.documentRef.id, count + 1);
     return count % 2 === 0 ? stream({ document: documents.find(document => document.documentRef.id === context.item.documentRef.id)!, id: requests }) : stream('Saved the original candidate for human review.');
@@ -609,6 +616,13 @@ test('Personal Agent creates only from its own module, recovers a lost receipt, 
     expect(requests).toBe(4);
     await page.getByRole('tab', { name: 'Invoices', exact: true }).click(); await page.locator('.personal-items button').first().click();
     await expect(page.getByRole('region', { name: 'Selected Work invoice', exact: true })).toBeVisible();
+    const peer = page.getByRole('region', { name: 'Independent invoice review', exact: true });
+    await peer.getByText('Invite reviewer', { exact: true }).click();
+    await expect(peer).toContainText('Total 113.00');
+    expect(requests).toBe(4);
+    await peer.getByRole('button', { name: 'Confirm and run review', exact: true }).click();
+    await expect(peer).toContainText('Independent advice: verify the missing invoice number.', { timeout: 15000 });
+    expect(requests).toBe(5);
     await page.getByRole('button', { name: 'View original invoice / review', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Personal Agent invoice review', exact: true })).toBeVisible();
     const selected = await page.evaluate(async () => { const saved = await window.flowmate.invoiceWorks.get({ view: 'work', workId: 1 }); return saved.ok && saved.data.view === 'work' ? saved.data.items[0] : null; });
@@ -625,8 +639,8 @@ test('Personal Agent creates only from its own module, recovers a lost receipt, 
     await page.locator('.personal-items button').nth(1).click(); await page.getByLabel('Disposition reason', { exact: true }).fill('Explicitly excluded after review.');
     await page.getByRole('button', { name: 'Exclude invoice from this work', exact: true }).click();
     await expect(page.locator('.personal-work-detail')).toContainText('1 excluded'); await expect(page.locator('.personal-work-detail header')).toContainText('completed');
-    expect(requests).toBe(4);
-    await page.getByRole('button', { name: 'Create related work', exact: true }).click(); expect(requests).toBe(4);
+    expect(requests).toBe(5);
+    await page.getByRole('button', { name: 'Create related work', exact: true }).click(); expect(requests).toBe(5);
     await expect(page.getByRole('heading', { name: 'Create related invoice work', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Submit invoice work', exact: true }).click(); await expect(page.getByRole('heading', { name: 'Work 2', exact: true })).toBeVisible();
     await expect(page.locator('.personal-work-detail')).toContainText('2 unresolved');

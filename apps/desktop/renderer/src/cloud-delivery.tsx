@@ -49,7 +49,8 @@ export function CloudDeliveryPanel(props: { workspaceId: string; owner: Omit<Clo
         {item.state === 'pending' && item.nextAt && <p>Next delivery attempt: {item.nextAt}</p>}
         {item.state === 'blocked' && <button type="button" disabled={busy} onClick={() => void run(async token => {
           CloudRuntimeRetryReceiptSchema.parse(await request({ type: 'cloud_delivery_retry', input: { ...owner,
-            ...(item.itemId === undefined ? {} : { itemId: item.itemId }), requestId: item.requestId, nativeSubmissionId: item.nativeSubmissionId } }));
+            ...(item.itemId === undefined ? {} : { itemId: item.itemId }), ...(item.participant ? { participant: item.participant } : {}),
+            requestId: item.requestId, nativeSubmissionId: item.nativeSubmissionId } }));
           if (token === generation.current) { setMessage('The original result was queued for delivery.'); await load(owner, token); }
         })}>Retry original result {item.nativeSubmissionId}</button>}
       </article>)}

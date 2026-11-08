@@ -3,6 +3,8 @@ import { Type, type Context, type Message, type TranscriptContext } from '@earen
 import { appError, fail, ok, type ProviderConfig, type Result } from '@flowmate/contracts';
 import type { InvoiceWorkWorkingContext } from '../../packages/contracts/src/personal-context.ts';
 import { createDurableModels } from '../../packages/runtime-durable/src/models.ts';
+import { MemoryStorage } from '@earendil-works/pi-durable';
+import { createDurableRuntime } from '../../packages/runtime-durable/src/runtime.ts';
 
 const at = '2026-10-29T00:00:00.000Z';
 const config: ProviderConfig = { version: 1, name: 'phase-model', revision: 3,
@@ -172,3 +174,51 @@ test.each(['read-failure', 'malformed-working-set', 'user-history', 'system-hist
     const result = await prepared.models.completeSimple(model, nativeContext());
     expect(result.stopReason).toBe('error'); expect(requests).toBe(0); expect(charged).toBe(0);
   });
+
+test('the reviewer opens a distinct conversation and sends only the confirmed review material', async () => {
+  const requests: WireRequest[] = [];
+  const server = Bun.serve({ port: 0, fetch: async request => {
+    requests.push(await request.json() as WireRequest);
+    return response();
+  } });
+  const work = { workId: 7, sessionId: 70, itemId: 71 };
+  const reviewer = { ...work, participant: 'reviewer' as const };
+  const phase = { ...reviewer, attemptId: 21, requestId: 'phase-original' };
+  const shared = '{"invoiceNumber":"000123"}';
+  const runtime = need(await createDurableRuntime({
+    storage: new MemoryStorage(), readApiKey: () => 'synthetic-product-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined),
+    readWorkingContext: input => ok(input.participant === 'reviewer'
+      ? { ...workingContext(), peerReview: { shared } } : workingContext()),
+    verifyWorkingContext: () => ok(undefined),
+  }));
+  try {
+    const original = need(await runtime.openConversation(work));
+    const review = need(await runtime.openConversation(reviewer));
+    expect(review.nativeConversationId).not.toBe(original.nativeConversationId);
+    expect(need(await runtime.openConversation(reviewer))).toEqual(review);
+    expect(await runtime.openConversation({ workId: 7, sessionId: 70, participant: 'reviewer' }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    need(await runtime.submit({ ...phase, text: 'PRIVATE-INTERNAL-PLACEHOLDER', config: {
+      ...config, connection: { ...config.connection!, baseUrl: 'http://127.0.0.1:' + server.port + '/v1' },
+    } }));
+    expect(need(await runtime.waitForSubmission(phase))).toMatchObject({ status: 'done', answer: 'Selected invoice checked.' });
+    expect(need(await runtime.getSubmission({ ...work, attemptId: phase.attemptId, requestId: phase.requestId }))).toBeNull();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.messages.map(message => message.role)).toEqual(['system', 'user']);
+    expect(requests[0]!.messages[1]?.content).toBe(shared);
+    expect(requests[0]!.tools ?? []).toEqual([]);
+    const observed = need(await runtime.observeSubmission(phase));
+    expect(observed).toMatchObject({ participant: 'reviewer', nativeConversationId: review.nativeConversationId,
+      execution: 'closed' });
+    const answerId = observed?.nativeAnswerEntryId;
+    if (answerId === undefined) throw Error('Missing verified native answer');
+    const history = need(await runtime.queryHistory({ ...reviewer, limit: 20 }));
+    expect(history.entries.map(entry => ({ id: entry.nativeEntryId, kind: entry.kind }))).toContainEqual({
+      id: answerId, kind: 'pi.assistant',
+    });
+    const answer = need(await runtime.queryHistoryEntry({ ...reviewer, entryId: answerId,
+      throughEntryId: answerId, offset: 0, limit: 16384 }));
+    expect(answer.text).toContain('Selected invoice checked.');
+  } finally { await runtime.close(); server.stop(true); }
+});

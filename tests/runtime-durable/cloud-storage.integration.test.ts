@@ -66,6 +66,25 @@ test('cloud storage reopens the original Work and its separate invoice conversat
   } finally { await runtime.close(); need(await session.close()); need(await store.close()); }
 });
 
+test('cloud storage reopens distinct primary and reviewer native conversations for the same invoice', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-review-owner-')), store = need(await openCloudRuntimeStore(root));
+  const session = need(await store.openSession(first, true));
+  const harness = await Harness.open(session.storage, { models: models(), registry: createRegistry() }, BACKGROUND_CONTEXT);
+  const binding = defineDoc({ kind: 'flowmate.runtime.binding', version: 3, scope: 'conversation', history: 'latest', fork: 'initial',
+    initial: (): { workId: number; sessionId: number; itemId: number | null; participant: 'reviewer' | null; attemptId: null; requestKey: null } =>
+      ({ workId: first.workId, sessionId: first.sessionId, itemId: null, participant: null, attemptId: null, requestKey: null }), checkpointWhen: () => true });
+  try {
+    await harness.commit(async tx => {
+      for (const participant of [null, 'reviewer'] as const) {
+        const conversation = await tx.createConversation({ ownership: { kind: 'ownerless' } });
+        const saved = await tx.doc(binding, conversation.id);
+        saved.itemId = 101; saved.participant = participant;
+      }
+    }, BACKGROUND_CONTEXT);
+    await harness.close(BACKGROUND_CONTEXT); need(await session.close());
+    expect(await store.openSession(first, false)).toMatchObject({ ok: true });
+  } finally { await harness.close(BACKGROUND_CONTEXT); await session.close(); need(await store.close()); }
+});
 test('cloud storage rejects an unsupported native owner binding version', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-future-item-owner-')), store = need(await openCloudRuntimeStore(root));
   const session = need(await store.openSession(first, true));

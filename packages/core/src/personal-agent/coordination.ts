@@ -38,7 +38,8 @@ const active = (status: string | null) => status === 'created' || status === 'ru
 const identity = (state: State): DurableAttemptIdentity => ({ workId: state.row.id, sessionId: state.row.session_id,
   attemptId: state.task.attempt.attemptId });
 const query = (state: State, phase: InvoiceWorkPhase): DurableSubmissionQuery => ({ ...identity(state),
-  ...(phase.basis.executionMode === 'item-lane-approval-v1' && phase.itemId !== null ? { itemId: phase.itemId } : {}), requestId: phase.requestId });
+  ...(phase.basis.executionMode === 'item-lane-approval-v1' && phase.itemId !== null ? { itemId: phase.itemId } : {}),
+  ...(phase.basis.participant ? { participant: phase.basis.participant } : {}), requestId: phase.requestId });
 
 /** Reconcile persisted business commands at native boundaries; native Harness remains the execution scheduler. */
 export class InvoiceWorkCoordinator {
@@ -204,6 +205,11 @@ export class InvoiceWorkCoordinator {
       for (const phase of state.phases.filter(phase => phase.closedAt === null)) need(await this.options.phaseObserver.reconcile(query(state, phase)));
       await this.finish(state, null); return;
     }
+    const review = state.phases.find(phase => phase.basis.participant === 'reviewer');
+    if (review) {
+      await this.advancePeerReview(state, review, recovering);
+      return;
+    }
     let completedPhaseId: number | undefined;
     while (!this.closed) {
       state = await this.state(workId, attemptId);
@@ -334,16 +340,38 @@ export class InvoiceWorkCoordinator {
     }
   }
 
+  private async advancePeerReview(state: State, phase: State['phases'][number], recovering: boolean): Promise<void> {
+    const owner = query(state, phase);
+    if (phase.closedAt !== null) {
+      await this.finish(state, null, phase.phaseId);
+      return;
+    }
+    if (state.task.attempt.runId === null) {
+      const admitted = need(await this.options.governor.assess(state.row.id));
+      if (admitted.kind !== 'ready') return;
+      const binding = need(await this.options.modelService.prepare(owner));
+      const budget = need(await this.options.governor.remainingBudget(state.row.id));
+      if (this.closed) return;
+      await this.createRun(state, binding, budget, true);
+      state = await this.state(owner.workId, owner.attemptId);
+    }
+    if (this.timedOut.has(owner.attemptId)) {
+      await this.finish(state, appError('agent_timeout', 'runtime', 'The authorized Work time budget ended.'));
+      return;
+    }
+    if (await this.executePhase(state, phase, recovering)) await this.finish(state, null, phase.phaseId);
+  }
+
   private async createRun(state: State, binding: DurableModelBinding,
-    remaining: InvoiceWorkContextBuildInput['remainingBudget']): Promise<void> {
+    remaining: InvoiceWorkContextBuildInput['remainingBudget'], reviewer = false): Promise<void> {
     const fixed = PersonalAgentConfigurationSchema.parse(JSON.parse(state.row.configuration_json));
     const originalBudget = DurableWorkBudgetSchema.parse(JSON.parse(state.row.budget_json)), provider = binding.configuration;
-    if (remaining.toolFeedbackBytes <= 0) throw new CoordinationFault(appError('tool_context_limit', 'runtime', 'The shared Work tool feedback budget is exhausted.'));
+    if (!reviewer && remaining.toolFeedbackBytes <= 0) throw new CoordinationFault(appError('tool_context_limit', 'runtime', 'The shared Work tool feedback budget is exhausted.'));
     const config = DurableRunConfigSnapshotSchema.parse({ version: 3, runtimeKind: 'durable', name: provider.name, revision: provider.revision,
       requestedModel: provider.modelRef, resolvedModel: null, api: provider.connection?.api ?? null, endpoint: provider.connection?.baseUrl ?? null,
       sdk: this.options.sdk, parameters: provider.parameters,
-      runtimeBudget: { ...originalBudget.runtimeBudget, maxModelCalls: remaining.modelCalls, maxToolCalls: remaining.toolCalls,
-        maxToolFeedbackBytes: remaining.toolFeedbackBytes }, limits: originalBudget.limits,
+      runtimeBudget: { ...originalBudget.runtimeBudget, maxModelCalls: reviewer ? 1 : remaining.modelCalls, maxToolCalls: reviewer ? 0 : remaining.toolCalls,
+        maxToolFeedbackBytes: reviewer ? originalBudget.runtimeBudget.maxToolFeedbackBytes : remaining.toolFeedbackBytes }, limits: originalBudget.limits,
       durable: { workId: state.row.id, attemptId: state.task.attempt.attemptId, configurationRevision: state.row.agent_revision },
       resources: fixed.resources, extensions: fixed.extensions, workingDirectory: fixed.workingDirectory });
     await this.options.database.transaction(scope => {
@@ -362,7 +390,7 @@ export class InvoiceWorkCoordinator {
   private async executePhase(state: State, phase: InvoiceWorkPhase, recovering: boolean): Promise<boolean> {
     const original = query(state, phase);
     const configuration = PersonalAgentConfigurationSchema.parse(JSON.parse(state.row.configuration_json));
-    need(await this.options.verifyResources(configuration, state.row.agent_revision));
+    if (!original.participant) need(await this.options.verifyResources(configuration, state.row.agent_revision));
     if (this.closed) return false;
     let submission = need(await this.options.runtime.getSubmission(original));
     if (this.closed) return false;
@@ -392,10 +420,11 @@ export class InvoiceWorkCoordinator {
         }
       }
       need(await this.options.runtime.openConversation({ workId: state.row.id, sessionId: state.row.session_id,
-        ...(phase.basis.executionMode === 'item-lane-approval-v1' && phase.itemId !== null ? { itemId: phase.itemId } : {}) }));
+        ...(original.itemId === undefined ? {} : { itemId: original.itemId }),
+        ...(original.participant ? { participant: original.participant } : {}) }));
       submission = need(await this.options.runtime.submit({ ...original, config: binding.configuration, binding,
         thinkingLevel: PersonalAgentConfigurationSchema.parse(JSON.parse(state.row.configuration_json)).thinkingLevel,
-        text: `Process the committed invoice phase ${phase.phaseId}; read its saved working context.` }));
+        text: original.participant === 'reviewer' ? 'Review the confirmed invoice fields.' : `Process the committed invoice phase ${phase.phaseId}; read its saved working context.` }));
       if (this.closed) return false;
       need(await this.options.phaseObserver.reconcile(original));
       if (this.recoveryPending.has(state.task.attempt.attemptId)) {
@@ -404,7 +433,7 @@ export class InvoiceWorkCoordinator {
     }
     let failure: AppError | null = null;
     if (submission.status === 'queued' || submission.status === 'placed') {
-      if (phase.basis.executionMode === 'item-lane-approval-v1'
+      if (!original.participant && phase.basis.executionMode === 'item-lane-approval-v1'
         && (configuration.tools.includes('browser_request_read') || configuration.tools.includes('desktop_propose_action'))) {
         await this.armDeadline(state); return false;
       }
@@ -426,6 +455,10 @@ export class InvoiceWorkCoordinator {
       need(await this.options.tasks.reconcileStop({ workId: state.row.id, attemptId: state.task.attempt.attemptId })); return false;
     }
     if (latest.task.stoppedAt !== null) return false;
+    if (original.participant === 'reviewer' && failure?.code === 'cloud_transport_result_unknown') {
+      await this.armDeadline(latest);
+      return false;
+    }
     if (failure) { await this.finish(state, failure); return false; }
     need(await this.options.phaseObserver.reconcile(original));
     const observed = need(await this.options.runtime.observeSubmission(original));
@@ -444,11 +477,11 @@ export class InvoiceWorkCoordinator {
     }
     this.clearDeadline(state.task.attempt.attemptId);
     if (submission.status === 'unanswered') {
-      if (await this.cancelledQueueInput(state, phase, submission)) { await this.recordWaiting(state, phase, true); return true; }
+      if (!original.participant && await this.cancelledQueueInput(state, phase, submission)) { await this.recordWaiting(state, phase, true); return true; }
       await this.finish(state, appError('durable_phase_unanswered', 'runtime', submission.reason ?? 'The original invoice phase failed.'));
       return false;
     }
-    await this.recordWaiting(state, phase);
+    if (!original.participant) await this.recordWaiting(state, phase);
     return true;
   }
 
@@ -573,19 +606,38 @@ export class InvoiceWorkCoordinator {
       .sort((left, right) => Date.parse(left.closedAt!) - Date.parse(right.closedAt!) || left.phaseId - right.phaseId).at(-1);
     const last = (!failure ? latest.phases.find(phase => phase.phaseId === completedPhaseId) ?? lastClosed : undefined) ?? latest.phases.at(-1);
     const result = last ? need(await this.options.runtime.getSubmission(query(latest, last))) : null;
+    const reviewer = last?.basis.participant === 'reviewer';
+    if (reviewer && !failure) {
+      const observed = need(await this.options.runtime.observeSubmission(query(latest, last)));
+      if (!observed || observed.participant !== 'reviewer' || observed.execution !== 'closed'
+        || observed.status !== 'done' || !observed.nativeAnswerEntryId || !result || result.participant !== 'reviewer'
+        || observed.nativeConversationId !== result.nativeConversationId || observed.nativeSubmissionId !== result.nativeSubmissionId
+        || !result.answer?.trim() || Buffer.byteLength(result.answer, 'utf8') > 8192)
+        failure = appError('peer_review_unverified', 'runtime', 'The independent review has no verified answer.');
+      else if (this.options.runtimeScope === 'cloud') {
+        const receipt = await this.options.database.read(scope => scope.db.query(`SELECT r.receipt_id
+          FROM cloud_native_result_receipts r JOIN sessions s ON s.durable_runtime_id=r.durable_runtime_id
+          WHERE s.id=? AND r.work_id=? AND r.attempt_id=? AND r.native_conversation_id=? AND r.native_submission_id=?
+            AND json_extract(r.event_json,'$.participant')='reviewer'
+            AND json_extract(r.event_json,'$.nativeAnswerEntryId')=?
+            AND json_extract(r.event_json,'$.answer')=?`).get(latest.row.session_id, latest.row.id, last.attemptId,
+          observed.nativeConversationId, observed.nativeSubmissionId, observed.nativeAnswerEntryId!, result.answer));
+        if (!receipt) return;
+      }
+    }
     const oversized = this.options.runtimeScope === 'cloud' && result?.answer !== null && result?.answer !== undefined
       && new TextEncoder().encode(result.answer).byteLength > RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
     if (oversized && !failure) failure = appError('cloud_result_too_large', 'runtime', 'The original answer exceeds the delivery limit and remains in native history.');
-    const cancelled = !failure && last && result?.status === 'unanswered'
+    const cancelled = !reviewer && !failure && last && result?.status === 'unanswered'
       ? await this.cancelledQueueInput(latest, last, result) : false;
-    const outputText = oversized ? null : result?.answer ?? (cancelled ? 'The queued invoice input was cancelled before execution.' : null);
+    const outputText = oversized || (reviewer && failure) ? null : result?.answer ?? (cancelled ? 'The queued invoice input was cancelled before execution.' : null);
     await this.options.database.transaction(scope => {
       const current = need(scope.invoiceWorkAttempts.get({ workId: state.row.id, attemptId: state.task.attempt.attemptId })).task;
       if (current.stopRequestedAt !== null || current.stoppedAt !== null) return;
       const original = need(scope.runs.get(run.runId)), at = this.options.now();
       if (active(original.status)) {
         // A supplement committing before this transaction keeps its original root and is selected next.
-        if (!failure && need(this.options.governor.nextItemInStore(scope, state.row.id)).itemId !== null) { this.pending = true; return; }
+        if (!reviewer && !failure && need(this.options.governor.nextItemInStore(scope, state.row.id)).itemId !== null) { this.pending = true; return; }
         const finished = need(scope.runs.finish(run.runId, { status: failure ? 'failed' : 'completed',
           output: outputText === null ? null : { version: 3, text: outputText, partial: failure !== null,
             stopReason: failure?.code ?? (cancelled ? 'cloud-queue-cancelled' : 'phase-boundary'), responseId: null, responseModel: null,

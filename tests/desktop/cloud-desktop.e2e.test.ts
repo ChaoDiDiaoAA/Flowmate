@@ -219,7 +219,8 @@ test('desktop chooses cloud explicitly and creates work from the uploaded cloud 
           case 'invoice_work_create': created = true; return { ok: true, data: { operation: 'create', personalAgentId: 1, workId: 7,
             sessionId: 8, revision: 0, requestId: command.input.requestId, receivedAt: at,
             execution: { kind: 'waiting', authorizationAccepted: false, attempt: null, reason: 'Waiting for the original work.', todoIds: [] } } };
-          case 'invoice_work_get': return command.input.view === 'item' ? { ok: true, data: { view: 'item', work, item, todos: [], nextAfterTodoId: null } }
+          case 'invoice_work_get': return command.input.view === 'item' ? { ok: true, data: { view: 'item', work, item, todos: [], nextAfterTodoId: null,
+            ...(command.input.includePeerReview ? { peerReview: { kind: 'unavailable', reason: 'Wait for the initial Work attempt to close.' } } : {}) } }
             : { ok: true, data: { view: 'work', work, items: [item], nextAfterItemId: null } };
           case 'invoice_work_desktop_list': case 'invoice_work_browser_list': return { ok: true,
             data: { workId: 7, itemId: command.input.itemId, items: [], nextAfterProposalId: null } };
@@ -384,6 +385,7 @@ test('desktop chooses cloud explicitly and creates work from the uploaded cloud 
     await app.evaluate(() => (Reflect.get(globalThis, 'cloudUseItemLanes') as () => void)());
     await page.getByRole('button', { name: 'Refresh saved work', exact: true }).click();
     await page.getByRole('button', { name: /Cloud invoice 101/ }).click();
+    await expect(page.getByRole('region', { name: 'Independent invoice review' })).toContainText('Wait for the initial Work attempt to close.');
     await expect.poll(async () => (await app.evaluate(() => Reflect.get(globalThis, 'cloudWorkFrames')) as Array<{ command?: { type: string; input?: { itemId?: number } } }>)
       .some(value => value.command?.type === 'cloud_queue_read' && value.command.input?.itemId === 9)).toBe(true);
     await page.getByLabel('Disposition reason').fill('My unsent disposition reason.');

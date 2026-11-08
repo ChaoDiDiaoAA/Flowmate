@@ -5,7 +5,7 @@ import { appError, fail, ok, PersonalAgentConfigurationSchema, InvoiceWorkContin
 import type { DbHandle } from '../storage/database.ts';
 
 const id = InvoiceWorkContinueRequestSchema.shape.workId;
-const querySchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id,
+const querySchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), participant: z.literal('reviewer').optional(), attemptId: id,
   requestId: InvoiceWorkContinueRequestSchema.shape.requestId }).strict();
 export type InvoiceWorkModelServiceOptions = {
   database: Pick<DbHandle, 'read' | 'transaction'>;

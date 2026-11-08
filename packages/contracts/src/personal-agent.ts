@@ -24,8 +24,26 @@ export type InvoiceWorkStatus = z.infer<typeof InvoiceWorkStatusSchema>;
 export const InvoiceWorkItemDispositionSchema = z.enum(['unresolved', 'accepted', 'rejected', 'excluded']);
 export type InvoiceWorkItemDisposition = z.infer<typeof InvoiceWorkItemDispositionSchema>;
 
+const peerReviewText = z.string().min(1).max(8192).refine(value => new TextEncoder().encode(value).byteLength <= 8192);
+export const InvoicePeerReviewApprovalSchema = z.object({
+  itemId: id, expectedItemRevision: revision, candidateRef: z.object({ id, sequence: id }).strict(),
+  sourcePhaseId: id, shared: peerReviewText,
+}).strict();
+export type InvoicePeerReviewApproval = z.infer<typeof InvoicePeerReviewApprovalSchema>;
+
+const reviewSource = { attemptId: id, sourcePhaseId: id };
+export const InvoicePeerReviewViewSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('available'), approval: InvoicePeerReviewApprovalSchema }).strict(),
+  z.object({ kind: z.literal('unavailable'), reason: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal('pending'), ...reviewSource }).strict(),
+  z.object({ kind: z.literal('completed'), ...reviewSource, answer: peerReviewText }).strict(),
+  z.object({ kind: z.literal('closed'), ...reviewSource, reason: z.string().min(1) }).strict(),
+]);
+export type InvoicePeerReviewView = z.infer<typeof InvoicePeerReviewViewSchema>;
+
 export const InvoiceWorkContinueRequestSchema = z.object({
   workId: id, requestId, expectedRevision: revision, expectedAttemptId: id.nullable(),
+  peerReview: InvoicePeerReviewApprovalSchema.optional(),
 }).strict();
 export type InvoiceWorkContinueRequest = z.infer<typeof InvoiceWorkContinueRequestSchema>;
 
@@ -219,14 +237,15 @@ export const InvoiceWorkListResultSchema = bounded(z.object({
 export type InvoiceWorkListResult = z.infer<typeof InvoiceWorkListResultSchema>;
 export const InvoiceWorkGetRequestSchema = z.discriminatedUnion('view', [
   z.object({ view: z.literal('work'), workId: id, afterItemId: id.optional(), limit: pageLimit }).strict(),
-  z.object({ view: z.literal('item'), workId: id, itemId: id, afterTodoId: id.optional(), limit: pageLimit }).strict(),
+  z.object({ view: z.literal('item'), workId: id, itemId: id, afterTodoId: id.optional(), limit: pageLimit, includePeerReview: z.literal(true).optional() }).strict(),
 ]);
 export type InvoiceWorkGetRequest = z.input<typeof InvoiceWorkGetRequestSchema>;
 export const InvoiceWorkGetResultSchema = bounded(z.discriminatedUnion('view', [
   z.object({ view: z.literal('work'), work: InvoiceWorkViewSchema, items: z.array(InvoiceWorkItemViewSchema).max(100).readonly(),
     nextAfterItemId: id.nullable() }).strict(),
   z.object({ view: z.literal('item'), work: InvoiceWorkViewSchema, item: InvoiceWorkItemViewSchema,
-    todos: z.array(InvoiceWorkTodoViewSchema).max(100).readonly(), nextAfterTodoId: id.nullable() }).strict(),
+    todos: z.array(InvoiceWorkTodoViewSchema).max(100).readonly(), nextAfterTodoId: id.nullable(),
+    peerReview: InvoicePeerReviewViewSchema.optional() }).strict(),
 ]).superRefine((value, context) => {
   if (value.view === 'work') {
     if (value.items.some((item, index) => item.workId !== value.work.workId || index > 0 && item.itemId <= value.items[index - 1]!.itemId)

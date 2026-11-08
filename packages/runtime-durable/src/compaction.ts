@@ -35,7 +35,8 @@ const identityOf = (value: DurableCompactionIdentity): DurableCompactionIdentity
   ...(value.child ? { child: value.child } : {}) });
 const phaseKey = (value: DurableSubmissionQuery) => JSON.stringify([value.attemptId, value.requestId]);
 const phaseJson = (query: DurableSubmissionQuery) => JSON.stringify({ workId: query.workId, sessionId: query.sessionId,
-  ...(query.itemId === undefined ? {} : { itemId: query.itemId }), attemptId: query.attemptId, requestId: query.requestId });
+  ...(query.itemId === undefined ? {} : { itemId: query.itemId }), ...(query.participant ? { participant: query.participant } : {}),
+  attemptId: query.attemptId, requestId: query.requestId });
 const operationKey = (value: DurableCompactionIdentity) => JSON.stringify([value.attemptId, value.requestId, value.operationId, value.child?.childRunId ?? null]);
 type Record = { conversationId: ConversationId; key: string; state: Readonly<State>; plan: DurableCompactionPlan };
 export type DurableCompactionPhase = DurableSubmissionQuery & { nativeConversationId: number; nativeSubmissionId: number;

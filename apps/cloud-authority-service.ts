@@ -55,9 +55,9 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
     const grant = await originalAuthorize(operation, request);
     return !grant.ok ? grant : grant.data.binding.workspaceId === workspace.data ? grant : forbidden();
   };
-  const guard = async <T>(owner: { workId: number; sessionId: number; itemId?: number }, action: () => Promise<Result<T>>): Promise<Result<T>> => {
+  const guard = async <T>(owner: { workId: number; sessionId: number; itemId?: number; participant?: 'reviewer' }, action: () => Promise<Result<T>>): Promise<Result<T>> => {
     const grant = await authorizeRuntime('queryHistory', { workId: owner.workId, sessionId: owner.sessionId,
-      ...(owner.itemId === undefined ? {} : { itemId: owner.itemId }) });
+      ...(owner.itemId === undefined ? {} : { itemId: owner.itemId }), ...(owner.participant ? { participant: owner.participant } : {}) });
     return grant.ok ? action() : grant;
   };
   const source = cloud.callbacks, child = source.subagents, compact = source.compactions;
@@ -149,12 +149,12 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
   if (!authority.ok) return authority;
   const model = await listenCloudModelSocket({ socketPath: options.modelSocket, proxy, allowStaleSocket: true, prepare: async input => {
     if (input.workspaceId !== workspace.data) return forbidden();
-    const grant = await authorizeRuntime('observeSubmission', { workId: input.workId, sessionId: input.sessionId,
-      ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId, requestId: input.requestId });
+    const original = { workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
+      ...(input.participant ? { participant: input.participant } : {}), attemptId: input.attemptId, requestId: input.requestId };
+    const grant = await authorizeRuntime('observeSubmission', original);
     if (!grant.ok) return grant;
     if (grant.data.binding.cloudRuntimeId !== input.cloudRuntimeId) return forbidden();
-    const phase = await cloud.reconcilePhase({ workId: input.workId, sessionId: input.sessionId,
-      ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId, requestId: input.requestId });
+    const phase = await cloud.reconcilePhase(original);
     return !phase.ok ? phase : phase.data ? ok(undefined)
       : fail(appError('source_invalid', 'runtime', 'The original model phase could not be reconciled.'));
   } });

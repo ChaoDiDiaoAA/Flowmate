@@ -2,7 +2,7 @@ import { appError, CloudRuntimeRetryReceiptSchema, CloudRuntimeRetryRequestSchem
   CloudWorkspaceIdSchema, fail, ok, type CloudRuntimeDeliveryPort, type Result } from '@flowmate/contracts';
 import type { DbHandle, SqlDatabaseStore } from '../packages/core/src/storage/database.ts';
 
-type Owner = { workId: number; sessionId: number; attemptId: number; itemId?: number };
+type Owner = { workId: number; sessionId: number; attemptId: number; itemId?: number; participant?: 'reviewer' };
 const denied = () => fail(appError('cloud_workspace_forbidden', 'input', 'The original cloud result is unavailable.'));
 const unavailable = () => fail(appError('cloud_result_unavailable', 'runtime', 'The original cloud result delivery could not be confirmed.', true));
 
@@ -21,10 +21,13 @@ export class CloudDeliveryAuthority {
       && session.data.durableRuntimeId !== 'local' && session.data.cloudWorkspaceId === this.workspaceId;
   }
   private phase(scope: SqlDatabaseStore, input: Owner & { requestId: string; nativeSubmissionId?: number }, checkItem = true): boolean {
-    const row = scope.db.query<{ native_submission_id: number | null; item_id: number | null; scheduler_state: string }, [number, number, string]>(
-      'SELECT native_submission_id,item_id,scheduler_state FROM invoice_work_phases WHERE work_id=? AND attempt_id=? AND request_id=?')
+    const row = scope.db.query<{ native_submission_id: number | null; item_id: number | null; scheduler_state: string; reviewer_phase: number | null }, [number, number, string]>(
+      `SELECT p.native_submission_id,p.item_id,p.scheduler_state,r.phase_id reviewer_phase FROM invoice_work_phases p
+        LEFT JOIN invoice_work_peer_reviews r ON r.phase_id=p.id AND r.attempt_id=p.attempt_id AND r.work_id=p.work_id AND r.item_id=p.item_id
+        WHERE p.work_id=? AND p.attempt_id=? AND p.request_id=?`)
       .get(input.workId, input.attemptId, input.requestId);
-    return !!row && (!checkItem || (row.scheduler_state === 'legacy' ? input.itemId === undefined : input.itemId === row.item_id))
+    return !!row && (!checkItem || ((input.participant === 'reviewer') === (row.reviewer_phase !== null)
+      && (row.scheduler_state === 'legacy' ? input.itemId === undefined : input.itemId === row.item_id)))
       && (input.nativeSubmissionId === undefined || row.native_submission_id === null || row.native_submission_id === input.nativeSubmissionId);
   }
   async status(raw: unknown) {
@@ -42,7 +45,7 @@ export class CloudDeliveryAuthority {
         return this.owner(scope, input) && session.ok && session.data.runtimeKind === 'durable'
           && session.data.durableConversationId === checked.data.native.conversationId
           && (!checked.data.wake?.requestId || this.phase(scope, { ...input, requestId: checked.data.wake.requestId }, false))
-          && checked.data.results.items.every(item => this.phase(scope, { ...input, itemId: item.itemId,
+          && checked.data.results.items.every(item => this.phase(scope, { ...input, itemId: item.itemId, participant: item.participant,
             requestId: item.requestId, nativeSubmissionId: item.nativeSubmissionId }));
       });
       return valid ? ok(checked.data) : denied();
@@ -56,7 +59,7 @@ export class CloudDeliveryAuthority {
       const result = await this.options.runtime.retry(input); if (!result.ok) return result;
       const checked = CloudRuntimeRetryReceiptSchema.safeParse(result.data);
       return checked.success && checked.data.workId === input.workId && checked.data.sessionId === input.sessionId
-        && checked.data.itemId === input.itemId && checked.data.attemptId === input.attemptId && checked.data.requestId === input.requestId
+        && checked.data.itemId === input.itemId && checked.data.participant === input.participant && checked.data.attemptId === input.attemptId && checked.data.requestId === input.requestId
         && checked.data.nativeSubmissionId === input.nativeSubmissionId ? ok(checked.data) : unavailable();
     } catch { return unavailable(); }
   }

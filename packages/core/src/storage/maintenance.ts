@@ -22,11 +22,11 @@ export type BackupManifest = { version: 1; backupId: string; createdAt: string; 
 export type BackupReceipt = { directory: string; manifest: BackupManifest };
 
 export const InstalledReleaseSchema = z.object({ version: z.literal(1), releaseId: z.string().uuid(),
-  productVersion: z.string().min(1).max(128), schemaVersion: z.number().int().min(1).max(27),
+  productVersion: z.string().min(1).max(128), schemaVersion: z.number().int().min(1).max(28),
   settingsVersion: z.number().int().min(1).max(7) }).strict();
 const backupSchema = z.object({ version: z.literal(1), backupId: z.string().uuid(), createdAt: z.string().datetime(),
   productVersion: z.string().max(128).nullable(), releaseId: z.string().uuid().nullable(),
-  schemaVersion: z.number().int().min(1).max(27).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
+  schemaVersion: z.number().int().min(1).max(28).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
   files: z.array(z.object({ path: z.string().min(1).max(1024), byteLength: z.number().int().nonnegative().safe() }).strict()).min(1),
   gaps: z.array(z.string().max(256)) }).strict();
 
@@ -69,7 +69,7 @@ function inspectDatabase(db: Database): { schemaVersion: number | null; journalM
   let schemaVersion: number | null = null;
   if (migrationTable) {
     const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
-    if (!rows.length || rows.length > 27 || rows.some((row, index) => row.version !== index + 1)) throw Error('maintenance_store_incompatible');
+    if (!rows.length || rows.length > 28 || rows.some((row, index) => row.version !== index + 1)) throw Error('maintenance_store_incompatible');
     schemaVersion = rows.length;
   } else if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get())
     throw Error('maintenance_store_incompatible');
@@ -130,7 +130,7 @@ function persistentFiles(paths: ProductPaths): string[] {
 
 async function checkReferences(paths: ProductPaths, version: number | null): Promise<string[]> {
   const gaps: string[] = [];
-  if (version !== 20 && version !== 21 && version !== 22 && version !== 23 && version !== 24 && version !== 25 && version !== 26 && version !== 27) { if (version !== null) gaps.push('matching_old_program_or_explicit_upgrade_required'); return gaps; }
+  if (version !== 20 && version !== 21 && version !== 22 && version !== 23 && version !== 24 && version !== 25 && version !== 26 && version !== 27 && version !== 28) { if (version !== null) gaps.push('matching_old_program_or_explicit_upgrade_required'); return gaps; }
   const db = new Database(paths.databaseFile, { readonly: true });
   try {
     const documents = createDocumentRepository(db), contentsReader = createManagedFileContents(db);
@@ -211,7 +211,7 @@ async function checkReferences(paths: ProductPaths, version: number | null): Pro
         throw Error('maintenance_store_incompatible');
       if (!history.ok || session.data.nativeUnusable || session.data.modelUseBlocked) gaps.push(`session_execution_requires_recheck:${row.id}`);
     }
-    if (version === 27) {
+    if (version >= 27) {
       const identities = db.query<{ id: number; environment: string; credential_ref: string }, []>(
         'SELECT id,environment,credential_ref FROM memory_identities').all();
       if (identities.length || db.query("SELECT id FROM memory_bindings WHERE provider='openviking' LIMIT 1").get())

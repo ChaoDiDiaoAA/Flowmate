@@ -2450,7 +2450,8 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       ipcMain.removeHandler('flowmate:list-session-runs');
       ipcMain.handle('flowmate:list-session-runs', async (_event, input) => ({ ok: true,
         data: input.sessionId === 13 ? { items: [], nextBeforeRunId: null } : runPage }));
-      const receipt = { session, runPage, inputs: [] as unknown[], items: [user] as unknown[], historyCalls: 0, restoreCalls: 0, activeQueries: 0, maxQueries: 0,
+      const receipt = { session, runPage, exactRun: null as Record<string, unknown> | null, inputs: [] as unknown[], items: [user] as unknown[],
+        inputCalls: 0, historyCalls: 0, restoreCalls: 0, activeQueries: 0, maxQueries: 0,
         navigation: 0, queries: [] as Array<{ id: number; navigation: number; frame: string; held: boolean; phase: string }>,
         startCalls: 0, hold: false, failNext: false, rejectNext: false, release: null as (() => void) | null };
       BrowserWindow.getAllWindows()[0]?.webContents.on('did-start-navigation', (_event, _url, _inPlace, mainFrame) => {
@@ -2460,8 +2461,14 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       ipcMain.removeHandler('flowmate:restore-workspace');
       ipcMain.handle('flowmate:restore-workspace', async () => { receipt.restoreCalls++; return { ok: true, data: { workspace, clearedReferences: [] } }; });
       ipcMain.removeHandler('flowmate:list-session-inputs');
-      ipcMain.handle('flowmate:list-session-inputs', async (_event, input) => ({ ok: true,
-        data: { items: input.sessionId === 12 ? receipt.inputs : [], nextBeforeInputId: null } }));
+      ipcMain.handle('flowmate:list-session-inputs', async (_event, input) => {
+        receipt.inputCalls++;
+        return { ok: true, data: { items: input.sessionId === 12 ? receipt.inputs : [], nextBeforeInputId: null } };
+      });
+      ipcMain.removeHandler('flowmate:query-run');
+      ipcMain.handle('flowmate:query-run', async (_event, id) => receipt.exactRun?.runId === id
+        ? { ok: true, data: receipt.exactRun }
+        : { ok: false, error: { code: 'run_not_found', category: 'runtime', message: 'Controlled Run unavailable.', retryable: true } });
       ipcMain.removeHandler('flowmate:list-session-messages');
       ipcMain.handle('flowmate:list-session-messages', async (_event, input) => {
         if (input.sessionId === 13) return { ok: true, data: { session: otherSession, leafId: 'renderer-t1', entryCount: 1,
@@ -2608,11 +2615,11 @@ it('reconciles Renderer messages from the public history IPC without replaying a
     expect(await page.locator('.chat-transcript').textContent()).not.toContain('OLD RUN TEXT');
     const reconnectBaseline = await app.evaluate(() => {
       const receipt = (globalThis as unknown as { rendererReceipt: { hold: boolean; rejectNext: boolean; release: (() => void) | null;
-        historyCalls: number; restoreCalls: number; runPage: { items: Array<Record<string, unknown>> }; inputs: unknown[] } }).rendererReceipt;
+        historyCalls: number; restoreCalls: number; runPage: { items: Array<Record<string, unknown>> }; exactRun: Record<string, unknown> | null; inputs: unknown[] } }).rendererReceipt;
       receipt.hold = true; receipt.rejectNext = true; receipt.release = null;
-      receipt.runPage.items.unshift({ ...receipt.runPage.items[0], runId: 103, status: 'cancelled',
+      receipt.exactRun = { ...receipt.runPage.items[0], runId: 103, status: 'cancelled',
         endedAt: '2026-09-30T00:00:01.000Z', stoppedAt: '2026-09-30T00:00:01.000Z',
-        cleanup: { version: 1, stopped: true, stopReason: 'connection-closed', errors: [], lateObservationRequired: false } });
+        cleanup: { version: 1, stopped: true, stopReason: 'connection-closed', errors: [], lateObservationRequired: false } };
       receipt.inputs.push({ inputId: 91, sessionId: 12, clientSequence: 3, mode: 'followUp', goalMode: 'answer', runId: 103,
         contextSnapshotId: null, content: { version: 2, text: 'Original queued instruction', workspaceContext: null, workspaceInput: null,
           allowedDocumentIds: [], allowedArtifactIds: [], promptText: 'Original queued instruction' }, status: 'cancelled',
@@ -2620,10 +2627,11 @@ it('reconciles Renderer messages from the public history IPC without replaying a
         createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:01.000Z' });
       return { history: receipt.historyCalls, restore: receipt.restoreCalls };
     });
-    historyCheckpoint = 'reconnect after a failed old history request';
+    historyCheckpoint = 'reconnect while the old history request is still pending';
     await page.getByRole('button', { name: 'Refresh history', exact: true }).click();
     await expect.poll(() => app.evaluate(() => Boolean((globalThis as unknown as { rendererReceipt: { release: (() => void) | null } })
       .rendererReceipt.release))).toBe(true);
+    await app.evaluate(() => { Reflect.get(globalThis, 'rendererReceipt').hold = false; });
     await app.evaluate(({ BrowserWindow }, data) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event',
       { type: 'host_state', state: { ...data, ready: false } }), desktop.data);
     await page.waitForTimeout(100);
@@ -2631,15 +2639,14 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       { type: 'host_state', state: { ...data, ready: true } }), desktop.data);
     await expect.poll(() => app.evaluate(() => (globalThis as unknown as { rendererReceipt: { restoreCalls: number } })
       .rendererReceipt.restoreCalls)).toBeGreaterThan(reconnectBaseline.restore);
-    await app.evaluate(() => {
-      const receipt = (globalThis as unknown as { rendererReceipt: { hold: boolean; release: (() => void) | null } }).rendererReceipt;
-      receipt.hold = false; receipt.release?.();
-    });
     await expect.poll(() => app.evaluate(() => (globalThis as unknown as { rendererReceipt: { historyCalls: number } })
-      .rendererReceipt.historyCalls)).toBeGreaterThanOrEqual(reconnectBaseline.history + 2);
+      .rendererReceipt.historyCalls), { timeout: 3_000 }).toBeGreaterThanOrEqual(reconnectBaseline.history + 2);
     await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
     await expect(page.getByText('Original queued instruction', { exact: true })).toBeVisible();
     await expect(page.getByText('followUp · cancelled', { exact: true })).toBeVisible();
+    await app.evaluate(() => Reflect.get(globalThis, 'rendererReceipt').release?.());
+    await expect.poll(() => app.evaluate(() => Reflect.get(globalThis, 'rendererReceipt').activeQueries)).toBe(0);
+    await expect(page.getByRole('alert').filter({ hasText: 'History could not be loaded.' })).toHaveCount(0);
     expect(await page.getByRole('textbox', { name: 'Message to model' }).inputValue()).toBe('Draft stays editable');
     expect(await app.evaluate(() => (globalThis as unknown as { rendererReceipt: { startCalls: number } }).rendererReceipt.startCalls)).toBe(0);
     await app.evaluate(() => { (globalThis as unknown as { rendererReceipt: { hold: boolean } }).rendererReceipt.hold = true; });
@@ -2676,8 +2683,10 @@ it('reconciles Renderer messages from the public history IPC without replaying a
     await page.locator('[data-message-entry="renderer-gap-59"]').waitFor({ state: 'visible' });
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).waitFor({ state: 'visible', timeout: 1000 });
     expect(await page.locator('[data-message-entry="renderer-gap-0"]').count()).toBe(0);
+    const beforePaging = await app.evaluate(() => Reflect.get(globalThis, 'rendererReceipt').inputCalls);
     await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
     await page.locator('[data-message-entry="renderer-gap-0"]').waitFor({ state: 'visible' });
+    expect(await app.evaluate(() => Reflect.get(globalThis, 'rendererReceipt').inputCalls)).toBe(beforePaging);
     expect(await page.locator('[data-message-entry]').count()).toBe(63);
     expect(await page.locator('[data-message-entry]').evaluateAll((items) => items.slice(3)
       .map((item) => item.getAttribute('data-message-entry')))).toEqual(Array.from({ length: 60 }, (_, index) => `renderer-gap-${index}`));

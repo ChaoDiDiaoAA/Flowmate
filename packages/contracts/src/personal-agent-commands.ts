@@ -153,7 +153,12 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
       return input.view === 'work' ? data.view === 'work' && data.items.length <= input.limit
         && data.items.every(item => input.afterItemId === undefined || item.itemId > input.afterItemId)
         : data.view === 'item' && data.item.itemId === input.itemId && data.todos.length <= input.limit
-          && data.todos.every(todo => input.afterTodoId === undefined || todo.todoId > input.afterTodoId);
+          && data.todos.every(todo => input.afterTodoId === undefined || todo.todoId > input.afterTodoId)
+          && Boolean(data.peerReview) === Boolean(input.includePeerReview)
+          && (data.peerReview?.kind !== 'available' || data.peerReview.approval.itemId === input.itemId
+            && data.peerReview.approval.expectedItemRevision === data.item.revision
+            && data.peerReview.approval.candidateRef.id === data.item.candidateRef?.id
+            && data.peerReview.approval.candidateRef.sequence === data.item.candidateRef?.sequence);
     }
     case 'personal_task_list': return 'items' in data && 'workId' in data && data.workId === captured.input.workId
       && data.items.length <= captured.input.limit && data.items.every(item => 'attempt' in item

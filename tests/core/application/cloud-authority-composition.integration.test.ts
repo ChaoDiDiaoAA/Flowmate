@@ -7,7 +7,7 @@ import { Database } from 'bun:sqlite';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
-import { appError, fail, CloudProgressEventSchema, CloudRuntimeStatusSchema, CloudQueueReceiptSchema, CloudQueueViewSchema, CloudReviewCandidateReceiptSchema, CloudReviewOpenReceiptSchema, InvoiceWorkCreateReceiptSchema, InvoiceWorkGetResultSchema, PersonalAgentConfigurationSchema, PersonalAgentSnapshotSchema,
+import { appError, fail, CloudProgressEventSchema, CloudRuntimeStatusSchema, CloudQueueReceiptSchema, CloudQueueViewSchema, CloudReviewCandidateReceiptSchema, CloudReviewOpenReceiptSchema, DURABLE_REVIEWER_INSTRUCTIONS, InvoiceWorkCreateReceiptSchema, InvoiceWorkGetResultSchema, PersonalAgentConfigurationSchema, PersonalAgentSnapshotSchema,
   PersonalTaskGetResultSchema, type ProviderConfig, type Result } from '@flowmate/contracts';
 import { createApplication } from '../../../apps/composition.ts';
 import type { PersonalAgentRuntime } from '../../../apps/personal-agent.ts';
@@ -156,10 +156,12 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
         candidate.fields.totalAmount.sources = [{ documentId: cloudDocumentId, version: cloudDocumentVersion, artifactId: cloudParsedArtifactId,
           page: 1, blockId: 'b1', quote: 'Controlled invoice total 113.00' }];
         const tool = wire.length === 2;
+        const answer = typeof init.body === 'string' && init.body.includes(DURABLE_REVIEWER_INSTRUCTIONS)
+          ? 'Independent advice for the original invoice.' : 'The original invoice needs human review.';
         const chunk = { id: 'controlled-cloud', object: 'chat.completion.chunk', created: 1, model: 'deepseek-fixture',
           choices: [{ index: 0, delta: tool ? { role: 'assistant', tool_calls: [{ index: 0, id: 'controlled-save', type: 'function',
             function: { name: 'save_invoice_candidate', arguments: JSON.stringify({ documentId: cloudDocumentId, candidate }) } }] }
-            : { role: 'assistant', content: 'The original invoice needs human review.' }, finish_reason: tool ? 'tool_calls' : 'stop' }] };
+            : { role: 'assistant', content: answer }, finish_reason: tool ? 'tool_calls' : 'stop' }] };
         return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
       } } }));
   if (!control?.cloudAuthority) throw Error('Cloud Authority callbacks were not assembled.');
@@ -211,7 +213,7 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
     AbortSignal.any([bridgeAbort.signal, AbortSignal.timeout(envelope.command.type === 'cloud_progress_wait' ? 90_000 : 30_000)])));
   bridge.then(() => child.emit('close', 0, null));
   const desktop = new CloudSshSession(child as unknown as ChildProcessWithoutNullStreams, workspaceId);
-  let originalSession = 0, originalAttempt = 0, failure: unknown;
+  let originalSession = 0, reviewAttempt = 0, failure: unknown;
   try {
     const material = need(await uploadCloudMaterial({ workspaceId, documentRef: document.documentRef }, localExport, desktop));
     const resource = need(await uploadCloudResource({ workspaceId, ref }, resourceExport, desktop));
@@ -236,7 +238,7 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
       personalAgentId: agent.personalAgentId, expectedAgentRevision: agent.revision, requestId: 'original-cloud-work',
       goal: 'Review the original controlled invoice.', documents: [material.cloudDocumentRef] } })));
     const attemptId = created.execution.attempt?.attemptId; if (!attemptId) throw Error(`Cloud Work was not admitted: ${JSON.stringify(created.execution)}`);
-    originalSession = created.sessionId; originalAttempt = attemptId;
+    originalSession = created.sessionId;
     try { await waitFor(async () => wire.length > 0, 10_000); }
     catch { throw Error(JSON.stringify({ errors, runtimeError, created, observed: await desktop.request({ type: 'personal_task_get', input: {
       workId: created.workId, attemptId, limit: 10 } }) })); }
@@ -308,6 +310,30 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
     const candidate = CloudReviewCandidateReceiptSchema.parse(need(await desktop.request({ type: 'cloud_review_candidate', input: {
       ...target, jobId: selected.jobId!, candidateId: selected.candidateRef!.id } })));
     expect(candidate.detail.candidate.fields.totalAmount.normalized).toBe('113.00');
+    const itemQuery = { view: 'item' as const, workId: created.workId, itemId: selected.itemId, includePeerReview: true as const, limit: 10 };
+    const preview = InvoiceWorkGetResultSchema.parse(need(await desktop.request({ type: 'invoice_work_get', input: itemQuery })));
+    if (preview.view !== 'item' || preview.peerReview?.kind !== 'available') throw Error('The original invoice has no review preview.');
+    expect(wire).toHaveLength(4);
+    expect(preview.peerReview.approval.shared).toContain(source);
+    const confirm = { type: 'invoice_work_continue' as const, input: { workId: created.workId, expectedRevision: preview.work.revision,
+      expectedAttemptId: attemptId, requestId: 'cloud-e2e-peer-review', peerReview: preview.peerReview.approval } };
+    const reviewReceipt = need(await desktop.request(confirm));
+    expect(need(await desktop.request(confirm))).toEqual(reviewReceipt);
+    let reviewed = preview;
+    await waitFor(async () => {
+      const current = InvoiceWorkGetResultSchema.parse(need(await desktop.request({ type: 'invoice_work_get', input: itemQuery })));
+      if (current.view !== 'item') return false;
+      reviewed = current;
+      return reviewed.peerReview?.kind === 'completed';
+    }, 15_000);
+    expect(reviewed).toMatchObject({ item: { candidateRef: selected.candidateRef, disposition: 'unresolved' }, peerReview: {
+      kind: 'completed', answer: 'Independent advice for the original invoice.', sourcePhaseId: preview.peerReview.approval.sourcePhaseId } });
+    reviewAttempt = reviewed.work.execution.attempt?.attemptId ?? 0;
+    expect(reviewAttempt).toBeGreaterThan(attemptId);
+    const reviewBody = JSON.parse(payloads.at(-1)!);
+    expect(reviewBody.messages).toEqual([{ role: 'system', content: DURABLE_REVIEWER_INSTRUCTIONS },
+      { role: 'user', content: preview.peerReview.approval.shared }]);
+    expect(reviewBody.tools ?? []).toEqual([]);
     const opened = CloudReviewOpenReceiptSchema.parse(need(await desktop.request({ type: 'cloud_review_open', input: {
       ...target, jobId: selected.jobId!, candidateId: selected.candidateRef!.id } })));
     const acceptRequest = { operationRef: 'cloud-e2e-accept', jobId: opened.jobId, expectedCandidateId: opened.candidateId,
@@ -316,13 +342,13 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
     expect(accepted).toMatchObject({ candidateId: opened.candidateId, sequence: opened.sequence, status: 'accepted' });
     expect(need(await desktop.request({ type: 'cloud_review_query_accept', input: { ...target, request: acceptRequest } }))).toEqual(accepted);
     expect(need(await desktop.request({ type: 'invoice_work_dispose_item', input: { workId: created.workId, itemId: selected.itemId,
-      requestId: 'cloud-e2e-attach', expectedRevision: finished.work.revision,
+      requestId: 'cloud-e2e-attach', expectedRevision: reviewed.work.revision,
       decision: { kind: 'accepted', candidateRef: { id: opened.candidateId, sequence: opened.sequence }, acceptRequest } } })))
       .toMatchObject({ disposition: 'accepted' });
-    expect(wire).toEqual(Array.from({ length: 4 }, () => ({ url: 'https://api.deepseek.com/chat/completions', authorization: 'Bearer synthetic-key' })));
+    expect(wire).toEqual(Array.from({ length: 5 }, () => ({ url: 'https://api.deepseek.com/chat/completions', authorization: 'Bearer synthetic-key' })));
     expect(payloads.some(value => value.includes(steerText))).toBe(true);
     expect(payloads.some(value => value.includes(followupText))).toBe(true);
-    const contexts = payloads.map(value => {
+    const contexts = payloads.slice(0, -1).map(value => {
       const body = JSON.parse(value) as { messages: Array<{ role: string; content: string }> };
       return JSON.parse(body.messages.find(message => message.role === 'user')!.content);
     });
@@ -352,10 +378,10 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
   const row = product.query<{ durable_runtime_id: string }, [number]>('SELECT durable_runtime_id FROM sessions WHERE id=?').get(originalSession);
   const modelAttempts = product.query<{ native_task_id: number; transport_ordinal: number; http_status: number }, []>(
     'SELECT native_task_id,transport_ordinal,http_status FROM cloud_model_attempts ORDER BY rowid').all();
-  expect(modelAttempts.map(value => [value.transport_ordinal, value.http_status])).toEqual([[0, 503], [1, 200], [0, 200], [0, 200]]);
+  expect(modelAttempts.map(value => [value.transport_ordinal, value.http_status])).toEqual([[0, 503], [1, 200], [0, 200], [0, 200], [0, 200]]);
   expect(modelAttempts[0]!.native_task_id).toBe(modelAttempts[1]!.native_task_id);
   product.close(); if (!row) throw Error('The original cloud Session is missing.');
   const native = new Database(join(runtimeRoot, 'sessions', row.durable_runtime_id, 'runtime.sqlite'), { readonly: true });
-  try { expect(native.query('SELECT attempt_id FROM flowmate_cloud_wake WHERE singleton=1').get()).toEqual({ attempt_id: originalAttempt }); }
+  try { expect(native.query('SELECT attempt_id FROM flowmate_cloud_wake WHERE singleton=1').get()).toEqual({ attempt_id: reviewAttempt }); }
   finally { native.close(); }
 }, 90_000);

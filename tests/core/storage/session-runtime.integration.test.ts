@@ -50,7 +50,7 @@ test('021 upgrades actual schema20 Sessions as legacy and preserves their rows, 
   const before = old.query('SELECT * FROM sessions').all(); old.close();
   const current = need(openTestDatabase(input));
   try {
-    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 27 });
+    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 28 });
     expect(current.db.query('SELECT id,native_session_id,title,status,created_at,updated_at,metadata_json,hidden_at FROM sessions').all()).toEqual(before);
     expect(current.sessions.get(1)).toMatchObject({ ok: true, data: { runtimeKind: 'agent_session', nativeSessionId: 'original-pi-session', durableConversationId: null } });
     expect(current.db.query('SELECT active_session_id FROM workspace WHERE id=1').get()).toEqual({ active_session_id: 1 });
@@ -87,7 +87,7 @@ test('schema22 Sessions keep their original identities and receive a verified pr
 
   const current = need(openTestDatabase(input));
   try {
-    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 27 });
+    expect(current.db.query('SELECT max(version) AS version FROM schema_migrations').get()).toEqual({ version: 28 });
     expect(current.sessions.get(1)).toMatchObject({ ok: true, data: { runtimeKind: 'agent_session', nativeSessionId: 'legacy-before-cloud' } });
     expect(current.sessions.get(2)).toMatchObject({ ok: true, data: { runtimeKind: 'durable', durableRuntimeId: 'local', durableConversationId: 17 } });
     expect(current.db.query('SELECT active_session_id FROM workspace WHERE id=1').get()).toEqual({ active_session_id: 1 });
@@ -387,10 +387,10 @@ test('schema23 remains inspectable and backed up without interpreting an unbound
   const input = paths(), current = need(openTestDatabase(input));
   const session = need(current.sessions.create({ runtimeKind: 'durable', nativeSessionId: null, title: 'Accepted before native binding', at }));
   await current.close();
-  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 27 } });
+  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 28 } });
   mkdirSync(join(input.root, 'backups'));
   const backup = need(await backupStore(input, join(input.root, 'backups/saved-backup')));
-  expect(backup.manifest.schemaVersion).toBe(27);
+  expect(backup.manifest.schemaVersion).toBe(28);
   expect(backup.manifest.gaps).not.toContain(`session_execution_requires_recheck:${session.sessionId}`);
 });
 
@@ -414,7 +414,7 @@ test('maintenance preserves an actual zero-model Durable Conversation binding an
     need(await current.transaction(scope => scope.sessions.bindDurableConversation(session.sessionId, conversation.id, at)));
     expect(await current.read(scope => scope.db.query('SELECT count(*) AS count FROM fm_durable_tasks').get())).toEqual({ count: 0 });
   } finally { await harness.close(BACKGROUND_CONTEXT); await current.close(); }
-  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 27 } });
+  expect(inspectStore(input)).toMatchObject({ ok: true, data: { schemaVersion: 28 } });
   mkdirSync(join(input.root, 'backups'));
   expect(await backupStore(input, join(input.root, 'backups/bound-backup'))).toMatchObject({ ok: true });
   const changed = need(openTestDatabase(input));
