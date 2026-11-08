@@ -97,6 +97,8 @@ export async function createCloudRuntimeService(raw: { root: string; runtimeSock
       verifySchedulingUse: (input, pending) => authority.verifySchedulingUse(input, pending),
       reserveModelRequest: () => fail(appError('cloud_model_transport_unavailable', 'runtime', 'Cloud model quota is reserved by the Authority proxy.')),
       readWorkingContext: input => authority.readWorkingContext(input), verifyWorkingContext: input => authority.verifyWorkingContext(input),
+      readMemory: input => authority.readMemory!(input),
+      approvalWait: authority.approvalWait,
       verifyQueueInputs: input => authority.verifyQueueInputs(input),
       tools: options.tools, executeTool: input => authority.executeTool(input), readToolResult: input => authority.readToolResult(input),
       onToolFeedback: input => authority.onToolFeedback(input), subagents: authority.subagents, compactions: authority.compactions,

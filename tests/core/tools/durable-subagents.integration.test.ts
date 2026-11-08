@@ -9,12 +9,13 @@ import { invoiceWorkToolsFixture } from '../../support/invoice-work-tools.ts';
 
 const at = '2026-10-29T00:00:00.000Z';
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
-async function fixture() {
+async function fixture(itemLane = false) {
   const configuration = PersonalAgentConfigurationSchema.parse({ modelId: 'controlled', thinkingLevel: 'off',
     resources: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] },
     tools: [...INVOICE_REVIEW_TOOL_NAMES, 'Agent'], workingDirectory: null, preferences: '' });
-  const f = await invoiceWorkToolsFixture({ configuration });
+  const f = await invoiceWorkToolsFixture({ configuration, itemLane });
   await f.database.transaction(scope => {
+    if (itemLane) need(scope.sessions.bindDurableConversation(f.created.sessionId, 10, at));
     need(scope.invoiceWorks.linkPhase({ workId: f.created.workId, attemptId: f.attemptId, phaseId: f.phase.phaseId,
       nativeConversationId: 11, nativeSubmissionId: 12, at }));
     need(scope.invoiceWorkModelBindings.save({ workId: f.created.workId, attemptId: f.attemptId, modelId: 'controlled', at,
@@ -29,12 +30,27 @@ async function fixture() {
     observeSubagent: async () => ok(observation) });
   const executor = createToolExecutor({ database: f.database, definitions: [...f.definitions, service.tool], now: () => at });
   const bridge = createInvoiceWorkToolBridge({ database: f.database, executor });
-  const call = { workId: f.created.workId, sessionId: f.created.sessionId, attemptId: f.attemptId, requestId: f.phase.requestId,
+  const call = { workId: f.created.workId, sessionId: f.created.sessionId, ...(itemLane ? { itemId: f.itemId } : {}), attemptId: f.attemptId, requestId: f.phase.requestId,
     nativeConversationId: 11, nativeTaskId: 17, nativeToolCallId: 'wire-delegate', name: 'Agent',
     arguments: { prompt: 'Verify only the total on this invoice; return sources and gaps.', description: 'Check original total',
       subagent_type: 'invoice-evidence-checker', run_in_background: false } };
   return { ...f, governor, service, bridge, executor, call, setObservation: (value: DurableSubagentObservation) => { observation = value; } };
 }
+
+test('an invoice-lane child retains its original item and rejects another invoice owner', async () => {
+  const f = await fixture(true);
+  try {
+    const result = need(await f.bridge.executeTool({ ...f.call, signal: new AbortController().signal, nativeDelegate: async original => {
+      expect(original.itemId).toBe(f.itemId);
+      expect(await f.service.callbacks.verify({ ...original, itemId: f.itemId + 1 })).toMatchObject({ ok: false });
+      need(await f.service.callbacks.adopt({ ...original, nativeConversationId: 31 }));
+      return ok({ ...original, creation: 'created', nativeConversationId: 31, nativeSubmissionId: 32, status: 'done',
+        answer: 'Original evidence.', reason: null, consumedAt: at, execution: 'closed', creatorExecution: 'active',
+        parentToolResultEntryId: null, parentModelTaskId: null, parentModelReceivedAt: null });
+    } }));
+    expect(result.status).toBe('succeeded');
+  } finally { await f.database.close(); }
+});
 
 test('a Durable delegation owns one read-only child and reuses its original Run and receipt', async () => {
   const f = await fixture(); let plan: DurableSubagentPlan | null = null;

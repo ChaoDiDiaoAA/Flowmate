@@ -3,11 +3,13 @@ import type { JsonValue } from '@earendil-works/chord';
 import { Type } from '@earendil-works/pi-ai';
 import { AssistantEntry, defineDocFamily, defineTool, GenerationTask, ToolResultEntry, ToolTask, type ConversationId, type EntryRecord, type Harness, type Storage, type TaskId,
   type ToolExecutionApi, type ToolExecutionResult } from '@earendil-works/pi-durable';
-import { appError, type Result, type ToolResult } from '@flowmate/contracts';
+import { appError, AppErrorSchema, type Result, type ToolResult } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import type { DurableProductToolCall, DurableProductToolDefinition, DurableProductToolFeedback } from '../../contracts/src/durable-runtime.ts';
 import type { DurableProductToolExecution, DurableSubagentInvoker } from '../../contracts/src/durable-subagents.ts';
+import type { DurableApprovalWaitCallbacks } from '../../contracts/src/durable-approval.ts';
+import type { InvoiceWorkWorkingContext } from '../../contracts/src/personal-context.ts';
 
 export type DurableProductToolOptions = {
   definitions: readonly DurableProductToolDefinition[];
@@ -16,11 +18,12 @@ export type DurableProductToolOptions = {
   execute(call: DurableProductToolExecution): Result<ToolResult<unknown>> | Promise<Result<ToolResult<unknown>>>;
   read(call: DurableProductToolCall): Result<ToolResult<unknown> | null> | Promise<Result<ToolResult<unknown> | null>>;
   delegate?(api: ToolExecutionApi, context: Context, call: DurableProductToolCall): DurableSubagentInvoker;
+  approval?: { context(call: DurableProductToolCall): Promise<Result<InvoiceWorkWorkingContext>>; wait?: DurableApprovalWaitCallbacks };
 };
 const invocationMemo = 'flowmate.product-tool.invoked';
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const callSchema = z.object({ workId: id, sessionId: id, attemptId: id, requestId: z.string().min(1), nativeConversationId: id,
-  nativeTaskId: id, nativeToolCallId: z.string().min(1), name: z.string().min(1), arguments: z.unknown(),
+const callSchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId: z.string().min(1), nativeConversationId: id,
+  nativeTaskId: id, nativeToolCallId: z.string().min(1), name: z.string().min(1), arguments: z.unknown(), parentNativeTaskId: id.optional(),
   child: z.object({ childRunId: id, childSessionId: id, originToolCallId: id }).strict().optional() }).strict();
 // TaskDocs retire at terminal settlement; this immutable execution provenance remains with its conversation.
 const ToolProvenance = defineDocFamily({ kind: 'flowmate.runtime.tool-provenance', version: 1, family: true, scope: 'conversation',
@@ -66,25 +69,64 @@ function unknownResult(): ToolExecutionResult {
 }
 
 export function createDurableProductTools(options: DurableProductToolOptions) {
-  const productResult = (call: DurableProductToolCall, result: ToolResult<unknown>): ToolExecutionResult => {
+  const productResult = async (call: DurableProductToolCall, result: ToolResult<unknown>, api: ToolExecutionApi, context: Context): Promise<ToolExecutionResult> => {
     const native = nativeResult(result);
-    return (call.name === 'desktop_propose_action' || call.name === 'browser_request_read') && result.status === 'succeeded'
-      ? { ...native, control: { terminate: true } } : native;
+    if ((call.name !== 'desktop_propose_action' && call.name !== 'browser_request_read') || result.status !== 'succeeded') return native;
+    const saved = await options.approval?.context(call);
+    if (!saved?.ok) return unknownResult();
+    if (saved.data.phase.basis.executionMode !== 'item-lane-approval-v1') return { ...native, control: { terminate: true } };
+    const proposal = z.object({ proposalId: id }).passthrough().safeParse(result.data), signal = context.abortSignal;
+    if (!proposal.success || !signal || !options.approval?.wait || call.itemId === undefined || saved.data.item.itemId !== call.itemId) return unknownResult();
+    const identity = { workId: call.workId, sessionId: call.sessionId, attemptId: call.attemptId, requestId: call.requestId,
+      itemId: call.itemId, phaseId: saved.data.phase.phaseId, nativeConversationId: call.nativeConversationId, nativeTaskId: call.nativeTaskId,
+      proposalId: proposal.data.proposalId, kind: call.name === 'browser_request_read' ? 'browser' as const : 'desktop' as const };
+    let state = await options.approval.wait.begin(identity);
+    let begun = state.ok;
+    for (;;) {
+      signal.throwIfAborted();
+      if (!state.ok && !state.error.retryable) return unknownResult();
+      if (state.ok && state.data.scheduling === 'active' && state.data.status === 'rejected')
+        return nativeResult({ status: 'failed', error: appError('approval_rejected', 'runtime', 'The original action was rejected by the user.') });
+      if (state.ok && (state.data.status === 'invalidated' || state.data.status === 'unknown')) return unknownResult();
+      if (state.ok && state.data.scheduling === 'active' && state.data.status === 'approved') {
+        const checkedState = await options.approval.wait.read(identity);
+        if (!checkedState.ok && !checkedState.error.retryable) return unknownResult();
+        if (checkedState.ok && checkedState.data.status === 'approved' && checkedState.data.scheduling === 'active'
+          && checkedState.data.deviceReady !== false) {
+          const nested = await api.executeTool(call.name === 'browser_request_read' ? 'browser_read_approved' : 'desktop_execute_approved',
+            call.name === 'browser_request_read' ? {} : { proposalId: proposal.data.proposalId }, context, { key: 'approved-execution' });
+          const checked = z.discriminatedUnion('status', [z.object({ status: z.literal('succeeded'), data: z.unknown() }).strict(),
+            z.object({ status: z.literal('failed'), error: AppErrorSchema, data: z.unknown().optional() }).strict(),
+            z.object({ status: z.literal('cancelled'), error: AppErrorSchema, data: z.unknown().optional() }).strict()]).safeParse(nested.details);
+          if (!checked.success || nested.isError !== (checked.data.status !== 'succeeded')) return unknownResult();
+          return nativeResult(checked.data.status === 'succeeded' ? { status: 'succeeded', data: checked.data.data } : checked.data);
+        }
+        state = checkedState;
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, 5000);
+        const abort = () => { clearTimeout(timer); reject(Error('cancelled')); };
+        if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+      });
+      state = begun ? await options.approval.wait.read(identity) : await options.approval.wait.begin(identity);
+      begun ||= state.ok;
+    }
   };
-  const original = async (call: DurableProductToolCall): Promise<ToolExecutionResult> => {
+  const original = async (call: DurableProductToolCall, api: ToolExecutionApi, context: Context): Promise<ToolExecutionResult> => {
     try {
       const saved = await options.read(call);
-      return saved.ok && saved.data !== null ? productResult(call, saved.data) : unknownResult();
+      return saved.ok && saved.data !== null ? productResult(call, saved.data, api, context) : unknownResult();
     } catch { return unknownResult(); }
   };
   return options.definitions.map(definition => defineTool({ name: definition.name, description: definition.description,
-    parameters: Type.Unsafe(definition.inputSchema), executionMode: definition.executionMode, callers: ['model'],
+    parameters: Type.Unsafe(definition.inputSchema), executionMode: definition.executionMode,
+    callers: definition.name === 'browser_read_approved' || definition.name === 'desktop_execute_approved' ? ['model', 'tools'] : ['model'],
     // Only safe reads without a receipt may reach product execution again; Agent resumes its owned child.
     replay: 'safe', execute: async (_args, api, context) => {
       const call = await options.resolve(api, context), signal = context.abortSignal;
       if (!signal) throw Error('The native tool cancellation signal is unavailable.');
       if (await api.memo<boolean>(invocationMemo, context) && definition.name !== 'Agent') {
-        if (definition.effect !== 'PURE' && definition.effect !== 'READ') return original(call);
+        if (definition.effect !== 'PURE' && definition.effect !== 'READ') return original(call, api, context);
         try {
           const saved = await options.read(call);
           if (!saved.ok) return unknownResult();
@@ -99,10 +141,10 @@ export function createDurableProductTools(options: DurableProductToolOptions) {
         const result = await options.execute({ ...call, signal,
           ...(definition.name === 'Agent' && !call.child && options.delegate ? { nativeDelegate: options.delegate(api, context, call) } : {}) });
         signal.throwIfAborted();
-        return result.ok ? productResult(call, result.data) : original(call);
+        return result.ok ? productResult(call, result.data, api, context) : original(call, api, context);
       } catch {
         signal.throwIfAborted();
-        return original(call);
+        return original(call, api, context);
       }
     } }));
 }

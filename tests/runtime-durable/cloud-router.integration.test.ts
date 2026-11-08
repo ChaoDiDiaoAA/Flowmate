@@ -102,6 +102,36 @@ test('cold history reads inspect native storage without opening a Harness', asyn
   } finally { need(await cold.close()); need(await store.close()); }
 });
 
+test('cloud history keeps invoice conversations separate from the original Work root', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'flowmate-cloud-item-history-')), store = need(await openCloudRuntimeStore(directory));
+  let nativeId: number | null = null;
+  const authorize = (_operation: string, input: { workId: number; sessionId: number; itemId?: number }) =>
+    input.itemId !== undefined && input.itemId !== 101 && input.itemId !== 102
+      ? fail(appError('cloud_access_denied', 'runtime', 'Controlled denial.'))
+      : ok(nativeId === null ? { binding: first, state: 'allocated' as const }
+        : { binding: first, state: 'ready' as const, nativeConversationId: nativeId });
+  const original = createCloudRuntimeRouter({ store, runtimeOptions: options, authorize });
+  const owner = { workId: first.workId, sessionId: first.sessionId };
+  try {
+    nativeId = need(await original.openConversation(owner)).nativeConversationId;
+    const a = need(await original.openConversation({ ...owner, itemId: 101 }));
+    const b = need(await original.openConversation({ ...owner, itemId: 102 }));
+    expect(new Set([nativeId, a.nativeConversationId, b.nativeConversationId]).size).toBe(3);
+    need(await original.close());
+    let opened = 0;
+    const cold = createCloudRuntimeRouter({ store, runtimeOptions: () => { opened++; return options; }, authorize });
+    try {
+      const page = need(await cold.queryHistoryPage({ ...owner, itemId: 101 }));
+      expect(page.owner).toEqual({ ...owner, itemId: 101, runtimeKind: 'durable', childRunId: null });
+      expect(need(await cold.queryHistory({ ...owner, itemId: 101 })).nativeConversationId).toBe(a.nativeConversationId);
+      expect(need(await cold.queryHistory({ ...owner, itemId: 102 })).nativeConversationId).toBe(b.nativeConversationId);
+      expect(need(await cold.queryHistory(owner)).nativeConversationId).toBe(nativeId);
+      expect(await cold.queryHistoryPage({ ...owner, itemId: 103 })).toMatchObject({ ok: false });
+      expect(opened).toBe(0);
+    } finally { need(await cold.close()); }
+  } finally { await original.close(); need(await store.close()); }
+});
+
 test('scheduling requires a persisted wake intent and rechecks authorization afterwards', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-wake-gate-')), store = need(await openCloudRuntimeStore(root));
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();

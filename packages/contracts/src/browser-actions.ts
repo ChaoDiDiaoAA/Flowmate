@@ -23,13 +23,16 @@ export const BrowserToolInputSchema = z.object({}).strict();
 export const BrowserOwnerSchema = z.object({ workId: id, itemId: id, workspaceId: z.string().uuid().optional() }).strict();
 export const BrowserSelectionSchema = BrowserOwnerSchema.extend({ url: webUrl }).strict();
 export type BrowserSelection = z.infer<typeof BrowserSelectionSchema>;
+export const BrowserReadRebindSchema = z.object({ workId: id, itemId: id, proposalId: id,
+  confirmedTarget: BrowserTargetSchema, currentTarget: BrowserTargetSchema, resume: z.literal(true).optional() }).strict();
+export type BrowserReadRebind = z.infer<typeof BrowserReadRebindSchema>;
 export function browserTabGroup(input: { workId: number; itemId: number; cloud: boolean }): string {
   return `Flowmate ${input.cloud ? 'Cloud' : 'Local'} Work ${input.workId} Item ${input.itemId}`;
 }
 
 export const BrowserReadViewSchema = z.object({ proposalId: id, workId: id, itemId: id, proposalToolCallId: id,
   target: BrowserTargetSchema, status: z.enum(['waiting', 'approved', 'rejected', 'claimed', 'completed', 'unknown', 'invalidated', 'revoked']),
-  canDecide: z.boolean(), canReject: z.boolean(), canRevoke: z.boolean(), executionToolCallId: id.nullable(),
+  canDecide: z.boolean(), canReject: z.boolean(), canRevoke: z.boolean(), resumeOriginal: z.literal(true).optional(), executionToolCallId: id.nullable(),
   createdAt: z.string().datetime({ offset: true }), updatedAt: z.string().datetime({ offset: true }),
 }).strict().refine(value => ['claimed', 'completed', 'unknown', 'revoked'].includes(value.status) === (value.executionToolCallId !== null)
   && (!value.canDecide || value.canReject) && (!value.canReject || value.status === 'waiting')

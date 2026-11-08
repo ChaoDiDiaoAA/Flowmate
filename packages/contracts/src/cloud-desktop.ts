@@ -15,6 +15,9 @@ import { appError, fail, ok } from './errors.ts';
 import { DesktopBridgeRequestSchema, DesktopBridgeResultSchema } from './desktop-actions.ts';
 import { PersonalAgentCommandSchema, matchesPersonalAgentResponse, parsePersonalAgentHostResult,
   personalAgentHostFailure } from './personal-agent-commands.ts';
+import { MemoryEntriesPageSchema, MemoryEntriesRequestSchema, MemoryEntryDetailSchema, MemoryEntryRequestSchema, MemoryForgetRequestSchema, MemoryForgetResultSchema, MemoryOperationsPageSchema, MemoryRecallResultSchema, MemorySearchRequestSchema,
+  MemoryOperationsRequestSchema, MemoryPolicyUpdateSchema, MemoryRememberRecoveryRequestSchema, MemoryRememberRecoveryResultSchema,
+  MemoryRememberRequestSchema, MemoryRememberResultSchema, MemorySettingsViewSchema } from './openviking-memory.ts';
 
 export const CLOUD_DESKTOP_MAX_IN_FLIGHT = 32;
 export const CLOUD_DESKTOP_RESERVED_CONTROL = 2;
@@ -128,7 +131,22 @@ export const CloudDesktopRelayEventSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('request'), id: z.string().uuid(), request: DesktopBridgeRequestSchema }).strict(),
   z.object({ kind: z.literal('cancel'), id: z.string().uuid() }).strict(),
 ]);
-export const CloudDesktopUserCommandSchema = z.union([PersonalAgentCommandSchema, CloudQueueDesktopCommandSchema, CloudDeliveryDesktopCommandSchema, CloudChildReportCommandSchema, CloudProgressCommandSchema, CloudReviewCommandSchema]);
+const cloudMemoryRemember = MemoryRememberRequestSchema.refine(value => value.source.kind === 'work');
+const cloudMemorySearch = MemorySearchRequestSchema.refine(value => value.source.kind === 'work');
+export const CloudMemoryCommandSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('cloud_memory_get_settings'), input: z.object({}).strict() }).strict(),
+  z.object({ type: z.literal('cloud_memory_list_entries'), input: MemoryEntriesRequestSchema }).strict(),
+  z.object({ type: z.literal('cloud_memory_read_entry'), input: MemoryEntryRequestSchema }).strict(),
+  z.object({ type: z.literal('cloud_memory_list_operations'), input: MemoryOperationsRequestSchema }).strict(),
+  z.object({ type: z.literal('cloud_memory_search'), input: cloudMemorySearch }).strict(),
+  z.object({ type: z.literal('cloud_memory_update_policy'), input: MemoryPolicyUpdateSchema }).strict(),
+  z.object({ type: z.literal('cloud_memory_remember'), input: cloudMemoryRemember }).strict(),
+  z.object({ type: z.literal('cloud_memory_reconcile_remember'), input: cloudMemoryRemember }).strict(),
+  z.object({ type: z.literal('cloud_memory_reconcile_remember_by_id'), input: MemoryRememberRecoveryRequestSchema }).strict(),
+  z.object({ type: z.literal('cloud_memory_forget'), input: MemoryForgetRequestSchema }).strict(),
+]);
+export type CloudMemoryCommand = z.infer<typeof CloudMemoryCommandSchema>;
+export const CloudDesktopUserCommandSchema = z.union([PersonalAgentCommandSchema, CloudMemoryCommandSchema, CloudQueueDesktopCommandSchema, CloudDeliveryDesktopCommandSchema, CloudChildReportCommandSchema, CloudProgressCommandSchema, CloudReviewCommandSchema]);
 export const CloudDesktopRequestSchema = CloudDesktopWorkspaceSchema.extend({ command: CloudDesktopUserCommandSchema }).strict();
 export const CloudDesktopUploadSchema = CloudDesktopWorkspaceSchema.extend({ documentRef: DocumentRefSchema }).strict();
 export const CloudDesktopUploadResourceSchema = CloudDesktopWorkspaceSchema.extend({ ref: ResourceRefSchema }).strict();
@@ -143,8 +161,9 @@ export type CloudDesktopApi = {
   upload(input: z.infer<typeof CloudDesktopUploadSchema>): Promise<Result<z.infer<typeof CloudMaterialReceiptSchema>>>;
   uploadResource(input: z.infer<typeof CloudDesktopUploadResourceSchema>): Promise<Result<z.infer<typeof CloudResourceReceiptSchema>>>;
 };
-export const CloudDesktopCommandSchema = z.union([PersonalAgentCommandSchema, CloudMaterialCommandSchema, CloudResourceCommandSchema, CloudQueueDesktopCommandSchema, CloudDeliveryDesktopCommandSchema, CloudChildReportCommandSchema, CloudProgressCommandSchema, CloudReviewCommandSchema, CloudDesktopRelayCommandSchema]);
+export const CloudDesktopCommandSchema = z.union([PersonalAgentCommandSchema, CloudMemoryCommandSchema, CloudMaterialCommandSchema, CloudResourceCommandSchema, CloudQueueDesktopCommandSchema, CloudDeliveryDesktopCommandSchema, CloudChildReportCommandSchema, CloudProgressCommandSchema, CloudReviewCommandSchema, CloudDesktopRelayCommandSchema]);
 export type CloudDesktopCommand = z.infer<typeof CloudDesktopCommandSchema>;
+export function isCloudMemoryCommand(command: CloudDesktopCommand): command is CloudMemoryCommand { return command.type.startsWith('cloud_memory_'); }
 export function isCloudDesktopRelayCommand(command: CloudDesktopCommand): command is CloudDesktopRelayCommand {
   return command.type.startsWith('cloud_desktop_');
 }
@@ -173,6 +192,12 @@ export const CloudDesktopEnvelopeSchema = z.object({ version: z.literal(1), work
 export type CloudDesktopEnvelope = z.infer<typeof CloudDesktopEnvelopeSchema>;
 
 export function cloudDesktopFailure(command: CloudDesktopCommand): Extract<Result<never>, { ok: false }> {
+  if (isCloudMemoryCommand(command)) {
+    const write = command.type === 'cloud_memory_update_policy' || command.type === 'cloud_memory_remember'
+      || command.type === 'cloud_memory_reconcile_remember' || command.type === 'cloud_memory_reconcile_remember_by_id' || command.type === 'cloud_memory_forget';
+    return { ok: false, error: appError(write ? 'operation_result_unknown' : 'memory_unavailable', 'runtime',
+      write ? 'The original memory request could not be confirmed.' : 'The original memory information is unavailable.', true) };
+  }
   if (isCloudDesktopRelayCommand(command)) return { ok: false, error: appError('desktop_unavailable', 'runtime', 'The original interactive desktop is unavailable.', true) };
   if (isCloudProgressCommand(command)) return { ok: false, error: appError('cloud_progress_unavailable', 'runtime', 'Cloud progress is unavailable.', true) };
   if (isCloudChildReportCommand(command)) return { ok: false, error: appError('storage_read_failed', 'storage', 'The original child report could not be read.', true) };
@@ -205,6 +230,55 @@ export function cloudDesktopFailure(command: CloudDesktopCommand): Extract<Resul
 
 /** Validate every returned identity against the command before it crosses either transport boundary. */
 export function parseCloudDesktopResult(command: CloudDesktopCommand, value: unknown): Result<unknown> | null {
+  if (isCloudMemoryCommand(command)) {
+    const schema = command.type === 'cloud_memory_get_settings' || command.type === 'cloud_memory_update_policy'
+      ? MemorySettingsViewSchema : command.type === 'cloud_memory_list_entries' ? MemoryEntriesPageSchema
+        : command.type === 'cloud_memory_read_entry' ? MemoryEntryDetailSchema
+        : command.type === 'cloud_memory_list_operations' ? MemoryOperationsPageSchema : command.type === 'cloud_memory_search' ? MemoryRecallResultSchema
+        : command.type === 'cloud_memory_forget' ? MemoryForgetResultSchema
+          : command.type === 'cloud_memory_reconcile_remember_by_id' ? MemoryRememberRecoveryResultSchema : MemoryRememberResultSchema;
+    const parsed = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: schema }).strict(),
+      z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(value);
+    if (!parsed.success) return null;
+    if (!parsed.data.ok) {
+      const error = parsed.data.error;
+      if (error.runId !== undefined || error.sessionId !== undefined || error.toolCallId !== undefined) return null;
+      return fail(appError(error.code, error.category, 'The cloud memory operation could not be completed.', error.retryable));
+    }
+    const data = parsed.data.data;
+    if (command.type === 'cloud_memory_search') return MemoryRecallResultSchema.safeParse(data).success ? ok(data) : null;
+    if (command.type === 'cloud_memory_get_settings') return ok(data);
+    if (command.type === 'cloud_memory_list_entries') {
+      const page = MemoryEntriesPageSchema.safeParse(data);
+      return page.success && page.data.items.length <= command.input.limit
+        && page.data.items.every((item, index) => item.entryId > (index ? page.data.items[index - 1]!.entryId : command.input.afterId ?? 0))
+        && (page.data.nextAfterId === null || page.data.items.length === command.input.limit && page.data.nextAfterId === page.data.items.at(-1)?.entryId)
+        ? ok(page.data) : null;
+    }
+    if (command.type === 'cloud_memory_read_entry') {
+      const entry = MemoryEntryDetailSchema.safeParse(data);
+      return entry.success && entry.data.entryId === command.input.entryId ? ok(entry.data) : null;
+    }
+    if (command.type === 'cloud_memory_list_operations') {
+      const page = MemoryOperationsPageSchema.safeParse(data);
+      return page.success && page.data.items.length <= command.input.limit
+        && page.data.items.every((item, index) => item.kind === command.input.kind
+          && item.operationId > (index ? page.data.items[index - 1]!.operationId : command.input.afterId ?? 0))
+        && (page.data.nextAfterId === null || page.data.items.length === command.input.limit && page.data.nextAfterId === page.data.items.at(-1)?.operationId)
+        ? ok(page.data) : null;
+    }
+    if (command.type === 'cloud_memory_update_policy') return 'settings' in data && data.settings.revision === command.input.expectedRevision + 1
+      && data.settings.provider === command.input.provider && data.settings.recallEnabled === command.input.recallEnabled
+      && data.settings.captureMode === command.input.captureMode ? ok(data) : null;
+    if (command.type === 'cloud_memory_forget') return 'entryId' in data && data.entryId === command.input.entryId
+      && 'requestId' in data && data.requestId === command.input.requestId ? ok(data) : null;
+    if (command.type === 'cloud_memory_reconcile_remember_by_id') {
+      const recovery = MemoryRememberRecoveryResultSchema.safeParse(data);
+      return recovery.success && recovery.data.operationId === command.input.operationId
+        && recovery.data.result.requestId === command.input.requestId ? ok(recovery.data) : null;
+    }
+    return 'requestId' in data && data.requestId === command.input.requestId ? ok(data) : null;
+  }
   if (isCloudDesktopRelayCommand(command)) {
     const schema = command.type === 'cloud_desktop_next' ? cloudDesktopConnection.extend({ event: CloudDesktopRelayEventSchema.nullable() }).strict() : cloudDesktopConnection;
     const parsed = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: schema }).strict(),
@@ -246,7 +320,7 @@ export function parseCloudDesktopResult(command: CloudDesktopCommand, value: unk
     const input = command.input, data = parsed.data.data;
     if (data.workId !== input.workId || data.sessionId !== input.sessionId || data.attemptId !== input.attemptId) return null;
     if (command.type === 'cloud_delivery_retry') return 'requestId' in data && data.requestId === command.input.requestId
-      && data.nativeSubmissionId === command.input.nativeSubmissionId ? { ok: true, data } : null;
+      && data.itemId === command.input.itemId && data.nativeSubmissionId === command.input.nativeSubmissionId ? { ok: true, data } : null;
     return 'results' in data && data.results.items.length <= command.input.limit && (command.input.afterSubmissionId === undefined
       || data.results.items.every(item => item.nativeSubmissionId > command.input.afterSubmissionId!)) ? { ok: true, data } : null;
   }
@@ -325,7 +399,8 @@ export function parseCloudDesktopResult(command: CloudDesktopCommand, value: unk
     }
     const data = parsed.data.data;
     if (data === null) return command.type === 'cloud_queue_query_control' ? { ok: true, data: null } : null;
-    if (data.workId !== command.input.workId || data.sessionId !== command.input.sessionId || data.attemptId !== command.input.attemptId) return null;
+    if (data.workId !== command.input.workId || data.sessionId !== command.input.sessionId || data.itemId !== command.input.itemId
+      || data.attemptId !== command.input.attemptId) return null;
     if (command.type === 'cloud_queue_read') return 'items' in data && new Set(data.items.map(item => item.submissionId)).size === data.items.length
       ? { ok: true, data } : null;
     if (!('controlRequestId' in data) || data.controlRequestId !== command.input.controlRequestId

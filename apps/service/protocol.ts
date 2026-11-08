@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { AppErrorSchema, type AppError } from '@flowmate/contracts';
 import { ServiceCredentialMigrationRequestSchema, ServiceCredentialOperationQuerySchema, ServiceCredentialSettingsRequestSchema,
   ServiceCredentialStatusSchema, ServiceCredentialOperationReceiptSchema } from '../../packages/core/src/configuration/service-credentials.ts';
+import { ServiceMemoryConfigurationRequestSchema, ServiceMemoryOperationQuerySchema, ServiceMemoryOperationReceiptSchema } from '../../packages/core/src/configuration/service-memory-credentials.ts';
 
 export const SERVICE_PROTOCOL_VERSION = 1;
 export const SERVICE_DATA_VERSION = 21;
@@ -10,7 +11,8 @@ const privateErrorCodes = new Set(['host_protocol_invalid', 'host_closing', 'ser
   'foreground_stop_unconfirmed', 'config_revision_conflict', 'config_settings_invalid', 'credential_model_missing',
   'evaluation_settings_separate', 'operation_result_unknown', 'service_credential_models_changed', 'service_credential_not_prepared',
   'service_credential_operation_conflict', 'service_credential_operation_missing', 'service_credential_operation_unavailable',
-  'service_credential_publication_pending', 'service_credential_request_invalid', 'service_credential_status_unavailable']);
+  'service_credential_publication_pending', 'service_credential_request_invalid', 'service_credential_status_unavailable',
+  'service_memory_request_invalid', 'service_memory_operation_conflict', 'memory_identity_unavailable']);
 const safePrivateError = (error: AppError) => ({ code: privateErrorCodes.has(error.code) ? error.code : 'service_control_failed',
   category: error.category, retryable: error.retryable,
   message: 'The service operation could not be confirmed. Query the original operation before retrying.' });
@@ -65,6 +67,8 @@ export const ServicePrivateCommandSchema = z.discriminatedUnion('type', [
   z.object({ ...privateHeader, type: z.literal('service_credentials_commit'), input: ServiceCredentialOperationQuerySchema }).strict(),
   z.object({ ...privateHeader, type: z.literal('service_credentials_query_operation'), input: ServiceCredentialOperationQuerySchema }).strict(),
   z.object({ ...privateHeader, type: z.literal('service_settings_save'), input: ServiceCredentialSettingsRequestSchema }).strict(),
+  z.object({ ...privateHeader, type: z.literal('service_memory_configure'), input: ServiceMemoryConfigurationRequestSchema }).strict(),
+  z.object({ ...privateHeader, type: z.literal('service_memory_query'), input: ServiceMemoryOperationQuerySchema }).strict(),
   z.object({ ...privateHeader, type: z.literal('service_prepare_activation'), input: ServicePrepareActivationRequestSchema }).strict(),
   z.object({ ...privateHeader, type: z.literal('service_query_activation'), input: ServiceCredentialOperationQuerySchema }).strict(),
   ServiceActivationSchema,
@@ -90,6 +94,8 @@ export const ServicePrivateResultSchemas = {
   service_credentials_commit: serviceResult(privateReceipt),
   service_credentials_query_operation: serviceResult(privateReceipt.nullable()),
   service_settings_save: serviceResult(privateReceipt),
+  service_memory_configure: serviceResult(ServiceMemoryOperationReceiptSchema),
+  service_memory_query: serviceResult(ServiceMemoryOperationReceiptSchema.nullable()),
   service_activate: ServiceActivationResultSchema,
   service_prepare_activation: ServicePrepareActivationResultSchema,
   service_query_activation: ServiceQueryActivationResultSchema,

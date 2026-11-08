@@ -1,12 +1,13 @@
 import { z } from 'zod';
 import { desktopActionContinuationAuthorized } from './desktop-actions.ts';
-import { appError, CloudRuntimeIdSchema, CloudWorkspaceIdSchema, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema, DurableWorkBudgetSchema,
+import { appError, CloudRuntimeIdSchema, CloudWorkspaceIdSchema, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema, DurableWorkBudgetSchema, InvoiceWorkPhaseBasisSchema,
   PersonalAgentConfigurationSchema, UsageRecordSchema, InvoiceWorkTodoViewSchema } from '@flowmate/contracts';
 import type { AppError, DurableAttemptIdentity, DurableProductToolCall, DurableSubagentIdentity, InvoiceWorkContextBuildInput, InvoiceWorkTodoView, Result, UsageRecord } from '@flowmate/contracts';
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { InvoiceWorkExecutionCommand } from './invoice-work.ts';
 import type { InvoiceWorkAdmission } from './repository.ts';
 import { readInvoiceWorkToolResult } from './tool-scope.ts';
+import { inspectApprovalWaitInStore } from './approval-wait.ts';
 
 type WorkRow = { id: number; personal_agent_id: number; session_id: number; status: string; current_attempt_id: number | null;
   configuration_json: string; budget_json: string; created_at: string };
@@ -75,15 +76,81 @@ export class DurableInvoiceGovernor {
     return usage.attempts;
   }
 
+  private approvalPending(store: SqlDatabaseStore, work: WorkRow, toolCallId: number): boolean {
+    const row = store.db.query<{ phase_id: number; attempt_id: number; item_id: number; request_id: string; native_conversation_id: number;
+      native_tool_call_id: string; proposal_id: number; kind: 'browser' | 'desktop' }, [number, number, number, number]>(`
+      SELECT p.id phase_id,p.attempt_id,p.item_id,p.request_id,p.native_conversation_id,t.native_tool_call_id,a.id proposal_id,'browser' kind
+        FROM invoice_work_phases p JOIN invoice_work_tool_calls b ON b.phase_id=p.id JOIN tool_calls t ON t.id=b.tool_call_id
+        JOIN invoice_work_browser_reads a ON a.proposal_tool_call_id=t.id WHERE p.work_id=? AND t.id=?
+      UNION ALL SELECT p.id,p.attempt_id,p.item_id,p.request_id,p.native_conversation_id,t.native_tool_call_id,a.id,'desktop'
+        FROM invoice_work_phases p JOIN invoice_work_tool_calls b ON b.phase_id=p.id JOIN tool_calls t ON t.id=b.tool_call_id
+        JOIN invoice_work_desktop_actions a ON a.proposal_tool_call_id=t.id WHERE p.work_id=? AND t.id=?`)
+      .get(work.id, toolCallId, work.id, toolCallId);
+    const task = row && /^durable-task:([1-9]\d*)$/.exec(row.native_tool_call_id);
+    if (!row || !task || !Number.isSafeInteger(Number(task[1]))) return false;
+    try {
+      const state = inspectApprovalWaitInStore(store, { workId: work.id, sessionId: work.session_id, attemptId: row.attempt_id,
+        phaseId: row.phase_id, itemId: row.item_id, requestId: row.request_id, nativeConversationId: row.native_conversation_id,
+        nativeTaskId: Number(task[1]), proposalId: row.proposal_id, kind: row.kind });
+      return state.status === 'waiting' && state.scheduling === 'waiting_approval'
+        || ['approved', 'rejected'].includes(state.status) && ['ready', 'active'].includes(state.scheduling);
+    } catch { return false; }
+  }
+
+  private nestedApprovalResult(store: SqlDatabaseStore, work: WorkRow, toolCallId: number): boolean {
+    const row = store.db.query<{ phase_id: number; attempt_id: number; item_id: number; request_id: string; native_conversation_id: number;
+      proposal_id: number; parent_call_id: number; kind: 'browser' | 'desktop'; basis_json: string; decision_request_id: string | null;
+      feedback_native_entry_id: number | null; feedback_bytes: number | null }, [number, number, number, number]>(`
+      SELECT p.id phase_id,p.attempt_id,p.item_id,p.request_id,p.native_conversation_id,a.id proposal_id,a.proposal_tool_call_id parent_call_id,'browser' kind,
+        p.basis_json,a.decision_request_id,b.feedback_native_entry_id,b.feedback_bytes
+        FROM invoice_work_phases p JOIN invoice_work_tool_calls b ON b.phase_id=p.id
+        JOIN invoice_work_browser_reads a ON a.proposal_tool_call_id=b.tool_call_id
+        JOIN invoice_work_tool_calls nested ON nested.tool_call_id=a.execution_tool_call_id AND nested.phase_id=p.id
+        WHERE p.work_id=? AND a.execution_tool_call_id=? AND a.status='completed'
+      UNION ALL SELECT p.id,p.attempt_id,p.item_id,p.request_id,p.native_conversation_id,a.id,a.proposal_tool_call_id,'desktop',
+        p.basis_json,a.decision_request_id,b.feedback_native_entry_id,b.feedback_bytes
+        FROM invoice_work_phases p JOIN invoice_work_tool_calls b ON b.phase_id=p.id
+        JOIN invoice_work_desktop_actions a ON a.proposal_tool_call_id=b.tool_call_id
+        JOIN invoice_work_tool_calls nested ON nested.tool_call_id=a.execution_tool_call_id AND nested.phase_id=p.id
+        WHERE p.work_id=? AND a.execution_tool_call_id=? AND a.status='dispatched'`)
+      .get(work.id, toolCallId, work.id, toolCallId);
+    if (!row) return false;
+    try {
+      const parent = need(store.toolCalls.getById(row.parent_call_id)), nested = need(store.toolCalls.getById(toolCallId));
+      const parentTask = /^durable-task:([1-9]\d*)$/.exec(parent.nativeToolCallId), task = /^durable-task:([1-9]\d*)$/.exec(nested.nativeToolCallId);
+      if (!parentTask || !task || !Number.isSafeInteger(Number(parentTask[1])) || !Number.isSafeInteger(Number(task[1]))) return false;
+      if (row.feedback_native_entry_id !== null && row.feedback_bytes !== null && row.decision_request_id !== null) {
+        const proposal = parent.result?.status === 'succeeded' ? z.object({ proposalId: id }).passthrough().safeParse(parent.result.data) : null;
+        const decision = row.kind === 'browser' ? need(store.invoiceWorkBrowserReads.queryDecision({ workId: work.id, itemId: row.item_id,
+          proposalId: row.proposal_id, requestId: row.decision_request_id })) : need(store.invoiceWorkDesktopActions.queryDecision({
+          workId: work.id, itemId: row.item_id, proposalId: row.proposal_id, requestId: row.decision_request_id }));
+        return id.safeParse(row.feedback_native_entry_id).success && id.safeParse(row.feedback_bytes).success
+          && InvoiceWorkPhaseBasisSchema.parse(JSON.parse(row.basis_json)).executionMode === 'item-lane-approval-v1'
+          && proposal?.success === true && proposal.data.proposalId === row.proposal_id && decision?.decision === 'approve'
+          && parent.runId === nested.runId && parent.sessionId === nested.sessionId && nested.status === 'succeeded'
+          && nested.result?.status === 'succeeded' && nested.toolName === (row.kind === 'browser' ? 'browser_read_approved' : 'desktop_execute_approved');
+      }
+      const identity = { workId: work.id, sessionId: work.session_id, attemptId: row.attempt_id, itemId: row.item_id,
+        requestId: row.request_id, nativeConversationId: row.native_conversation_id };
+      const state = inspectApprovalWaitInStore(store, { ...identity, phaseId: row.phase_id, nativeTaskId: Number(parentTask[1]),
+        proposalId: row.proposal_id, kind: row.kind });
+      if (state.status !== 'approved' || state.scheduling !== 'active') return false;
+      const result = readInvoiceWorkToolResult(store, { ...identity, nativeTaskId: Number(task[1]), parentNativeTaskId: Number(parentTask[1]),
+        nativeToolCallId: 'approved-execution', name: row.kind === 'browser' ? 'browser_read_approved' : 'desktop_execute_approved',
+        arguments: nested.args.raw });
+      return result.ok && result.data?.status === 'succeeded';
+    } catch { return false; }
+  }
+
   private budget(store: SqlDatabaseStore, work: WorkRow, at: string, pendingFeedback: readonly DurableProductToolCall[] = []): RemainingBudget {
     const authorization = DurableWorkBudgetSchema.parse(JSON.parse(work.budget_json)), runs = this.runs(store, work.id);
     let modelCalls = 0, toolCalls = 0, toolFeedbackBytes = 0, elapsed = 0;
     const feedbackEntries = new Map<string, number>();
     for (const run of runs) {
       modelCalls += this.requestCount(store, run.id, JSON.parse(run.usage_json));
-      const calls = store.db.query<{ native_tool_call_id: string; result_json: string | null; feedback_native_entry_id: number | null;
+      const calls = store.db.query<{ tool_call_id: number; native_tool_call_id: string; result_json: string | null; feedback_native_entry_id: number | null;
         feedback_bytes: number | null; work_id: number | null; native_conversation_id: number | null }, [number]>(`SELECT
-        t.native_tool_call_id,t.result_json,b.feedback_native_entry_id,b.feedback_bytes,p.work_id,
+        t.id tool_call_id,t.native_tool_call_id,t.result_json,b.feedback_native_entry_id,b.feedback_bytes,p.work_id,
         CASE WHEN r.kind='subagent' THEN s.durable_conversation_id ELSE p.native_conversation_id END native_conversation_id
         FROM tool_calls t LEFT JOIN invoice_work_tool_calls b ON b.tool_call_id=t.id
         LEFT JOIN invoice_work_phases p ON p.id=b.phase_id JOIN runs r ON r.id=t.run_id
@@ -91,6 +158,8 @@ export class DurableInvoiceGovernor {
       toolCalls += Math.max(run.tool_call_count, calls.length);
       for (const call of calls) {
         if (call.result_json === null && call.feedback_native_entry_id === null && call.feedback_bytes === null) continue;
+        if (call.result_json !== null && call.feedback_native_entry_id === null && call.feedback_bytes === null
+          && (this.approvalPending(store, work, call.tool_call_id) || this.nestedApprovalResult(store, work, call.tool_call_id))) continue;
         const pending = pendingFeedback.find(value => value.workId === work.id && value.nativeConversationId === call.native_conversation_id
           && call.native_tool_call_id === `durable-task:${value.nativeTaskId}`);
         // Only original receipt settlement can proceed before its exact native feedback bytes exist.
@@ -243,14 +312,20 @@ export class DurableInvoiceGovernor {
     };
     const items = store.db.query<{ id: number; document_id: number; document_version: string; candidate_id: number | null }, [number]>(
       "SELECT * FROM invoice_work_items WHERE work_id=? AND disposition='unresolved' ORDER BY id").all(work.id);
+    const priority = !command && attempt ? store.db.query<{ item_id: number | null }, [number]>(`SELECT item_id FROM invoice_work_phases
+      WHERE attempt_id=? AND closed_at IS NULL AND scheduler_state IN ('legacy','active','ready')
+      ORDER BY CASE WHEN scheduler_state IN ('legacy','active') THEN 0 ELSE 1 END,id LIMIT 1`).get(attempt.id)?.item_id : null;
     let unavailable = false, desktopWaiting = false, browserWaiting = false;
     const waitingTodos: number[] = [];
     for (const item of items) {
+      if (priority != null && item.id !== priority) continue;
       const document = store.documents.get(item.document_id);
       if (!document.ok || document.data.documentRef.version !== item.document_version || document.data.status !== 'available'
         || document.data.isHidden || document.data.parsedArtifactId === null) { unavailable = true; continue; }
-      if (!command && attempt && store.db.query('SELECT id FROM invoice_work_phases WHERE attempt_id=? AND item_id=? AND closed_at IS NULL')
-        .get(attempt.id, item.id)) return ready(item.id);
+      const open = !command && attempt ? store.db.query<{ scheduler_state: string }, [number, number]>(
+        'SELECT scheduler_state FROM invoice_work_phases WHERE attempt_id=? AND item_id=? AND closed_at IS NULL').get(attempt.id, item.id) : null;
+      if (open?.scheduler_state === 'waiting_approval') { desktopWaiting = true; continue; }
+      if (open) return ready(item.id);
       const desktop = store.db.query<{ id: number; status: string; decision_request_id: string | null }, [number, number]>(
         `SELECT d.id,d.status,d.decision_request_id FROM invoice_work_desktop_actions d JOIN invoice_work_tool_calls t ON t.tool_call_id=d.proposal_tool_call_id
         JOIN invoice_work_phases p ON p.id=t.phase_id WHERE d.work_id=? AND d.item_id=? AND p.closed_at IS NOT NULL ORDER BY d.id DESC LIMIT 1`)
@@ -404,7 +479,7 @@ export class DurableInvoiceGovernor {
   }
 
   private verify(store: SqlDatabaseStore, input: DurableAttemptIdentity, at: string, requireRequestBudget: boolean,
-    pendingFeedback: readonly DurableProductToolCall[] = []) {
+    pendingFeedback: readonly DurableProductToolCall[] = [], allowWaitingRecovery = false) {
     const identity = identitySchema.parse(input), work = this.work(store, identity.workId), attempt = this.attempt(store, work);
     requireFact(identity.sessionId === work.session_id && identity.attemptId === attempt?.id && attempt.run_id !== null,
       'state_conflict', 'The model request does not belong to the current product Run.');
@@ -419,7 +494,19 @@ export class DurableInvoiceGovernor {
       .get(identity.workId, identity.attemptId) !== null;
     const admission = this.assessCurrent(store, identity.workId, at, requireRequestBudget, admittedPhase, pendingFeedback);
     if (admission.kind === 'blocked') throw new AdmissionFault(admission.reason);
-    if (admission.kind !== 'ready') throw new AdmissionFault(appError('invoice_work_admission_waiting', 'runtime',
+    const waitingRecovery = allowWaitingRecovery && admission.kind === 'waiting' && pendingFeedback.length > 0
+      && pendingFeedback.every(call => {
+        if (call.workId !== identity.workId || call.sessionId !== identity.sessionId || call.attemptId !== identity.attemptId
+          || call.itemId === undefined || call.child || call.name !== 'browser_request_read' && call.name !== 'desktop_propose_action') return false;
+        const row = store.db.query<{ id: number; scheduler_state: string }, [number, number, number, string, number, string]>(`
+          SELECT t.id,p.scheduler_state FROM tool_calls t JOIN invoice_work_tool_calls b ON b.tool_call_id=t.id
+          JOIN invoice_work_phases p ON p.id=b.phase_id WHERE p.work_id=? AND p.attempt_id=? AND p.item_id=? AND p.request_id=?
+            AND p.native_conversation_id=? AND t.native_tool_call_id=? AND p.closed_at IS NULL`)
+          .get(call.workId, call.attemptId, call.itemId, call.requestId, call.nativeConversationId, `durable-task:${call.nativeTaskId}`);
+        const saved = readInvoiceWorkToolResult(store, call);
+        return row?.scheduler_state === 'waiting_approval' && this.approvalPending(store, work, row.id) && saved.ok && saved.data !== null;
+      });
+    if (admission.kind !== 'ready' && !waitingRecovery) throw new AdmissionFault(appError('invoice_work_admission_waiting', 'runtime',
       admission.kind === 'waiting' ? admission.reason : 'Another qualified execution currently owns admission.', true));
     const used = this.requestCount(store, run.runId, run.usage);
     requireFact(requireRequestBudget ? used < config.runtimeBudget.maxModelCalls : used <= config.runtimeBudget.maxModelCalls,
@@ -433,7 +520,7 @@ export class DurableInvoiceGovernor {
   }
 
   public async verifySchedulingUse(identity: DurableAttemptIdentity, pendingFeedback: readonly DurableProductToolCall[]): Promise<Result<void>> {
-    try { return await this.database.read(store => this.guarded(() => { this.verify(store, identity, this.now(), false, pendingFeedback); })); }
+    try { return await this.database.read(store => this.guarded(() => { this.verify(store, identity, this.now(), false, pendingFeedback, true); })); }
     catch { return fail(appError('storage_read_failed', 'storage', 'Original tool feedback recovery eligibility could not be verified.', true)); }
   }
 

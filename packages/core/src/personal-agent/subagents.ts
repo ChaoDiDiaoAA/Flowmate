@@ -12,7 +12,7 @@ import { resolveInvoiceWorkToolScope, verifyInvoiceWorkToolScope } from './tool-
 import { visibleFrozenSkills } from '../skill-hub/capability-map.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER), requestId = z.string().min(1).max(128);
-const identitySchema = z.object({ workId: id, sessionId: id, attemptId: id, requestId,
+const identitySchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId,
   childRunId: id, childSessionId: id, originToolCallId: id, nativeToolTaskId: id }).strict();
 const time = z.string().datetime({ offset: true });
 class ChildFault extends Error { constructor(readonly fact: AppError) { super(fact.code); } }
@@ -21,7 +21,7 @@ function requireFact(value: unknown, code = 'subagent_origin_invalid', message =
   if (!value) throw new ChildFault(appError(code, 'runtime', message));
 }
 function identityOf(value: DurableSubagentIdentity): DurableSubagentIdentity {
-  return identitySchema.parse({ workId: value.workId, sessionId: value.sessionId, attemptId: value.attemptId, requestId: value.requestId,
+  return identitySchema.parse({ workId: value.workId, sessionId: value.sessionId, ...(value.itemId === undefined ? {} : { itemId: value.itemId }), attemptId: value.attemptId, requestId: value.requestId,
     childRunId: value.childRunId, childSessionId: value.childSessionId, originToolCallId: value.originToolCallId, nativeToolTaskId: value.nativeToolTaskId });
 }
 const active = (status: string) => status === 'created' || status === 'running';
@@ -51,7 +51,8 @@ export function createDurableInvoiceSubagentService(options: {
       && origin.nativeToolCallId === owner.plugin_agent_id && args.subagent_type === SUBAGENT_ROLE);
     const saved = need(store.invoiceWorkContexts.get({ workId: identity.workId, attemptId: identity.attemptId, requestId: identity.requestId }));
     requireFact(saved && saved.context.work.sessionId === identity.sessionId && saved.context.phase.phaseId === scope.phaseId
-      && saved.context.item.itemId === scope.itemId && saved.context.phase.requestId === scope.parentRequestId);
+      && saved.context.item.itemId === scope.itemId && saved.context.phase.requestId === scope.parentRequestId
+      && (saved.context.phase.basis.executionMode === 'item-lane-approval-v1' ? identity.itemId === scope.itemId : identity.itemId === undefined));
     if (live) need(store.runs.verifyDurableSubagentAdmission(run.runId));
     return { identity, run, scope, config, origin, args, context: saved.context };
   }
@@ -198,6 +199,7 @@ export function createDurableInvoiceSubagentService(options: {
       const child = need(store.runs.createDurableSubagent({ parentRunId: product.runId, originToolCallId: origin.toolCallId,
         nativeToolTaskId, args: parsed, scope, config, at: options.now() }));
       return { workId: phase.workId, sessionId: product.sessionId, attemptId: phase.attemptId, requestId: provenance.parentRequestId,
+        ...(saved.context.phase.basis.executionMode === 'item-lane-approval-v1' ? { itemId: phase.itemId } : {}),
         childRunId: child.runId, childSessionId: child.sessionId, originToolCallId: origin.toolCallId, nativeToolTaskId };
     });
   }
@@ -261,7 +263,10 @@ export function createDurableInvoiceSubagentService(options: {
           return rows.map(row => { const scope = DurableSubagentRunScopeSchema.parse(JSON.parse(row.scope_json));
             if (parent.stop_requested_at !== null || parent.status === 'cancelled') need(store.runs.recordCancel(row.id, options.now()));
             const task = /^durable-task:([1-9]\d*)$/.exec(row.plugin_agent_id); requireFact(task);
-            return identityOf({ ...identity, requestId: scope.parentRequestId, childRunId: row.id, childSessionId: row.session_id,
+            const phase = store.db.query<{ scheduler_state: string }, [number]>('SELECT scheduler_state FROM invoice_work_phases WHERE id=?').get(scope.phaseId);
+            requireFact(phase);
+            return identityOf({ ...identity, ...(phase.scheduler_state === 'legacy' ? {} : { itemId: scope.itemId }),
+              requestId: scope.parentRequestId, childRunId: row.id, childSessionId: row.session_id,
               originToolCallId: row.origin_tool_call_id, nativeToolTaskId: Number(task[1]) }); });
         });
         for (const child of children) await synchronize(child);

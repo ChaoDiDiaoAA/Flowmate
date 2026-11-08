@@ -30,7 +30,7 @@ import { nativeAssistantFacts, saveTestHistory } from '../../support/history.ts'
 
 const release: PackagedRelease = { version: 1, releaseId: '43f163a3-b56f-4133-b04d-8bbf92eb1e52', productVersion: '0.1.0',
   platform: 'win32', arch: 'x64', bunVersion: '1.4.4',
-  electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 25, settingsVersion: 7,
+  electronVersion: '44.4.5', sdkVersion: '1.4.0', pluginVersion: '0.19.0', schemaVersion: 27, settingsVersion: 7,
   files: PACKAGED_REQUIRED_FILES };
 
 for (const blocked of [true, false]) it('preserves an unverifiable original session only when model use is already blocked, blocked=' + blocked, async () => {
@@ -201,6 +201,8 @@ async function fixture(populated = true) {
     writeFileSync(join(root, 'data/settings.json'), JSON.stringify(defaultProductSettings()));
     mkdirSync(join(root, 'security/credentials'), { recursive: true });
     writeFileSync(join(root, 'security/credentials/synthetic-ref.json'), JSON.stringify({ version: 1, ciphertext: Buffer.from('synthetic encrypted bytes').toString('base64') }));
+    mkdirSync(join(root, 'security/memory-credentials'), { recursive: true });
+    writeFileSync(join(root, 'security/memory-credentials/synthetic-memory.json'), JSON.stringify({ version: 1, ciphertext: 'synthetic-encrypted-memory' }));
     mkdirSync(join(root, 'runtime/temporary-run'), { recursive: true }); writeFileSync(join(root, 'runtime/temporary-run/transient.txt'), 'not persistent');
     mkdirSync(join(root, 'outputs'), { recursive: true }); writeFileSync(join(root, 'outputs/receipt.json'), '{"synthetic":true}');
   }
@@ -303,8 +305,9 @@ it('backs up committed SQLite and all persistent references, then verifies an is
   const { root, paths, destination } = await fixture();
   const original = readFileSync(paths.databaseFile), settings = readFileSync(join(root, 'data/settings.json'));
   const backed = await backupStore(paths, destination); expect(backed.ok).toBe(true); if (!backed.ok) return;
-  expect(backed.data.manifest.schemaVersion).toBe(25); expect(backed.data.manifest.settingsVersion).toBe(7);
+  expect(backed.data.manifest.schemaVersion).toBe(27); expect(backed.data.manifest.settingsVersion).toBe(7);
   expect(backed.data.manifest.files.map(file => file.path)).toContain('security/credentials/synthetic-ref.json');
+  expect(backed.data.manifest.files.map(file => file.path)).toContain('security/memory-credentials/synthetic-memory.json');
   expect(backed.data.manifest.files.map(file => file.path)).toContain('runtime/resource-bundles/historical-bundle/skills/example/v1/SKILL.md');
   expect(backed.data.manifest.files.some(file => file.path.includes('temporary-run') || file.path.endsWith('.lock'))).toBe(false);
   expect(readFileSync(paths.databaseFile).equals(original)).toBe(true); expect(readFileSync(join(root, 'data/settings.json')).equals(settings)).toBe(true);
@@ -314,6 +317,36 @@ it('backs up committed SQLite and all persistent references, then verifies an is
   const db = new Database(restored.databaseFile, { readonly: true });
   try { expect(db.query('SELECT COUNT(*) AS count FROM managed_file_contents').get()).toEqual({ count: 3 }); }
   finally { db.close(); }
+});
+
+it('reports that an enabled OpenViking instance and missing user credential need separate backup', async () => {
+  const { paths, destination } = await fixture();
+  const db = new Database(paths.databaseFile);
+  try {
+    db.query("INSERT INTO memory_identities(id,environment,owner_id,account_id,user_id,peer_id,credential_ref,state,created_at,updated_at) VALUES(1,'local','owner','account','alice','agent','memory_12345678901234567890123456789012','active',?,?)")
+      .run('2026-11-07T00:00:00.000Z', '2026-11-07T00:00:00.000Z');
+    db.query("UPDATE memory_config SET provider='openviking',endpoint='http://127.0.0.1:19338' WHERE id=1").run();
+  } finally { db.close(); }
+  const backup = await backupStore(paths, destination);
+  expect(backup).toMatchObject({ ok: true, data: { manifest: { gaps: expect.arrayContaining([
+    'openviking_external_backup_required', 'memory_credential_backup_required:1',
+  ]) } } });
+});
+
+it('backs up the service memory credential and its original configuration receipt', async () => {
+  const { root, paths, destination } = await fixture();
+  const directory = join(root, 'security/service-memory-credentials'), operation = join(directory, 'operations');
+  mkdirSync(operation, { recursive: true });
+  writeFileSync(join(directory, 'memory_12345678901234567890123456789012.json'), JSON.stringify({ version: 1, ciphertext: 'synthetic-service-ciphertext' }));
+  writeFileSync(join(operation, 'original.json'), JSON.stringify({ phase: 'committed', operationId: 'controlled-original' }));
+  const backup = await backupStore(paths, destination);
+  expect(backup).toMatchObject({ ok: true });
+  if (!backup.ok) return;
+  expect(backup.data.manifest.files.map(file => file.path)).toEqual(expect.arrayContaining([
+    'security/service-memory-credentials/memory_12345678901234567890123456789012.json',
+    'security/service-memory-credentials/operations/original.json',
+  ]));
+  expect(await verifyBackupSnapshot(destination)).toMatchObject({ ok: true });
 });
 
 it('backs up Electron Local State with encrypted credentials and rejects a restore missing its original key state', async () => {
@@ -388,7 +421,7 @@ it('backs up before Settings migration, records only a successful installed open
     expect(JSON.parse(readFileSync(join(root, 'backups', backups[0]!, 'data/settings.json'), 'utf8')).version).toBe(6);
     expect(JSON.parse(readFileSync(settingsFile, 'utf8')).version).toBe(7);
     expect(JSON.parse(readFileSync(join(root, 'data/installed-release.json'), 'utf8'))).toEqual({ version: 1,
-      releaseId: release.releaseId, productVersion: release.productVersion, schemaVersion: 25, settingsVersion: 7 });
+      releaseId: release.releaseId, productVersion: release.productVersion, schemaVersion: 27, settingsVersion: 7 });
   } finally { await opened.data.close(); }
   const again = await createApplication(options); expect(again.ok).toBe(true);
   if (again.ok) await again.data.close();
@@ -434,11 +467,11 @@ it('refuses linked references and unsafe or existing destinations without copyin
 it('backs up a different release even at the same Schema and skips only the matching successful release', async () => {
   const { root, paths } = await fixture();
   writeFileSync(join(root, 'data/installed-release.json'), JSON.stringify({ version: 1, releaseId: release.releaseId,
-    productVersion: release.productVersion, schemaVersion: 25, settingsVersion: 7 }));
+    productVersion: release.productVersion, schemaVersion: 27, settingsVersion: 7 }));
   expect(await prepareStoreUpgrade(paths, release)).toEqual({ ok: true, data: null });
   const next = { ...release, releaseId: '54ec481d-a0d9-4cf9-8143-3600e67f77b9' };
   const backed = await prepareStoreUpgrade(paths, next); expect(backed.ok).toBe(true);
-  if (backed.ok) { expect(backed.data?.manifest.releaseId).toBe(release.releaseId); expect(backed.data?.manifest.schemaVersion).toBe(25); }
+  if (backed.ok) { expect(backed.data?.manifest.releaseId).toBe(release.releaseId); expect(backed.data?.manifest.schemaVersion).toBe(27); }
   expect(readdirSync(join(root, 'backups'))).toHaveLength(1);
   expect(JSON.parse(readFileSync(join(root, 'data/installed-release.json'), 'utf8')).releaseId).toBe(release.releaseId);
 });
@@ -449,7 +482,7 @@ it('rejects future or nonconsecutive Schema and corrupt Settings before any upgr
     if (kind === 'settings') writeFileSync(join(root, 'data/settings.json'), '{"version":8}');
     else {
       const db = new Database(paths.databaseFile);
-      if (kind === 'future') db.query('INSERT INTO schema_migrations(version,applied_at) VALUES(26,?)').run('2026-10-17T00:00:00.000Z');
+      if (kind === 'future') db.query('INSERT INTO schema_migrations(version,applied_at) VALUES(28,?)').run('2026-10-17T00:00:00.000Z');
       else db.query('DELETE FROM schema_migrations WHERE version=19').run(); db.close();
     }
     const before = readFileSync(paths.databaseFile), settings = readFileSync(join(root, 'data/settings.json'));
@@ -541,6 +574,9 @@ it('does not create an empty database when persisted business files have lost th
 it.each([
   { file: 'data/settings.json', content: JSON.stringify(defaultProductSettings()) },
   { file: 'security/credentials/preserved.json', content: JSON.stringify({ version: 1, ciphertext: 'synthetic-encrypted-configuration' }) },
+  { file: 'security/memory-credentials/preserved.json', content: JSON.stringify({ version: 1, ciphertext: 'synthetic-encrypted-memory' }) },
+  { file: 'data/desktop-service-memory-request.json', content: '{"operationId":"original"}' },
+  { file: 'data/desktop-memory-request.json', content: '{"operationId":"original"}' },
 ])('does not treat retained product configuration without its database as a first empty root: $file', async ({ file, content }) => {
   const { root, paths } = await fixture(false);
   mkdirSync(dirname(join(root, file)), { recursive: true }); writeFileSync(join(root, file), content);
@@ -595,7 +631,7 @@ it('runs the bundled offline CLI against the same controller lease, then saves a
   expect(blocked.code).toBe(1); expect(blocked.output.result).toMatchObject({ ok: false, error: { code: 'runtime_already_owned' } });
   expect(existsSync(destination)).toBe(false); await lease.release();
   const saved = await command(entry, args);
-  expect(saved.code).toBe(0); expect(saved.output.result).toMatchObject({ ok: true, data: { directory: destination, schemaVersion: 25, settingsVersion: 7 } });
+  expect(saved.code).toBe(0); expect(saved.output.result).toMatchObject({ ok: true, data: { directory: destination, schemaVersion: 27, settingsVersion: 7 } });
   expect(saved.output.result.data.fileCount).toBeGreaterThan(3); expect(existsSync(join(destination, 'manifest.json'))).toBe(true);
 });
 
@@ -639,7 +675,7 @@ async function serviceRestoreFixture() {
     enabled: true, activationOperationId: randomUUID(), activationSettingsRevision: 3 });
   writeFileSync(join(f.root, 'service-installation.json'), JSON.stringify(originalInstallation));
   const installed = (releaseId: string) => writeFileSync(join(f.root, 'data/installed-release.json'), JSON.stringify({ version: 1,
-    releaseId, productVersion: release.productVersion, schemaVersion: 25, settingsVersion: 7 }));
+    releaseId, productVersion: release.productVersion, schemaVersion: 27, settingsVersion: 7 }));
   installed(release.releaseId);
   const addNative = async (title: string) => {
     const database = need(openDatabase(f.paths)), storage = await createDurableSqliteStorage(database.coordinator);

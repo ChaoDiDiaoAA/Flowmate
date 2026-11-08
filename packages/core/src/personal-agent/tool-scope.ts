@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { appError, fail, ok, DurableRunConfigSnapshotSchema, DurableRunScopeSchema, DurableSubagentRunScopeSchema,
   DurableSubagentConfigSnapshotSchema, DurableWorkBudgetSchema, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, PERSONAL_BROWSER_TOOL_NAMES,
   InvoiceWorkPhaseBasisSchema, InvoiceWorkWorkingContextSchema, PersonalAgentConfigurationSchema, RunScopeSchema,
+  BrowserReadDecisionRequestSchema, BrowserReadDecisionReceiptSchema, DesktopActionDecisionRequestSchema, DesktopActionDecisionReceiptSchema,
   InvoiceWorkSupplementRequestSchema, InvoiceWorkSupplementReceiptSchema, InvoiceWorkContinueReceiptSchema,
   type AppError, type DocumentRef, type InvoiceWorkWorkingContext, type ProductToolContext, type Result, type RunScope, type ToolResult } from '@flowmate/contracts';
 import type { DurableProductToolCall, DurableProductToolFeedback } from '../../../contracts/src/durable-runtime.ts';
@@ -10,13 +11,14 @@ import type { DurableChildToolOwner, DurableProductToolExecution } from '../../.
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 import type { ToolExecutor } from '../tools/executor.ts';
 import type { SynchronousDatabaseExecutor } from '../storage/write-coordinator.ts';
+import { inspectApprovalWaitInStore } from './approval-wait.ts';
 
-export type InvoiceWorkToolIdentity = { runId: number; sessionId: number; workId: number; attemptId: number; requestId: string;
+export type InvoiceWorkToolIdentity = { runId: number; sessionId: number; workId: number; itemId?: number; attemptId: number; requestId: string;
   child?: DurableChildToolOwner };
 export type InvoiceWorkToolScope = { scope: RunScope; jobId: number; documentRef: DocumentRef; workingDirectory: string | null };
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const childOwnerSchema = z.object({ childRunId: id, childSessionId: id, originToolCallId: id }).strict();
-const identitySchema = z.object({ runId: id, sessionId: id, workId: id, attemptId: id, requestId: z.string().min(1).max(128),
+const identitySchema = z.object({ runId: id, sessionId: id, workId: id, itemId: id.optional(), attemptId: id, requestId: z.string().min(1).max(128),
   child: childOwnerSchema.optional() }).strict();
 class ToolScopeFault extends Error { constructor(readonly fact: AppError) { super(fact.code); } }
 function requireFact(value: unknown, code = 'tool_access_denied', message = 'The invoice tool does not belong to its original active phase.'): asserts value {
@@ -32,7 +34,37 @@ export function invoiceWorkPhaseItemProgress(db: SynchronousDatabaseExecutor, co
     `SELECT COUNT(*) count,MAX(c.id) latest_id FROM invoice_candidates c JOIN invoice_work_tool_calls t ON t.tool_call_id=c.tool_call_id
      WHERE t.phase_id=? AND c.job_id=? AND c.origin='model'`).get(context.phase.phaseId, current.jobId);
   if (!writes || current.candidateId !== (writes.count > 0 ? writes.latest_id : original.candidateRef?.id ?? null)) return unavailable;
-  const revision = original.revision + writes.count;
+  let decisionsCount = 0;
+  if (context.phase.basis.executionMode === 'item-lane-approval-v1') {
+    const decisions = db.query<{ kind: 'browser' | 'desktop'; id: number; item_revision: number; status: string;
+      decision_request_id: string | null; decision_request_json: string | null; decision_receipt_json: string | null }, [number, number]>(`
+      SELECT 'browser' kind,a.id,a.item_revision,a.status,a.decision_request_id,a.decision_request_json,a.decision_receipt_json
+        FROM invoice_work_browser_reads a JOIN invoice_work_tool_calls b ON b.tool_call_id=a.proposal_tool_call_id WHERE b.phase_id=?
+      UNION ALL SELECT 'desktop' kind,a.id,a.item_revision,a.status,a.decision_request_id,a.decision_request_json,a.decision_receipt_json
+        FROM invoice_work_desktop_actions a JOIN invoice_work_tool_calls b ON b.tool_call_id=a.proposal_tool_call_id WHERE b.phase_id=?`)
+      .all(context.phase.phaseId, context.phase.phaseId);
+    const revisions: number[] = [];
+    for (const decision of decisions) {
+      if (decision.decision_request_id === null) {
+        if (decision.decision_request_json !== null || decision.decision_receipt_json !== null) return unavailable;
+        continue;
+      }
+      if (!decision.decision_request_json || !decision.decision_receipt_json || decision.item_revision < original.revision
+        || decision.item_revision >= current.revision || revisions.includes(decision.item_revision)
+        || !['approved', 'rejected', 'claimed', 'dispatched', 'completed'].includes(decision.status)) return unavailable;
+      const request = (decision.kind === 'browser' ? BrowserReadDecisionRequestSchema : DesktopActionDecisionRequestSchema)
+        .parse(JSON.parse(decision.decision_request_json));
+      const receipt = (decision.kind === 'browser' ? BrowserReadDecisionReceiptSchema : DesktopActionDecisionReceiptSchema)
+        .parse(JSON.parse(decision.decision_receipt_json));
+      const { revision: receiptRevision, receivedAt: _receivedAt, ...receivedRequest } = receipt;
+      if (request.workId !== context.work.workId || request.itemId !== original.itemId || request.proposalId !== decision.id
+        || request.requestId !== decision.decision_request_id || receiptRevision !== request.expectedRevision + 1
+        || !isDeepStrictEqual(request, receivedRequest)
+        || request.decision !== (decision.status === 'rejected' ? 'reject' : 'approve')) return unavailable;
+      revisions.push(decision.item_revision); decisionsCount++;
+    }
+  }
+  const revision = original.revision + writes.count + decisionsCount;
   if (current.revision === revision && current.latestInputId === original.latestInputId) return { current: true, readable: true };
   const pending = db.query<{ id: number; todo_id: number; request_id: string; text: string; materials_json: string;
     operation_id: number | null; request_json: string | null; receipt_json: string | null; consumed: number }, [number, number, number]>(
@@ -102,6 +134,7 @@ export function resolveInvoiceWorkToolScope(db: SynchronousDatabaseExecutor, raw
     const scope = DurableRunScopeSchema.parse(JSON.parse(row.scope_json)), config = DurableRunConfigSnapshotSchema.parse(JSON.parse(row.config_json));
     const workConfig = PersonalAgentConfigurationSchema.parse(JSON.parse(row.configuration_json));
     const basis = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(row.basis_json));
+    requireFact(input.itemId === undefined || basis.executionMode === 'item-lane-approval-v1' && input.itemId === row.item_id);
     const context = InvoiceWorkWorkingContextSchema.parse(JSON.parse(row.context_json));
     requireFact(scope.workId === input.workId && scope.attemptId === input.attemptId
       && config.durable.workId === input.workId && config.durable.attemptId === input.attemptId
@@ -201,19 +234,33 @@ export function verifyInvoiceWorkCandidateScope(db: SynchronousDatabaseExecutor,
   }
 }
 
-const nativeCallSchema = identitySchema.omit({ runId: true }).extend({ nativeConversationId: id, nativeTaskId: id,
-  nativeToolCallId: z.string().min(1).max(256), name: z.string().min(1).max(128), arguments: z.unknown() }).strict();
+const nativeCallSchema = identitySchema.omit({ runId: true }).extend({ itemId: id.optional(), nativeConversationId: id, nativeTaskId: id,
+  nativeToolCallId: z.string().min(1).max(256), name: z.string().min(1).max(128), arguments: z.unknown(), parentNativeTaskId: id.optional() }).strict();
 const productCallId = (input: DurableProductToolCall) => `durable-task:${input.nativeTaskId}`;
 function originalPhase(db: SynchronousDatabaseExecutor, input: DurableProductToolCall) {
   nativeCallSchema.parse(input);
-    const row = db.query<{ run_id: number; phase_id: number; native_conversation_id: number }, [number, number, number, string]>(`SELECT a.run_id,p.id phase_id,p.native_conversation_id
+    const row = db.query<{ run_id: number; phase_id: number; native_conversation_id: number; item_id: number | null;
+      scheduler_state: string; durable_conversation_id: number | null }, [number, number, number, string]>(`SELECT a.run_id,p.id phase_id,p.native_conversation_id,
+      p.item_id,p.scheduler_state,s.durable_conversation_id
     FROM invoice_work_phases p JOIN invoice_work_attempts a ON a.id=p.attempt_id AND a.work_id=p.work_id
     JOIN invoice_works w ON w.id=p.work_id JOIN sessions s ON s.id=w.session_id
     JOIN runs r ON r.id=a.run_id AND r.session_id=s.id AND s.runtime_kind='durable'
     WHERE p.work_id=? AND p.attempt_id=? AND w.session_id=? AND p.request_id=?
-      AND p.native_conversation_id=s.durable_conversation_id AND p.native_submission_id IS NOT NULL`)
+      AND p.native_conversation_id IS NOT NULL AND p.native_submission_id IS NOT NULL`)
     .get(input.workId, input.attemptId, input.sessionId, input.requestId);
-  requireFact(row);
+  requireFact(row && (row.scheduler_state === 'legacy' ? input.itemId === undefined && row.native_conversation_id === row.durable_conversation_id
+    : row.item_id !== null && row.item_id === input.itemId));
+  if (row.scheduler_state !== 'legacy' && (input.name === 'desktop_execute_approved' || input.name === 'browser_read_approved')) {
+    requireFact(input.parentNativeTaskId !== undefined && !input.child && row.scheduler_state === 'active');
+    const browser = input.name === 'browser_read_approved';
+    const parent = db.query<{ proposal_id: number; status: string }, [number, number, string]>(`SELECT approval.id proposal_id,approval.status
+      FROM invoice_work_tool_calls binding JOIN tool_calls parent ON parent.id=binding.tool_call_id
+      JOIN ${browser ? 'invoice_work_browser_reads' : 'invoice_work_desktop_actions'} approval ON approval.proposal_tool_call_id=parent.id
+      WHERE binding.phase_id=? AND parent.run_id=? AND parent.native_tool_call_id=? AND parent.status='succeeded'`)
+      .get(row.phase_id, row.run_id, `durable-task:${input.parentNativeTaskId}`);
+    requireFact(parent && ['approved', 'claimed', 'completed', 'dispatched', 'unknown', 'revoked'].includes(parent.status)
+      && isDeepStrictEqual(input.arguments, browser ? {} : { proposalId: parent.proposal_id }));
+  } else requireFact(input.parentNativeTaskId === undefined);
   if (!input.child) { requireFact(row.native_conversation_id === input.nativeConversationId); return { ...row, parent_run_id: row.run_id, session_id: input.sessionId }; }
   const child = db.query<{ scope_json: string; durable_conversation_id: number | null }, [number, number, number, number]>(`SELECT r.scope_json,s.durable_conversation_id
     FROM runs r JOIN sessions s ON s.id=r.session_id AND s.runtime_kind='durable' WHERE r.kind='subagent'
@@ -287,6 +334,54 @@ export function readInvoiceWorkToolResult(store: SqlDatabaseStore, call: Durable
   }
   catch (error) { return fail(error instanceof ToolScopeFault ? error.fact : appError('storage_read_failed', 'storage', 'The original product tool receipt is unavailable.', true)); }
 }
+
+function approvalFeedback(store: SqlDatabaseStore, call: DurableProductToolCall,
+  original: import('@flowmate/contracts').ToolCallSnapshot, historical = false): Result<ToolResult<unknown> | null> {
+  try {
+    const proposal = original.result?.status === 'succeeded' ? z.object({ proposalId: id }).passthrough().safeParse(original.result.data) : null;
+    requireFact(proposal?.success && call.itemId !== undefined);
+    const browser = call.name === 'browser_request_read';
+    const phase = originalPhase(store.db, call);
+    if (historical) {
+      const row = store.db.query<{ status: string; decision_request_id: string | null; execution_tool_call_id: number | null }, [number, number]>(
+        `SELECT status,decision_request_id,execution_tool_call_id FROM ${browser ? 'invoice_work_browser_reads' : 'invoice_work_desktop_actions'}
+         WHERE id=? AND proposal_tool_call_id=?`).get(proposal.data.proposalId, original.toolCallId);
+      requireFact(row?.decision_request_id);
+      const target = { workId: call.workId, itemId: call.itemId, proposalId: proposal.data.proposalId, requestId: row.decision_request_id };
+      const decision = browser ? needToolCall(store.invoiceWorkBrowserReads.queryDecision(target))
+        : needToolCall(store.invoiceWorkDesktopActions.queryDecision(target));
+      requireFact(decision);
+      if (row.status === 'rejected' && decision.decision === 'reject') return ok({ status: 'failed',
+        error: appError('approval_rejected', 'runtime', 'The original action was rejected by the user.') });
+      requireFact(decision.decision === 'approve' && row.status === (browser ? 'completed' : 'dispatched') && row.execution_tool_call_id !== null);
+      const nested = needToolCall(store.toolCalls.getById(row.execution_tool_call_id));
+      const binding = store.db.query<{ phase_id: number }, [number]>('SELECT phase_id FROM invoice_work_tool_calls WHERE tool_call_id=?').get(nested.toolCallId);
+      requireFact(binding?.phase_id === phase.phase_id && nested.runId === original.runId && nested.sessionId === original.sessionId
+        && nested.toolName === (browser ? 'browser_read_approved' : 'desktop_execute_approved') && nested.status === 'succeeded');
+      return readOriginalToolResult(store.toolCalls, nested);
+    }
+    const state = inspectApprovalWaitInStore(store, { workId: call.workId, sessionId: call.sessionId, itemId: call.itemId,
+      attemptId: call.attemptId, phaseId: phase.phase_id, requestId: call.requestId, nativeConversationId: call.nativeConversationId,
+      nativeTaskId: call.nativeTaskId, proposalId: proposal.data.proposalId, kind: browser ? 'browser' : 'desktop' });
+    requireFact(state.scheduling === 'active');
+    if (state.status === 'rejected') return ok({ status: 'failed',
+      error: appError('approval_rejected', 'runtime', 'The original action was rejected by the user.') });
+    requireFact(state.status === 'approved');
+    const row = store.db.query<{ execution_tool_call_id: number | null }, [number, number]>(`SELECT execution_tool_call_id
+      FROM ${browser ? 'invoice_work_browser_reads' : 'invoice_work_desktop_actions'} WHERE id=? AND proposal_tool_call_id=?`)
+      .get(proposal.data.proposalId, original.toolCallId);
+    if (!row?.execution_tool_call_id) return ok(null);
+    const nested = needToolCall(store.toolCalls.getById(row.execution_tool_call_id));
+    const task = /^durable-task:([1-9]\d*)$/.exec(nested.nativeToolCallId);
+    requireFact(task && Number.isSafeInteger(Number(task[1])));
+    return readInvoiceWorkToolResult(store, { ...call, nativeTaskId: Number(task[1]), parentNativeTaskId: call.nativeTaskId,
+      nativeToolCallId: `${call.nativeToolCallId}/approved-execution`, name: browser ? 'browser_read_approved' : 'desktop_execute_approved',
+      arguments: nested.args.raw });
+  } catch (error) { return fail(error instanceof ToolScopeFault ? error.fact
+    : appError('tool_commit_unconfirmed', 'runtime', 'The original approval result is unavailable.', true)); }
+}
+
+function needToolCall<T>(value: Result<T>): T { if (!value.ok) throw new ToolScopeFault(value.error); return value.data; }
 
 /** Original product receipts remain readable after a phase closes; execution still needs its live scope. */
 export function createInvoiceWorkToolBridge(input: { database: Pick<DbHandle, 'read' | 'transaction'>; executor: ToolExecutor }) {
@@ -362,21 +457,25 @@ export function recordInvoiceWorkToolFeedback(db: SynchronousDatabaseExecutor, i
     const message = z.object({ role: z.literal('toolResult'), toolCallId: z.string(), toolName: z.string(), isError: z.boolean(),
       content: z.array(z.unknown()), details: z.unknown() }).passthrough().parse(JSON.parse(feedbackJson));
     requireFact(message.toolCallId === call.nativeToolCallId && message.toolName === call.name);
+    const bytes = new TextEncoder().encode(feedbackJson).byteLength;
+    requireFact(bytes > 0 && Number.isSafeInteger(bytes));
+    if (row.feedback_native_entry_id !== null)
+      requireFact(row.feedback_native_entry_id === nativeEntryId && row.feedback_bytes === bytes, 'state_conflict');
     const original = repository.getById(row.tool_call_id);
     if (!original.ok) return original;
     let result: Result<ToolResult<unknown> | null>;
-    if (call.name === 'browser_read_approved') result = store ? readInvoiceWorkToolResult(store, call)
+    const savedPhase = db.query<{ basis_json: string }, [number]>('SELECT basis_json FROM invoice_work_phases WHERE id=?').get(phase.phase_id);
+    const itemApproval = savedPhase && InvoiceWorkPhaseBasisSchema.parse(JSON.parse(savedPhase.basis_json)).executionMode === 'item-lane-approval-v1'
+      && (call.name === 'browser_request_read' || call.name === 'desktop_propose_action');
+    if (itemApproval) result = store ? approvalFeedback(store, call, original.data, row.feedback_native_entry_id !== null)
+      : fail(appError('tool_access_denied', 'runtime', 'Approval feedback needs its original product owner.'));
+    else if (call.name === 'browser_read_approved') result = store ? readInvoiceWorkToolResult(store, call)
       : fail(appError('tool_access_denied', 'runtime', 'Browser feedback needs its original authorization.'));
     else result = readOriginalToolResult(repository, original.data);
     if (!result.ok) return result;
     requireFact(result.data !== null, 'tool_commit_unconfirmed', 'The original product tool result is still unknown.');
     requireFact(message.isError === (result.data.status !== 'succeeded') && isDeepStrictEqual(message.details, result.data), 'tool_invalid_output');
-    const bytes = new TextEncoder().encode(feedbackJson).byteLength;
-    requireFact(bytes > 0 && Number.isSafeInteger(bytes));
-    if (row.feedback_native_entry_id !== null) {
-      requireFact(row.feedback_native_entry_id === nativeEntryId && row.feedback_bytes === bytes, 'state_conflict');
-      return ok(undefined);
-    }
+    if (row.feedback_native_entry_id !== null) return ok(undefined);
     db.query('UPDATE invoice_work_tool_calls SET feedback_native_entry_id=?,feedback_bytes=? WHERE tool_call_id=?')
       .run(nativeEntryId, bytes, row.tool_call_id);
     if (original.data.delivery.state === 'not_attempted') {

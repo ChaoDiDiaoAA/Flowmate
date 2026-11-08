@@ -27,10 +27,11 @@ test('the Kimi child receives desktop startup variables but no model credentials
 test('the MCP adapter uses fixed operations and passes UI text only as data', async () => {
   const window = { id: 42, app: 'Example', title: 'Draft' }, signal = new AbortController().signal;
   const calls: Array<{ operation: string; args: unknown }> = [];
+  let tree = '[3] Edit value', focused = 'Focused: Edit value';
   const cu = {
     list_windows: async () => [window],
     get_window_state: async (args: unknown) => { calls.push({ operation: 'observe', args });
-      return { window, accessibility: { tree: '[3] Edit value', focused_element: 'Focused: Edit value' } }; },
+      return { window, accessibility: { tree, focused_element: focused } }; },
     set_value: async (args: unknown) => { calls.push({ operation: 'setValue', args }); },
   };
   const client = { callTool: async (name: string, args: Record<string, unknown>) => {
@@ -47,6 +48,11 @@ test('the MCP adapter uses fixed operations and passes UI text only as data', as
   await api.setValue(window, 3, text, signal);
   expect(calls).toEqual([{ operation: 'observe', args: { window, include_screenshot: false, include_text: true } },
     { operation: 'setValue', args: { window, element_index: 3, value: text } }]);
+  tree += '\n' + 'x'.repeat(30000) + '\n[9] Edit IsPassword=true value=fixture-secret';
+  expect(await api.observe(window, signal)).toEqual({ protected: true });
+  tree = '[3] Edit value';
+  focused = 'Focused: 编辑 验证码';
+  expect(await api.observe(window, signal)).toEqual({ protected: true });
 });
 
 test('the MCP adapter treats an error result as failure, never as successful input', async () => {

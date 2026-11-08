@@ -4,6 +4,8 @@ import { parsePersonalAgentCommand, parsePersonalAgentHostResult, matchesPersona
 import { PersonalTaskIdentitySchema, type PersonalAgentApi, type InvoiceWorksApi, type PersonalTasksApi } from '../../contracts/src/personal-agent.ts';
 import { ResearchSessionRequestSchema, ResearchSessionResultSchema, ResearchPageRequestSchema, ResearchEvidenceRequestSchema,
   PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema } from '@flowmate/contracts';
+import { MemoryEntriesRequestSchema, MemoryEntryRequestSchema, MemoryForgetRequestSchema, MemoryOperationsRequestSchema, MemoryPolicyUpdateSchema, MemorySearchRequestSchema,
+  MemoryRememberRecoveryRequestSchema, MemoryRememberRequestSchema } from '@flowmate/contracts';
 import { isDeepStrictEqual } from 'node:util';
 import {
   appError,
@@ -114,6 +116,7 @@ type ResourceService = ReturnType<typeof createResourceService>;
 type ResourceQueryPort = { [K in 'catalog' | 'readFile' | 'verifyFrozen' | 'readFrozenFile' | 'validateSelection']:
   (...input: Parameters<ResourceService[K]>) => ReturnType<ResourceService[K]> | Promise<ReturnType<ResourceService[K]>> };
 export type ProductApplicationOptions = {
+  memory?: import('@flowmate/contracts').MemoryApi;
   personal?: { agent: PersonalAgentApi; works: InvoiceWorksApi; tasks: PersonalTasksApi; close?: () => Promise<Result<void>> };
   research?: {
     listMaterials(...input: Parameters<ResearchRepository['listMaterials']>): ReturnType<ResearchRepository['listMaterials']> | Promise<ReturnType<ResearchRepository['listMaterials']>>;
@@ -200,8 +203,8 @@ export function makeApplication(
     if (!command) return fail(appError('input_invalid', 'input', 'The Personal Agent request is invalid.'));
     if (!products?.personal) return personalUnavailable();
     if (closing && ['personal_agent_update', 'invoice_work_create', 'invoice_work_supplement', 'invoice_work_dispose_item',
-      'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_discard',
-      'invoice_work_browser_decide', 'invoice_work_browser_revoke', 'personal_task_stop'].includes(type))
+      'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_rebind', 'invoice_work_desktop_discard',
+      'invoice_work_browser_decide', 'invoice_work_browser_rebind', 'invoice_work_browser_revoke', 'personal_task_stop'].includes(type))
       return fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.'));
     try {
       const result = parsePersonalAgentHostResult(type, await invoke(command.input as I));
@@ -228,6 +231,59 @@ export function makeApplication(
       : fail(appError('state_conflict', 'runtime', 'Tool call does not belong to this Run.', false, runId));
   };
   return {
+    memory: {
+      getSettings: () => products?.memory?.getSettings() ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.'))),
+      listEntries: raw => {
+        const input = MemoryEntriesRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The memory list request is invalid.')));
+        return products?.memory?.listEntries(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      readEntry: raw => {
+        const input = MemoryEntryRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The memory entry request is invalid.')));
+        return products?.memory?.readEntry(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      listOperations: raw => {
+        const input = MemoryOperationsRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The memory operation list request is invalid.')));
+        return products?.memory?.listOperations(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      search: raw => {
+        const input = MemorySearchRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The memory search request is invalid.')));
+        return products?.memory?.search(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      updatePolicy: raw => {
+        const input = MemoryPolicyUpdateSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The memory policy is invalid.')));
+        if (closing) return Promise.resolve(fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.')));
+        return products?.memory?.updatePolicy(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      remember: raw => {
+        const input = MemoryRememberRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The remember request is invalid.')));
+        if (closing) return Promise.resolve(fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.')));
+        return products?.memory?.remember(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      reconcileRemember: raw => {
+        const input = MemoryRememberRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The remember request is invalid.')));
+        return products?.memory?.reconcileRemember(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      reconcileRememberById: raw => {
+        const input = MemoryRememberRecoveryRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The original memory operation is invalid.')));
+        if (closing) return Promise.resolve(fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.')));
+        return products?.memory?.reconcileRememberById(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      forget: raw => {
+        const input = MemoryForgetRequestSchema.safeParse(raw);
+        if (!input.success) return Promise.resolve(fail(appError('input_invalid', 'input', 'The forget request is invalid.')));
+        if (closing) return Promise.resolve(fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.')));
+        return products?.memory?.forget(input.data) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.')));
+      },
+      reconcileSync: (syncId, abandonConfirmed) => products?.memory?.reconcileSync(syncId, abandonConfirmed) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.'))),
+    },
     personalAgent: {
       get: () => personalCommand('personal_agent_get', {}, () => products?.personal?.agent.get()),
       update: raw => personalCommand('personal_agent_update', raw, input => products?.personal?.agent.update(input)),
@@ -244,10 +300,12 @@ export function makeApplication(
       queryOperation: raw => personalCommand('invoice_work_query_operation', raw, input => products?.personal?.works.queryOperation(input)),
       listDesktopActions: raw => personalCommand('invoice_work_desktop_list', raw, input => products?.personal?.works.listDesktopActions(input)),
       decideDesktopAction: raw => personalCommand('invoice_work_desktop_decide', raw, input => products?.personal?.works.decideDesktopAction(input)),
+      rebindDesktopAction: raw => personalCommand('invoice_work_desktop_rebind', raw, input => products?.personal?.works.rebindDesktopAction(input)),
       discardDesktopAction: raw => personalCommand('invoice_work_desktop_discard', raw, input => products?.personal?.works.discardDesktopAction(input)),
       queryDesktopDecision: raw => personalCommand('invoice_work_desktop_query_decision', raw, input => products?.personal?.works.queryDesktopDecision(input)),
       listBrowserReads: raw => personalCommand('invoice_work_browser_list', raw, input => products?.personal?.works.listBrowserReads(input)),
       decideBrowserRead: raw => personalCommand('invoice_work_browser_decide', raw, input => products?.personal?.works.decideBrowserRead(input)),
+      rebindBrowserRead: raw => personalCommand('invoice_work_browser_rebind', raw, input => products?.personal?.works.rebindBrowserRead(input)),
       revokeBrowserRead: raw => personalCommand('invoice_work_browser_revoke', raw, input => products?.personal?.works.revokeBrowserRead(input)),
       queryBrowserDecision: raw => personalCommand('invoice_work_browser_query_decision', raw, input => products?.personal?.works.queryBrowserDecision(input)),
       timeline: raw => personalCommand('invoice_work_timeline', raw, input => products?.personal?.works.timeline(input)),

@@ -37,6 +37,7 @@ import type {
   ForkSessionRequest, ForkSessionResult,
 } from '@flowmate/contracts';
 import { createHistoryReader } from '../memory/history.ts';
+import { copySessionMemoryBinding } from '../openviking/repository.ts';
 import type { SessionRepository, SessionRow, AgentSessionRow, SessionHistorySnapshot } from '../storage/repositories.ts';
 import type { DbHandle, SqlDatabaseStore } from '../storage/database.ts';
 
@@ -289,8 +290,16 @@ export class SessionService {
       const moved = await this.agent.moveSessionLeaf(row.nativeSessionId, request.targetEntryId);
       let failure = moved.ok ? appError('storage_write_failed', 'storage', 'Branch selection could not be saved.', true) : moved.error;
       if (moved.ok && sameJson(moved.data, intended.history)) {
-        const saved = await this.writeCommand(scope => scope.memory.commit({ sessionId: request.sessionId, expected: commit, header: history.header,
-          appendEntries: [], contexts: [], leafId: request.targetEntryId, unusable: history.unusable }));
+        const saved = await this.writeCommand(scope => {
+          const result = scope.memory.commit({ sessionId: request.sessionId, expected: commit, header: history.header,
+            appendEntries: [], contexts: [], leafId: request.targetEntryId, unusable: history.unusable });
+          const stored = scope.db.query<{ leaf_id: string | null; entry_count: number; commit_revision: number }, [number]>(
+            'SELECT leaf_id,entry_count,commit_revision FROM session_native_history WHERE session_id=?').get(request.sessionId);
+          if (history.leafId !== request.targetEntryId && stored?.leaf_id === intended.commit.leafId
+            && stored.entry_count === intended.commit.entryCount && stored.commit_revision === intended.commit.commitRevision)
+            copySessionMemoryBinding(scope.db, request.sessionId, request.sessionId, this.now());
+          return result;
+        });
         if (!saved.ok) failure = saved.error;
       }
       // Read back once after an uncertain receipt; never repeat the leaf mutation or CAS.

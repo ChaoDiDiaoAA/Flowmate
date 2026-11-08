@@ -1,4 +1,5 @@
 import { createManagedFileContents } from './managed-file-contents.ts';
+import { copySessionMemoryBinding } from '../openviking/repository.ts';
 import { verifyInvoiceWorkCandidateScope, verifyInvoiceWorkToolScope } from '../personal-agent/tool-scope.ts';
 import { readInvoiceCandidateChildReports } from '../personal-agent/candidate-evidence.ts';
 import type { ManagedFileContents } from './managed-file-contents.ts';
@@ -3334,6 +3335,7 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
           source_leaf_id,selected_entry_id,inherited_entry_count,client_operation_id,request_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
           .run(target, request.sourceSessionId, request.expected.commitRevision, request.expected.entryCount, request.expected.leafId,
             request.targetEntryId, history.entries.length, request.clientOperationId, asJson(request), at);
+        copySessionMemoryBinding(db, request.sourceSessionId, target, at);
         // Only a fresh reader after provenance exists may resolve copied NULL associations.
         require(this.readHistorySnapshot(target, value => value.blocked
           ? fail(appError('session_scope_revoked', 'session', 'Material access was revoked.')) : ok(value.bundle)));
@@ -3511,6 +3513,11 @@ export function createSessionRepository(db: Database, events?: RuntimeEventStore
         if (db.query("SELECT id FROM runs WHERE kind='agent' AND session_id=? AND status IN ('created','running') LIMIT 1").get(sessionId)) {
           return fail(appError('session_busy', 'session', 'An Agent Run is active in this Session. Wait for it to finish before deleting this Session.', true));
         }
+        if (db.query(`SELECT b.id FROM memory_bindings b WHERE b.session_id=? AND
+          (b.remote_state IN ('creating','unknown') OR EXISTS (SELECT 1 FROM memory_sync m WHERE m.binding_id=b.id
+            AND m.state IN ('sending','unknown','accepted','running')) OR EXISTS (SELECT 1 FROM memory_remember_requests r
+            WHERE r.binding_id=b.id AND r.state IN ('sending','unknown'))) LIMIT 1`).get(sessionId))
+          return fail(appError('memory_operation_unresolved', 'session', 'Resolve the outstanding memory operation before deleting this Session.', true));
         const metadata = parseSessionMetadata((row as { metadata_json: string }).metadata_json);
         db.query("UPDATE sessions SET status='archived',metadata_json=?,updated_at=? WHERE id=?")
           .run(asJson({ ...metadata, delete_pending: true }), at, sessionId);

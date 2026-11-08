@@ -5,10 +5,12 @@ const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const position = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const bytes = (text: string) => new TextEncoder().encode(text).byteLength;
 const format = z.literal('pi-durable-entry/v1');
-export const PersonalHistoryTargetSchema = z.object({ workId: id, childRunId: id.optional() }).strict();
+export const PersonalHistoryTargetSchema = z.object({ workId: id, itemId: id.optional(), childRunId: id.optional() }).strict()
+  .refine(value => value.itemId === undefined || value.childRunId === undefined);
 export type PersonalHistoryTarget = z.infer<typeof PersonalHistoryTargetSchema>;
 export const PersonalHistoryOwnerSchema = z.object({ runtimeKind: z.literal('durable'), workId: id,
-  sessionId: id, childRunId: id.nullable() }).strict();
+  sessionId: id, childRunId: id.nullable(), itemId: id.optional() }).strict()
+  .refine(value => value.itemId === undefined || value.childRunId === null);
 export type PersonalHistoryOwner = z.infer<typeof PersonalHistoryOwnerSchema>;
 export const PersonalHistoryRequestSchema = z.object({ target: PersonalHistoryTargetSchema,
   throughEntryId: position.optional(), beforeEntryId: id.optional(), limit: z.number().int().min(1).max(100).default(50),

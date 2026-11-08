@@ -141,7 +141,7 @@ it('prepares the real installed record and XML while the original Host remains t
     const directory = serviceActivationBackupDirectory(pending.data, operationId); if (!directory.ok) throw Error(directory.error.code);
     mkdirSync(join(dataRoot, 'backups'), { recursive: true });
     const saved = await invoke('backup', ['--destination', directory.data]);
-    expect(saved).toMatchObject({ code: 0, stderr: '', output: { result: { ok: true, data: { directory: directory.data, schemaVersion: 25 } } } });
+    expect(saved).toMatchObject({ code: 0, stderr: '', output: { result: { ok: true, data: { directory: directory.data, schemaVersion: 27 } } } });
     expect(await readServiceActivationBackup({ installation: pending.data, operationId })).toEqual({ ok: true,
       data: { id: saved.output.result.data.backupId, directory: directory.data } });
     writeFileSync(join(dataRoot, 'data/settings.json'), JSON.stringify({ ...base.data.settings, revision: base.data.settings.revision + 1,

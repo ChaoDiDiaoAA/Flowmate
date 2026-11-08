@@ -14,7 +14,7 @@ function reject(code: string, message: string): never { throw new AttemptFault(a
 function need<T>(value: Result<T>): T { if (!value.ok) throw new AttemptFault(value.error); return value.data; }
 const identity = (input: Request): DurableAttemptIdentity => ({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId });
 const childIdentity = (input: Request): DurableSubagentIdentity | null => input.child
-  ? { ...identity(input), requestId: input.requestId, childRunId: input.child.childRunId, childSessionId: input.child.childSessionId,
+  ? { ...identity(input), ...(input.itemId === undefined ? {} : { itemId: input.itemId }), requestId: input.requestId, childRunId: input.child.childRunId, childSessionId: input.child.childSessionId,
     originToolCallId: input.child.originToolCallId, nativeToolTaskId: input.child.nativeToolTaskId } : null;
 
 /** Product transactions bind one native request identity to one quota reservation and one transport. */
@@ -36,18 +36,20 @@ export class CloudModelAttempts {
 
   private original(store: SqlDatabaseStore, input: Request): void {
     const row = store.db.query<{ durable_runtime_id: string; cloud_workspace_id: string | null; native_conversation_id: number | null;
-      native_submission_id: number | null; run_id: number | null }, [number, number, number, number, string]>(`SELECT s.durable_runtime_id,
-      s.cloud_workspace_id,p.native_conversation_id,p.native_submission_id,a.run_id FROM invoice_work_phases p
+      native_submission_id: number | null; run_id: number | null; item_id: number | null; scheduler_state: string }, [number, number, number, number, string]>(`SELECT s.durable_runtime_id,
+      s.cloud_workspace_id,p.native_conversation_id,p.native_submission_id,p.item_id,p.scheduler_state,a.run_id FROM invoice_work_phases p
       JOIN invoice_work_attempts a ON a.id=p.attempt_id AND a.work_id=p.work_id
       JOIN invoice_works w ON w.id=p.work_id JOIN sessions s ON s.id=w.session_id
       WHERE p.id=? AND p.work_id=? AND p.attempt_id=? AND w.session_id=? AND p.request_id=?`)
       .get(input.phaseId, input.workId, input.attemptId, input.sessionId, input.requestId);
     if (!row || row.durable_runtime_id !== input.cloudRuntimeId || row.cloud_workspace_id !== input.workspaceId
-      || row.native_submission_id !== input.nativeSubmissionId || row.run_id === null)
+      || row.native_submission_id !== input.nativeSubmissionId || row.run_id === null
+      || (row.scheduler_state === 'legacy' ? input.itemId !== undefined : row.item_id !== input.itemId))
       reject('source_invalid', 'The model attempt does not belong to its original cloud phase.');
     const session = need(store.sessions.get(input.child?.childSessionId ?? input.sessionId));
     if (session.runtimeKind !== 'durable' || session.durableRuntimeId !== input.cloudRuntimeId
-      || session.cloudWorkspaceId !== input.workspaceId || session.durableConversationId !== input.nativeConversationId
+      || session.cloudWorkspaceId !== input.workspaceId
+      || (input.child || row.scheduler_state === 'legacy') && session.durableConversationId !== input.nativeConversationId
       || !input.child && row.native_conversation_id !== input.nativeConversationId)
       reject('source_invalid', 'The model attempt does not belong to its original native Session.');
     const run = need(store.runs.get(row.run_id)), config = DurableRunConfigSnapshotSchema.parse(run.config);

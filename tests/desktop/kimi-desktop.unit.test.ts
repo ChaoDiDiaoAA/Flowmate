@@ -76,6 +76,38 @@ test('a selected window is scoped to the invoice, and an observation cannot be b
   expect(await selectedWindows({ workId: 1, itemId: 9 }, signal)).toMatchObject({ ok: false });
 });
 
+test('a protected window withholds observations and invalidates old targets before input', async () => {
+  let protectedWindow = false, inputCalls = 0;
+  const input = async () => { inputCalls++; };
+  const desktop = createKimiDesktop({ listWindows: async () => [window],
+    observe: async () => protectedWindow ? { protected: true as const } : { window, tree: '[3] Button Submit', focused: null },
+    click: input, setValue: input, typeText: input, close: async () => {} });
+  const cloud = { ...owner, workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' };
+  await desktop.listWindows(signal);
+  for (const invoice of [owner, cloud]) {
+    await desktop.select(invoice, window, signal);
+    const before = await desktop.observe(invoice, signal);
+    if (!before.ok) throw Error(before.error.code);
+    const proposed = action(before.data.observationId);
+    const target = await desktop.resolveTarget(invoice, proposed, signal);
+    if (!target.ok) throw Error(target.error.code);
+    protectedWindow = true;
+    expect(await desktop.dispatch(invoice, proposed, target.data, signal))
+      .toMatchObject({ ok: false, error: { code: 'desktop_protected_content', message: expect.stringContaining('manually') } });
+    expect(await desktopModule.handleKimiDesktopRequest(desktop, invoice, { kind: 'observe', ...owner }, signal))
+      .toMatchObject({ ok: false, error: { code: 'desktop_protected_content' } });
+    protectedWindow = false;
+    expect(await desktop.resolveTarget(invoice, proposed, signal)).toMatchObject({ ok: false, error: { code: 'desktop_target_changed' } });
+    const after = await desktop.observe(invoice, signal);
+    if (!after.ok) throw Error(after.error.code);
+    protectedWindow = true;
+    expect(await desktop.resolveTarget(invoice, action(after.data.observationId), signal))
+      .toMatchObject({ ok: false, error: { code: 'desktop_target_changed', message: expect.stringContaining('manually') } });
+    protectedWindow = false;
+  }
+  expect(inputCalls).toBe(0);
+});
+
 test('revalidation and dispatch share a queue and changed controls are not clicked', async () => {
   const f = fixture();
   await f.desktop.listWindows(signal); await f.desktop.select(owner, window, signal);

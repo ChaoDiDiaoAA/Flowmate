@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject, type Reac
 import { usePanelLayout } from './panel-layout.tsx';
 import { ResearchPage } from './research.tsx';
 import { PersonalAgentPage } from './personal-agent.tsx';
+import { MemorySettingsPanel } from './memory.tsx';
 import { readPersonalDraft, savePersonalDraft, type PersonalReviewTarget } from './personal-state.ts';
 import { EvaluationModels } from './evaluation-models.tsx';
 import { EvaluationPage } from './evaluation.tsx';
@@ -220,6 +221,7 @@ export function App() {
   const [messageState, setMessageState] = useState<MessageViewState | null>(null);
   const [messageCursor, setMessageCursor] = useState<string | null>(null);
   const [inputReadError, setInputReadError] = useState<string | null>(null);
+  const [savedInputs, setSavedInputs] = useState<readonly SessionInputSnapshot[]>([]);
   const [inputSubmitting, setInputSubmitting] = useState(false);
   const [unknownInput, setUnknownInput] = useState<{ sessionId: number; clientSequence: number } | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -1635,7 +1637,9 @@ export function App() {
     const result = await window.flowmate.listSessionInputs({ sessionId, limit: 50 }).catch(() => null);
     if (inputReadTokens.current.get(sessionId) !== request || epoch !== workspaceHostEpoch.current || selection !== sessionLoadSequence.current || selectedSessionIdRef.current !== sessionId) return;
     if (!result?.ok) { setInputReadError('Saved inputs are unavailable.'); return; }
+    if (result.data.items.some(input => input.sessionId !== sessionId)) { setInputReadError('Saved inputs do not match this chat.'); return; }
     setInputReadError(null);
+    setSavedInputs(result.data.items.filter(input => input.status !== 'consumed'));
     const resolved = result.data.items.filter(input => input.status !== 'queued');
     const resolvedIds = new Set(resolved.map(input => input.inputId));
     const resolvedSequences = new Set(resolved.map(input => input.clientSequence));
@@ -1735,6 +1739,17 @@ export function App() {
         knownRunSessions.current.set(item.runId, sessionId);
         if (item.status === 'completed' || item.status === 'failed' || item.status === 'cancelled') closedRuns.add(item.runId);
       }
+      const tracked = activeChatSessionId.current === sessionId
+        ? runsResult.data.items.find(item => item.runId === activeAgentRunIdRef.current) : undefined;
+      if (tracked && (tracked.status === 'completed' || tracked.status === 'failed' || tracked.status === 'cancelled')
+        && tracked.stoppedAt !== null && tracked.cleanup.stopped && !tracked.cleanup.lateObservationRequired) {
+        const turnId = activeChatTurnId.current;
+        activeAgentRunIdRef.current = null; activeChatSessionId.current = null; activeChatTurnId.current = null;
+        setActiveAgentRunId(null); setActiveAgentSessionId(null); setActiveRunModel(null);
+        agentStopRequested.current = false; setCancelPending(false); setBusy(false);
+        if (turnId) setChatTurns(turns => turns.filter(turn => turn.id !== turnId));
+        setRun(tracked); setRunId(tracked.runId);
+      }
       const merged = mergeSavedHistory({ ...base, closedRuns }, messagesResult.data, historyQuery);
       publishMessages(merged.state);
       setSelectedSession(sessionResult.data);
@@ -1764,7 +1779,8 @@ export function App() {
       }
     } finally {
       coordinator.inFlight = false;
-      const followUp = coordinator.refreshPending && !failed && selectedSessionIdRef.current === sessionId;
+      const stale = selection !== sessionLoadSequence.current || epoch !== workspaceHostEpoch.current;
+      const followUp = coordinator.refreshPending && (!failed || stale) && hostReadyRef.current && selectedSessionIdRef.current === sessionId;
       const pendingBefore = coordinator.beforeEntryId;
       coordinator.refreshPending = false;
       delete coordinator.beforeEntryId;
@@ -1800,6 +1816,7 @@ export function App() {
     setMessageState(sessionId === null ? null : messageStates.current.get(sessionId) ?? null);
     setMessageCursor(sessionId === null ? null : messageCursors.current.get(sessionId) ?? null);
     setInputReadError(null);
+    setSavedInputs([]);
     setUnknownInput(sessionId !== null && unknownInputs.current.has(sessionId)
       ? { sessionId, clientSequence: unknownInputs.current.get(sessionId)!.clientSequence } : null);
     if (sessionId === null) setHistoryLoading(false);
@@ -3320,6 +3337,7 @@ export function App() {
               <button className="text-button" onClick={() => setSettingsTab('LLM')}>Manage models</button></div><dl className="settings-facts">
                 {savedModels.map(model => <div key={model.id}><dt>{model.name}</dt><dd>{state?.modelCredentials[model.id] === 'configured' ? 'API key saved' : 'API key needed'}</dd></div>)}</dl>
               {!savedModels.length && <p className="connection-empty">No model connections configured.</p>}</section>
+              <MemorySettingsPanel hostEpoch={workspaceHostEpoch.current} ready={Boolean(state?.ready)} sessionId={selectedSessionId ?? workspace?.sessionId ?? null} />
               {state && <ExtensionsPage summary hostEpoch={workspaceHostEpoch.current} ready={state.ready} settings={state.settings}
                 selectedSessionId={selectedSessionId ?? workspace?.sessionId ?? null} refreshToken={contextRefresh}
                 onSaved={async () => { const next = await window.flowmate.getState(); if (next.ok) receiveDesktopState(next.data); }} />}
@@ -3360,6 +3378,7 @@ export function App() {
         onSend={() => void sendAssistantMessage()}
         onAppend={mode => void appendChatInput(mode)}
         canAppend={canAppend}
+        savedInputs={savedInputs}
         inputReadError={inputReadError}
         unknownInput={unknownInput !== null}
         onCheckInputStatus={() => void checkInputStatus()}
@@ -3745,6 +3764,7 @@ function AgentChatPanel({
   onSend,
   onAppend,
   canAppend,
+  savedInputs,
   inputReadError,
   unknownInput,
   onCheckInputStatus,
@@ -3796,6 +3816,7 @@ function AgentChatPanel({
   onSend(): void;
   onAppend(mode: 'steer' | 'followUp'): void;
   canAppend: boolean;
+  savedInputs: readonly SessionInputSnapshot[];
   inputReadError: string | null;
   unknownInput: boolean;
   onCheckInputStatus(): void;
@@ -3925,6 +3946,9 @@ function AgentChatPanel({
         {item.limits && <p className="chat-save-feedback">{item.limits}</p>}
       </div>)}
     </div>
+    {savedInputs.length > 0 && <section className="chat-save-feedback" aria-label="Saved inputs"><strong>Saved inputs</strong>
+      {savedInputs.map(saved => <div key={saved.inputId}><span>{saved.mode} · {saved.status}</span><p>{saved.content.text}</p></div>)}
+    </section>}
     {inputReadError && <p className="chat-save-feedback" role="alert">{inputReadError}</p>}
     {unknownInput && <div className="chat-save-feedback" role="status">The original input receipt is unknown. Your draft is preserved.
       <button className="text-button" type="button" onClick={onCheckInputStatus}>Check input status</button></div>}

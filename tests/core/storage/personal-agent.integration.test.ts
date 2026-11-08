@@ -101,6 +101,95 @@ async function phaseFixture() {
   return { ...f, received, request, phaseQuery: query };
 }
 
+test('a waiting invoice phase permits another invoice but retains the original active and item boundaries', async () => {
+  const f = await phaseFixture();
+  const contexts = new InvoiceWorkPhaseContextService({ database: f.database, now: () => later, buildContext: buildInvoiceWorkContext });
+  const firstRequest = { ...f.request, basis: { ...f.request.basis, executionMode: 'item-lane-approval-v1' as const } };
+  try {
+    const first = need(await contexts.freeze(firstRequest));
+    const work = await f.work(f.receipt.workId), other = work.items.find(item => item.itemId !== f.item.itemId)!;
+    expect(work.work.execution).toMatchObject({ itemLanes: true });
+    expect(other.execution).toBeUndefined();
+    const second = { workId: firstRequest.workId, attemptId: firstRequest.attemptId, itemId: other.itemId, requestId: 'other-invoice',
+      kind: 'prompt' as const, at: later, basis: { contextSnapshotId: null, configurationRevision: 0, itemRevision: other.revision,
+        documentRefs: [other.documentRef], inputIds: [], executionMode: 'item-lane-approval-v1' as const } };
+    expect(await f.command(repository => repository.freezePhase(second))).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    await f.command((_repository, scope) => scope.db.query("UPDATE invoice_work_phases SET scheduler_state='waiting_approval' WHERE id=?")
+      .run(first.context.phase.phaseId));
+    const next = need(await f.command(repository => repository.freezePhase(second)));
+    expect(await f.query((_repository, scope) => scope.db.query('SELECT scheduler_state FROM invoice_work_phases WHERE id=?').get(next.phaseId)))
+      .toEqual({ scheduler_state: 'active' });
+    expect(await f.command(repository => repository.freezePhase({ ...second, itemId: f.item.itemId, requestId: 'duplicate-invoice',
+      basis: { ...firstRequest.basis, inputIds: [] } }))).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    await f.command((_repository, scope) => {
+      scope.db.query("UPDATE invoice_work_phases SET scheduler_state='ready' WHERE id=?").run(first.context.phase.phaseId);
+      scope.db.query('UPDATE invoice_work_phases SET closed_at=? WHERE id=?').run(later, next.phaseId);
+    });
+    expect(await f.command(repository => repository.freezePhase({ ...second, requestId: 'do-not-overtake-ready' })))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  } finally { await f.database.close(); }
+});
+
+test('item phase links preserve the product Session and cannot borrow another invoice conversation', async () => {
+  const f = await phaseFixture();
+  const contexts = new InvoiceWorkPhaseContextService({ database: f.database, now: () => later, buildContext: buildInvoiceWorkContext });
+  const request = { ...f.request, basis: { ...f.request.basis, executionMode: 'item-lane-approval-v1' as const } };
+  try {
+    const first = need(await contexts.freeze(request)), work = await f.work(f.receipt.workId);
+    const link = { workId: request.workId, attemptId: request.attemptId, phaseId: first.context.phase.phaseId,
+      nativeConversationId: 101, nativeSubmissionId: 1001, at: later };
+    const original = need(await f.command(repository => repository.linkPhase(link)));
+    expect(need(await f.command(repository => repository.linkPhase(link)))).toEqual(original);
+    expect(need(await f.query((_repository, scope) => scope.sessions.get(work.work.sessionId))).durableConversationId).toBeNull();
+    expect(await f.command(repository => repository.linkPhase({ ...link, nativeConversationId: 102 })))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    await f.command((_repository, scope) => scope.db.query("UPDATE invoice_work_phases SET scheduler_state='waiting_approval' WHERE id=?").run(link.phaseId));
+    const other = work.items.find(item => item.itemId !== f.item.itemId)!;
+    const next = need(await f.command(repository => repository.freezePhase({ workId: request.workId, attemptId: request.attemptId,
+      itemId: other.itemId, requestId: 'other-item-link', kind: 'prompt', at: later,
+      basis: { contextSnapshotId: null, inputIds: [], documentRefs: [other.documentRef], configurationRevision: 0,
+        itemRevision: other.revision, executionMode: 'item-lane-approval-v1' } })));
+    expect(await f.command(repository => repository.linkPhase({ ...link, phaseId: next.phaseId, nativeSubmissionId: 1002 })))
+      .toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+    expect(need(await f.command(repository => repository.linkPhase({ ...link, phaseId: next.phaseId,
+      nativeConversationId: 102, nativeSubmissionId: 1002 })))).toMatchObject({ nativeConversationId: 102, nativeSubmissionId: 1002 });
+  } finally { await f.database.close(); }
+});
+
+test('a real item conversation reconciles its original phase without binding the legacy root', async () => {
+  const f = await phaseFixture(), durable = await import('@flowmate/runtime-durable');
+  const contexts = new InvoiceWorkPhaseContextService({ database: f.database, now: () => new Date().toISOString(), buildContext: buildInvoiceWorkContext });
+  const request = { ...f.request, basis: { ...f.request.basis, executionMode: 'item-lane-approval-v1' as const } };
+  const query = { ...f.phaseQuery, itemId: f.item.itemId }, first = need(await contexts.freeze(request));
+  let requests = 0;
+  const server = Bun.serve({ port: 0, fetch: () => {
+    requests++;
+    const chunk = { id: 'item-phase', object: 'chat.completion.chunk', created: 1, model: 'invoice-test',
+      choices: [{ index: 0, delta: { role: 'assistant', content: 'Original invoice result.' }, finish_reason: 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const runtime = need(await durable.createDurableRuntime({ storage: await durable.createDurableSqliteStorage(f.database.coordinator),
+    readApiKey: () => 'synthetic-key', verifyModelUse: () => ({ ok: true, data: undefined }),
+    reserveModelRequest: () => ({ ok: true, data: undefined }), readWorkingContext: input => contexts.get(input),
+    verifyWorkingContext: input => contexts.verify(input) }));
+  const config = { version: 1 as const, name: 'item-phase', revision: 1,
+    modelRef: { provider: 'controlled', model: 'invoice-test' }, native: { authPath: 'unused-auth.json', modelsPath: null },
+    connection: { api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, contextWindow: 64000, maxTokens: 8192 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
+  const observer = new InvoiceWorkPhaseObserver({ database: f.database, runtime, now: () => new Date().toISOString() });
+  try {
+    const opened = need(await runtime.openConversation({ workId: query.workId, sessionId: query.sessionId, itemId: query.itemId }));
+    const submitted = need(await runtime.submit({ ...query, text: 'Process this invoice.', config }));
+    expect(need(await runtime.waitForSubmission(query))).toMatchObject({ status: 'done', answer: 'Original invoice result.' });
+    const observed = need(await observer.reconcile(query));
+    expect(observed).toMatchObject({ phaseId: first.context.phase.phaseId, itemId: query.itemId,
+      nativeConversationId: opened.nativeConversationId, nativeSubmissionId: submitted.nativeSubmissionId });
+    expect(need(await f.query((_repository, scope) => scope.sessions.get(query.sessionId))).durableConversationId).toBeNull();
+    expect(await contexts.get({ ...query, itemId: query.itemId + 1 })).toMatchObject({ ok: false });
+    expect(requests).toBe(1);
+  } finally { need(await runtime.close()); server.stop(true); await f.database.close(); }
+}, 15_000);
+
 test('phase and frozen working context commit together and replays retain the original whole-work progress', async () => {
   const f = await phaseFixture(); let builds = 0;
   const service = new InvoiceWorkPhaseContextService({ database: f.database, now: () => later,

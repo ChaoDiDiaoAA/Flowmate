@@ -11,6 +11,8 @@ import type { InvoiceWorkContextSnapshot, InvoiceWorkPhaseContextService, Invoic
 import type { InvoiceWorkPhase, InvoiceWorkTodoDefinition } from './repository.ts';
 import type { PersonalTasksService } from './tasks.ts';
 import { invoiceCandidateTodos } from './invoice-todos.ts';
+import { createInvoiceWorkApprovalWait } from './approval-wait.ts';
+import { invoiceWorkPhaseItemProgress } from './tool-scope.ts';
 
 export type InvoiceWorkCoordinatorOptions = {
   database: Pick<DbHandle, 'read' | 'transaction' | 'recoveryError'>;
@@ -29,13 +31,14 @@ export type InvoiceWorkCoordinatorOptions = {
 };
 type WorkRow = { id: number; session_id: number; current_attempt_id: number | null; status: string;
   configuration_json: string; budget_json: string; agent_revision: number; goal: string; created_at: string };
-type State = { row: WorkRow; task: PersonalTaskView; phases: Array<InvoiceWorkPhase & { closedAt: string | null }> };
+type State = { row: WorkRow; task: PersonalTaskView; phases: Array<InvoiceWorkPhase & { closedAt: string | null; schedulerState: string }> };
 class CoordinationFault extends Error { constructor(readonly fact: AppError) { super(fact.code); } }
 function need<T>(value: Result<T>): T { if (!value.ok) throw new CoordinationFault(value.error); return value.data; }
 const active = (status: string | null) => status === 'created' || status === 'running';
 const identity = (state: State): DurableAttemptIdentity => ({ workId: state.row.id, sessionId: state.row.session_id,
   attemptId: state.task.attempt.attemptId });
-const query = (state: State, phase: InvoiceWorkPhase): DurableSubmissionQuery => ({ ...identity(state), requestId: phase.requestId });
+const query = (state: State, phase: InvoiceWorkPhase): DurableSubmissionQuery => ({ ...identity(state),
+  ...(phase.basis.executionMode === 'item-lane-approval-v1' && phase.itemId !== null ? { itemId: phase.itemId } : {}), requestId: phase.requestId });
 
 /** Reconcile persisted business commands at native boundaries; native Harness remains the execution scheduler. */
 export class InvoiceWorkCoordinator {
@@ -45,6 +48,7 @@ export class InvoiceWorkCoordinator {
   private running: Promise<Result<void>> | null = null;
   private readonly ownedDeadlines = new Map<number, ReturnType<typeof setTimeout>>();
   private readonly timedOut = new Set<number>();
+  private readonly recoveryPending = new Set<number>();
   private readonly cloudActive = new Map<number, Promise<void>>();
   private readonly cloudPaused = new Map<number, number>();
   private readonly cloudRecovery = new Set<number>();
@@ -180,9 +184,10 @@ export class InvoiceWorkCoordinator {
       const row = scope.db.query<WorkRow, [number]>('SELECT * FROM invoice_works WHERE id=?').get(workId);
       if (!row) throw new CoordinationFault(appError('invoice_work_not_found', 'input', 'The original invoice Work does not exist.'));
       const task = need(scope.invoiceWorkAttempts.get({ workId, attemptId })).task;
-      const phases = scope.db.query<{ request_id: string; closed_at: string | null }, [number, number]>(
-        'SELECT request_id,closed_at FROM invoice_work_phases WHERE work_id=? AND attempt_id=? ORDER BY id').all(workId, attemptId)
-        .map(value => ({ ...need(scope.invoiceWorks.getPhase({ workId, attemptId, requestId: value.request_id }))!, closedAt: value.closed_at }));
+      const phases = scope.db.query<{ request_id: string; closed_at: string | null; scheduler_state: string }, [number, number]>(
+        'SELECT request_id,closed_at,scheduler_state FROM invoice_work_phases WHERE work_id=? AND attempt_id=? ORDER BY id').all(workId, attemptId)
+        .map(value => ({ ...need(scope.invoiceWorks.getPhase({ workId, attemptId, requestId: value.request_id }))!,
+          closedAt: value.closed_at, schedulerState: value.scheduler_state }));
       return { row, task, phases };
     });
   }
@@ -199,6 +204,7 @@ export class InvoiceWorkCoordinator {
       for (const phase of state.phases.filter(phase => phase.closedAt === null)) need(await this.options.phaseObserver.reconcile(query(state, phase)));
       await this.finish(state, null); return;
     }
+    let completedPhaseId: number | undefined;
     while (!this.closed) {
       state = await this.state(workId, attemptId);
       if (state.task.stopRequestedAt !== null || state.row.status === 'cancelled') {
@@ -213,22 +219,49 @@ export class InvoiceWorkCoordinator {
         if (remaining.timeoutMs === 0) {
           await this.finish(state, appError('agent_timeout', 'runtime', 'The original invoice Work time budget ended before recovery.')); return;
         }
+        const submitted = state.phases.filter(phase => phase.closedAt === null && phase.nativeSubmissionId !== null);
+        for (const phase of submitted) need(await this.options.modelService.restore(query(state, phase)));
+        if (submitted.some(phase => phase.basis.executionMode === 'item-lane-approval-v1')) this.recoveryPending.add(attemptId);
       }
-      const existing = state.phases.find(phase => phase.closedAt === null);
+      let existing = state.phases.find(phase => phase.closedAt === null && ['legacy', 'active'].includes(phase.schedulerState));
+      if (!existing) {
+        const ready = state.phases.find(phase => phase.closedAt === null && phase.schedulerState === 'ready');
+        if (ready) {
+          if (!await this.activateApproval(state, ready)) return;
+          state = await this.state(workId, attemptId);
+          existing = state.phases.find(phase => phase.phaseId === ready.phaseId);
+          if (this.recoveryPending.has(attemptId)) {
+            need(await this.options.runtime.resumeAttempt(identity(state))); this.recoveryPending.delete(attemptId);
+          }
+        }
+      }
       let phase: InvoiceWorkPhase | undefined = existing;
       if (!phase) {
-        const last = state.phases.at(-1);
-        if (last) {
-          const original = need(await this.options.runtime.getSubmission(query(state, last)));
-          if (original?.status === 'done') await this.recordWaiting(state, last);
+        const latest = state.phases.filter((candidate, index) => candidate.itemId === null ? index === state.phases.length - 1
+          : !state.phases.slice(index + 1).some(other => other.itemId === candidate.itemId));
+        for (const prior of latest) {
+          const original = need(await this.options.runtime.getSubmission(query(state, prior)));
+          if (original && prior.closedAt === null && (original.status === 'done' || original.status === 'unanswered')) {
+            const observed = need(await this.options.runtime.observeSubmission(query(state, prior)));
+            if (!observed || observed.execution !== 'closed') continue;
+            need(await this.options.phaseObserver.reconcile(query(state, prior)));
+          }
+          if (original?.status === 'done') await this.recordWaiting(state, prior);
           else if (original?.status === 'unanswered') {
-            if (await this.cancelledQueueInput(state, last, original)) await this.recordWaiting(state, last, true);
+            if (await this.cancelledQueueInput(state, prior, original)) await this.recordWaiting(state, prior, true);
             else { await this.finish(state, appError('durable_phase_unanswered', 'runtime', original.reason ?? 'The original invoice phase failed.')); return; }
           }
         }
+        state = await this.state(workId, attemptId);
         const assessed = need(await this.options.governor.assess(workId));
         if (assessed.kind !== 'ready') {
-          if (state.task.attempt.runId !== null && assessed.kind === 'waiting') await this.finish(state, null);
+          if (assessed.kind === 'waiting' && state.phases.some(phase => phase.closedAt === null && phase.schedulerState === 'waiting_approval')) {
+            if (this.recoveryPending.has(attemptId)) {
+              need(await this.options.runtime.resumeAttempt(identity(state))); this.recoveryPending.delete(attemptId);
+            }
+            await this.armDeadline(state); return;
+          }
+          if (state.task.attempt.runId !== null && assessed.kind === 'waiting') await this.finish(state, null, completedPhaseId);
           else if (state.task.attempt.runId !== null && assessed.kind === 'blocked') await this.finish(state, assessed.reason);
           return;
         }
@@ -278,7 +311,7 @@ export class InvoiceWorkCoordinator {
         const remainingBudget = need(await this.options.governor.remainingBudget(workId));
         const freezeRequest = { workId, attemptId, itemId: prepared.itemId,
           requestId: `invoice-item:${prepared.itemId}:revision:${prepared.basis.itemRevision}`, kind: 'prompt' as const,
-          basis: prepared.basis, remainingBudget };
+          basis: { ...prepared.basis, executionMode: 'item-lane-approval-v1' as const }, remainingBudget };
         let frozen: InvoiceWorkContextSnapshot | null;
         try {
           frozen = await this.options.database.transaction(scope => {
@@ -297,6 +330,7 @@ export class InvoiceWorkCoordinator {
       const completed = await this.executePhase(state, phase, recovering);
       recovering = false;
       if (!completed || this.closed) return;
+      completedPhaseId = phase.phaseId;
     }
   }
 
@@ -327,7 +361,8 @@ export class InvoiceWorkCoordinator {
 
   private async executePhase(state: State, phase: InvoiceWorkPhase, recovering: boolean): Promise<boolean> {
     const original = query(state, phase);
-    need(await this.options.verifyResources(PersonalAgentConfigurationSchema.parse(JSON.parse(state.row.configuration_json)), state.row.agent_revision));
+    const configuration = PersonalAgentConfigurationSchema.parse(JSON.parse(state.row.configuration_json));
+    need(await this.options.verifyResources(configuration, state.row.agent_revision));
     if (this.closed) return false;
     let submission = need(await this.options.runtime.getSubmission(original));
     if (this.closed) return false;
@@ -339,23 +374,40 @@ export class InvoiceWorkCoordinator {
     if (submission) {
       need(await this.options.modelService.restore(original));
       need(await this.options.phaseObserver.reconcile(original));
-      if (recovering && (submission.status === 'queued' || submission.status === 'placed')) {
+      if ((recovering || this.recoveryPending.has(state.task.attempt.attemptId)) && (submission.status === 'queued' || submission.status === 'placed')) {
         need(await this.options.governor.verifyModelUse(identity(state)));
         need(await this.options.runtime.resumeAttempt(identity(state)));
+        this.recoveryPending.delete(state.task.attempt.attemptId);
       }
     } else {
       if (phase.nativeSubmissionId !== null) throw new CoordinationFault(appError('storage_corrupt', 'storage', 'The original native phase receipt is unavailable.'));
       const binding = need(await this.options.modelService.prepare(original));
       if (this.closed) return false;
-      need(await this.options.runtime.openConversation({ workId: state.row.id, sessionId: state.row.session_id }));
+      if (phase.basis.executionMode === 'item-lane-approval-v1') {
+        const session = need(await this.options.database.read(scope => scope.sessions.get(state.row.session_id)));
+        if (session.runtimeKind !== 'durable') throw new CoordinationFault(appError('source_invalid', 'runtime', 'The original Session is not Durable.'));
+        if (session.durableConversationId === null) {
+          const root = need(await this.options.runtime.openConversation({ workId: state.row.id, sessionId: state.row.session_id }));
+          need(await this.options.database.transaction(scope => scope.sessions.bindDurableConversation(state.row.session_id, root.nativeConversationId, this.options.now())));
+        }
+      }
+      need(await this.options.runtime.openConversation({ workId: state.row.id, sessionId: state.row.session_id,
+        ...(phase.basis.executionMode === 'item-lane-approval-v1' && phase.itemId !== null ? { itemId: phase.itemId } : {}) }));
       submission = need(await this.options.runtime.submit({ ...original, config: binding.configuration, binding,
         thinkingLevel: PersonalAgentConfigurationSchema.parse(JSON.parse(state.row.configuration_json)).thinkingLevel,
         text: `Process the committed invoice phase ${phase.phaseId}; read its saved working context.` }));
       if (this.closed) return false;
       need(await this.options.phaseObserver.reconcile(original));
+      if (this.recoveryPending.has(state.task.attempt.attemptId)) {
+        need(await this.options.runtime.resumeAttempt(identity(state))); this.recoveryPending.delete(state.task.attempt.attemptId);
+      }
     }
     let failure: AppError | null = null;
     if (submission.status === 'queued' || submission.status === 'placed') {
+      if (phase.basis.executionMode === 'item-lane-approval-v1'
+        && (configuration.tools.includes('browser_request_read') || configuration.tools.includes('desktop_propose_action'))) {
+        await this.armDeadline(state); return false;
+      }
       const remaining = need(await this.options.governor.remainingBudget(state.row.id));
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -406,6 +458,31 @@ export class InvoiceWorkCoordinator {
     this.ownedDeadlines.delete(attemptId);
   }
 
+  private async armDeadline(state: State): Promise<void> {
+    const attemptId = state.task.attempt.attemptId;
+    if (this.ownedDeadlines.has(attemptId)) return;
+    const remaining = need(await this.options.governor.remainingBudget(state.row.id));
+    this.ownedDeadlines.set(attemptId, setTimeout(() => {
+      this.ownedDeadlines.delete(attemptId); this.timedOut.add(attemptId); this.wake();
+    }, remaining.timeoutMs));
+  }
+
+  private async activateApproval(state: State, phase: InvoiceWorkPhase): Promise<boolean> {
+    const sources = await this.options.database.read(scope => scope.db.query<{ native_tool_call_id: string; proposal_id: number; kind: 'browser' | 'desktop' }, [number, number]>(`
+      SELECT t.native_tool_call_id,a.id proposal_id,'browser' kind FROM invoice_work_tool_calls b JOIN tool_calls t ON t.id=b.tool_call_id
+        JOIN invoice_work_browser_reads a ON a.proposal_tool_call_id=t.id WHERE b.phase_id=? AND b.feedback_native_entry_id IS NULL AND a.status IN ('approved','rejected')
+      UNION ALL SELECT t.native_tool_call_id,a.id,'desktop' FROM invoice_work_tool_calls b JOIN tool_calls t ON t.id=b.tool_call_id
+        JOIN invoice_work_desktop_actions a ON a.proposal_tool_call_id=t.id WHERE b.phase_id=? AND b.feedback_native_entry_id IS NULL AND a.status IN ('approved','rejected')`).all(phase.phaseId, phase.phaseId));
+    const source = sources.length === 1 ? sources[0] : undefined;
+    const task = source && /^durable-task:([1-9]\d*)$/.exec(source.native_tool_call_id);
+    if (!source || !task || !Number.isSafeInteger(Number(task[1])) || phase.itemId === null || phase.nativeConversationId === null)
+      throw new CoordinationFault(appError('state_conflict', 'runtime', 'The original approval identity is unavailable.'));
+    const approvals = createInvoiceWorkApprovalWait({ database: this.options.database, now: this.options.now });
+    const result = need(await approvals.activate({ ...identity(state), itemId: phase.itemId, phaseId: phase.phaseId, requestId: phase.requestId,
+      nativeConversationId: phase.nativeConversationId, nativeTaskId: Number(task[1]), proposalId: source.proposal_id, kind: source.kind }));
+    return result.activated;
+  }
+
   private async cancelledQueueInput(state: State, phase: InvoiceWorkPhase, submission: DurableSubmissionView): Promise<boolean> {
     if (this.options.runtimeScope !== 'cloud' || submission.reason !== 'cloud-queue-cancelled' || !this.options.queueCancelled) return false;
     return need(await this.options.queueCancelled({ ...query(state, phase), nativeSubmissionId: submission.nativeSubmissionId }));
@@ -423,7 +500,12 @@ export class InvoiceWorkCoordinator {
       const input = need(scope.invoiceWorks.selectPhaseInput({ workId: state.row.id, attemptId: state.task.attempt.attemptId, itemId: phase.itemId! }));
       if (input.basis.inputIds.some(inputId => !phase.basis.inputIds.includes(inputId))) return;
       const candidate = found.item.candidateRef;
-      if (candidate === null && found.item.revision !== phase.basis.itemRevision) return;
+      if (candidate === null && found.item.revision !== phase.basis.itemRevision) {
+        const saved = need(scope.invoiceWorkContexts.get({ workId: state.row.id, attemptId: state.task.attempt.attemptId, requestId: phase.requestId }));
+        if (phase.basis.executionMode !== 'item-lane-approval-v1' || !saved
+          || !invoiceWorkPhaseItemProgress(scope.db, saved.context, { revision: found.item.revision, latestInputId: found.item.latestInputId,
+            candidateId: null, jobId: found.item.jobId }).current) return;
+      }
       const todos = scope.db.query<{ id: number; revision: number; definition_json: string }, [number, number]>(
         'SELECT id,revision,definition_json FROM invoice_work_todos WHERE work_id=? AND item_id=? AND superseded_at IS NULL ORDER BY id')
         .all(state.row.id, phase.itemId!);
@@ -457,7 +539,7 @@ export class InvoiceWorkCoordinator {
     });
   }
 
-  private async finish(state: State, failure: AppError | null): Promise<void> {
+  private async finish(state: State, failure: AppError | null, completedPhaseId?: number): Promise<void> {
     if (this.closed || state.task.attempt.runId === null) return;
     const latest = await this.state(state.row.id, state.task.attempt.attemptId);
     if (latest.task.stopRequestedAt !== null || latest.row.status === 'cancelled') {
@@ -487,7 +569,10 @@ export class InvoiceWorkCoordinator {
     }
     if (this.closed) return;
     need(await this.options.tasks.reconcileChildren(identity(latest)));
-    const last = latest.phases.at(-1), result = last ? need(await this.options.runtime.getSubmission(query(latest, last))) : null;
+    const lastClosed = latest.phases.filter(phase => phase.closedAt !== null)
+      .sort((left, right) => Date.parse(left.closedAt!) - Date.parse(right.closedAt!) || left.phaseId - right.phaseId).at(-1);
+    const last = (!failure ? latest.phases.find(phase => phase.phaseId === completedPhaseId) ?? lastClosed : undefined) ?? latest.phases.at(-1);
+    const result = last ? need(await this.options.runtime.getSubmission(query(latest, last))) : null;
     const oversized = this.options.runtimeScope === 'cloud' && result?.answer !== null && result?.answer !== undefined
       && new TextEncoder().encode(result.answer).byteLength > RUNTIME_CONFIG.llmPayload.maxOutputTextBytes;
     if (oversized && !failure) failure = appError('cloud_result_too_large', 'runtime', 'The original answer exceeds the delivery limit and remains in native history.');

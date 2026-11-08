@@ -48,6 +48,38 @@ async function foregroundFixture(mode = '', enabled = true, response?: (count: n
   } };
 }
 
+it('the Windows service uses its own encrypted memory credential across desktop reconnection', async () => {
+  const f = await fixture(), key = 'synthetic-service-memory-key', operationId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    ref = 'memory_' + operationId.replaceAll('-', '');
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: request => request.headers.get('x-api-key') === key
+    ? Response.json({ status: 'ok', version: '0.4.23', auth_mode: 'api_key', role: 'user', account_id: 'account', user_id: 'alice' })
+    : new Response('unauthorized', { status: 401 }) });
+  const first = await ownerClient(f.installation);
+  let second: Awaited<ReturnType<typeof ownerClient>> | undefined;
+  try {
+    const input = { installationId: f.installation.installationId, operationId, expectedRevision: 0, endpoint: `http://127.0.0.1:${server.port}`,
+      accountId: 'account', userId: 'alice', peerId: 'flowmate.alice.agent', apiKey: key, recallEnabled: true, captureMode: 'explicit' };
+    expect(await first.call({ type: 'service_memory_configure', input })).toMatchObject({ ok: true, data: {
+      operationId, phase: 'committed', settings: { settings: { revision: 1, provider: 'openviking' } } } });
+    expect(await first.call({ type: 'memory_configure', input: { ...input, apiKey: undefined, installationId: undefined, operationId: undefined,
+      credentialRef: ref, expectedRevision: 1 } })).toMatchObject({ ok: false, error: { code: 'service_command_forbidden' } });
+    expect(readFileSync(join(f.installation.dataRoot, 'security/service-memory-credentials', ref + '.json'), 'utf8')).not.toContain(key);
+    first.socket.destroy(); need(await f.process.close()); await f.process.child.exited;
+    f.process = await spawnOwnerFixture(f.installation);
+    second = await ownerClient(f.installation);
+    expect(await second.call({ type: 'service_memory_query', input: { installationId: f.installation.installationId, operationId } }))
+      .toMatchObject({ ok: true, data: { operationId, phase: 'committed' } });
+    expect(await second.call({ type: 'memory_get_settings', input: {} })).toMatchObject({ ok: true,
+      data: { settings: { revision: 1, provider: 'openviking' }, identity: { userId: 'alice' } } });
+    expect(await second.call({ type: 'service_memory_configure', input })).toMatchObject({ ok: true, data: { operationId, phase: 'committed' } });
+    expect(f.process.child.exitCode).toBeNull();
+    expect(f.process.stderr()).not.toContain(key);
+  } finally {
+    first.socket.destroy(); second?.socket.destroy(); await f.process.close(); await f.process.child.exited;
+    server.stop(true); removeOwnerFixture(f.installation.dataRoot);
+  }
+}, 90000);
+
 it('binds the interactive desktop to one live service client and releases it on disconnect', async () => {
   const f = await foregroundFixture('', false), other = await ownerClient(f.installation);
   try {

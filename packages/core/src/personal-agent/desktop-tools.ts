@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { appError, DesktopActionExecuteSchema, DesktopActionProposalSchema, DesktopActionTargetSchema, ToolExecutionFailure,
-  type DesktopActionExecute, type DesktopActionProposal, type DesktopActionTarget, type ProductToolContext, type Result, type ToolDefinition } from '@flowmate/contracts';
+  type DesktopActionExecute, type DesktopActionProposal, type DesktopActionTarget, type DesktopActionView, type ProductToolContext, type Result, type ToolDefinition } from '@flowmate/contracts';
 import type { DbHandle } from '../storage/database.ts';
 import { verifyInvoiceWorkToolScope } from './tool-scope.ts';
 
@@ -82,6 +82,7 @@ export function createDesktopExecutionTool(options: {
   now: () => string;
   resolveTarget: (input: DesktopActionProposal, context: ProductToolContext, signal: AbortSignal) => Promise<Result<DesktopActionTarget>>;
   dispatch: (input: DesktopActionProposal, target: DesktopActionTarget, context: ProductToolContext, signal: AbortSignal, proposalId: number) => Promise<Result<void>>;
+  approvedAction?: (context: ProductToolContext, proposal: DesktopActionView) => { action: DesktopActionProposal; target: DesktopActionTarget } | undefined;
 }): ToolDefinition<DesktopActionExecute, z.infer<typeof executionOutput>> {
   return {
     name: 'desktop_execute_approved', version: '1', label: 'Execute approved desktop action',
@@ -97,7 +98,8 @@ export function createDesktopExecutionTool(options: {
       });
       if (!original.ok) throw new ToolExecutionFailure(original.error);
       if (original.data.status !== 'approved') throw new ToolExecutionFailure(appError('tool_access_denied', 'runtime', 'The original action is not approved.'));
-      const target = await options.resolveTarget(original.data.action, context, call.signal);
+      const approved = options.approvedAction?.(context, original.data) ?? { action: original.data.action, target: original.data.target };
+      const target = await options.resolveTarget(approved.action, context, call.signal);
       if (!target.ok) {
         if (target.error.code === 'desktop_target_changed') {
           const invalidated = await options.database.transaction(scope => scope.invoiceWorkDesktopActions.invalidate({ ...query, at: options.now() }));
@@ -105,7 +107,7 @@ export function createDesktopExecutionTool(options: {
         }
         throw new ToolExecutionFailure(target.error);
       }
-      if (!isDeepStrictEqual(target.data, original.data.target)) {
+      if (!isDeepStrictEqual(target.data, approved.target)) {
         const invalidated = await options.database.transaction(scope => scope.invoiceWorkDesktopActions.invalidate({ ...query, at: options.now() }));
         if (!invalidated.ok) throw new ToolExecutionFailure(invalidated.error);
         throw new ToolExecutionFailure(appError('desktop_target_changed', 'runtime', 'The approved desktop target changed; observe and confirm it again.'));
@@ -119,18 +121,20 @@ export function createDesktopExecutionTool(options: {
         return scope.invoiceWorkDesktopActions.claim({ ...query, executionToolCallId: toolCall.data.toolCallId, at: options.now() });
       });
       if (!claimed.ok) throw new ToolExecutionFailure(claimed.error);
-      let dispatched = false;
+      let result: Result<void> | undefined;
       try {
         if (!call.signal.aborted) {
           // The desktop owner must revalidate and serialize immediately before input.
-          const result = await options.dispatch(claimed.data.action, claimed.data.target, context, call.signal, input.proposalId);
-          dispatched = result.ok;
+          result = await options.dispatch(approved.action, approved.target, context, call.signal, input.proposalId);
         }
       } catch { /* Input may already have happened. */ }
+      const dispatched = result?.ok === true;
       const settled = await options.database.transaction(scope => scope.invoiceWorkDesktopActions.finish({ ...query,
         executionToolCallId: claimed.data.executionToolCallId!, outcome: dispatched ? 'dispatched' : 'unknown', at: options.now() }));
       if (!settled.ok || !dispatched) throw new ToolExecutionFailure(appError('desktop_action_unconfirmed', 'runtime',
-        'The desktop input may have happened. Inspect the original window before proposing another action.'));
+        result?.ok === false && result.error.code === 'desktop_protected_content'
+          ? 'Inspect the original window. Ask the user to handle the protected field manually in the original application.'
+          : 'The desktop input may have happened. Inspect the original window before proposing another action.'));
       return { proposalId: input.proposalId, outcome: 'dispatched' };
     },
   };

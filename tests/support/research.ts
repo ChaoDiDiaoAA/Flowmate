@@ -18,7 +18,7 @@ type Request = { tools?: Array<{ function: { name: string } }>; messages: Array<
 type ToolReply = { tool: string; args: unknown; id: string; note?: string };
 type Reply = { text: string } | ToolReply | { tools: ToolReply[] };
 export async function researchFixture(respond: (request: Request, index: number) => Reply | Promise<Reply>,
-  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults' | 'toolDefinitions' | 'researchPreferences'> & { material?: string; parsedDocument?: string } = {}) {
+  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults' | 'toolDefinitions' | 'researchPreferences' | 'memory'> & { material?: string; parsedDocument?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-research-fixture-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), artifactsDir: join(root, 'artifacts'),
     runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') };
@@ -55,7 +55,7 @@ export async function researchFixture(respond: (request: Request, index: number)
   } });
   deferCleanup(() => server.stop(true));
   const open = async () => {
-  const opened = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, researchPreferences: options.researchPreferences, logger: { write: () => undefined, close: async () => undefined },
+  const opened = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, researchPreferences: options.researchPreferences, memory: options.memory, logger: { write: () => undefined, close: async () => undefined },
     agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }) }));
   deferCleanup(() => opened.close());

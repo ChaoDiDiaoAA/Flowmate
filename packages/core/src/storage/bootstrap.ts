@@ -7,6 +7,7 @@ import { Database } from 'bun:sqlite';
 import { createDatabaseCoordinator, type SynchronousDatabaseExecutor } from './write-coordinator.ts';
 import type { DbHandle, SqlDatabaseStore } from './database.ts';
 import { createMemoryStore } from '../memory/persistence.ts';
+import { createMemoryIntegrationRepository } from '../openviking/repository.ts';
 import { appError, fail, ok, type ProductPaths, type Result } from '@flowmate/contracts';
 import { validateProductPaths } from '@flowmate/shared';
 import { createSessionInputLedger } from '../sessions/input-ledger.ts';
@@ -30,7 +31,7 @@ function createSqlStore(db: SynchronousDatabaseExecutor, listeners: Set<EventLis
   const runtimeEventStore = createRuntimeEventStore(db, listeners);
   const sessions = createSessionRepository(db, runtimeEventStore);
   return {
-    db, runtimeEventStore, sessions, memory: createMemoryStore(db, runtimeEventStore),
+    db, runtimeEventStore, sessions, memory: createMemoryStore(db, runtimeEventStore), memoryIntegration: createMemoryIntegrationRepository(db),
     runs: createRunRepository(db, runtimeEventStore), sessionInputs: createSessionInputLedger(db, runtimeEventStore),
     documents: createDocumentRepository(db), contents: createManagedFileContents(db), workspace: createWorkspaceRepository(db),
     jobs: createJobRepository(db), toolCalls: createToolCallRepository(db, runtimeEventStore),
@@ -45,9 +46,9 @@ function createSqlStore(db: SynchronousDatabaseExecutor, listeners: Set<EventLis
   };
 }
 
-type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25;
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27;
 function migrationSql(version: SchemaVersion): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql', '024_desktop_actions.sql', '025_browser_reads.sql'][version - 1];
+  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql', '024_desktop_actions.sql', '025_browser_reads.sql', '026_personal_item_lanes.sql', '027_openviking_memory.sql'][version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
@@ -160,7 +161,7 @@ function runMigration(db: Database, version: SchemaVersion, paths?: ProductPaths
         || db.query('SELECT id FROM runs WHERE parent_run_id IS NOT NULL OR origin_tool_call_id IS NOT NULL OR plugin_agent_id IS NOT NULL').get())
         throw new Error('migration_preservation_failed');
       db.exec('COMMIT');
-    } else if (version === 15 || version === 16 || version === 18 || version === 19 || version === 20 || version === 24 || version === 25) {
+    } else if (version === 15 || version === 16 || version === 18 || version === 19 || version === 20 || version === 24 || version === 25 || version === 26 || version === 27) {
       // Trigger bodies contain semicolons: execute each explicit whole-statement boundary.
       for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
       if (version === 20 && paths) migrateLegacyMetadata(db, paths, backup);
@@ -229,16 +230,16 @@ function migrateToLatest(db: Database, paths: ProductPaths): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 25) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 27) {
     throw new Error('unsupported_schema_version');
   }
   const backup = migrationTable && versions.length < 20 ? backupLegacyStore(db, paths) : null;
-  for (let version = versions.length + 1; version <= 25; version += 1) {
+  for (let version = versions.length + 1; version <= 27; version += 1) {
     if (version === 23 && migrationTable) backupBeforeRuntimeScopes(db, paths);
     runMigration(db, version as SchemaVersion, paths, backup);
   }
   const completed = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
-  if (completed.length !== 25 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
+  if (completed.length !== 27 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
 }
 
 export function bootstrapDatabase(paths: ProductPaths): Result<DatabaseBootstrap> {
@@ -261,6 +262,11 @@ export function bootstrapDatabase(paths: ProductPaths): Result<DatabaseBootstrap
       const at = new Date().toISOString();
       db!.query("UPDATE invoice_work_desktop_actions SET status='unknown',updated_at=? WHERE status='claimed'").run(at);
       db!.query("UPDATE invoice_work_browser_reads SET status='unknown',updated_at=? WHERE status='claimed'").run(at);
+      db!.query("UPDATE memory_recalls SET status='unavailable',entries_json='[]' WHERE status='pending'").run();
+      db!.query("UPDATE memory_bindings SET remote_state='unknown' WHERE remote_state='creating'").run();
+      db!.query("UPDATE memory_sync SET state='unknown',updated_at=? WHERE state='sending'").run(at);
+      db!.query("UPDATE memory_remember_requests SET state='unknown',updated_at=? WHERE state='sending'").run(at);
+      db!.query("UPDATE memory_forget_requests SET state='unknown',updated_at=? WHERE state='sending'").run(at);
     }).immediate();
     const listeners = new Set<EventListener>();
     const stores = createSqlStore(db, listeners);

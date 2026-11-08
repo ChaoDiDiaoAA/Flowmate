@@ -157,10 +157,11 @@ export type InvoiceWorkAction = z.infer<typeof InvoiceWorkActionSchema>;
 export const InvoiceWorkExecutionViewSchema = z.object({
   attempt: InvoiceWorkAttemptReferenceSchema.nullable(), runStatus: RunStatusSchema.nullable(),
   queued: z.boolean(), requiresContinue: z.boolean(), stopUnconfirmed: z.boolean(),
+  itemLanes: z.literal(true).optional(),
   waitingReason: z.string().max(2048).nullable(),
   // Only currently occupied child capacity is listed here; historical results have their own read page.
   ownedChildRunIds: z.array(id).max(4).refine(uniqueIds, 'Owned children must be unique.').readonly(),
-}).strict().refine(value => value.attempt !== null || value.runStatus === null && !value.queued
+}).strict().refine(value => value.attempt !== null || value.runStatus === null && !value.queued && !value.itemLanes
   && !value.stopUnconfirmed && value.ownedChildRunIds.length === 0, 'Execution references require the original product attempt.').readonly();
 export type InvoiceWorkExecutionView = z.infer<typeof InvoiceWorkExecutionViewSchema>;
 export const InvoiceWorkViewSchema = bounded(z.object({
@@ -183,6 +184,7 @@ export const InvoiceWorkItemViewSchema = bounded(z.object({
   workId: id, itemId: id, revision, documentRef: DocumentRefSchema, jobId: id.nullable(), candidateRef,
   disposition: InvoiceWorkItemDispositionSchema, decision: InvoiceWorkDispositionDecisionSchema.nullable(),
   disposedAt: time.nullable(), todoCount: revision, latestInputId: id.nullable(), updatedAt: time,
+  execution: z.object({ state: z.enum(['active', 'waiting_approval', 'ready', 'closed']) }).strict().optional(),
 }).strict().superRefine((value, context) => {
   if (value.disposition === 'unresolved' ? value.decision !== null || value.disposedAt !== null
     : value.decision?.kind !== value.disposition || value.disposedAt === null)
@@ -293,10 +295,12 @@ export interface InvoiceWorksApi extends InvoiceWorkTimelineApi {
   queryOperation(input: InvoiceWorkQueryOperationRequest): Promise<Result<InvoiceWorkOperationReceipt | null>>;
   listDesktopActions(input: import('./desktop-actions.ts').DesktopActionListRequest): Promise<Result<import('./desktop-actions.ts').DesktopActionListResult>>;
   decideDesktopAction(input: import('./desktop-actions.ts').DesktopActionDecisionRequest): Promise<Result<import('./desktop-actions.ts').DesktopActionDecisionReceipt>>;
+  rebindDesktopAction(input: import('./desktop-actions.ts').DesktopActionRebind): Promise<Result<import('./desktop-actions.ts').DesktopActionView>>;
   discardDesktopAction(input: import('./desktop-actions.ts').DesktopActionDiscard): Promise<Result<import('./desktop-actions.ts').DesktopActionView>>;
   queryDesktopDecision(input: import('./desktop-actions.ts').DesktopActionDecisionQuery): Promise<Result<import('./desktop-actions.ts').DesktopActionDecisionReceipt | null>>;
   listBrowserReads(input: import('./browser-actions.ts').BrowserReadListRequest): Promise<Result<import('./browser-actions.ts').BrowserReadListResult>>;
   decideBrowserRead(input: import('./browser-actions.ts').BrowserReadDecisionRequest): Promise<Result<import('./browser-actions.ts').BrowserReadDecisionReceipt>>;
+  rebindBrowserRead(input: import('./browser-actions.ts').BrowserReadRebind): Promise<Result<import('./browser-actions.ts').BrowserReadView>>;
   revokeBrowserRead(input: import('./browser-actions.ts').BrowserReadRevoke): Promise<Result<import('./browser-actions.ts').BrowserReadView>>;
   queryBrowserDecision(input: import('./browser-actions.ts').BrowserReadDecisionQuery): Promise<Result<import('./browser-actions.ts').BrowserReadDecisionReceipt | null>>;
 }

@@ -18,6 +18,10 @@ Personal Agent is a separate workspace for continuing work on a fixed group of i
 
 Every invoice needs an explicit final disposition. Work completes only after the required business writes and execution have settled; a generated candidate or finished child is not itself an accepted invoice. The [workflow guide](workflows.md#personal-agent) summarizes the operations alongside the other invoice paths.
 
+## Desktop window access
+
+For KimiCU desktop tools, selecting a window authorizes reading its accessibility text for that invoice. The text may enter Work history and reach the selected model provider. Flowmate blocks observation and automated input when KimiCU reports recognizable credential labels. Handle those fields manually in the original application. Clicks and text entry each require approval.
+
 ## Controlled page reading
 
 On Windows, local or cloud Work can read a Chrome tab selected by the user. Install the official Kimi WebBridge and enable the [Kimi Browser Extension](https://www.kimi.com/en/help/kimi-webbridge/kimi-webbridge-introduction). Entering the cloud workspace attempts to start WebBridge and reuses a healthy running service. Startup failures are shown without blocking the cloud connection. Local Work still requires WebBridge to be started manually if the cloud workspace has not been opened.
@@ -34,7 +38,11 @@ Enable **Browser page reading** in **Assistant configuration**, save it, and cre
 
 When the model requests a read, the interface shows the Work, invoice, dedicated tab and origin. **Approve one read and continue** allows one read; the request can also be rejected or revoked. Approval covers paths in that tab with the same scheme, host and port, including other paths on that origin. The browser can still navigate on its own, but page text from a different origin is refused. A disconnect, rebinding, cancellation or uncertain outcome requires a new confirmation. Revocation cannot recall data already read, saved or sent.
 
-The result contains the URL, title and up to 22,000 UTF-8 bytes of text, with a truncation marker. It may be retained in local or cloud Work history and sent to the selected model provider. Page text remains untrusted tool output and cannot grant authority or become a system instruction; compaction summaries are also marked as model-generated. Page content can still mislead the model or affect its answer, and later tools retain their own permission and confirmation rules.
+New phases retain the original tool Task while it waits for a decision. Other eligible invoices in the Work can proceed in sequence; the decided phase resumes after the active phase ends or begins waiting. Waiting still consumes the Work's original wall-clock budget, and expiry requires fresh authorization.
+
+If the connection changes after approval but before dispatch, select the same window or same-origin tab and use **Confirm selected window for original approval** or **Confirm current tab for original approval**. The original proposal, current connection and target are checked, and the original decision is reused. Confirmation alone does not execute; choose **Resume original approved action** or **Resume original approved read** afterwards. If an operation was dispatched but its outcome is unknown, inspect the application or page; it is not automatically repeated. Older phases and approvals retain their original flow.
+
+The result contains the page origin and path, the title and up to 22,000 UTF-8 bytes of text, with a truncation marker. The path, title and text may still contain sensitive information. The result may be retained in local or cloud Work history and sent to the selected model provider. Page text remains untrusted tool output and cannot grant authority or become a system instruction; compaction summaries are also marked as model-generated. Page content can still mislead the model or affect its answer, and later tools retain their own permission and confirmation rules.
 
 ## Work, attempts and evidence
 
@@ -60,6 +68,8 @@ flowchart LR
 
 The **Invoices**, **Tasks**, **History** and **Timeline** tabs expose different saved facts. Tasks can show the attempt and owned child evidence; History reads native entries; Timeline shows business events and references. Browsing these views or checking a saved receipt does not start a model call or trigger recovery. A child report, a valid source reference and confirmed parent receipt do not by themselves prove the report's meaning or approve a candidate.
 
+New phases keep a separate native conversation for each invoice. Select an invoice and use **View invoice history** to inspect its history; the older root history remains available. Cloud input queues and result receipts are checked against the invoice owner, and reconnecting or reading results does not resubmit the original input.
+
 ## Continue, stop and recover
 
 - **Continue work** checks the original inputs, authorization, current state and remaining budget. Depending on those facts it may continue or return an existing attempt, authorize a linked new attempt, queue it, or report a blocker. It cannot revive completed or cancelled work.
@@ -79,6 +89,8 @@ This path does not require enabling the AgentSession **subagents** extension. Th
 ## Process and recovery boundary
 
 In local mode, the Bun Host owns the product Application. When service mode is explicitly activated, a separate ServiceOwner owns it and the desktop connects through ServiceClient; an unavailable selected service does not silently start a second local Host. Service preparation alone is not activation.
+
+Continuing cloud Work depends on the existing cloud services running. Local Work can continue after the desktop closes only while the Windows background service is running. Local Work cannot execute while the computer sleeps or is off; desktop actions and page reads also require the Windows device and its connection. AgentSession still stops its foreground run when the owning desktop connection drops. Reconnection reads the original session, saved inputs and run state without resending input.
 
 The repository implements persisted work and eligible recovery, but real Windows SCM installation/startup, boot recovery and continued execution after closing the desktop require separate system acceptance. A package, an isolated service test or a saved Work does not establish those outcomes. Data location, backup and account-dependent credential recovery are described in [Packaging and recovery](packaging-and-recovery.md).
 

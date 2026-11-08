@@ -1,11 +1,164 @@
 import { expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createRegistry, defineTask, defineTool, MemoryStorage } from '@earendil-works/pi-durable';
 import { Type } from '@earendil-works/pi-ai';
 import { appError, fail, ok, type DurableAttemptIdentity, type ProviderConfig, type Result } from '@flowmate/contracts';
+import { createDatabaseCoordinator } from '@flowmate/core';
 import * as durable from '@flowmate/runtime-durable';
 
 function need<T>(value: Result<T>): T { if (!value.ok) throw Error(value.error.code); return value.data; }
+
+test('a Work retains a distinct original Durable conversation for each invoice', async () => {
+  let authorizations = 0;
+  const runtime = need(await durable.createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => undefined,
+    verifyModelUse: () => { authorizations++; return ok(undefined); }, reserveModelRequest: () => ok(undefined) }));
+  const owner = { workId: 7, sessionId: 70 }, first = { ...owner, itemId: 101 }, second = { ...owner, itemId: 102 };
+  try {
+    const opened = await Promise.all([runtime.openConversation(owner), runtime.openConversation(first),
+      runtime.openConversation(second), runtime.openConversation(first)]);
+    const root = need(opened[0]!), a = need(opened[1]!), b = need(opened[2]!);
+    expect(a).toEqual(need(opened[3]!));
+    expect(new Set([root.nativeConversationId, a.nativeConversationId, b.nativeConversationId]).size).toBe(3);
+    expect(need(await runtime.openConversation(owner))).toEqual(root);
+    expect(await runtime.openConversation({ workId: 8, sessionId: 70, itemId: 101 })).toMatchObject({ ok: false });
+    expect(await runtime.openConversation({ ...owner, itemId: 0 })).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(authorizations).toBe(0);
+  } finally { await runtime.close(); }
+});
+
+test('invoice conversations keep their original submissions and history separate within one Work', async () => {
+  const requests: string[] = [];
+  const server = Bun.serve({ port: 0, fetch: async request => {
+    const body = await request.text(); requests.push(body);
+    const answer = body.includes('invoice one') ? 'first answer' : 'second answer';
+    const chunk = { id: 'item', object: 'chat.completion.chunk', created: 1, model: 'selected-model',
+      choices: [{ index: 0, delta: { role: 'assistant', content: answer }, finish_reason: 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const config: ProviderConfig = { version: 1, name: 'item-conversations', revision: 1,
+    modelRef: { provider: 'controlled', model: 'selected-model' }, native: { authPath: 'unused-auth.json', modelsPath: null },
+    connection: { api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, contextWindow: 64_000, maxTokens: 8_192 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
+  const runtime = need(await durable.createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined) }));
+  const owner = { workId: 7, sessionId: 70, attemptId: 700 }, first = { ...owner, itemId: 101, requestId: 'first' },
+    second = { ...owner, itemId: 102, requestId: 'second' };
+  try {
+    need(await runtime.openConversation({ workId: first.workId, sessionId: first.sessionId, itemId: first.itemId }));
+    need(await runtime.openConversation({ workId: second.workId, sessionId: second.sessionId, itemId: second.itemId }));
+    const a = need(await runtime.submit({ ...first, text: 'Review invoice one.', config }));
+    expect(need(await runtime.waitForSubmission(first))).toMatchObject({ ...first, status: 'done', answer: 'first answer' });
+    const b = need(await runtime.submit({ ...second, text: 'Review invoice two.', config }));
+    expect(need(await runtime.waitForSubmission(second))).toMatchObject({ ...second, status: 'done', answer: 'second answer' });
+    expect(a.nativeConversationId).not.toBe(b.nativeConversationId);
+    expect(need(await runtime.getSubmission(first))?.nativeSubmissionId).toBe(a.nativeSubmissionId);
+    expect(need(await runtime.getSubmission({ ...first, itemId: second.itemId }))).toBeNull();
+    const firstHistory = need(await runtime.queryHistory({ workId: first.workId, sessionId: first.sessionId, itemId: first.itemId, limit: 100 }));
+    const secondHistory = need(await runtime.queryHistory({ workId: second.workId, sessionId: second.sessionId, itemId: second.itemId, limit: 100 }));
+    expect(firstHistory.entries.some(entry => entry.json.includes('invoice one'))).toBe(true);
+    expect(firstHistory.entries.some(entry => entry.json.includes('invoice two'))).toBe(false);
+    expect(secondHistory.entries.some(entry => entry.json.includes('invoice two'))).toBe(true);
+    const firstPage = need(await runtime.queryHistoryPage({ workId: first.workId, sessionId: first.sessionId, itemId: first.itemId, limit: 100 }));
+    const secondPage = need(await runtime.queryHistoryPage({ workId: second.workId, sessionId: second.sessionId, itemId: second.itemId, limit: 100 }));
+    expect(firstPage.owner).toMatchObject({ workId: first.workId, sessionId: first.sessionId, itemId: first.itemId, childRunId: null });
+    expect(secondPage.owner.itemId).toBe(second.itemId);
+    expect(firstPage.entries.some(entry => entry.preview.text.includes('invoice one'))).toBe(true);
+    expect(firstPage.entries.some(entry => entry.preview.text.includes('invoice two'))).toBe(false);
+    expect(secondPage.entries.some(entry => entry.preview.text.includes('invoice two'))).toBe(true);
+    expect(await runtime.queryHistoryEntry({ workId: second.workId, sessionId: second.sessionId, itemId: second.itemId,
+      entryId: firstPage.entries[0]!.entryId, throughEntryId: secondPage.throughEntryId })).toMatchObject({ ok: false });
+    expect(requests).toHaveLength(2);
+  } finally { await runtime.close(); server.stop(true); }
+});
+
+test('stopping an attempt stops each of its original invoice conversations', async () => {
+  const entered = Promise.withResolvers<void>(); let running = 0;
+  const registry = createRegistry();
+  registry.install({ name: 'controlled-item-wait', tools: [defineTool({ name: 'wait_for_invoice',
+    description: 'Wait for cancellation.', parameters: Type.Object({}), replay: 'safe', execute: async (_args, _api, context) => {
+      if (++running === 2) entered.resolve();
+      const signal = context.abortSignal;
+      if (!signal) throw Error('Missing cancellation signal');
+      await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }); });
+      return { output: [{ type: 'text', text: 'stopped' }] };
+    } })] });
+  const server = Bun.serve({ port: 0, fetch: () => {
+    const chunk = { id: 'item-stop', object: 'chat.completion.chunk', created: 1, model: 'selected-model',
+      choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'wait', type: 'function',
+        function: { name: 'wait_for_invoice', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const config: ProviderConfig = { version: 1, name: 'item-stop', revision: 1,
+    modelRef: { provider: 'controlled', model: 'selected-model' }, native: { authPath: 'unused-auth.json', modelsPath: null },
+    connection: { api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, contextWindow: 64_000, maxTokens: 8_192 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
+  const runtime = need(await durable.createDurableRuntime({ storage: new MemoryStorage(), registry, readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined) }));
+  const owner = { workId: 7, sessionId: 70, attemptId: 700 }, first = { ...owner, itemId: 101, requestId: 'first' },
+    second = { ...owner, itemId: 102, requestId: 'second' };
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: first.itemId }));
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: second.itemId }));
+    need(await runtime.submit({ ...first, text: 'First invoice.', config }));
+    need(await runtime.submit({ ...second, text: 'Second invoice.', config }));
+    await entered.promise;
+    expect(need(await runtime.stopAttempt({ ...owner, stopGraceMs: 1000 }))).toMatchObject({ stopped: true, reason: 'stopped' });
+    expect(need(await runtime.getSubmission(first))).toMatchObject({ status: 'unanswered' });
+    expect(need(await runtime.getSubmission(second))).toMatchObject({ status: 'unanswered' });
+  } finally { await runtime.close(); server.stop(true); }
+}, 10_000);
+
+test('a restarted Work resumes its original waiting invoice task after another invoice completes', async () => {
+  const coordinator = createDatabaseCoordinator(new Database(':memory:'));
+  const entered = Promise.withResolvers<void>(), tasks: number[] = [];
+  let ready = false, requests = 0;
+  const registry = createRegistry();
+  registry.install({ name: 'controlled-restart-wait', tools: [defineTool({ name: 'wait_for_approval',
+    description: 'Wait for a controlled decision.', parameters: Type.Object({}), replay: 'safe', execute: async (_args, api, context) => {
+      tasks.push(api.taskId); entered.resolve();
+      if (!ready) await new Promise<void>((_resolve, reject) => {
+        const signal = context.abortSignal;
+        if (!signal || signal.aborted) reject(Error('stopped'));
+        else signal.addEventListener('abort', () => reject(Error('stopped')), { once: true });
+      });
+      return { output: [{ type: 'text', text: 'approved' }] };
+    } })] });
+  const server = Bun.serve({ port: 0, fetch: async request => {
+    requests++; const body = await request.text();
+    const tool = body.includes('invoice one') && !body.includes('approved');
+    const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: 'original-approval', type: 'function',
+      function: { name: 'wait_for_approval', arguments: '{}' } }] }
+      : { role: 'assistant', content: body.includes('invoice one') ? 'first completed' : 'second completed' };
+    const chunk = { id: 'item-restart', object: 'chat.completion.chunk', created: 1, model: 'selected-model',
+      choices: [{ index: 0, delta, finish_reason: tool ? 'tool_calls' : 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const config: ProviderConfig = { version: 1, name: 'item-restart', revision: 1,
+    modelRef: { provider: 'controlled', model: 'selected-model' }, native: { authPath: 'unused-auth.json', modelsPath: null },
+    connection: { api: 'openai-completions', baseUrl: `http://127.0.0.1:${server.port}/v1`, contextWindow: 64_000, maxTokens: 8_192 },
+    parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } };
+  const options = { registry, readApiKey: () => 'synthetic-key', verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined) };
+  const owner = { workId: 7, sessionId: 70, attemptId: 700 }, first = { ...owner, itemId: 101, requestId: 'first' },
+    second = { ...owner, itemId: 102, requestId: 'second' };
+  let runtime = need(await durable.createDurableRuntime({ ...options, storage: await durable.createDurableSqliteStorage(coordinator) }));
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: first.itemId }));
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: second.itemId }));
+    const binding = need(await runtime.prepareModel({ ...first, config }));
+    const original = need(await runtime.submit({ ...first, text: 'Review invoice one.', config, binding }));
+    await entered.promise;
+    need(await runtime.submit({ ...second, text: 'Review invoice two.', config }));
+    expect(need(await runtime.waitForSubmission(second))).toMatchObject({ status: 'done', answer: 'second completed' });
+    need(await runtime.close());
+    runtime = need(await durable.createDurableRuntime({ ...options, storage: await durable.createDurableSqliteStorage(coordinator) }));
+    need(await runtime.restoreModel({ ...first, binding })); ready = true;
+    need(await runtime.resumeAttempt(owner));
+    expect(need(await runtime.waitForSubmission(first))).toMatchObject({ nativeSubmissionId: original.nativeSubmissionId,
+      nativeConversationId: original.nativeConversationId, status: 'done', answer: 'first completed' });
+    expect(tasks).toHaveLength(2); expect(tasks[1]).toBe(tasks[0]); expect(requests).toBe(3);
+  } finally { await runtime.close(); await coordinator.close(); server.stop(true); }
+}, 15_000);
 
 test('Durable runtime isolates product conversations and model configurations in one Harness without replaying receipt queries', async () => {
   expect(durable.createDurableRuntime).toBeFunction();

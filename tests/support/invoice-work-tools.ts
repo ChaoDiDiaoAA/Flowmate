@@ -20,7 +20,7 @@ const sdk = { durable: installedVersion('@earendil-works/pi-durable'), ai: insta
   chord: installedVersion('@earendil-works/chord') };
 
 export async function invoiceWorkToolsFixture(options: { at?: string; provider?: ProviderConfig; configuration?: PersonalAgentConfiguration;
-  maxToolFeedbackBytes?: number; durableRuntimeId?: string } = {}) {
+  maxToolFeedbackBytes?: number; durableRuntimeId?: string; itemLane?: boolean; timeoutMs?: number } = {}) {
   const at = options.at ?? '2026-10-29T00:00:00.000Z';
   const root = mkdtempSync(join(tmpdir(), 'flowmate-invoice-work-tools-'));
   const paths = { root, databaseFile: join(root, 'data/app.sqlite'), artifactsDir: join(root, 'artifacts'),
@@ -59,6 +59,8 @@ export async function invoiceWorkToolsFixture(options: { at?: string; provider?:
   if (options.maxToolFeedbackBytes !== undefined) await database.transaction(scope => scope.db.query(
     "UPDATE invoice_works SET budget_json=json_set(budget_json,'$.runtimeBudget.maxToolFeedbackBytes',?) WHERE id=?")
     .run(options.maxToolFeedbackBytes!, created.workId));
+  if (options.timeoutMs !== undefined) await database.transaction(scope => scope.db.query(
+    "UPDATE invoice_works SET budget_json=json_set(budget_json,'$.limits.timeoutMs',?) WHERE id=?").run(options.timeoutMs!, created.workId));
   const attemptId = created.execution.attempt.attemptId;
   const admitted = await database.transaction(scope => {
     const view = need(scope.invoiceWorks.get({ view: 'work', workId: created.workId }));
@@ -83,7 +85,7 @@ export async function invoiceWorkToolsFixture(options: { at?: string; provider?:
     if (current.view !== 'item') throw Error('Expected the owned item.');
     const phase = need(scope.invoiceWorks.freezePhase({ workId: created.workId, attemptId, itemId, requestId: 'invoice-phase-1', kind: 'prompt',
       basis: { contextSnapshotId: null, inputIds: [], documentRefs: [current.item.documentRef], configurationRevision: 0,
-        itemRevision: current.item.revision }, at }));
+        itemRevision: current.item.revision, ...(options.itemLane ? { executionMode: 'item-lane-approval-v1' as const } : {}) }, at }));
     const context = need(buildInvoiceWorkContext(need(scope.invoiceWorks.readContextInput({ workId: created.workId, attemptId,
       requestId: phase.requestId, remainingBudget: { modelCalls: 12, toolCalls: 24,
         toolFeedbackBytes: Math.min(65536, budget.runtimeBudget.maxToolFeedbackBytes), timeoutMs: 30000, childSlots: 1 } }))));

@@ -5,7 +5,7 @@ const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const requestId = z.string().min(1).max(128);
 const text = z.string().min(1).refine(value => new TextEncoder().encode(value).byteLength <= 262_144);
 const instruction = z.string().min(1).max(22_000).refine(value => new TextEncoder().encode(value).byteLength <= 22_000);
-export const CloudQueueOwnerSchema = z.object({ workId: id, sessionId: id, attemptId: id }).strict();
+export const CloudQueueOwnerSchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id }).strict();
 export const CloudQueueActionSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('cancel'), submissionId: id }).strict(),
   z.object({ kind: z.literal('edit'), submissionId: id, content: instruction }).strict(),
@@ -42,6 +42,7 @@ export type CloudQueueView = z.infer<typeof CloudQueueViewSchema>;
 export type CloudQueueReceipt = z.infer<typeof CloudQueueReceiptSchema>;
 export function matchesCloudQueueReceipt(input: CloudQueueControl, receipt: CloudQueueReceipt): boolean {
   return receipt.workId === input.workId && receipt.sessionId === input.sessionId && receipt.attemptId === input.attemptId
+    && receipt.itemId === input.itemId
     && receipt.controlRequestId === input.controlRequestId
     && (receipt.status !== 'applied' || receipt.version === input.expectedVersion + 1)
     && (input.action.kind === 'enqueue' && receipt.status === 'applied' ? receipt.submissionId !== undefined : receipt.submissionId === undefined);

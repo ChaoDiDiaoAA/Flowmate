@@ -9,7 +9,7 @@ const workspacePackages = ['@flowmate/contracts', '@flowmate/core', '@flowmate/r
 export default defineConfig({
   main: {
     envDir: false,
-    plugins: [externalizeDepsPlugin({ exclude: [...workspacePackages, '@earendil-works/pi-mcp', 'proper-lockfile'] })],
+    plugins: [externalizeDepsPlugin({ exclude: [...workspacePackages, '@earendil-works/pi-mcp', '@openviking/sdk', 'proper-lockfile'] })],
     build: { rollupOptions: { input: { index: resolve(root, 'apps/desktop/main/entry.ts') },
       output: { entryFileNames: 'index.js', chunkFileNames: 'chunks/[name].js', assetFileNames: '[name][extname]' } } },
   },

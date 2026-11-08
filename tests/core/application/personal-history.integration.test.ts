@@ -6,8 +6,8 @@ import { invoiceWorkToolsFixture } from '../../support/invoice-work-tools.ts';
 
 const at = '2026-10-29T00:00:00.000Z';
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(result.error.code); return result.data; }
-async function fixture() {
-  const f = await invoiceWorkToolsFixture({ configuration: PersonalAgentConfigurationSchema.parse({ modelId: null, thinkingLevel: 'off',
+async function fixture(itemLane = false) {
+  const f = await invoiceWorkToolsFixture({ itemLane, configuration: PersonalAgentConfigurationSchema.parse({ modelId: null, thinkingLevel: 'off',
     tools: ['Agent', 'read_invoice_document'], resources: { prompt: null, enabledSkills: [] }, extensions: { enabledExtensions: [] },
     workingDirectory: null, preferences: '' }) });
   const args = { prompt: 'Check the original invoice total.', description: 'Check total', subagent_type: 'invoice-evidence-checker', run_in_background: false as const };
@@ -28,7 +28,8 @@ async function fixture() {
   const calls: Array<DurablePublicHistoryQuery | DurablePublicHistoryEntryQuery> = [];
   let foreign = false;
   const owner = (input: DurablePublicHistoryQuery) => ({ runtimeKind: 'durable' as const,
-    workId: input.workId, sessionId: input.child?.childSessionId ?? input.sessionId, childRunId: input.child?.childRunId ?? null });
+    workId: input.workId, sessionId: input.child?.childSessionId ?? input.sessionId, childRunId: input.child?.childRunId ?? null,
+    ...(input.itemId === undefined ? {} : { itemId: input.itemId }) });
   const service = createPersonalHistoryService({ database: f.database, runtime: {
     queryHistoryPage: async input => { calls.push(input); return ok({ owner: { ...owner(input), workId: foreign ? 999 : input.workId },
       throughEntryId: 0, entries: [], nextBeforeEntryId: null } satisfies PersonalHistoryPage); },
@@ -54,6 +55,29 @@ test('product history resolves original root and child owners without execution,
         originToolCallId: f.child.originToolCallId, nativeToolTaskId: 91 } });
     expect(await f.database.read(store => store.db.query('SELECT COUNT(*) count FROM runs').get())).toEqual(before);
     expect(await f.service.historyEntry({ target: { ...target, childRunId: f.child.runId }, entryId: 1, throughEntryId: 1 })).toMatchObject({ ok: true });
+  } finally { await f.database.close(); }
+});
+
+test('product history resolves an invoice owner and rejects foreign or ambiguous targets', async () => {
+  const f = await fixture();
+  try {
+    const target = { workId: f.created.workId, itemId: f.itemId };
+    expect(need(await f.service.history({ target })).owner).toEqual({ ...target, sessionId: f.created.sessionId,
+      runtimeKind: 'durable', childRunId: null });
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]).toMatchObject({ ...target, sessionId: f.created.sessionId });
+    expect(await f.service.history({ target: { ...target, itemId: 999 } })).toMatchObject({ ok: false });
+    expect(await f.service.history({ target: { ...target, childRunId: f.child.runId } })).toMatchObject({ ok: false });
+    expect(f.calls).toHaveLength(1);
+  } finally { await f.database.close(); }
+});
+
+test('child history retains the parent invoice conversation identity without changing its public child owner', async () => {
+  const f = await fixture(true);
+  try {
+    const target = { workId: f.created.workId, childRunId: f.child.runId };
+    expect(need(await f.service.history({ target })).owner).toEqual({ ...target, sessionId: f.child.sessionId, runtimeKind: 'durable' });
+    expect(f.calls[0]).toMatchObject({ child: { childRunId: f.child.runId, itemId: f.itemId } });
   } finally { await f.database.close(); }
 });
 

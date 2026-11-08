@@ -70,8 +70,21 @@ async function verifyNativeOwner(storage: Storage, binding: CloudRuntimeBinding)
   } while (cursor);
   if (!conversations.length) return;
   const roots = conversations.filter(record => !record.owner);
-  if (roots.length !== 1) throw new RuntimeOwnerMismatch();
-  const root = roots[0]!, records = new Map(conversations.map(record => [record.id, record]));
+  if (!roots.length) throw new RuntimeOwnerMismatch();
+  const records = new Map(conversations.map(record => [record.id, record])), items: Array<number | null> = [];
+  for (const root of roots) {
+    const document = await storage.findDocument({ kind: 'flowmate.runtime.binding',
+      scope: { kind: 'conversation', conversationId: root.id } }, 'current', BACKGROUND_CONTEXT);
+    const saved = document && await storage.document(document.id, 'current', BACKGROUND_CONTEXT);
+    if (!saved || saved.value.workId !== binding.workId || saved.value.sessionId !== binding.sessionId) throw new RuntimeOwnerMismatch();
+    if (saved.version !== 1 && saved.version !== 2 || saved.version === 1 && saved.value.itemId !== undefined) throw new RuntimeOwnerMismatch();
+    const item = saved.version === 1 && saved.value.itemId === undefined ? null
+      : z.number().int().positive().safe().nullable().safeParse(saved.value.itemId);
+    if (item !== null && !item.success) throw new RuntimeOwnerMismatch();
+    const itemId = item === null ? null : item.data;
+    if (items.includes(itemId)) throw new RuntimeOwnerMismatch();
+    items.push(itemId);
+  }
   for (const record of conversations) {
     const visited = new Set<number>(); let current = record;
     while (current.owner) {
@@ -82,13 +95,8 @@ async function verifyNativeOwner(storage: Storage, binding: CloudRuntimeBinding)
       if (!task || !parent || task.conversationId !== parent.id) throw new RuntimeOwnerMismatch();
       current = parent;
     }
-    if (current.id !== root.id) throw new RuntimeOwnerMismatch();
+    if (!roots.some(root => root.id === current.id)) throw new RuntimeOwnerMismatch();
   }
-  const document = await storage.findDocument({ kind: 'flowmate.runtime.binding',
-    scope: { kind: 'conversation', conversationId: root.id } }, 'current', BACKGROUND_CONTEXT);
-  const saved = document && await storage.document(document.id, 'current', BACKGROUND_CONTEXT);
-  if (!saved || saved.version !== 1 || saved.value.workId !== binding.workId || saved.value.sessionId !== binding.sessionId)
-    throw new RuntimeOwnerMismatch();
 }
 
 /** Opens native Session stores in an existing private root; it does not open or resume a Harness. */
@@ -226,6 +234,12 @@ export async function openCloudRuntimeStore(root: string): Promise<Result<CloudR
       const sameEvent = (row: ResultRow, event: CloudNativeResult | CloudNativeOversizedResult) => isDeepStrictEqual(storedEvent(row), event);
       const validateNativeResult = async (event: CloudNativeResult | CloudNativeOversizedResult) => {
         const conversationId = event.nativeConversationId as ConversationId;
+        const bindingDocument = await nativeStorage.findDocument({ kind: 'flowmate.runtime.binding',
+          scope: { kind: 'conversation', conversationId } }, 'current', BACKGROUND_CONTEXT);
+        const nativeBinding = bindingDocument && await nativeStorage.document(bindingDocument.id, 'current', BACKGROUND_CONTEXT);
+        if (!nativeBinding || ![1, 2].includes(nativeBinding.version) || nativeBinding.value.workId !== event.workId
+          || nativeBinding.value.sessionId !== event.sessionId
+          || (nativeBinding.version === 1 ? undefined : nativeBinding.value.itemId ?? undefined) !== event.itemId) throw new RuntimeOwnerMismatch();
         const submission = await nativeStorage.submission(event.nativeSubmissionId as SubmissionId, BACKGROUND_CONTEXT);
         if (!submission || submission.type !== 'input' || submission.conversationId !== conversationId
           || submission.requestId !== JSON.stringify([event.attemptId, event.requestId]) || submission.status !== event.status
@@ -240,20 +254,31 @@ export async function openCloudRuntimeStore(root: string): Promise<Result<CloudR
           : !('reason' in event) || submission.reason !== event.reason)) throw new RuntimeOwnerMismatch();
         if (submission.entry !== undefined) {
           const original = (await nativeStorage.entry(submission.entry, BACKGROUND_CONTEXT))?.entry;
-          const data = original?.data as { workId?: number; sessionId?: number; attemptId?: number; requestId?: string } | undefined;
+          const data = original?.data as { workId?: number; sessionId?: number; itemId?: number; attemptId?: number; requestId?: string } | undefined;
           if (original?.kind !== 'flowmate.input' || original.conversationId !== conversationId || data?.workId !== event.workId
-            || data.sessionId !== event.sessionId || data.attemptId !== event.attemptId || data.requestId !== event.requestId) throw new RuntimeOwnerMismatch();
+            || data.sessionId !== event.sessionId || data.itemId !== event.itemId || data.attemptId !== event.attemptId
+            || data.requestId !== event.requestId) throw new RuntimeOwnerMismatch();
         }
         const document = await nativeStorage.findDocument({ kind: 'flowmate.runtime.consumption',
           scope: { kind: 'conversation', conversationId }, key: JSON.stringify([event.attemptId, event.requestId]) }, 'current', BACKGROUND_CONTEXT);
         const consumed = document && await nativeStorage.document(document.id, 'current', BACKGROUND_CONTEXT);
         if ((consumed?.value.consumedAt ?? null) !== event.consumedAt || consumed && (consumed.value.workId !== event.workId
-          || consumed.value.sessionId !== event.sessionId || consumed.value.attemptId !== event.attemptId || consumed.value.requestId !== event.requestId
+          || consumed.value.sessionId !== event.sessionId || consumed.value.itemId !== event.itemId
+          || consumed.value.attemptId !== event.attemptId || consumed.value.requestId !== event.requestId
           || consumed.value.nativeSubmissionId !== event.nativeSubmissionId || consumed.value.nativeEntryId !== event.nativeInputEntryId))
           throw new RuntimeOwnerMismatch();
         if (submission.status !== 'unanswered' || submission.entry !== undefined) {
-          for (const status of ['pending', 'running', 'waiting', 'sleeping', 'completing'] as const)
-            if ((await nativeStorage.scanTasks({ status }, 1, undefined, BACKGROUND_CONTEXT)).items.length) throw new Error('cloud_result_execution_active');
+          const conversations = [conversationId];
+          for (const current of conversations) {
+            for (const status of ['pending', 'running', 'waiting', 'sleeping', 'completing'] as const)
+              if ((await nativeStorage.scanTasks({ conversationId: current, status }, 1, undefined, BACKGROUND_CONTEXT)).items.length)
+                throw new Error('cloud_result_execution_active');
+            let cursor: Cursor | undefined;
+            do {
+              const children = await nativeStorage.scanConversations({ ownerConversationId: current }, 100, cursor, BACKGROUND_CONTEXT);
+              conversations.push(...children.items.map(child => child.id)); cursor = children.next;
+            } while (cursor);
+          }
         }
       };
       let closed: Promise<Result<void>> | undefined;
@@ -368,9 +393,10 @@ export async function openCloudRuntimeStore(root: string): Promise<Result<CloudR
               if (row.receipt_json !== null) {
                 const receipt = CloudNativeResultReceiptSchema.parse(JSON.parse(row.receipt_json));
                 if (receipt.cloudRuntimeId !== event.cloudRuntimeId || receipt.workId !== event.workId || receipt.sessionId !== event.sessionId
+                  || receipt.itemId !== event.itemId
                   || receipt.nativeConversationId !== event.nativeConversationId || receipt.nativeSubmissionId !== event.nativeSubmissionId) throw new RuntimeOwnerMismatch();
               }
-              return { requestId: event.requestId, nativeSubmissionId: event.nativeSubmissionId, state: row.state,
+              return { requestId: event.requestId, ...(event.itemId === undefined ? {} : { itemId: event.itemId }), nativeSubmissionId: event.nativeSubmissionId, state: row.state,
                 attempts: row.attempts, nextAt: row.next_at, nativeStatus: event.status,
                 ...(row.state === 'blocked' ? { blockedReason: 'answerBytes' in event || 'reasonLength' in event ? 'size_limit' as const : 'retry_limit' as const } : {}) };
             });
@@ -391,6 +417,7 @@ export async function openCloudRuntimeStore(root: string): Promise<Result<CloudR
           try {
             const event = validateEvent(raw), receipt = CloudNativeResultReceiptSchema.parse(rawReceipt);
             if (receipt.cloudRuntimeId !== event.cloudRuntimeId || receipt.workId !== event.workId || receipt.sessionId !== event.sessionId
+              || receipt.itemId !== event.itemId
               || receipt.nativeConversationId !== event.nativeConversationId || receipt.nativeSubmissionId !== event.nativeSubmissionId)
               return failure('cloud_result_conflict', 'The Authority receipt belongs to another native result.');
             return await owner.transaction(async sql => {
@@ -445,7 +472,7 @@ export async function openCloudRuntimeStore(root: string): Promise<Result<CloudR
             const row = await readResult(parsed.data.nativeSubmissionId);
             if (!row) return failure('cloud_result_conflict', 'The original native result is unavailable.');
             const saved = storedEvent(row), event = 'answerBytes' in saved || 'reasonLength' in saved ? validateOversized(saved) : validateEvent(saved);
-            if (event.attemptId !== parsed.data.attemptId || event.requestId !== parsed.data.requestId
+            if (event.attemptId !== parsed.data.attemptId || event.itemId !== parsed.data.itemId || event.requestId !== parsed.data.requestId
               || event.nativeSubmissionId !== parsed.data.nativeSubmissionId) return failure('cloud_result_conflict', 'The result retry belongs to another phase.');
             if ('answerBytes' in event || 'reasonLength' in event) return failure('cloud_result_too_large', 'The original result exceeds the delivery limit and remains in native history.');
             return session.retryResult(event);

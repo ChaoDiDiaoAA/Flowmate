@@ -26,7 +26,7 @@ export async function packageCloud(output: string): Promise<boolean> {
     const product = JSON.parse(readFileSync(join(repository, 'package.json'), 'utf8')) as { version?: unknown };
     if (typeof product.version !== 'string' || !product.version || Object.values(DURABLE_SDK_VERSIONS).some(value => value !== '1.4.0')) return false;
     mkdirSync(output);
-    const built = await Bun.build({ entrypoints: ['cloud-authority-main', 'cloud-runtime-main', 'cloud-desktop-bridge']
+    const built = await Bun.build({ entrypoints: ['cloud-authority-main', 'cloud-runtime-main', 'cloud-desktop-bridge', 'cloud-openviking-bridge']
       .map(name => join(repository, 'apps', `${name}.ts`)), outdir: output, target: 'bun' });
     if (!built.success) return false;
     copyTree(join(repository, 'packages/core/src/storage/migrations'), join(output, 'migrations'));

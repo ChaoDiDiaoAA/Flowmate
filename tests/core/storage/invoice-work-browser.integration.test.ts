@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { ok, type DurableRuntimePort, type Result } from '@flowmate/contracts';
 import { invoiceWorkToolsFixture } from '../../support/invoice-work-tools.ts';
-import { openTestDatabase } from '../../support/database.ts';
+import { openTestDatabase, removeMemorySchemaFromFixture } from '../../support/database.ts';
 import { DurableInvoiceGovernor } from '../../../packages/core/src/personal-agent/admission.ts';
 import { InvoiceWorkService } from '../../../packages/core/src/personal-agent/invoice-work.ts';
 import { readInvoiceWorkToolResult, resolveInvoiceWorkToolScope } from '../../../packages/core/src/personal-agent/tool-scope.ts';
@@ -34,11 +34,12 @@ test('upgrading a schema 24 database preserves Work and desktop action records',
   }));
   await f.database.close();
   const legacy = new Database(f.paths.databaseFile);
-  legacy.exec('DROP TABLE IF EXISTS invoice_work_browser_reads; DELETE FROM schema_migrations WHERE version=25;');
+  removeMemorySchemaFromFixture(legacy);
+  legacy.exec('DROP INDEX invoice_work_phase_one_active; DROP INDEX invoice_work_phase_one_item; ALTER TABLE invoice_work_phases DROP COLUMN scheduler_state; DELETE FROM schema_migrations WHERE version=26; DROP TABLE IF EXISTS invoice_work_browser_reads; DELETE FROM schema_migrations WHERE version=25;');
   legacy.close();
   const migrated = need(openTestDatabase(f.paths));
   try {
-    expect(migrated.db.query('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: 25 });
+    expect(migrated.db.query('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: 27 });
     expect(migrated.db.query('SELECT * FROM invoice_works').all()).toEqual(before.works);
     expect(migrated.db.query('SELECT * FROM invoice_work_items').all()).toEqual(before.items);
     expect(migrated.db.query('SELECT * FROM invoice_work_desktop_actions').all()).toEqual(before.actions);
@@ -46,6 +47,58 @@ test('upgrading a schema 24 database preserves Work and desktop action records',
       .toEqual({ name: 'invoice_work_browser_reads' });
     expect(migrated.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
   } finally { await migrated.close(); }
+});
+
+test.each(['success', 'registration failure'] as const)('item-lane migration preserves original Work and AgentSession history on %s', async mode => {
+  const at = '2026-11-06T00:00:00.000Z', f = await invoiceWorkToolsFixture();
+  const history = { storageVersion: 1 as const,
+    header: { type: 'session' as const, version: 3, id: 'item-lane-migration-session', timestamp: at, cwd: f.paths.runtimeDir },
+    entries: [{ type: 'message', id: 'item-lane-user', parentId: null, timestamp: at,
+      message: { role: 'user', content: 'Original AgentSession input.', timestamp: 1 } }],
+    leafId: 'item-lane-user', unusable: false };
+  const session = need(await f.database.transaction(scope => scope.sessions.create({ nativeSessionId: history.header.id,
+    title: 'Original AgentSession', at, nativeHistory: history })));
+  const phaseColumns = 'id,work_id,attempt_id,item_id,request_id,kind,basis_json,native_conversation_id,native_submission_id,created_at,consumed_at,closed_at,durable_runtime_id';
+  const before = await f.database.read(scope => ({ works: scope.db.query('SELECT * FROM invoice_works').all(),
+    items: scope.db.query('SELECT * FROM invoice_work_items').all(), phases: scope.db.query(`SELECT ${phaseColumns} FROM invoice_work_phases`).all(),
+    session: scope.db.query('SELECT * FROM sessions WHERE id=?').get(session.sessionId),
+    history: scope.db.query('SELECT * FROM session_native_history WHERE session_id=?').get(session.sessionId),
+    entries: scope.db.query('SELECT * FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(session.sessionId) }));
+  await f.database.close();
+  const legacy = new Database(f.paths.databaseFile);
+  removeMemorySchemaFromFixture(legacy);
+  if (legacy.query<{ name: string }, []>('PRAGMA table_info(invoice_work_phases)').all().some(column => column.name === 'scheduler_state')) {
+    legacy.exec('DROP INDEX IF EXISTS invoice_work_phase_one_active; DROP INDEX IF EXISTS invoice_work_phase_one_item; ALTER TABLE invoice_work_phases DROP COLUMN scheduler_state; DELETE FROM schema_migrations WHERE version=26;');
+  }
+  if (mode === 'registration failure') legacy.exec("CREATE TRIGGER reject_schema26 BEFORE INSERT ON schema_migrations WHEN NEW.version=26 BEGIN SELECT RAISE(ABORT,'controlled schema26 failure'); END");
+  legacy.close();
+  const opened = openTestDatabase(f.paths);
+  if (mode === 'registration failure') {
+    if (opened.ok) await opened.data.close();
+    expect(opened).toMatchObject({ ok: false, error: { code: 'storage_open_failed' } });
+    const after = new Database(f.paths.databaseFile, { readonly: true });
+    try {
+      expect(after.query('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: 25 });
+      expect(after.query<{ name: string }, []>('PRAGMA table_info(invoice_work_phases)').all().some(column => column.name === 'scheduler_state')).toBe(false);
+      expect(after.query('SELECT * FROM invoice_works').all()).toEqual(before.works);
+      expect(after.query('SELECT * FROM invoice_work_items').all()).toEqual(before.items);
+      expect(after.query(`SELECT ${phaseColumns} FROM invoice_work_phases`).all()).toEqual(before.phases);
+      expect(after.query('SELECT * FROM sessions WHERE id=?').get(session.sessionId)).toEqual(before.session);
+      expect(after.query('SELECT * FROM session_native_history WHERE session_id=?').get(session.sessionId)).toEqual(before.history);
+      expect(after.query('SELECT * FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(session.sessionId)).toEqual(before.entries);
+    } finally { after.close(); }
+  } else {
+    const current = need(opened);
+    try {
+      expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 27 });
+      expect(await current.read(scope => scope.db.query(`SELECT ${phaseColumns} FROM invoice_work_phases`).all())).toEqual(before.phases);
+      expect(await current.read(scope => scope.db.query('SELECT scheduler_state FROM invoice_work_phases').all())).toEqual([{ scheduler_state: 'legacy' }]);
+      expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_works').all())).toEqual(before.works);
+      expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_work_items').all())).toEqual(before.items);
+      expect(await current.read(scope => scope.sessions.loadHistory(session.sessionId))).toEqual(ok(history));
+      expect(await current.read(scope => scope.db.query('PRAGMA foreign_key_check').all())).toEqual([]);
+    } finally { await current.close(); }
+  }
 });
 
 test('a page read proposal requires its completed phase and exact user-confirmed target', async () => {

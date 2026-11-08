@@ -55,7 +55,7 @@ Live events help the UI refresh. Saved state and tool evidence answer whether an
 
 ## Context and resource boundaries
 
-Flowmate separates the current working basis from saved conversation and research facts. These are responsibilities with different lifetimes, not a new general-purpose memory service:
+Flowmate separates the current working basis from saved conversation and research facts. These responsibilities have different lifetimes:
 
 | Layer | Contents and lifetime |
 |---|---|
@@ -69,7 +69,23 @@ For new AgentSession prompt, steer and follow-up inputs, the product saves the a
 
 Historical records are not rewritten to remove earlier page content. Pi continues to own AgentSession history and compaction; request-local projection does not replace saved conversation history. Fill Form retains its frozen Workspace input path, and Personal Agent retains its separate Durable phase context. Research preference text and material content are untrusted data: they do not grant permissions or expand a task's authorized source scope. A model request may send this context to the selected provider.
 
-Merely reading a material on the controller side is weaker evidence than showing it in the actual model request; neither proves semantic use by the model. The existing implementation does not infer long-term preferences from conversations or turn this layering into automatic vector memory.
+Merely reading a material on the controller side is weaker evidence than showing it in the actual model request; neither proves semantic use by the model. Without an external memory connection, Flowmate does not extract long-term preferences from conversations.
+
+The optional OpenViking connection is off by default. Existing Sessions and Works retain their original bindings and their histories are not uploaded automatically. Local and cloud environments use separate services, accounts, credentials and data; they do not sync automatically or use WeKnora's existing instance. New Sessions and Works can select OpenViking. Requests retrieve only authorized memories with sources and use them as untrusted request-local references, without replacing Pi history or Durable work facts. If the service is unavailable, external memory is reported as unavailable while existing business execution continues under its original authorization.
+
+In **Settings → Connections → Long-term memory**, users can configure a local connection, choose recall and capture policies, explicitly save or forget memories, inspect original operations and search manually. The connection file supplies a loopback endpoint, account, user, peer and ordinary user key. The file is not automatically deleted; the key is separately saved in Windows secure storage. Administrator and Root keys are rejected for ordinary memory operations. Background service mode uses its own secure store and does not assume it can decrypt the desktop user's credentials.
+
+**OpenViking management** on the same page uses a separate identity file. For a local connection, provide a loopback `endpoint`, `apiKey` and `role`. P also requires `accountId`, `userId` and `peerId`. A requires `accountId` and `userId`. S uses a system administrator key.
+
+For cloud management, provide `kind: "cloud"`, `workspaceId`, `role` and a `target` with `host`, `port`, `username`, `privateKeyPath` and `knownHostsPath`. The desktop uses the dedicated SSH identity. Authority verifies the workspace, role and OpenViking identity and holds the OpenViking credential. See the [cloud service instructions](../../deploy/cloud/README.zh-CN.md) for the role setup.
+
+Select an operation and enter its listed parameters as JSON. Uploads, downloads, private Options and issued user keys use native file dialogs. Cloud files travel in 256 KiB chunks, with a 256 MiB limit per file. To resume an upload, retry the original operation in the same desktop management connection. The desktop keeps the original file selection and resumes from the offset confirmed by Authority. **Check original target or resume file** resumes a download from its local staging file after reconnecting or reopening. Writes require native confirmation and retain an encrypted receipt for the management identity. Reconciliation uses the original operation or task. Abandoning reconciliation closes the local receipt, and the remote outcome may remain unknown.
+
+Automatic capture requires separate consent and applies only to successful ordinary chat turns after it is enabled. Long-term memory follows its source runtime. AgentSession chats and Personal Agent Works each recall entries from their own authorized scope, even under the same identity. Older entries without a verifiable origin remain in the management list and are omitted from automatic recall. Invoice Work capture is manual and uses the original Work phase and selected scope. After a restart, writes with an unknown result retain their original operation for reconciliation. Disabling or forgetting prevents future authorized recall, while committed history and business results follow their existing retention rules. Changing the default backend affects new bindings. Forks and continued history branches use new remote Sessions. A fork inherits the original Session's currently valid Session-scoped memory grants.
+
+AgentSession skips automatic OpenViking recall for inputs with recognizable credential markers, and skips automatic capture if any input or the final answer contains one. This check covers explicit markers such as labeled passwords and private key headers. Manual search and explicit saving continue to use the selected source and scope.
+
+Search, explicit saving and extraction depend on the selected OpenViking service and its model services. Local memory work cannot run while WSL2 is stopped or the computer is asleep or powered off. A cloud connection requires separate Authority configuration; see the [cloud service instructions](../../deploy/cloud/README.zh-CN.md).
 
 Resource refresh affects future selections, not historical run copies. Revoked material access or unusable native history can block continued model use while leaving saved facts inspectable. Automatic/native compaction and explicit Session compaction use the Pi history path; a displayed summary is not a replacement for missing committed history. Child Sessions cannot be manually compacted through the root Session operation.
 

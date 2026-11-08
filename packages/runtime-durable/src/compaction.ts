@@ -26,12 +26,16 @@ const Phase = defineDocFamily({ kind: 'flowmate.runtime.phase-head', version: 1,
 class CompactionFailure extends Error { constructor(readonly fact: AppError) { super(fact.code); } }
 const need = <T>(value: Result<T>): T => { if (!value.ok) throw new CompactionFailure(value.error); return value.data; };
 const requestOf = (value: DurableCompactionPlan | DurableCompactionRequest): DurableCompactionRequest => ({
-  workId: value.workId, sessionId: value.sessionId, attemptId: value.attemptId, requestId: value.requestId, operationId: value.operationId,
+  workId: value.workId, sessionId: value.sessionId, ...(value.itemId === undefined ? {} : { itemId: value.itemId }),
+  attemptId: value.attemptId, requestId: value.requestId, operationId: value.operationId,
   ...(value.child ? { child: value.child } : {}), reason: value.reason, expectedTailEntryId: value.expectedTailEntryId, instructions: value.instructions });
 const identityOf = (value: DurableCompactionIdentity): DurableCompactionIdentity => DurableCompactionIdentitySchema.parse({
-  workId: value.workId, sessionId: value.sessionId, attemptId: value.attemptId, requestId: value.requestId, operationId: value.operationId,
+  workId: value.workId, sessionId: value.sessionId, ...(value.itemId === undefined ? {} : { itemId: value.itemId }),
+  attemptId: value.attemptId, requestId: value.requestId, operationId: value.operationId,
   ...(value.child ? { child: value.child } : {}) });
 const phaseKey = (value: DurableSubmissionQuery) => JSON.stringify([value.attemptId, value.requestId]);
+const phaseJson = (query: DurableSubmissionQuery) => JSON.stringify({ workId: query.workId, sessionId: query.sessionId,
+  ...(query.itemId === undefined ? {} : { itemId: query.itemId }), attemptId: query.attemptId, requestId: query.requestId });
 const operationKey = (value: DurableCompactionIdentity) => JSON.stringify([value.attemptId, value.requestId, value.operationId, value.child?.childRunId ?? null]);
 type Record = { conversationId: ConversationId; key: string; state: Readonly<State>; plan: DurableCompactionPlan };
 export type DurableCompactionPhase = DurableSubmissionQuery & { nativeConversationId: number; nativeSubmissionId: number;
@@ -101,7 +105,7 @@ export function createDurableCompactionRuntime(options: DurableCompactionRuntime
   const preparePhase = async (query: DurableSubmissionQuery, conversationId: ConversationId, inputEntryId?: number) => {
     await harness.commit(async tx => {
       const state = await tx.doc(Phase, conversationId, phaseKey(query), null);
-      const queryJson = JSON.stringify({ workId: query.workId, sessionId: query.sessionId, attemptId: query.attemptId, requestId: query.requestId });
+      const queryJson = phaseJson(query);
       if (state.queryJson !== null) { if (state.queryJson !== queryJson) throw Error('state_conflict'); return; }
       if (await options.hasLiveOwnedTasks?.(tx, conversationId)) throw Error('agent_busy');
       for (const status of ['pending', 'running', 'waiting', 'sleeping', 'completing'] as const)
@@ -252,15 +256,15 @@ export function createDurableCompactionRuntime(options: DurableCompactionRuntime
     if (!found) for (const candidate of await all()) if (candidate.conversationId === conversationId) {
       const observed = need(await observe(candidate.plan)); if (observed?.summaryEntryId === view.head.id) { found = candidate; break; }
     }
-    if (!found || found.plan.workId !== query.workId || found.plan.sessionId !== query.sessionId || found.plan.attemptId !== query.attemptId
+    if (!found || found.plan.workId !== query.workId || found.plan.sessionId !== query.sessionId || found.plan.itemId !== query.itemId || found.plan.attemptId !== query.attemptId
       || found.plan.requestId !== query.requestId || !found.state.source || found.state.source.firstKept !== view.head.head) throw Error('state_conflict');
     const observed = need(await observe(found.plan));
     if (!observed?.summarySaved || observed.summaryEntryId !== view.head.id) throw Error('state_conflict'); return found;
   };
   const verifyInput = async (query: DurableSubmissionQuery, conversationId: ConversationId, view: ContextView, inputEntryId: number) => {
     const phase = await harness.snapshot(Phase, conversationId, phaseKey(query), context);
-    if (!phase?.lowerBound || inputEntryId < phase.lowerBound || phase.queryJson !== JSON.stringify({ workId: query.workId, sessionId: query.sessionId,
-      attemptId: query.attemptId, requestId: query.requestId }) || view.entries.some(entry => entry.id < phase.lowerBound!)) throw Error('state_conflict');
+    if (!phase?.lowerBound || inputEntryId < phase.lowerBound || phase.queryJson !== phaseJson(query)
+      || view.entries.some(entry => entry.id < phase.lowerBound!)) throw Error('state_conflict');
     const inputs = view.entries.filter(entry => entry.kind === 'flowmate.input' || entry.kind === 'flowmate.child-input');
     if (inputs.at(-1)?.id === inputEntryId) return;
     const summary = await summaryRecord(query, conversationId, view);
@@ -283,7 +287,7 @@ export function createDurableCompactionRuntime(options: DurableCompactionRuntime
     verifyInput,
     projectPhase: async (query: DurableSubmissionQuery, conversationId: ConversationId, view: ContextView): Promise<{ messages: Message[]; summary?: UserMessage }> => {
       const phase = await harness.snapshot(Phase, conversationId, phaseKey(query), context);
-      if (!phase?.lowerBound || phase.queryJson !== JSON.stringify({ workId: query.workId, sessionId: query.sessionId, attemptId: query.attemptId, requestId: query.requestId })
+      if (!phase?.lowerBound || phase.queryJson !== phaseJson(query)
         || view.entries.some(entry => entry.id < phase.lowerBound!)) throw Error('state_conflict');
       let summary: UserMessage | undefined;
       if (await summaryRecord(query, conversationId, view)) {

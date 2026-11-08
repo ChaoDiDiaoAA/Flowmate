@@ -8,11 +8,12 @@ import { createDurableInvoiceSubagentService } from '../../../packages/core/src/
 import { prepareDurableModelBinding } from '../../../packages/runtime-durable/src/models.ts';
 import { buildInvoiceWorkContext } from '../../../packages/runtime-durable/src/context.ts';
 import { invoiceWorkToolsFixture } from '../../support/invoice-work-tools.ts';
+import { createCloudRuntimeAuthorizer } from '../../../apps/cloud-runtime-authority.ts';
 
 const at = '2026-10-29T00:00:00.000Z';
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
 
-async function fixture() {
+async function fixture(itemLane = false) {
   const provider = { version: 1 as const, name: 'original-compaction-model', revision: 1,
     modelRef: { provider: 'controlled-compaction', model: 'original' }, native: { authPath: 'C:/controlled-unused/auth.json', modelsPath: null },
     connection: { baseUrl: 'http://127.0.0.1:1/v1', api: 'openai-completions' as const, contextWindow: 64000, maxTokens: 8192, reasoning: true },
@@ -20,23 +21,36 @@ async function fixture() {
   const configuration = PersonalAgentConfigurationSchema.parse({ modelId: provider.name, thinkingLevel: 'high',
     tools: [...INVOICE_REVIEW_TOOL_NAMES, 'Agent'], resources: { prompt: null, enabledSkills: [] },
     extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' });
-  const f = await invoiceWorkToolsFixture({ provider, configuration }), binding = need(await prepareDurableModelBinding(provider));
+  const f = await invoiceWorkToolsFixture({ provider, configuration, itemLane,
+    ...(itemLane ? { durableRuntimeId: '11111111-1111-4111-8111-111111111111' } : {}) }), binding = need(await prepareDurableModelBinding(provider));
   await f.database.transaction(store => {
     need(store.invoiceWorks.linkPhase({ workId: f.created.workId, attemptId: f.attemptId, phaseId: f.phase.phaseId,
       nativeConversationId: 11, nativeSubmissionId: 12, at }));
     need(store.invoiceWorkModelBindings.save({ workId: f.created.workId, attemptId: f.attemptId,
       modelId: provider.name, binding, at }));
   });
-  const governor = new DurableInvoiceGovernor(f.database, () => at, () => false);
+  const governor = new DurableInvoiceGovernor(f.database, () => at, () => false, itemLane ? 'cloud' : 'local');
   const contexts = new InvoiceWorkPhaseContextService({ database: f.database, now: () => at, buildContext: buildInvoiceWorkContext });
   const subagents = createDurableInvoiceSubagentService({ database: f.database, governor, now: () => at, observeSubagent: async () => ok(null) });
   const callbacks = createInvoiceWorkCompactionCallbacks({ database: f.database, governor, contexts, subagents: subagents.callbacks });
-  const request: DurableCompactionRequest = { workId: f.created.workId, sessionId: f.created.sessionId, attemptId: f.attemptId,
+  const request: DurableCompactionRequest = { workId: f.created.workId, sessionId: f.created.sessionId, ...(itemLane ? { itemId: f.itemId } : {}), attemptId: f.attemptId,
     requestId: f.phase.requestId, operationId: 'original-summary', reason: 'threshold', expectedTailEntryId: 20, instructions: null };
   const reservations = () => f.database.read(store => store.db.query<{ count: number }, []>(
     'SELECT COALESCE(SUM(count),0) count FROM invoice_work_model_reservations').get()!.count);
   return { ...f, provider, binding, governor, callbacks, contexts, subagents, request, reservations };
 }
+
+test('an invoice summary uses only its original item phase and the shared Work budget', async () => {
+  const f = await fixture(true);
+  try {
+    const plan = need(await f.callbacks.readPlan(f.request));
+    expect(plan.itemId).toBe(f.itemId);
+    expect(await f.callbacks.readPlan({ ...f.request, itemId: f.itemId + 1 })).toMatchObject({ ok: false });
+    const { itemId: _itemId, ...withoutItem } = f.request;
+    expect(await f.callbacks.readPlan(withoutItem)).toMatchObject({ ok: false });
+    need(await f.callbacks.reserveModelRequest(plan)); expect(await f.reservations()).toBe(1);
+  } finally { await f.database.close(); }
+});
 
 test('compaction reads the original phase model and thinking without reserving or following later defaults', async () => {
   const f = await fixture();
@@ -136,8 +150,8 @@ test('an ended Root or closed original phase cannot authorize another summary re
   }
 });
 
-test('a real read-only child summary uses its original parent phase and the same shared Work quota', async () => {
-  const f = await fixture();
+test.each([false, true])('a real read-only child summary uses its original parent phase and shared Work quota (item lane: %s)', async itemLane => {
+  const f = await fixture(itemLane);
   try {
     const child: DurableSubagentIdentity = await f.database.transaction(store => {
       const args = { subagent_type: 'invoice-evidence-checker', description: 'Check total', prompt: 'Verify only the original total.', run_in_background: false as const };
@@ -151,7 +165,7 @@ test('a real read-only child summary uses its original parent phase and the same
         args, at, config: DurableSubagentConfigSnapshotSchema.parse({ ...f.config, version: 4, subagent: source }),
         scope: DurableSubagentRunScopeSchema.parse({ ...source, version: 5, workId: f.created.workId, attemptId: f.attemptId,
           allowedTools: ['read_invoice_document'], allowedDocumentIds: [1], allowedArtifactIds: [1, 2], allowedResourcePaths: [] }) }));
-      return { workId: f.created.workId, sessionId: f.created.sessionId, attemptId: f.attemptId, requestId: f.phase.requestId,
+      return { workId: f.created.workId, sessionId: f.created.sessionId, ...(itemLane ? { itemId: f.itemId } : {}), attemptId: f.attemptId, requestId: f.phase.requestId,
         childRunId: made.runId, childSessionId: made.sessionId, originToolCallId: call.toolCallId, nativeToolTaskId: 91 };
     });
     need(await f.subagents.callbacks.adopt({ ...child, nativeConversationId: 31 }));
@@ -159,6 +173,12 @@ test('a real read-only child summary uses its original parent phase and the same
     const rootPlan = need(await f.callbacks.readPlan(f.request)); need(await f.callbacks.reserveModelRequest(rootPlan));
     const childPlan = need(await f.callbacks.readPlan({ ...f.request, operationId: 'original-child-summary', child }));
     expect(childPlan.binding).toEqual(f.binding); expect(childPlan.thinkingLevel).toBe('high');
+    if (itemLane) {
+      const authorize = createCloudRuntimeAuthorizer(f.database);
+      expect(await authorize('compact', childPlan)).toMatchObject({ ok: true });
+      expect(await authorize('compact', { ...childPlan, child: { ...child, itemId: f.itemId + 1 } })).toMatchObject({ ok: false });
+      expect(await authorize('compact', { ...childPlan, itemId: f.itemId + 1 })).toMatchObject({ ok: false });
+    }
     need(await f.callbacks.reserveModelRequest(childPlan));
     expect(need(await f.governor.remainingBudget(f.created.workId)).modelCalls).toBe(before.modelCalls - 2);
     const counts = await f.database.read(store => store.db.query<{ run_id: number; count: number }, []>(

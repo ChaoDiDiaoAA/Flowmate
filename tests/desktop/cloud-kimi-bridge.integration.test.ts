@@ -103,6 +103,46 @@ test('an unexpected cloud desktop disconnect invalidates local browser bindings'
   } finally { await bridge.close(); }
 });
 
+test('a cloud reconnect binds the original browser approval to the verified current tab only once', async () => {
+  const relay = new CloudDesktopRelay();
+  const approved = { ...browser, status: 'approved' as const, canDecide: false, canReject: false, canRevoke: true, resumeOriginal: true as const };
+  const currentTarget = { ...browser.target, connectionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', bindingId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' };
+  let verified = false, rebinds = 0, reads = 0, decisions = 0;
+  const handler = createCloudDesktopHandler({ workspaceId, authorize: async () => ok(undefined), desktopRelay: relay,
+    dispatch: async command => command.type === 'invoice_work_browser_list'
+      ? ok({ workId: browser.workId, itemId: browser.itemId, items: [approved], nextAfterProposalId: null })
+      : command.type === 'invoice_work_browser_rebind' ? (rebinds++, ok(approved))
+      : command.type === 'invoice_work_browser_decide' ? (decisions++, ok(undefined)) : ok(undefined) });
+  const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr, kill: () => { stdin.end(); return true; } });
+  const transport = runCloudDesktopBridge(stdin, stdout, async envelope => ok(await handler(envelope)));
+  void transport.then(() => child.emit('close', 0, null));
+  const session = new CloudSshSession(child as unknown as ChildProcessWithoutNullStreams, workspaceId);
+  const controller = new CloudDesktopController({ connect: async () => ok(session), upload: async () => { throw Error('unused'); },
+    desktop: { verify: async () => ok(undefined), verifyBrowser: async (_workspace, read) => verified && JSON.stringify(read.target) === JSON.stringify(currentTarget)
+      ? ok(undefined) : fail(appError('browser_unavailable', 'runtime', 'Target changed.')),
+    execute: async () => { reads++; return ok({ kind: 'browser_read' as const, page: { url: 'https://example.test/page', title: 'Page', text: 'page', truncated: false } }); } } });
+  const profile = { workspaceId, target: { host: '127.0.0.1', port: 22, username: 'flowmate', privateKeyPath: 'C:\\test\\key', knownHostsPath: 'C:\\test\\hosts' } };
+  expect(await controller.connect(profile)).toMatchObject({ ok: true });
+  try {
+    const input = { workId: 1, itemId: 2, proposalId: 11, confirmedTarget: browser.target, currentTarget };
+    const request = { kind: 'browser_read' as const, workId: 1, itemId: 2, proposalId: 11, target: currentTarget };
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_browser_rebind', input } })).toMatchObject({ ok: false });
+    expect(rebinds).toBe(0); verified = true;
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_browser_rebind', input: { ...input, resume: true } } })).toMatchObject({ ok: false });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_browser_rebind', input: { ...input, currentTarget: { ...currentTarget, origin: 'https://other.test' } } } })).toMatchObject({ ok: false });
+    expect(rebinds).toBe(0);
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_browser_rebind', input } })).toMatchObject({ ok: true });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_browser_rebind', input: { ...input, resume: true } } })).toMatchObject({ ok: true });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: true });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect({ rebinds, reads, decisions }).toEqual({ rebinds: 2, reads: 1, decisions: 0 });
+  } finally { await controller.close(); relay.close(); }
+});
+
 test('a cloud browser decision requires the local target and a revocation suppresses a late result', async () => {
   const relay = new CloudDesktopRelay(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let decisions = 0, reads = 0, verified = false;
@@ -193,6 +233,48 @@ test('the local desktop dispatches only the exact approved cloud action once', a
     expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
     expect(inputs).toBe(1);
   } finally { await bridge.close(); relay.close(); }
+});
+
+test('a cloud reconnect confirms the same action and control before binding its original approval', async () => {
+  const relay = new CloudDesktopRelay();
+  const approved = { ...action, status: 'approved' as const, canDecide: false, canReject: false, resumeOriginal: true as const };
+  const observationId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  const currentAction = { ...action.action, observationId }, currentTarget = { ...action.target, connectionId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' };
+  let changed = true, rebinds = 0, dispatches = 0, decisions = 0;
+  const handler = createCloudDesktopHandler({ workspaceId, authorize: async () => ok(undefined), desktopRelay: relay,
+    dispatch: async command => command.type === 'invoice_work_desktop_list'
+      ? ok({ workId: action.workId, itemId: action.itemId, items: [approved], nextAfterProposalId: null })
+      : command.type === 'invoice_work_desktop_rebind' ? (rebinds++, ok(approved))
+      : command.type === 'invoice_work_desktop_decide' ? (decisions++, ok(undefined)) : ok(undefined) });
+  const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+  const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr, kill: () => { stdin.end(); return true; } });
+  const transport = runCloudDesktopBridge(stdin, stdout, async envelope => ok(await handler(envelope)));
+  void transport.then(() => child.emit('close', 0, null));
+  const session = new CloudSshSession(child as unknown as ChildProcessWithoutNullStreams, workspaceId);
+  const controller = new CloudDesktopController({ connect: async () => ok(session), upload: async () => { throw Error('unused'); },
+    desktop: { verify: async () => ok(undefined), execute: async (_workspace, request) => {
+      if (request.kind === 'observe') return ok({ kind: 'observe', observationId, window: currentTarget.window, tree: '[4] Button', truncated: false });
+      if (request.kind === 'resolve') return ok({ kind: 'resolve', target: changed ? { ...currentTarget, element: '[4] Different' } : currentTarget });
+      if (request.kind === 'dispatch') { dispatches++; return ok({ kind: 'dispatch' }); }
+      return fail(appError('desktop_unavailable', 'runtime', 'Unavailable.'));
+    } } });
+  const profile = { workspaceId, target: { host: '127.0.0.1', port: 22, username: 'flowmate', privateKeyPath: 'C:\\test\\key', knownHostsPath: 'C:\\test\\hosts' } };
+  expect(await controller.connect(profile)).toMatchObject({ ok: true });
+  try {
+    const input = { workId: 1, itemId: 2, proposalId: 9, confirmedAction: action.action, confirmedTarget: action.target };
+    const request = { kind: 'dispatch' as const, workId: 1, itemId: 2, proposalId: 9, action: currentAction, target: currentTarget };
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_desktop_rebind', input } })).toMatchObject({ ok: false });
+    expect(rebinds).toBe(0); changed = false;
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_desktop_rebind', input: { ...input, resume: true } } })).toMatchObject({ ok: false });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_desktop_rebind', input } })).toMatchObject({ ok: true });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect(await controller.request({ workspaceId, command: { type: 'invoice_work_desktop_rebind', input: { ...input, resume: true } } })).toMatchObject({ ok: true });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: true });
+    expect(await relay.request(request, new AbortController().signal)).toMatchObject({ ok: false });
+    expect({ rebinds, dispatches, decisions }).toEqual({ rebinds: 2, dispatches: 1, decisions: 0 });
+  } finally { await controller.close(); relay.close(); }
 });
 
 test('a user decision binds the cloud proposal to the connected Windows receiver before continuing', async () => {

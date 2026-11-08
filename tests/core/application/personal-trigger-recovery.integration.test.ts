@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,12 +11,15 @@ import * as durable from '@flowmate/runtime-durable';
 import * as composition from '../../../apps/composition.ts';
 import { createProductCommandDispatcher, type ProductCommandDispatcher } from '../../../apps/host/dispatch.ts';
 import { InvoiceWorkPhaseObserver } from '../../../packages/core/src/personal-agent/phase-context.ts';
-import { createHttpProvider, deferCleanup, mkdtempSync, waitFor } from '../../support/resources.ts';
+import { cleanupResources, createHttpProvider, deferCleanup, mkdtempSync, waitFor } from '../../support/resources.ts';
 import { invoiceWorkCandidateDraft } from '../../support/invoice-work-tools.ts';
 
+// The shared hook is registered only in the file that first imports its module.
+afterEach(cleanupResources);
+
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(`${result.error.code}: ${result.error.message}`); return result.data; }
-const queryOf = ({ workId, sessionId, attemptId, requestId }: DurableSubmissionQuery): DurableSubmissionQuery =>
-  ({ workId, sessionId, attemptId, requestId });
+const queryOf = ({ workId, sessionId, itemId, attemptId, requestId }: DurableSubmissionQuery): DurableSubmissionQuery =>
+  ({ workId, sessionId, ...(itemId === undefined ? {} : { itemId }), attemptId, requestId });
 async function observed<T>(promise: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([promise, new Promise<never>((_, reject) => {
@@ -68,7 +71,7 @@ async function fixture(resources = false) {
   const linkSpy = spyOn(InvoiceWorkPhaseObserver.prototype, 'reconcile').mockImplementation(async function (this: InvoiceWorkPhaseObserver, input) {
     // Keep this exact link unavailable until cold reopening; the real SDK submission already exists.
     if (interruptedLink && input.workId === interruptedLink.workId && input.sessionId === interruptedLink.sessionId
-      && input.attemptId === interruptedLink.attemptId && input.requestId === interruptedLink.requestId)
+      && input.itemId === interruptedLink.itemId && input.attemptId === interruptedLink.attemptId && input.requestId === interruptedLink.requestId)
       return fail(appError('storage_write_failed', 'storage', 'The original product linkage response remains unavailable until reopening.', true));
     const result = await reconcile.call(this, input);
     if (result.ok && gap?.kind === 'product-link' && input.attemptId !== gap.previousAttemptId
@@ -100,7 +103,7 @@ async function fixture(resources = false) {
     contexts.push(context);
     if (held) { const original = held; held = null; original.entered.resolve(); await original.release.promise; }
     if (failWorkIds.has(context.work.workId)) {
-      rejected.push({ workId: context.work.workId, sessionId: context.work.sessionId,
+      rejected.push({ workId: context.work.workId, sessionId: context.work.sessionId, itemId: context.item.itemId,
         attemptId: context.phase.attemptId, requestId: context.phase.requestId });
       return new Response('Controlled original model rejection.', { status: 400 });
     }

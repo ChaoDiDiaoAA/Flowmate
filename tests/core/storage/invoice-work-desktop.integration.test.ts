@@ -5,7 +5,7 @@ import { createInvoiceWorkToolBridge, readInvoiceWorkToolResult, resolveInvoiceW
 import { InvoiceWorkService } from '../../../packages/core/src/personal-agent/invoice-work.ts';
 import { DurableInvoiceGovernor } from '../../../packages/core/src/personal-agent/admission.ts';
 import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
-import { openTestDatabase } from '../../support/database.ts';
+import { openTestDatabase, removeMemorySchemaFromFixture } from '../../support/database.ts';
 import { invoiceWorkToolsFixture } from '../../support/invoice-work-tools.ts';
 import { appError, fail, ok, type Result, type RunScope } from '@flowmate/contracts';
 
@@ -31,7 +31,9 @@ test.each(['success', 'registration failure'] as const)('schema24 migration pres
     entries: scope.db.query('SELECT * FROM session_native_entries WHERE session_id=? ORDER BY sequence').all(session.sessionId) }));
   await f.database.close();
   const old = new Database(f.paths.databaseFile);
-  old.exec(`DROP TABLE invoice_work_browser_reads; DELETE FROM schema_migrations WHERE version=25; DROP TRIGGER invoice_work_desktop_action_immutable; DROP TRIGGER invoice_work_desktop_action_preserved;
+  removeMemorySchemaFromFixture(old);
+  old.exec(`DROP INDEX invoice_work_phase_one_active; DROP INDEX invoice_work_phase_one_item; ALTER TABLE invoice_work_phases DROP COLUMN scheduler_state; DELETE FROM schema_migrations WHERE version=26;
+    DROP TABLE invoice_work_browser_reads; DELETE FROM schema_migrations WHERE version=25; DROP TRIGGER invoice_work_desktop_action_immutable; DROP TRIGGER invoice_work_desktop_action_preserved;
     DROP TABLE invoice_work_desktop_actions; DELETE FROM schema_migrations WHERE version=24;`);
   if (mode === 'registration failure') old.exec("CREATE TRIGGER reject_schema24 BEFORE INSERT ON schema_migrations WHEN NEW.version=24 BEGIN SELECT RAISE(ABORT,'controlled schema24 failure'); END");
   old.close();
@@ -50,7 +52,7 @@ test.each(['success', 'registration failure'] as const)('schema24 migration pres
     } finally { after.close(); }
   } else {
     const current = need(opened);
-    expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 25 });
+    expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 27 });
     expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_works').all())).toEqual(before.works);
     expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_work_items').all())).toEqual(before.items);
     expect(await current.read(scope => scope.sessions.get(session.sessionId))).toMatchObject({ ok: true,
@@ -124,7 +126,7 @@ test('a proposal whose original tool failed can be discarded but never approved'
 });
 
 test.each(['unknown receipt', 'interrupted claim', 'conflicting approval', 'conflicting continuation', 'altered target', 'rejected decision',
-  'tool dispatch', 'stale tool target', 'stale target error', 'cancel before claim', 'uncertain tool dispatch', 'stale invoice', 'stale after approval'] as const)(
+  'tool dispatch', 'stale tool target', 'stale target error', 'cancel before claim', 'uncertain tool dispatch', 'protected after claim', 'stale invoice', 'stale after approval'] as const)(
   'a desktop action is claimed once after approval and remains unknown after %s', async outcome => {
   const f = await invoiceWorkToolsFixture({ at, configuration: { modelId: 'desktop-model', thinkingLevel: 'off',
     tools: ['desktop_list_windows', 'desktop_observe_window', 'desktop_propose_action', 'desktop_execute_approved'],
@@ -310,7 +312,8 @@ test.each(['unknown receipt', 'interrupted claim', 'conflicting approval', 'conf
     expect(await service.queryDesktopDecision({ ...input, requestId: decision.requestId })).toEqual({ ok: true, data: approved });
     return;
   }
-  if (outcome === 'tool dispatch' || outcome === 'stale tool target' || outcome === 'stale target error' || outcome === 'cancel before claim' || outcome === 'uncertain tool dispatch') {
+  const dispatchUnconfirmed = outcome === 'uncertain tool dispatch' || outcome === 'protected after claim';
+  if (outcome === 'tool dispatch' || outcome === 'stale tool target' || outcome === 'stale target error' || outcome === 'cancel before claim' || dispatchUnconfirmed) {
     await f.database.transaction(scope => need(scope.toolCalls.finish({ toolCallId: execution.call.toolCallId,
       result: { version: 1, committedCandidateId: null, status: 'failed', error: { version: 1, code: 'tool_access_denied',
         category: 'tool', message: 'The earlier call was not dispatched.', retryable: false } },
@@ -326,6 +329,7 @@ test.each(['unknown receipt', 'interrupted claim', 'conflicting approval', 'conf
         return outcome === 'stale target error' ? fail(appError('desktop_target_changed', 'runtime', 'The control changed.'))
           : ok(outcome === 'stale tool target' ? { ...target, window: { ...target.window, title: 'Changed' } } : target); },
       dispatch: async (action: unknown, actual: unknown) => { dispatches++; expect(action).toEqual(proposal); expect(actual).toEqual(target);
+        if (outcome === 'protected after claim') return fail(appError('desktop_protected_content', 'runtime', 'Protected field.'));
         if (outcome === 'uncertain tool dispatch') throw Error('The input receipt was lost.'); return ok(undefined); } });
     const executor = createToolExecutor({ database: f.database, definitions: [tool], now: () => at });
     const context = { ...f.product, scope: execution.scope, nativeToolCallId: 'durable-task:205', signal: new AbortController().signal };
@@ -342,13 +346,14 @@ test.each(['unknown receipt', 'interrupted claim', 'conflicting approval', 'conf
       return;
     }
     if (outcome === 'stale tool target' || outcome === 'stale target error') expect(first.result).toMatchObject({ status: 'failed', error: { code: 'desktop_target_changed' } });
-    else if (outcome === 'uncertain tool dispatch') expect(first.result).toMatchObject({ status: 'failed', error: { code: 'desktop_action_unconfirmed' } });
+    else if (dispatchUnconfirmed) expect(first.result).toMatchObject({ status: 'failed', error: { code: 'desktop_action_unconfirmed',
+      ...(outcome === 'protected after claim' ? { message: expect.stringContaining('manually') } : {}) } });
     else expect(first.result).toMatchObject({ status: 'succeeded', data: { proposalId: created.proposalId, outcome: 'dispatched' } });
     expect((await executor.execute('desktop_execute_approved', { proposalId: created.proposalId }, context)).result).toMatchObject(first.result);
     expect(dispatches).toBe(outcome === 'stale tool target' || outcome === 'stale target error' ? 0 : 1);
     expect(need(await f.database.read(scope => scope.invoiceWorkDesktopActions.get({ workId: f.created.workId,
       itemId: f.itemId, proposalId: created.proposalId })))).toMatchObject({ status: outcome === 'stale tool target' || outcome === 'stale target error' ? 'invalidated'
-        : outcome === 'uncertain tool dispatch' ? 'unknown' : 'dispatched' });
+        : dispatchUnconfirmed ? 'unknown' : 'dispatched' });
     if (outcome === 'uncertain tool dispatch') {
       const original = { workId: f.created.workId, sessionId: f.created.sessionId, attemptId: f.attemptId, requestId: 'desktop-approved',
         nativeConversationId: 101, nativeTaskId: 205, nativeToolCallId: 'wire-205', name: 'desktop_execute_approved',

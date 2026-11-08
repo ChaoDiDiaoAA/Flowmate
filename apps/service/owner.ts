@@ -7,6 +7,7 @@ import { readServiceInstallation, resolveServiceRuntime, type ServiceInstallatio
 import { createServiceSecureStorage } from '../../packages/shared/src/service-secure-storage.ts';
 import { createCredentialStore } from '../../packages/shared/src/secure-credential-store.ts';
 import { createServiceCredentialService } from '../../packages/core/src/configuration/service-credentials.ts';
+import { createServiceMemoryCredentialService } from '../../packages/core/src/configuration/service-memory-credentials.ts';
 import { parseHostCommand, type HostCommand, type HostInvoiceFormRequest, type HostOutput, type HostReady } from '../host/protocol.ts';
 import type { ProductCommandDispatcher } from '../host/dispatch.ts';
 import { createServicePipeServer, type ServicePipeConnection } from './pipe.ts';
@@ -29,7 +30,8 @@ const failure = (code: string, message: string) => ({ ok: false as const, error:
 const interactive = (command: HostCommand) => ['start_run', 'submit_invoice_form_input', 'compact_session', 'call_provider'].includes(command.type)
   || command.type === 'submit_session_input' && command.input.mode === 'prompt';
 const protectedRequest = (command: HostCommand) => interactive(command)
-  || ['login_model', 'create_session', 'rename_session', 'delete_session'].includes(command.type);
+  || ['login_model', 'create_session', 'rename_session', 'delete_session', 'memory_configure', 'memory_update_policy', 'memory_remember',
+    'memory_reconcile_remember', 'memory_reconcile_remember_by_id', 'memory_forget', 'memory_reconcile_sync'].includes(command.type);
 
 /** One installed product owner. A connection owns only its foreground operations and receivers. */
 export async function createServiceOwner(input: { installationFile: string; runtimeRoot: string }): Promise<Result<ServiceOwner>> {
@@ -48,7 +50,8 @@ export async function createServiceOwner(input: { installationFile: string; runt
   const desktops = createDesktopRouting<Client>(client => client.live && !client.preparing);
   const compactions = new Map<string, OwnedForeground>();
   let dispatcher: ProductCommandDispatcher, ready: HostReady | undefined, closed = false;
-  let credentialService: ReturnType<typeof createServiceCredentialService>, activatedOperationId: string | null = null, ownerClosing = false;
+  let credentialService: ReturnType<typeof createServiceCredentialService>, memoryCredentialService: ReturnType<typeof createServiceMemoryCredentialService>,
+    activatedOperationId: string | null = null, ownerClosing = false;
   const trustedBootOperationId = saved.enabled === true ? saved.activationOperationId ?? null : null;
   let closing: Promise<Result<CloseReport>> | null = null;
   const unknownForm = (output: HostInvoiceFormRequest): InvoiceFormApplicationReceipt => ({
@@ -279,8 +282,14 @@ export async function createServiceOwner(input: { installationFile: string; runt
       if (!credentialReference.test(reference)) throw Error('service_credential_reference_invalid');
       return createCredentialStore(join(saved.dataRoot, 'security/service-credentials', reference + '.json'), storage);
     };
+    const memoryStore = (reference: string) => {
+      if (!/^memory_[a-f0-9]{32}$/.test(reference)) throw Error('service_memory_credential_reference_invalid');
+      return createCredentialStore(join(saved.dataRoot, 'security/service-memory-credentials', reference + '.json'), storage);
+    };
     const created = await createProductCommandDispatcher({ userDataRoot: saved.dataRoot, runtimeRoot: saved.runtimeRoot,
-      invoiceSourceRoot: layout.data.runtime.invoiceSourceRoot, send, credentials: {
+      invoiceSourceRoot: layout.data.runtime.invoiceSourceRoot, send,
+      memoryCredentialRead: async reference => { const result = await memoryStore(reference).read(); return result.ok ? result.data ?? undefined : undefined; },
+      credentials: {
         async read(reference) {
           const result = await store(reference).read(); if (!result.ok) throw Error(result.error.code);
           if (result.data === null) return undefined;
@@ -306,6 +315,8 @@ export async function createServiceOwner(input: { installationFile: string; runt
     dispatcher = created.data;
     credentialService = createServiceCredentialService({ installationId: saved.installationId, dataRoot: saved.dataRoot,
       secureStorage: storage, settingsAuthority: dispatcher.settingsAuthority });
+    memoryCredentialService = createServiceMemoryCredentialService({ installationId: saved.installationId, dataRoot: saved.dataRoot, secureStorage: storage,
+      controller: { configure: input => dispatcher.configureMemory(input), inspect: input => dispatcher.inspectMemory(input) } });
     if (!ready?.state.ready) { await dispatcher.close(); return failure('service_owner_unavailable', 'The service owner could not open.'); }
   } catch { return failure('service_owner_unavailable', 'The installed service owner could not open.'); }
   let server: Awaited<ReturnType<typeof createServicePipeServer>>;
@@ -319,7 +330,7 @@ export async function createServiceOwner(input: { installationFile: string; runt
       try {
         if ('input' in control && 'installationId' in control.input && control.input.installationId !== saved.installationId)
           value = failure('service_installation_invalid', 'The original installation identity does not match.');
-        else if (ownerClosing && !['service_credentials_status', 'service_credentials_query_operation', 'service_prepare_disconnect', 'service_query_disconnect', 'service_query_activation'].includes(control.type))
+        else if (ownerClosing && !['service_credentials_status', 'service_credentials_query_operation', 'service_memory_query', 'service_prepare_disconnect', 'service_query_disconnect', 'service_query_activation'].includes(control.type))
           value = failure('host_closing', 'The service owner is closing.');
         else switch (control.type) {
           case 'service_prepare_disconnect': value = ok(await prepareDisconnect(client)); break;
@@ -332,6 +343,8 @@ export async function createServiceOwner(input: { installationFile: string; runt
           case 'service_credentials_commit': value = await credentialService.commitMigration(control.input); break;
           case 'service_credentials_query_operation': value = await credentialService.queryOperation(control.input); break;
           case 'service_settings_save': value = await credentialService.saveSettings(control.input); break;
+          case 'service_memory_configure': value = await memoryCredentialService.configure(control.input); break;
+          case 'service_memory_query': value = await memoryCredentialService.query(control.input); break;
           case 'service_prepare_activation': {
             const prepared = await activationConditions(control.input.operationId, control.input.expectedSettingsRevision, true);
             value = prepared.ok ? ok({ installationId: saved.installationId, operationId: control.input.operationId,
@@ -371,7 +384,8 @@ export async function createServiceOwner(input: { installationFile: string; runt
     }
     const reject = (code = 'service_command_forbidden') => write(client, { version: 1, type: 'response', requestId: command.requestId,
       value: failure(code, 'This operation is not available to this service connection.') });
-    if (command.type === 'close' || command.type === 'credential_response') { await reject(); return; }
+    if (command.type === 'close' || command.type === 'credential_response' || command.type === 'memory_configure'
+      || command.type === 'memory_inspect_configuration') { await reject(); return; }
     if (activatedOperationId === null && (interactive(command) || command.type === 'submit_session_input' || command.type === 'login_model')) { await reject('service_standby'); return; }
     if (client.preparing && (interactive(command) || command.type === 'submit_session_input'
       || command.type === 'login_model' || command.type === 'subscribe_runtime_events')) { await reject('service_connection_draining'); return; }

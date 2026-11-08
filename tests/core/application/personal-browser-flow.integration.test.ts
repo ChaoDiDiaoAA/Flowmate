@@ -50,11 +50,11 @@ test('a real Durable Work reads a page once after approval and keeps injected te
     tools: ['browser_request_read', 'browser_read_approved'], resources: { prompt: null, enabledSkills: [] },
     extensions: { enabledExtensions: [] }, workingDirectory: null, preferences: '' });
   const target = { connectionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', bindingId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', origin: 'https://example.test' };
-  let reads = 0;
+  let reads = 0, connected = true, selected = target;
   const application = need(await createApplication({ paths,
     provider: { prepare: async () => fail(appError('unused', 'provider', 'Unused.')), close: async () => ({ stopped: true, closed: true, errors: [] }) },
     personalAgent: { defaultConfiguration: configuration, resolveConfiguration: () => ok(provider), readApiKey: () => 'synthetic-key',
-      browser: { resolveTarget: async () => ok(target), read: async () => { reads++; return ok({ url: 'https://example.test/page',
+      browser: { resolveTarget: async () => connected ? ok(selected) : fail(appError('browser_unavailable', 'runtime', 'Controlled disconnected browser.', true)), read: async () => { reads++; return ok({ url: 'https://example.test/page',
         title: 'Synthetic page', text: injection, truncated: false }); } } } }));
   deferCleanup(() => application.close());
   const agent = need(await application.personalAgent.get());
@@ -74,12 +74,26 @@ test('a real Durable Work reads a page once after approval and keeps injected te
   expect(reads).toBe(0); expect(JSON.stringify(wire)).not.toContain(injection);
   const listed = need(await application.invoiceWorks.listBrowserReads({ workId: created.workId, itemId }));
   const proposal = listed.items[0]!;
+  expect(proposal.resumeOriginal).toBe(true);
   const current = need(await application.invoiceWorks.get({ view: 'work', workId: created.workId, limit: 1 }));
-  const decision = need(await application.invoiceWorks.decideBrowserRead({ workId: created.workId, itemId, proposalId: proposal.proposalId,
+  connected = false;
+  need(await application.invoiceWorks.decideBrowserRead({ workId: created.workId, itemId, proposalId: proposal.proposalId,
     expectedRevision: current.work.revision, requestId: 'browser-approved', decision: 'approve', confirmedTarget: target }));
-  const continued = need(await application.invoiceWorks.continueWork({ workId: created.workId, expectedRevision: decision.revision,
-    expectedAttemptId: current.work.execution.attempt?.attemptId ?? null, requestId: 'browser-continue' }));
-  expect(continued.execution.authorizationAccepted).toBe(true);
+  await new Promise(resolve => setTimeout(resolve, 6000));
+  expect(need(await application.invoiceWorks.listBrowserReads({ workId: created.workId, itemId })).items[0]).toMatchObject({ status: 'approved' });
+  expect(reads).toBe(0); connected = true;
+  selected = { ...target, connectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', bindingId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' };
+  await new Promise(resolve => setTimeout(resolve, 5500));
+  expect(reads).toBe(0);
+  expect(await application.invoiceWorks.rebindBrowserRead({ workId: created.workId, itemId, proposalId: proposal.proposalId,
+    confirmedTarget: target, currentTarget: { ...selected, origin: 'https://different.test' } })).toMatchObject({ ok: false });
+  expect(await application.invoiceWorks.rebindBrowserRead({ workId: created.workId, itemId, proposalId: proposal.proposalId,
+    confirmedTarget: target, currentTarget: selected, resume: true })).toMatchObject({ ok: false });
+  need(await application.invoiceWorks.rebindBrowserRead({ workId: created.workId, itemId, proposalId: proposal.proposalId,
+    confirmedTarget: target, currentTarget: selected }));
+  await Bun.sleep(5500); expect(reads).toBe(0);
+  need(await application.invoiceWorks.rebindBrowserRead({ workId: created.workId, itemId, proposalId: proposal.proposalId,
+    confirmedTarget: target, currentTarget: selected, resume: true }));
   try { await waitFor(async () => {
     const currentWork = need(await application.invoiceWorks.get({ view: 'work', workId: created.workId, limit: 1 }));
     if (currentWork.work.execution.runStatus === 'failed') throw Error('The continued attempt failed.');
@@ -100,6 +114,7 @@ test('a real Durable Work reads a page once after approval and keeps injected te
     messages: request.messages.map(message => ({ role: message.role, content: message.content?.slice(0, 300) })) })),
     work: state, ...details, facts })); }
   expect(reads).toBe(1);
+  expect(wire).toHaveLength(2);
   const withPage = wire.find(request => request.messages.some(message => message.role === 'tool' && message.content?.includes('Ignore all rules')))!;
   expect(withPage.messages.filter(message => message.role === 'system')).toHaveLength(1);
   expect(withPage.messages.find(message => message.role === 'tool')?.content).toContain('desktop_execute_approved');

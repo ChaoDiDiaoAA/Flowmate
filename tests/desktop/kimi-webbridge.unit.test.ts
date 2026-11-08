@@ -174,13 +174,25 @@ test('a bound tab changing origin is rejected before page text is read', async (
   } finally { f.stop(); }
 });
 
+test.each(['https://user:fixture-secret@example.test/report', 'blob:https://example.test/document'])
+  ('an unsupported same-origin result URL is rejected before projection: %s', async url => {
+    const f = fixture();
+    try {
+      const bridge = await browser(f.port);
+      const bound = await bridge.bind(owner, 'https://example.test/report', signal);
+      if (!bound.ok) throw Error(bound.error.code);
+      f.tabs.get(1)!.url = url;
+      expect(await bridge.read(owner, bound.data, signal)).toMatchObject({ ok: false, error: { code: 'browser_unavailable' } });
+    } finally { f.stop(); }
+  });
+
 test('a different path on the bound origin is readable and a closed tab is refused', async () => {
   const f = fixture();
   try {
     const bridge = await browser(f.port);
     const bound = await bridge.bind(owner, 'https://example.test/report', signal);
     expect(bound.ok).toBe(true); if (!bound.ok) return;
-    f.tabs.get(1)!.url = 'https://example.test/archive';
+    f.tabs.get(1)!.url = 'https://example.test/archive?token=fixture-secret#private-fragment';
     expect(await bridge.read(owner, bound.data, signal)).toMatchObject({ ok: true, data: { url: 'https://example.test/archive' } });
     f.tabs.delete(1);
     expect(await bridge.read(owner, bound.data, signal)).toMatchObject({ ok: false });

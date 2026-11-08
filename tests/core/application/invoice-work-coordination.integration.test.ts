@@ -235,7 +235,8 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
         ? DelegateArgsSchema.extend({ run_in_background: DelegateArgsSchema.shape.run_in_background.removeDefault() }) : tool.inputSchema) } })),
     executeTool: async input => {
       if (authorityTools) return authorityClient!.executeTool(input);
-      const reconciled = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId, requestId: input.requestId });
+      const reconciled = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
+        attemptId: input.attemptId, requestId: input.requestId });
       return reconciled.ok ? bridge.executeTool(input) : reconciled;
     }, readToolResult: input => authorityTools ? authorityClient!.readToolResult(input) : bridge.readToolResult(input),
     onToolFeedback: input => authorityTools ? authorityClient!.onToolFeedback(input) : bridge.onToolFeedback(input) };
@@ -245,7 +246,7 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
   const modelSocketPath = join(modelSocketDir, 'model.sock');
   const modelServer = socketTransport && proxy ? need(await listenCloudModelSocket({ socketPath: modelSocketPath, proxy,
     prepare: async input => {
-      const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId,
+      const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
         attemptId: input.attemptId, requestId: input.requestId });
       return linked.ok ? ok(undefined) : linked;
     } })) : null;
@@ -256,7 +257,8 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
       : fail(appError('state_conflict', 'runtime', 'Controlled child context unavailable.')) : contexts.verify(input),
     verifyModelUse: input => governor.verifyModelUse(input), verifySchedulingUse: (input, pending) => governor.verifySchedulingUse(input, pending),
     executeTool: async input => {
-      const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId, requestId: input.requestId });
+      const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
+        attemptId: input.attemptId, requestId: input.requestId });
       return linked.ok ? bridge.executeTool(input) : linked;
     }, readToolResult: input => bridge.readToolResult(input), onToolFeedback: input => bridge.onToolFeedback(input),
     subagents: subagents.callbacks, compactions: productCompactions,
@@ -281,7 +283,7 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
       cloudModel: { binding,
       send: async (input, signal) => {
         if (modelServer) return callCloudModelSocket(modelSocketPath, input, signal);
-        const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId,
+        const linked = await observer.reconcile({ workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }),
           attemptId: input.attemptId, requestId: input.requestId });
         if (!linked.ok) return linked;
         if (proxy) return proxy.send(input, signal);
@@ -314,9 +316,10 @@ async function fixture(mode: 'candidate' | 'no-candidate' | 'fail' | 'owned' | '
   const models = new InvoiceWorkModelService({ database, runtime, now, resolveConfiguration: () => ok(provider) });
   const tasks = new PersonalTasksService({ database, runtime, now, phaseObserver: observer,
     ...(childMode ? { reconcileChildren: identity => subagents.reconcileAttempt(identity) } : {}), restoreAttempt: async identity => {
-    const phase = await database.read(scope => scope.db.query<{ request_id: string }, [number]>(
-      'SELECT request_id FROM invoice_work_phases WHERE attempt_id=? ORDER BY id DESC LIMIT 1').get(identity.attemptId));
-    return phase ? models.restore({ ...identity, requestId: phase.request_id }) : ok(undefined);
+    const phase = await database.read(scope => scope.db.query<{ request_id: string; item_id: number | null; scheduler_state: string }, [number]>(
+      'SELECT request_id,item_id,scheduler_state FROM invoice_work_phases WHERE attempt_id=? ORDER BY id DESC LIMIT 1').get(identity.attemptId));
+    return phase ? models.restore({ ...identity, requestId: phase.request_id,
+      ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}) }) : ok(undefined);
   }, verifyModelUse: identity => governor.verifyModelUse(identity), onChanged: () => coordinator.wake() });
   coordinator = new InvoiceWorkCoordinator({ database, runtime, modelService: models, contexts, phaseObserver: observer, governor, tasks,
     now, sdk, runtimeScope, verifyResources: () => ok(undefined), onError: error => errors.push(error.code) });
@@ -517,6 +520,19 @@ test('persisted create notifications drive the real SDK through read/save, relea
   expect(facts.candidates).toEqual({ count: 3 }); expect(facts.snapshots).toEqual({ count: 3 }); expect(f.errors).toEqual([]);
 }, 20_000);
 
+test('new Work phases use one native conversation per invoice even without approval tools', async () => {
+  const f = await fixture('no-candidate'), created = await f.create('separate-invoice-conversations');
+  await f.start();
+  await waitFor(async () => (await f.database.read(scope => scope.db.query<{ count: number }, [number]>(
+    'SELECT COUNT(*) count FROM invoice_work_phases WHERE work_id=? AND closed_at IS NOT NULL').get(created.workId)))!.count === 2, 10000);
+  const phases = await f.database.read(scope => scope.db.query<{ item_id: number; native_conversation_id: number; scheduler_state: string }, [number]>(
+    'SELECT item_id,native_conversation_id,scheduler_state FROM invoice_work_phases WHERE work_id=? ORDER BY id').all(created.workId));
+  expect(phases).toHaveLength(2);
+  expect(phases[0]!.item_id).not.toBe(phases[1]!.item_id);
+  expect(phases[0]!.native_conversation_id).not.toBe(phases[1]!.native_conversation_id);
+  expect(phases.every(phase => phase.scheduler_state !== 'legacy')).toBe(true);
+}, 20000);
+
 test('one invoice waiting for clarification does not block another fixed invoice, and a phase without business progress never polls the model', async () => {
   const f = await fixture('no-candidate'), created = await f.create('needs-material');
   const first = (await f.work(created.workId)).items[0]!;
@@ -637,10 +653,10 @@ test('native cloud result outbox keeps the exact original submission across reop
     requestId: 'cloud-outbox-original', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
   { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
   f.coordinator.wake(); need(await f.coordinator.drain());
-  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number }, [number]>(
-    'SELECT request_id,attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number; item_id: number }, [number]>(
+    'SELECT request_id,attempt_id,item_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
   if (!phase || !f.cloudStore) throw Error('Expected the original native phase and isolated store.');
-  const query = { workId: work.workId, sessionId: work.sessionId, attemptId: phase.attempt_id, requestId: phase.request_id };
+  const query = { workId: work.workId, sessionId: work.sessionId, itemId: phase.item_id, attemptId: phase.attempt_id, requestId: phase.request_id };
   const view = need(await f.runtime.getSubmission(query)), observation = need(await f.runtime.observeSubmission(query));
   if (!view || !observation || view.status !== 'done') throw Error('Expected the original native completion.');
   const session = need(await f.cloudStore.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
@@ -685,9 +701,9 @@ test('native cloud result outbox keeps the exact original submission across reop
   expect(need(await reopened.pendingResults())).toEqual([]);
   expect(need(await reopened.listResults({ attemptId: query.attemptId, limit: 10 }))).toMatchObject({
     items: [{ requestId: query.requestId, nativeSubmissionId: event.nativeSubmissionId, state: 'blocked', attempts: 8 }], nextAfterSubmissionId: null });
-  expect(await reopened.retryResultByIdentity({ attemptId: query.attemptId, requestId: 'another-phase', nativeSubmissionId: event.nativeSubmissionId }))
+  expect(await reopened.retryResultByIdentity({ attemptId: query.attemptId, itemId: query.itemId, requestId: 'another-phase', nativeSubmissionId: event.nativeSubmissionId }))
     .toMatchObject({ ok: false });
-  need(await reopened.retryResultByIdentity({ attemptId: query.attemptId, requestId: query.requestId, nativeSubmissionId: event.nativeSubmissionId }));
+  need(await reopened.retryResultByIdentity({ attemptId: query.attemptId, itemId: query.itemId, requestId: query.requestId, nativeSubmissionId: event.nativeSubmissionId }));
   expect(need(await reopened.pendingResults())).toMatchObject([{ event, attempts: 0 }]);
   expect(await reopened.acknowledgeResult(event, { ...firstReceipt, workId: firstReceipt.workId + 1 })).toMatchObject({ ok: false });
   expect(need(await reopened.pendingResults())).toHaveLength(1);
@@ -712,7 +728,7 @@ test('an oversized native answer stays available in its original entry and is sh
   const session = need(await f.cloudStore!.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
   const result = need(await session.listResults({ attemptId })).items[0]!;
   expect(result).toMatchObject({ state: 'blocked', blockedReason: 'size_limit', nativeStatus: 'done' });
-  expect(await session.retryResultByIdentity({ attemptId, requestId: result.requestId, nativeSubmissionId: result.nativeSubmissionId }))
+  expect(await session.retryResultByIdentity({ attemptId, itemId: result.itemId, requestId: result.requestId, nativeSubmissionId: result.nativeSubmissionId }))
     .toMatchObject({ ok: false, error: { code: 'cloud_result_too_large' } });
   expect(need(await session.pendingResults())).toEqual([]); expect(f.requests).toHaveLength(1);
   need(await f.coordinator.drain());
@@ -816,12 +832,12 @@ test('reopening a cloud Session repairs a missing outbox record without repeatin
     requestId: 'cloud-outbox-repair', goal: 'Review this original invoice.', documents: [{ id: 1, version: 'v1' }] },
   { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
   f.coordinator.wake(); need(await f.coordinator.drain());
-  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number }, [number]>(
-    'SELECT request_id,attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number; item_id: number }, [number]>(
+    'SELECT request_id,attempt_id,item_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
   if (!phase) throw Error('Expected the original cloud phase.');
   const originalCalls = f.requests.length; expect(originalCalls).toBe(1);
   await f.restart();
-  need(await f.runtime.getSubmission({ workId: work.workId, sessionId: work.sessionId, attemptId: phase.attempt_id, requestId: phase.request_id }));
+  need(await f.runtime.getSubmission({ workId: work.workId, sessionId: work.sessionId, itemId: phase.item_id, attemptId: phase.attempt_id, requestId: phase.request_id }));
   if (!f.cloudStore) throw Error('Expected the reopened cloud store.');
   const session = need(await f.cloudStore.openSession({ ...binding, workId: work.workId, sessionId: work.sessionId }, false));
   await waitFor(async () => need(await session.pendingResults()).length === 1, 3_000);
@@ -990,12 +1006,16 @@ test.skipIf(process.platform !== 'linux')('cloud invoice delegation crosses the 
   expect(calls.filter(value => value.child !== null)).toHaveLength(1);
   const observed = f.childObservations.find(value => (value as { creation?: string }).creation === 'created') as import('@flowmate/contracts').DurableSubagentObservation | undefined;
   if (!observed) throw Error('The original child observation is missing.');
+  expect(observed.itemId).toBeDefined();
   const child = { workId: observed.workId, sessionId: observed.sessionId, attemptId: observed.attemptId, requestId: observed.requestId,
+    itemId: observed.itemId,
     childRunId: observed.childRunId, childSessionId: observed.childSessionId, originToolCallId: observed.originToolCallId,
     nativeToolTaskId: observed.nativeToolTaskId };
   const history = need(await f.runtime.queryHistoryPage({ workId: work.workId, sessionId: work.sessionId, child, limit: 100 }));
   expect(history.owner).toMatchObject({ workId: work.workId, sessionId: child.childSessionId, childRunId: child.childRunId });
   expect(history.entries.length).toBeGreaterThan(0);
+  expect(await f.runtime.queryHistoryPage({ workId: work.workId, sessionId: work.sessionId,
+    child: { ...child, itemId: undefined }, limit: 100 })).toMatchObject({ ok: false });
   expect(await f.runtime.queryHistoryPage({ workId: work.workId, sessionId: work.sessionId,
     child: { ...child, requestId: 'another-original-phase' }, limit: 100 })).toMatchObject({ ok: false });
 }, 20_000);
@@ -1084,8 +1104,8 @@ test.skipIf(process.platform !== 'linux')('manual delivery retry after a blocked
   { at: now(), admission: { kind: 'queued' }, runtimeOwner: binding })));
   f.coordinator.wake(); need(await f.coordinator.drain());
   await waitFor(async () => f.authorityResultRequests() > 0, 3_000);
-  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number }, [number]>(
-    'SELECT request_id,attempt_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
+  const phase = await f.database.read(scope => scope.db.query<{ request_id: string; attempt_id: number; item_id: number }, [number]>(
+    'SELECT request_id,attempt_id,item_id FROM invoice_work_phases WHERE work_id=?').get(work.workId));
   if (!phase) throw Error('Expected the original phase.');
   let nativeSubmissionId = 0;
   await f.restart(async () => {
@@ -1100,8 +1120,10 @@ test.skipIf(process.platform !== 'linux')('manual delivery retry after a blocked
   });
   const delivery = (f.runtime as DurableRuntimePort & { delivery: CloudRuntimeDeliveryPort }).delivery;
   const owner = { workId: work.workId, sessionId: work.sessionId, attemptId: phase.attempt_id };
-  const original = { ...owner, requestId: phase.request_id, nativeSubmissionId };
-  expect(need(await delivery.status(owner)).results.items).toMatchObject([{ requestId: original.requestId, nativeSubmissionId, state: 'blocked', attempts: 8 }]);
+  const original = { ...owner, itemId: phase.item_id, requestId: phase.request_id, nativeSubmissionId };
+  expect(need(await delivery.status(owner)).results.items).toMatchObject([{ itemId: phase.item_id, requestId: original.requestId, nativeSubmissionId, state: 'blocked', attempts: 8 }]);
+  expect(await delivery.retry({ ...owner, requestId: phase.request_id, nativeSubmissionId })).toMatchObject({ ok: false, error: { code: 'cloud_runtime_forbidden' } });
+  expect(await delivery.retry({ ...original, itemId: phase.item_id + 1 })).toMatchObject({ ok: false, error: { code: 'cloud_runtime_forbidden' } });
   expect(await delivery.retry({ ...original, nativeSubmissionId: nativeSubmissionId + 1 })).toMatchObject({ ok: false });
   f.setResultDelivery(true);
   expect(await delivery.retry(original)).toMatchObject({ ok: true, data: { ...original, state: 'pending' } });
@@ -1180,7 +1202,7 @@ test('cloud native compaction sends its summary through the same Authority proxy
   expect(summary?.state).toBe('confirmed');
   const original = JSON.parse(summary!.request_json);
   const observed = need(await f.runtime.queryCompaction({ workId: work.workId, sessionId: work.sessionId,
-    attemptId: original.attemptId, requestId: original.requestId, operationId: original.compactionOperationId }));
+    itemId: original.itemId, attemptId: original.attemptId, requestId: original.requestId, operationId: original.compactionOperationId }));
   expect(observed).toMatchObject({ nativeTaskId: original.nativeTaskId, outcome: 'completed', summarySaved: true });
   const reservations = await f.database.read(scope => scope.db.query<{ count: number }, []>('SELECT SUM(count) count FROM invoice_work_model_reservations').get());
   const attempts = await f.database.read(scope => scope.db.query<{ count: number }, []>('SELECT COUNT(*) count FROM cloud_model_attempts').get());
@@ -1199,7 +1221,7 @@ test('a confirmed retryable compaction failure retains the original summary task
   expect(attempts.map(value => [value.transport_ordinal, value.http_status])).toEqual([[0, 503], [1, 200]]);
   const first = JSON.parse(attempts[0]!.request_json), second = JSON.parse(attempts[1]!.request_json);
   expect(first.nativeTaskId).toBe(second.nativeTaskId); expect(first.modelAttemptId).not.toBe(second.modelAttemptId);
-  expect(need(await f.runtime.queryCompaction({ workId: work.workId, sessionId: work.sessionId, attemptId: first.attemptId,
+  expect(need(await f.runtime.queryCompaction({ workId: work.workId, sessionId: work.sessionId, itemId: first.itemId, attemptId: first.attemptId,
     requestId: first.requestId, operationId: first.compactionOperationId }))).toMatchObject({ nativeTaskId: first.nativeTaskId, outcome: 'completed', summarySaved: true });
 }, 20_000);
 
@@ -1344,7 +1366,7 @@ test('cold recovery resumes an admitted native input with its stored model and c
   need(await f.coordinator.recover());
   expect(await f.database.read(scope => scope.db.query('SELECT id,native_conversation_id,native_submission_id FROM invoice_work_phases').get())).toEqual(original);
   expect((await f.work(created.workId)).work.execution.runStatus).toBe('completed');
-  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, limit: 100 }));
+  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, itemId: (await f.work(created.workId)).items[0]!.itemId, limit: 100 }));
   expect(history.entries.filter(entry => entry.kind === 'flowmate.input')).toHaveLength(1);
   expect(f.errors).toEqual([]);
 }, 20_000);
@@ -1440,26 +1462,26 @@ test.each(['before-native-submit', 'after-native-submit'] as const)('cold recove
   if (gap === 'before-native-submit') f.runtime.submit = async () => fail(appError('storage_write_failed', 'storage', 'Controlled original submission outage.', true));
   else f.observer.reconcile = async () => fail(appError('storage_write_failed', 'storage', 'Controlled product link commit outage.', true));
   await expect(f.start()).rejects.toThrow('storage_write_failed');
-  const stored = await f.database.read(scope => scope.db.query<{ id: number; request_id: string; native_submission_id: number | null }, []>(
-    'SELECT id,request_id,native_submission_id FROM invoice_work_phases').get()!);
+  const stored = await f.database.read(scope => scope.db.query<{ id: number; item_id: number; request_id: string; native_submission_id: number | null }, []>(
+    'SELECT id,item_id,request_id,native_submission_id FROM invoice_work_phases').get()!);
   expect(stored.native_submission_id).toBeNull();
-  const identity = { workId: created.workId, sessionId: created.sessionId, attemptId: created.execution.attempt!.attemptId, requestId: stored.request_id };
+  const identity = { workId: created.workId, sessionId: created.sessionId, itemId: stored.item_id, attemptId: created.execution.attempt!.attemptId, requestId: stored.request_id };
   const submitted = need(await f.runtime.getSubmission(identity));
   expect(submitted === null).toBe(gap === 'before-native-submit');
   await f.restart(); gate.release.resolve(); need(await f.coordinator.recover());
   const recovered = await f.database.read(scope => scope.db.query('SELECT id,native_submission_id FROM invoice_work_phases').get());
   expect(recovered).toMatchObject({ id: stored.id, native_submission_id: submitted?.nativeSubmissionId ?? expect.any(Number) });
   expect((await f.work(created.workId)).work.execution.runStatus).toBe('completed');
-  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, limit: 100 }));
+  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, itemId: stored.item_id, limit: 100 }));
   expect(history.entries.filter(entry => entry.kind === 'flowmate.input')).toHaveLength(1);
 }, 20_000);
 
 test('a done input with a real owned native Task holds root admission until the actual owned completion event', async () => {
   const f = await fixture('owned'), first = await f.create('owned-first', [1]);
   await f.start(); await f.owned.entered.promise;
-  const original = await f.database.read(scope => scope.db.query<{ request_id: string }, []>('SELECT request_id FROM invoice_work_phases').get()!);
+  const original = await f.database.read(scope => scope.db.query<{ request_id: string; item_id: number }, []>('SELECT request_id,item_id FROM invoice_work_phases').get()!);
   const observed = need(await f.runtime.observeSubmission({ workId: first.workId, sessionId: first.sessionId,
-    attemptId: first.execution.attempt!.attemptId, requestId: original.request_id }));
+    itemId: original.item_id, attemptId: first.execution.attempt!.attemptId, requestId: original.request_id }));
   expect(observed).toMatchObject({ status: 'done', execution: 'active' });
   const second = await f.create('owned-second', [2]); need(await f.coordinator.drain());
   expect(f.requests).toHaveLength(1); expect((await f.work(first.workId)).work.execution.runStatus).toBe('running');
@@ -1523,7 +1545,7 @@ test('the last authorized model request can finish its real candidate phase norm
 test('the persisted Work thinking level reaches actual HTTP and its original native submission', async () => {
   const f = await fixture('no-candidate', 'high'), created = await f.create('frozen-thinking', [1]);
   await f.start(); expect(f.wireRequests[0]!.reasoning_effort).toBe('high');
-  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, limit: 100 }));
+  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, itemId: (await f.work(created.workId)).items[0]!.itemId, limit: 100 }));
   expect(history.entries.filter(entry => entry.kind === 'flowmate.input').map(entry => JSON.parse(entry.json).data.thinkingLevel)).toEqual(['high']);
 }, 15_000);
 
@@ -1580,7 +1602,7 @@ test('a real phase and context COMMIT with a lost response resumes the same snap
   expect(await f.database.read(scope => scope.db.query('SELECT COUNT(*) count FROM runs').get())).toEqual({ count: 1 });
   expect((await f.work(created.workId)).work.execution).toMatchObject({ runStatus: 'completed', requiresContinue: false, stopUnconfirmed: false });
   expect(f.requests).toHaveLength(3); expect(f.requests.every(context => context.phase.phaseId === committed[0]!.phaseId)).toBe(true);
-  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, limit: 100 }));
+  const history = need(await f.runtime.queryHistory({ workId: created.workId, sessionId: created.sessionId, itemId: (await f.work(created.workId)).items[0]!.itemId, limit: 100 }));
   expect(history.entries.filter(entry => entry.kind === 'flowmate.input')).toHaveLength(1); expect(f.errors).toEqual([]);
 }, 15_000);
 

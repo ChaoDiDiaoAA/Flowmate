@@ -2450,13 +2450,18 @@ it('reconciles Renderer messages from the public history IPC without replaying a
       ipcMain.removeHandler('flowmate:list-session-runs');
       ipcMain.handle('flowmate:list-session-runs', async (_event, input) => ({ ok: true,
         data: input.sessionId === 13 ? { items: [], nextBeforeRunId: null } : runPage }));
-      const receipt = { session, items: [user] as unknown[], historyCalls: 0, activeQueries: 0, maxQueries: 0,
+      const receipt = { session, runPage, inputs: [] as unknown[], items: [user] as unknown[], historyCalls: 0, restoreCalls: 0, activeQueries: 0, maxQueries: 0,
         navigation: 0, queries: [] as Array<{ id: number; navigation: number; frame: string; held: boolean; phase: string }>,
-        startCalls: 0, hold: false, failNext: false, release: null as (() => void) | null };
+        startCalls: 0, hold: false, failNext: false, rejectNext: false, release: null as (() => void) | null };
       BrowserWindow.getAllWindows()[0]?.webContents.on('did-start-navigation', (_event, _url, _inPlace, mainFrame) => {
         if (mainFrame) receipt.navigation += 1;
       });
       (globalThis as unknown as { rendererReceipt: typeof receipt }).rendererReceipt = receipt;
+      ipcMain.removeHandler('flowmate:restore-workspace');
+      ipcMain.handle('flowmate:restore-workspace', async () => { receipt.restoreCalls++; return { ok: true, data: { workspace, clearedReferences: [] } }; });
+      ipcMain.removeHandler('flowmate:list-session-inputs');
+      ipcMain.handle('flowmate:list-session-inputs', async (_event, input) => ({ ok: true,
+        data: { items: input.sessionId === 12 ? receipt.inputs : [], nextBeforeInputId: null } }));
       ipcMain.removeHandler('flowmate:list-session-messages');
       ipcMain.handle('flowmate:list-session-messages', async (_event, input) => {
         if (input.sessionId === 13) return { ok: true, data: { session: otherSession, leafId: 'renderer-t1', entryCount: 1,
@@ -2470,9 +2475,11 @@ it('reconciles Renderer messages from the public history IPC without replaying a
         receipt.maxQueries = Math.max(receipt.maxQueries, receipt.activeQueries);
         const snapshot = structuredClone(receipt.items);
         const failThisQuery = receipt.failNext;
-        receipt.failNext = false;
+        const rejectThisQuery = receipt.rejectNext;
+        receipt.failNext = false; receipt.rejectNext = false;
         try {
           if (receipt.hold) await new Promise<void>((resolve) => { receipt.release = resolve; });
+          if (rejectThisQuery) throw Error('Controlled disconnected history request.');
           if (failThisQuery) {
             return { ok: false, error: { code: 'storage_read_failed', category: 'storage', message: 'Controlled history unavailable.', retryable: true } };
           }
@@ -2599,6 +2606,42 @@ it('reconciles Renderer messages from the public history IPC without replaying a
     await page.getByRole('button', { name: 'Stop', exact: true }).waitFor({ state: 'visible' });
     expect(await page.getByRole('textbox', { name: 'Message to model' }).inputValue()).toBe('Draft stays editable');
     expect(await page.locator('.chat-transcript').textContent()).not.toContain('OLD RUN TEXT');
+    const reconnectBaseline = await app.evaluate(() => {
+      const receipt = (globalThis as unknown as { rendererReceipt: { hold: boolean; rejectNext: boolean; release: (() => void) | null;
+        historyCalls: number; restoreCalls: number; runPage: { items: Array<Record<string, unknown>> }; inputs: unknown[] } }).rendererReceipt;
+      receipt.hold = true; receipt.rejectNext = true; receipt.release = null;
+      receipt.runPage.items.unshift({ ...receipt.runPage.items[0], runId: 103, status: 'cancelled',
+        endedAt: '2026-09-30T00:00:01.000Z', stoppedAt: '2026-09-30T00:00:01.000Z',
+        cleanup: { version: 1, stopped: true, stopReason: 'connection-closed', errors: [], lateObservationRequired: false } });
+      receipt.inputs.push({ inputId: 91, sessionId: 12, clientSequence: 3, mode: 'followUp', goalMode: 'answer', runId: 103,
+        contextSnapshotId: null, content: { version: 2, text: 'Original queued instruction', workspaceContext: null, workspaceInput: null,
+          allowedDocumentIds: [], allowedArtifactIds: [], promptText: 'Original queued instruction' }, status: 'cancelled',
+        processingStatus: 'cancelled', nativeEntryId: null, resultEntryId: null, dispatchedAt: null, error: null,
+        createdAt: '2026-09-30T00:00:00.000Z', updatedAt: '2026-09-30T00:00:01.000Z' });
+      return { history: receipt.historyCalls, restore: receipt.restoreCalls };
+    });
+    historyCheckpoint = 'reconnect after a failed old history request';
+    await page.getByRole('button', { name: 'Refresh history', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => Boolean((globalThis as unknown as { rendererReceipt: { release: (() => void) | null } })
+      .rendererReceipt.release))).toBe(true);
+    await app.evaluate(({ BrowserWindow }, data) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event',
+      { type: 'host_state', state: { ...data, ready: false } }), desktop.data);
+    await page.waitForTimeout(100);
+    await app.evaluate(({ BrowserWindow }, data) => BrowserWindow.getAllWindows()[0]?.webContents.send('flowmate:event',
+      { type: 'host_state', state: { ...data, ready: true } }), desktop.data);
+    await expect.poll(() => app.evaluate(() => (globalThis as unknown as { rendererReceipt: { restoreCalls: number } })
+      .rendererReceipt.restoreCalls)).toBeGreaterThan(reconnectBaseline.restore);
+    await app.evaluate(() => {
+      const receipt = (globalThis as unknown as { rendererReceipt: { hold: boolean; release: (() => void) | null } }).rendererReceipt;
+      receipt.hold = false; receipt.release?.();
+    });
+    await expect.poll(() => app.evaluate(() => (globalThis as unknown as { rendererReceipt: { historyCalls: number } })
+      .rendererReceipt.historyCalls)).toBeGreaterThanOrEqual(reconnectBaseline.history + 2);
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0);
+    await expect(page.getByText('Original queued instruction', { exact: true })).toBeVisible();
+    await expect(page.getByText('followUp · cancelled', { exact: true })).toBeVisible();
+    expect(await page.getByRole('textbox', { name: 'Message to model' }).inputValue()).toBe('Draft stays editable');
+    expect(await app.evaluate(() => (globalThis as unknown as { rendererReceipt: { startCalls: number } }).rendererReceipt.startCalls)).toBe(0);
     await app.evaluate(() => { (globalThis as unknown as { rendererReceipt: { hold: boolean } }).rendererReceipt.hold = true; });
     historyCheckpoint = 'switch Session while history is pending';
     await page.getByRole('button', { name: 'Refresh history', exact: true }).click();

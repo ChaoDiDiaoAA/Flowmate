@@ -10,7 +10,7 @@ import type { InvoiceWorkPhaseInstructions } from '../../../contracts/src/person
 const id = InvoiceWorkContinueRequestSchema.shape.workId;
 const requestId = InvoiceWorkContinueRequestSchema.shape.requestId;
 const phaseKey = z.object({ workId: id, attemptId: id, requestId }).strict();
-const querySchema = phaseKey.extend({ sessionId: id });
+const querySchema = phaseKey.extend({ sessionId: id, itemId: id.optional() });
 const freezeSchema = phaseKey.extend({ itemId: id, kind: z.literal('prompt'), basis: InvoiceWorkPhaseBasisSchema,
   remainingBudget: InvoiceWorkContextBuildInputSchema.unwrap().shape.remainingBudget });
 export type InvoiceWorkFreezeContextRequest = z.infer<typeof freezeSchema>;
@@ -86,7 +86,9 @@ export class InvoiceWorkPhaseContextService {
   private current(scope: SqlDatabaseStore, query: DurableSubmissionQuery): Result<InvoiceWorkWorkingContext> {
     const saved = scope.invoiceWorkContexts.get({ workId: query.workId, attemptId: query.attemptId, requestId: query.requestId });
     if (!saved.ok) return saved;
-    if (!saved.data || saved.data.context.work.sessionId !== query.sessionId) return missing();
+    if (!saved.data || saved.data.context.work.sessionId !== query.sessionId
+      || (saved.data.context.phase.basis.executionMode === 'item-lane-approval-v1'
+        ? saved.data.context.item.itemId !== query.itemId : query.itemId !== undefined)) return missing();
     const current = scope.invoiceWorks.readContextInput({ workId: query.workId, attemptId: query.attemptId,
       requestId: query.requestId, remainingBudget: saved.data.context.actions.remainingBudget });
     return current.ok ? ok(saved.data.context) : current;
@@ -122,12 +124,14 @@ export class InvoiceWorkPhaseObserver {
       });
       if (!original.ok || original.data === null) return original;
       const originalPhase = original.data;
+      if (originalPhase.basis.executionMode === 'item-lane-approval-v1'
+        ? originalPhase.itemId !== input.data.itemId : input.data.itemId !== undefined) return missing();
       const observed = await this.options.runtime.observeSubmission(input.data);
       if (!observed.ok) return observed;
       if (observed.data === null) return ok(null);
       const observation = observed.data;
       if (observation.workId !== input.data.workId || observation.sessionId !== input.data.sessionId
-        || observation.attemptId !== input.data.attemptId || observation.requestId !== input.data.requestId)
+        || observation.itemId !== input.data.itemId || observation.attemptId !== input.data.attemptId || observation.requestId !== input.data.requestId)
         return fail(appError('source_invalid', 'runtime', 'The native receipt belongs to another invoice phase.'));
       let rejected: Result<never> | undefined;
       try {

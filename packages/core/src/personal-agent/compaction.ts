@@ -7,7 +7,8 @@ import type { DbHandle } from '../storage/database.ts';
 import type { DurableInvoiceGovernor } from './admission.ts';
 import type { InvoiceWorkPhaseContextService } from './phase-context.ts';
 
-const phase = ({ workId, sessionId, attemptId, requestId }: DurableSubmissionQuery): DurableSubmissionQuery => ({ workId, sessionId, attemptId, requestId });
+const phase = ({ workId, sessionId, itemId, attemptId, requestId }: DurableSubmissionQuery): DurableSubmissionQuery =>
+  ({ workId, sessionId, ...(itemId === undefined ? {} : { itemId }), attemptId, requestId });
 const parent = ({ workId, sessionId, attemptId }: DurableSubmissionQuery) => ({ workId, sessionId, attemptId });
 const invalid = () => fail(appError('input_invalid', 'input', 'The original summary request is invalid.'));
 const changed = () => fail(appError('source_invalid', 'runtime', 'The summary differs from its original phase model or thinking level.'));

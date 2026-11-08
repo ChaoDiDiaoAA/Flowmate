@@ -3,8 +3,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { appError, CloudWorkspaceIdSchema, fail, ok, InvoiceWorkCreateRequestSchema, InvoiceWorkContinueRequestSchema,
   InvoiceWorkSupplementRequestSchema, InvoiceWorkDisposeItemRequestSchema, InvoiceWorkCancelRequestSchema,
   InvoiceWorkListRequestSchema, InvoiceWorkGetRequestSchema, InvoiceWorkQueryOperationRequestSchema,
-  DesktopActionDecisionQuerySchema, DesktopActionDecisionRequestSchema, DesktopActionListRequestSchema, DesktopActionDiscardSchema,
-  BrowserReadDecisionQuerySchema, BrowserReadDecisionRequestSchema, BrowserReadListRequestSchema, BrowserReadRevokeSchema,
+  DesktopActionDecisionQuerySchema, DesktopActionDecisionRequestSchema, DesktopActionListRequestSchema, DesktopActionDiscardSchema, DesktopActionRebindSchema,
+  BrowserReadDecisionQuerySchema, BrowserReadDecisionRequestSchema, BrowserReadListRequestSchema, BrowserReadRebindSchema, BrowserReadRevokeSchema,
   DurableModelBindingSchema, RuntimeRequestOverridesSchema } from '@flowmate/contracts';
 import type { InvoiceWorksApi, InvoiceWorkCreateRequest, InvoiceWorkContinueRequest, InvoiceWorkSupplementRequest,
   InvoiceWorkDisposeItemRequest, InvoiceWorkCancelRequest, InvoiceWorkListRequest, InvoiceWorkGetRequest,
@@ -28,10 +28,13 @@ export type InvoiceWorkServiceOptions = {
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
   cloudWorkspaceId?: string;
   captureModel?: (configuration: PersonalAgentConfiguration) => Result<DurableModelBinding | null> | Promise<Result<DurableModelBinding | null>>;
+  bindMemoryWork?: (scope: SqlDatabaseStore, work: { workId: number; sessionId: number }) => Result<void>;
   assessExecution: (command: InvoiceWorkExecutionCommand) => Result<InvoiceWorkAdmission> | Promise<Result<InvoiceWorkAdmission>>;
   /** Signal persisted facts; the coordinator must recheck authorization before dispatch. */
   onChanged: (receipt: InvoiceWorkOperationReceipt) => void;
   onDesktopChanged?: () => void;
+  rebindDesktopAction?: (input: import('@flowmate/contracts').DesktopActionRebind) => Promise<Result<DesktopActionView>>;
+  rebindBrowserRead?: (input: import('@flowmate/contracts').BrowserReadRebind) => Promise<Result<import('@flowmate/contracts').BrowserReadView>>;
 };
 
 const invalid = () => fail(appError('input_invalid', 'input', 'Invoice Work request is invalid.'));
@@ -181,7 +184,25 @@ export class InvoiceWorkService implements InvoiceWorksApi {
           runtimeOwner = proposedOwner;
         }
       }
-      return repository.create(parsed.data, { at, admission, runtimeDefaults, runtimeOwner });
+      const created = repository.create(parsed.data, { at, admission, runtimeDefaults, runtimeOwner });
+      if (!created.ok) return created;
+      if (this.options.bindMemoryWork) {
+        const bound = this.options.bindMemoryWork(scope, created.data); if (!bound.ok) return bound;
+      } else {
+        const settings = scope.memoryIntegration.getSettings(); if (!settings.ok) return settings;
+        if (settings.data.provider === 'native') {
+          const items = scope.db.query<{ id: number }, [number]>('SELECT id FROM invoice_work_items WHERE work_id=?').all(created.data.workId);
+          for (const item of items) {
+            const prior = scope.memoryIntegration.getWorkBinding({ workId: created.data.workId, itemId: item.id, branch: 0 });
+            if (!prior.ok) return prior;
+            if (prior.data) continue;
+            const bound = scope.memoryIntegration.bindWork({ workId: created.data.workId, sessionId: created.data.sessionId,
+              itemId: item.id, branch: 0, provider: 'native', identityId: null, remoteSessionId: null, at });
+            if (!bound.ok) return bound;
+          }
+        }
+      }
+      return created;
     }, { kind: 'create', request: parsed.data, ...(proposedOwner ? { runtimeOwner: proposedOwner } : {}) });
   }
 
@@ -266,6 +287,24 @@ export class InvoiceWorkService implements InvoiceWorksApi {
       return isDeepStrictEqual(original, request) ? ok(recovered.data)
         : fail(appError('state_conflict', 'input', 'The original browser decision belongs to a different request.'));
     }
+  }
+
+  public async rebindDesktopAction(input: import('@flowmate/contracts').DesktopActionRebind): Promise<Result<DesktopActionView>> {
+    const parsed = DesktopActionRebindSchema.safeParse(input); if (!parsed.success) return invalid();
+    if (!this.options.rebindDesktopAction) return fail(appError('desktop_unavailable', 'runtime', 'The current desktop connection cannot be confirmed.', true));
+    try {
+      if (!await this.options.database.read(scope => this.allowedDesktop(scope, parsed.data.workId))) return forbidden();
+      return await this.options.rebindDesktopAction(parsed.data);
+    } catch { return fail(appError('desktop_unavailable', 'runtime', 'The current desktop connection cannot be confirmed.', true)); }
+  }
+
+  public async rebindBrowserRead(input: import('@flowmate/contracts').BrowserReadRebind): Promise<Result<import('@flowmate/contracts').BrowserReadView>> {
+    const parsed = BrowserReadRebindSchema.safeParse(input); if (!parsed.success) return invalid();
+    if (!this.options.rebindBrowserRead) return fail(appError('browser_unavailable', 'runtime', 'The current browser connection cannot be confirmed.', true));
+    try {
+      if (!await this.options.database.read(scope => this.allowedDesktop(scope, parsed.data.workId))) return forbidden();
+      return await this.options.rebindBrowserRead(parsed.data);
+    } catch { return fail(appError('browser_unavailable', 'runtime', 'The current browser connection cannot be confirmed.', true)); }
   }
 
   public async queryDesktopDecision(input: DesktopActionDecisionQuery): Promise<Result<DesktopActionDecisionReceipt | null>> {

@@ -18,7 +18,8 @@ function answer(text: string) {
   return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
 }
 async function fixture(hold = false, api: 'openai-completions' | 'google-generative-ai' = 'openai-completions', cloud = false,
-  verifyQueueInputs?: () => Promise<void>) {
+  verifyQueueInputs?: () => Promise<void>, itemId?: number) {
+  const owner = { ...query, ...(itemId === undefined ? {} : { itemId }) };
   const coordinator = createDatabaseCoordinator(new Database(':memory:'));
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   const requests: Array<{ summary: boolean; key: string | null; body: { messages?: Array<{ role: string; content?: unknown }>; tools?: unknown[] } }> = [];
@@ -66,19 +67,22 @@ async function fixture(hold = false, api: 'openai-completions' | 'google-generat
   }, context)).id;
   const conversation = (await harness.conversation(conversationId, context))!;
   const submission = await conversation.submit({ type: 'input', requestId: JSON.stringify([query.attemptId, query.requestId]),
-    content: `NATIVE-SAME-PHASE-USER:${'x'.repeat(90000)}`, entry: { kind: 'flowmate.input', data: query } }, context);
+    content: `NATIVE-SAME-PHASE-USER:${'x'.repeat(90000)}`, entry: { kind: 'flowmate.input', data: owner } }, context);
   await submission.wait(context);
   const original = (await storage.submission(submission.id, context))!;
   if (original.type !== 'input' || original.entry === undefined) throw Error('Expected an actual original input.');
   const tail = (await storage.scanEntries({ conversationId }, 1, undefined, context)).items[0]!.id;
-  const plan = { ...query, operationId: 'original-compaction', reason: 'manual' as const, expectedTailEntryId: tail,
+  const plan = { ...owner, operationId: 'original-compaction', reason: 'manual' as const, expectedTailEntryId: tail,
     instructions: 'Retain exact evidence references.', binding, thinkingLevel: 'off' as const };
   const callbacks = { readPlan: async () => ok(plan), verify: async () => allowed ? ok(undefined)
     : fail(appError('compaction_revoked', 'runtime', 'Original compaction permission was revoked.')),
   reserveModelRequest: async () => { reserved++; return ok(undefined); } };
   const openCompactions = () => createDurableCompactionRuntime({ harness, storage, registry, models: source.models, callbacks, cloud,
     ...(verifyQueueInputs ? { verifyQueueInputs } : {}),
-    resolvePhase: async () => ({ ...query, nativeConversationId: conversationId, nativeSubmissionId: submission.id, nativeEntryId: original.entry!, model: source.modelRef }),
+    resolvePhase: async input => {
+      if (input.itemId !== owner.itemId) throw Error('state_conflict');
+      return { ...owner, nativeConversationId: conversationId, nativeSubmissionId: submission.id, nativeEntryId: original.entry!, model: source.modelRef };
+    },
     read: <T>(action: () => Promise<T>) => action(), isClosed: () => false, isStopping: () => false });
   compactions = openCompactions(); building = false;
   access.readWorkingContext = () => { projections++; return fail(appError('generation_projection_used', 'runtime', 'Summaries must retain their native request.')); };
@@ -95,6 +99,18 @@ async function fixture(hold = false, api: 'openai-completions' | 'google-generat
     },
     async close() { release.resolve(); await harness.close(context); await coordinator.close(); server.stop(true); } };
 }
+
+test('an invoice summary retains its item identity across restart and rejects another invoice', async () => {
+  const f = await fixture(false, 'openai-completions', false, undefined, 71);
+  try {
+    const started = need(await f.compactions.start(f.plan)); await f.harness.waitForTask(started.nativeTaskId as TaskId, context);
+    expect(need(await f.compactions.observe(f.plan))).toMatchObject({ itemId: 71, summarySaved: true });
+    expect(await f.compactions.observe({ ...f.plan, itemId: 72 })).toMatchObject({ ok: false });
+    await f.restart();
+    expect(need(await f.compactions.observe(f.plan))).toMatchObject({ itemId: 71, nativeTaskId: started.nativeTaskId, summarySaved: true });
+    expect(f.requests).toHaveLength(2);
+  } finally { await f.close(); }
+}, 15000);
 
 test('cloud compaction checks queued input authorization before sending a summary request', async () => {
   let checks = 0;

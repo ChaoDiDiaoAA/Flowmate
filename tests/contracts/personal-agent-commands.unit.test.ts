@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
+import { CloudRuntimeRetryRequestSchema, CloudRuntimeStatusRequestSchema } from '@flowmate/contracts';
 import { parseHostCommand } from '../../apps/host/protocol.ts';
 import { PersonalAgentCommandSchema, isPersonalAgentHostCommand, matchesPersonalAgentResponse,
   parsePersonalAgentCommand, parsePersonalAgentHostResult, personalAgentHostFailure,
@@ -24,6 +25,13 @@ const receipt = { operation: 'continueWork', workId: 7, requestId: 'continue-1',
   execution: { kind: 'accepted', authorizationAccepted: true, attempt, relation: 'new' } } as const;
 const continued = { type: 'invoice_work_continue', input: { workId: 7, requestId: 'continue-1', expectedRevision: 3, expectedAttemptId: 21 } };
 const ok = <T>(data: T) => ({ ok: true as const, data });
+
+it('keeps delivery status at Work scope while retry retains the invoice identity', () => {
+  const owner = { workId: 7, sessionId: 70, attemptId: 21 };
+  expect(CloudRuntimeStatusRequestSchema.safeParse(owner).success).toBe(true);
+  expect(CloudRuntimeStatusRequestSchema.safeParse({ ...owner, itemId: 71 }).success).toBe(false);
+  expect(CloudRuntimeRetryRequestSchema.safeParse({ ...owner, itemId: 71, requestId: 'phase', nativeSubmissionId: 9 }).success).toBe(true);
+});
 
 describe('P18 command protocol', () => {
   it('binds browser approval receipts to the displayed target and original Work', () => {
@@ -74,10 +82,16 @@ describe('P18 command protocol', () => {
       { type: 'invoice_work_query_operation', input: { operation: 'create', personalAgentId: 1, requestId: 'create-1' } },
       { type: 'invoice_work_desktop_list', input: { workId: 7, itemId: 71 } },
       { type: 'invoice_work_desktop_decide', input: { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'confirm-1', decision: 'approve' } },
+      { type: 'invoice_work_desktop_rebind', input: { workId: 7, itemId: 71, proposalId: 9,
+        confirmedAction: { kind: 'click', observationId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', elementIndex: 4 },
+        confirmedTarget: { connectionId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', window: { id: 3, app: 'Controlled', title: 'Sample' }, element: '[4] Button' } } },
       { type: 'invoice_work_desktop_discard', input: { workId: 7, itemId: 71, proposalId: 9 } },
       { type: 'invoice_work_desktop_query_decision', input: { workId: 7, itemId: 71, proposalId: 9, requestId: 'confirm-1' } },
       { type: 'invoice_work_browser_list', input: { workId: 7, itemId: 71 } },
       { type: 'invoice_work_browser_decide', input: { workId: 7, itemId: 71, proposalId: 9, expectedRevision: 3, requestId: 'browser-1', decision: 'reject' } },
+      { type: 'invoice_work_browser_rebind', input: { workId: 7, itemId: 71, proposalId: 9,
+        confirmedTarget: { connectionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', bindingId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', origin: 'https://example.test' },
+        currentTarget: { connectionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', bindingId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', origin: 'https://example.test' } } },
       { type: 'invoice_work_browser_revoke', input: { workId: 7, itemId: 71, proposalId: 9 } },
       { type: 'invoice_work_browser_query_decision', input: { workId: 7, itemId: 71, proposalId: 9, requestId: 'browser-1' } },
       { type: 'personal_task_list', input: { workId: 7 } },
@@ -129,6 +143,14 @@ describe('P18 command protocol', () => {
     expect(matchesPersonalAgentResponse(detailQuery, ok(detail))).toBe(true);
     expect(matchesPersonalAgentResponse({ ...detailQuery, input: { ...detailQuery.input, limit: 5 } }, ok(detail))).toBe(false);
     expect(matchesPersonalAgentResponse({ ...detailQuery, input: { ...detailQuery.input, offset: 3 } }, ok(detail))).toBe(false);
+    const invoiceQuery = { type: 'personal_task_history', input: { target: { workId: 7, itemId: 2 }, limit: 1 } };
+    const invoicePage = { ...page, owner: { runtimeKind: 'durable', workId: 7, sessionId: 70, childRunId: null, itemId: 2 } };
+    expect(matchesPersonalAgentResponse(invoiceQuery, ok(invoicePage))).toBe(true);
+    expect(matchesPersonalAgentResponse(invoiceQuery, ok({ ...invoicePage, owner: { ...invoicePage.owner, itemId: 3 } }))).toBe(false);
+    expect(matchesPersonalAgentResponse({ ...invoiceQuery, input: { target: { workId: 7 }, limit: 1 } }, ok(invoicePage))).toBe(false);
+    const invoiceDetail = { ...detail, owner: invoicePage.owner };
+    expect(matchesPersonalAgentResponse({ ...detailQuery, input: { ...detailQuery.input, target: { workId: 7, itemId: 2 } } }, ok(invoiceDetail))).toBe(true);
+    expect(matchesPersonalAgentResponse({ ...detailQuery, input: { ...detailQuery.input, target: { workId: 7, itemId: 3 } } }, ok(invoiceDetail))).toBe(false);
     const timeline = { type: 'invoice_work_timeline', input: { workId: 7 } };
     expect(matchesPersonalAgentResponse(timeline, ok({ workId: 7, semantics: 'live-facts', entries: [], nextBefore: null }))).toBe(true);
     expect(matchesPersonalAgentResponse(timeline, ok({ workId: 8, semantics: 'live-facts', entries: [], nextBefore: null }))).toBe(false);

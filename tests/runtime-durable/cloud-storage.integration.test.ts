@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels, InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
-import { createRegistry, defineTask, Harness, type ConversationId } from '@earendil-works/pi-durable';
+import { createRegistry, defineDoc, defineTask, Harness, type ConversationId } from '@earendil-works/pi-durable';
 import { SqliteStorage } from '@earendil-works/pi-durable/storage/sqlite';
 import { appError, fail, ok, type DurableRuntimePort, type Result } from '@flowmate/contracts';
 import { openCloudRuntimeStore } from '../../apps/cloud-runtime-storage.ts';
@@ -45,6 +45,39 @@ test('cloud sessions keep independent real Durable databases and reopen only the
       .toMatchObject({ ok: false, error: { code: 'cloud_runtime_owner_conflict' } });
     need(await reopened.close());
   } finally { need(await store.close()); }
+});
+
+test('cloud storage reopens the original Work and its separate invoice conversations', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-item-owners-')), store = need(await openCloudRuntimeStore(root));
+  let session = need(await store.openSession(first, true));
+  const options = { readApiKey: () => undefined, verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined) };
+  let runtime = need(await createDurableRuntime({ ...options, storage: session.storage }));
+  try {
+    const original = { workId: first.workId, sessionId: first.sessionId };
+    const rootConversation = need(await runtime.openConversation(original));
+    const a = need(await runtime.openConversation({ ...original, itemId: 101 }));
+    const b = need(await runtime.openConversation({ ...original, itemId: 102 }));
+    need(await runtime.close()); need(await session.close());
+    session = need(await store.openSession(first, false));
+    runtime = need(await createDurableRuntime({ ...options, storage: session.storage }));
+    expect(need(await runtime.openConversation(original))).toEqual(rootConversation);
+    expect(need(await runtime.openConversation({ ...original, itemId: 101 }))).toEqual(a);
+    expect(need(await runtime.openConversation({ ...original, itemId: 102 }))).toEqual(b);
+  } finally { await runtime.close(); need(await session.close()); need(await store.close()); }
+});
+
+test('cloud storage rejects an unsupported native owner binding version', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-future-item-owner-')), store = need(await openCloudRuntimeStore(root));
+  const session = need(await store.openSession(first, true));
+  const harness = await Harness.open(session.storage, { models: models(), registry: createRegistry() }, BACKGROUND_CONTEXT);
+  const future = defineDoc({ kind: 'flowmate.runtime.binding', version: 3, scope: 'conversation', history: 'latest', fork: 'initial',
+    initial: () => ({ workId: first.workId, sessionId: first.sessionId, itemId: null, attemptId: null, requestKey: null }), checkpointWhen: () => true });
+  try {
+    await harness.commit(async tx => { const conversation = await tx.createConversation({ ownership: { kind: 'ownerless' } });
+      await tx.doc(future, conversation.id); }, BACKGROUND_CONTEXT);
+    await harness.close(BACKGROUND_CONTEXT); need(await session.close());
+    expect(await store.openSession(first, false)).toMatchObject({ ok: false, error: { code: 'cloud_runtime_owner_conflict' } });
+  } finally { await harness.close(BACKGROUND_CONTEXT); await session.close(); need(await store.close()); }
 });
 
 test('a wake intent survives reopening and rejects stale scheduling callbacks', async () => {
@@ -121,6 +154,64 @@ test('an unanswered input cancelled before placement enters the native outbox wi
     expect(await session.enqueueResult({ ...event, reason: 'different' })).toMatchObject({ ok: false });
   } finally { if (harness) await harness.close(BACKGROUND_CONTEXT); if (reopened) need(await reopened.close());
     need(await session.close()); need(await store.close()); }
+});
+
+test('a finished invoice can enter the outbox while another invoice owns an active task', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-item-outbox-active-')), store = need(await openCloudRuntimeStore(root));
+  let session = need(await store.openSession(first, true));
+  const runtime = need(await createDurableRuntime({ storage: session.storage, readApiKey: () => undefined,
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined) }));
+  const owner = { workId: first.workId, sessionId: first.sessionId }, a = { ...owner, itemId: 101 }, b = { ...owner, itemId: 102 };
+  const firstConversation = need(await runtime.openConversation(a)), secondConversation = need(await runtime.openConversation(b));
+  need(await runtime.close()); need(await session.close()); session = need(await store.openSession(first, false));
+  const harness = await Harness.open(session.storage, { models: models(), registry: createRegistry() }, BACKGROUND_CONTEXT);
+  const waiting = defineTask<Record<string, never>, { phase: 'wait' }, null>({ name: 'controlled.other-invoice', version: 1,
+    initial: () => ({ phase: 'wait' }), phases: { wait: async () => {} }, abort: async () => {} });
+  const saved = await harness.commit(async tx => {
+    await tx.createTask(waiting, {}, { conversationId: secondConversation.nativeConversationId as ConversationId, ownership: { kind: 'conversation' } });
+    const entry = await tx.appendEntry(firstConversation.nativeConversationId as ConversationId, { kind: 'flowmate.input',
+      data: { ...a, attemptId: 3, requestId: 'completed-invoice' }, model: [{ role: 'user', content: 'Original invoice.', timestamp: 1 }] });
+    const submission = await tx.createSubmission({ type: 'input', conversationId: firstConversation.nativeConversationId as ConversationId,
+      requestId: JSON.stringify([3, 'completed-invoice']), status: 'queued' });
+    tx.placeSubmission(submission.id, entry.id); tx.settleSubmission(submission.id, { status: 'unanswered', reason: 'aborted' });
+    return { entry: entry.id, submission: submission.id };
+  }, BACKGROUND_CONTEXT);
+  await harness.close(BACKGROUND_CONTEXT); need(await session.close()); session = need(await store.openSession(first, false));
+  const event = { version: 1 as const, ...first, itemId: a.itemId, attemptId: 3, requestId: 'completed-invoice',
+    nativeConversationId: firstConversation.nativeConversationId, nativeSubmissionId: saved.submission, nativeInputEntryId: saved.entry,
+    nativeAnswerEntryId: null, consumedAt: null, status: 'unanswered' as const, answer: null, reason: 'aborted' };
+  try {
+    expect(await session.enqueueResult(event)).toEqual({ ok: true, data: undefined });
+    expect(need(await session.pendingResults())).toMatchObject([{ event }]);
+  } finally { need(await session.close()); need(await store.close()); }
+});
+
+test('a terminal invoice submission enters the original cloud outbox after restart', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-item-outbox-')), store = need(await openCloudRuntimeStore(root));
+  let session = need(await store.openSession(first, true));
+  const runtime = need(await createDurableRuntime({ storage: session.storage, readApiKey: () => undefined,
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined) }));
+  const owner = { workId: first.workId, sessionId: first.sessionId, itemId: 101 };
+  const conversation = need(await runtime.openConversation(owner));
+  need(await runtime.close()); need(await session.close()); session = need(await store.openSession(first, false));
+  const harness = await Harness.open(session.storage, { models: models(), registry: createRegistry() }, BACKGROUND_CONTEXT);
+  const submission = await harness.commit(async tx => {
+    const saved = await tx.createSubmission({ type: 'input', conversationId: conversation.nativeConversationId as ConversationId,
+      requestId: JSON.stringify([3, 'invoice-queued']), status: 'queued' });
+    tx.settleSubmission(saved.id, { status: 'unanswered', reason: 'aborted' }); return saved.id;
+  }, BACKGROUND_CONTEXT);
+  await harness.close(BACKGROUND_CONTEXT); need(await session.close()); session = need(await store.openSession(first, false));
+  const reopened = need(await createDurableRuntime({ storage: session.storage, readApiKey: () => undefined,
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined),
+    cloudModel: { binding: first, send: async () => fail(appError('cloud_model_transport_unavailable', 'runtime', 'No model is requested.')) },
+    onNativeResult: value => session.enqueueResult(value) }));
+  try {
+    await waitFor(async () => need(await session.pendingResults()).length === 1, 3_000);
+    const event = need(await session.pendingResults())[0]!.event;
+    expect(event).toMatchObject({ ...owner, attemptId: 3, requestId: 'invoice-queued', nativeConversationId: conversation.nativeConversationId,
+      nativeSubmissionId: submission, status: 'unanswered' });
+    expect(await session.enqueueResult({ ...event, itemId: 102 })).toMatchObject({ ok: false });
+  } finally { need(await reopened.close()); need(await session.close()); need(await store.close()); }
 });
 
 test('an oversized unanswered reason stays in its original submission and is shown as blocked', async () => {

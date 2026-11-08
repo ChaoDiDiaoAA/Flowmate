@@ -42,7 +42,8 @@ function config(port: number): ProviderConfig { return { version: 1, name: 'suba
   modelRef: { provider: 'controlled-subagent', model: 'subagent-model' }, native: { authPath: 'unused.json', modelsPath: null },
   connection: { api: 'openai-completions', baseUrl: `http://127.0.0.1:${port}/v1`, contextWindow: 64000, maxTokens: 8192 }, parameters: { maxRetries: 0, maxRetryDelayMs: 1000 } }; }
 
-test.each(['read', 'failed-child', 'nested-attempt'] as const)('a genuine owned child reports through the parent tool into the next Master HTTP request: %s', async mode => {
+test.each(['read', 'item-read', 'failed-child', 'nested-attempt'] as const)('a genuine owned child reports through the parent tool into the next Master HTTP request: %s', async mode => {
+  const phaseQuery = mode === 'item-read' ? { ...query, itemId: 71 } : query, isRead = mode === 'read' || mode === 'item-read';
   const coordinator = createDatabaseCoordinator(new Database(':memory:')), requests: Array<Record<string, unknown>> = [];
   let rootCalls = 0, childCalls = 0, readCalls = 0, agentCalls = 0, plan: DurableSubagentPlan | undefined;
   const consumed: Array<DurableSubagentIdentity & { nativeToolResultEntryId: number; nativeModelTaskId: number; observedAt: string }> = [];
@@ -62,15 +63,16 @@ test.each(['read', 'failed-child', 'nested-attempt'] as const)('a genuine owned 
   } });
   const runtime = need(await createDurableRuntime({ storage: await createDurableSqliteStorage(coordinator), readApiKey: () => 'synthetic-key',
     verifyModelUse: () => ok(undefined), reserveModelRequest: () => { rootCalls++; return ok(undefined); }, tools,
-    readWorkingContext: input => ok(working(input)), verifyWorkingContext: () => ok(undefined),
+    readWorkingContext: input => { const value = working(input); return ok(input.itemId === undefined ? value : { ...value,
+      phase: { ...value.phase, basis: { ...value.phase.basis, executionMode: 'item-lane-approval-v1' } } }); }, verifyWorkingContext: () => ok(undefined),
     subagents: { readPlan: async () => plan ? ok(plan) : fail(appError('state_conflict', 'runtime', 'No original child plan.')),
       verify: async () => ok(undefined), adopt: async () => ok(undefined), reserveModelRequest: async () => { childCalls++; return ok(undefined); },
       onParentConsumed: async value => { consumed.push(value); return ok(undefined); } },
     executeTool: async (call: DurableProductToolExecution): Promise<Result<ToolResult<unknown>>> => {
       if (call.name === 'Agent') {
         agentCalls++;
-        plan ??= { ...query, childRunId: 501, childSessionId: 801, originToolCallId: 901, nativeToolTaskId: call.nativeTaskId,
-          role: SUBAGENT_ROLE, binding: need(await runtime.prepareModel({ ...query, config: config(server.port!) })), thinkingLevel: 'off',
+        plan ??= { ...phaseQuery, childRunId: 501, childSessionId: 801, originToolCallId: 901, nativeToolTaskId: call.nativeTaskId,
+          role: SUBAGENT_ROLE, binding: need(await runtime.prepareModel({ ...phaseQuery, config: config(server.port!) })), thinkingLevel: 'off',
           prompt: 'Check only invoice eleven.', systemPrompt: SUBAGENT_SYSTEM_PROMPT, allowedTools: ['read_invoice_document'] };
         expect(call.nativeDelegate).toBeFunction();
         const result = await call.nativeDelegate!(plan, call.signal); delegateResults.push(result); const observed = need(result);
@@ -79,29 +81,30 @@ test.each(['read', 'failed-child', 'nested-attempt'] as const)('a genuine owned 
         return ok({ status: 'succeeded', data: { content: [{ type: 'text', text: observed.answer }], details: { childRunId: plan.childRunId } } });
       }
       expect(call.child).toEqual({ childRunId: 501, childSessionId: 801, originToolCallId: 901 });
-      expect(call).toMatchObject(query); readCalls++; return ok({ status: 'succeeded', data: { page: 1, text: 'Original invoice eleven evidence.' } });
+      expect(call).toMatchObject(phaseQuery); readCalls++; return ok({ status: 'succeeded', data: { page: 1, text: 'Original invoice eleven evidence.' } });
     }, readToolResult: () => ok(null), onToolFeedback: value => { feedback.push(value); return ok(undefined); } }));
   try {
     need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId }));
-    need(await runtime.submit({ ...query, config: config(server.port!), text: 'Use the checker for this original phase.' }));
-    const waited = await runtime.waitForSubmission(query);
+    if (mode === 'item-read') need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: 71 }));
+    need(await runtime.submit({ ...phaseQuery, config: config(server.port!), text: 'Use the checker for this original phase.' }));
+    const waited = await runtime.waitForSubmission(phaseQuery);
     if (!waited.ok) throw Error(JSON.stringify({ waited, delegateResults, requestCount: requests.length,
       native: await coordinator.read(db => db.all('SELECT * FROM fm_durable_tasks')) }));
     const settled = need(waited);
     if (settled.status !== 'done') throw Error(JSON.stringify({ settled, delegateResults, requests }));
     expect(settled).toMatchObject({ status: 'done', answer: 'Master received the original child evidence.' });
-    expect(rootCalls).toBe(2); expect(childCalls).toBe(mode === 'failed-child' ? 1 : 2); expect(readCalls).toBe(mode === 'read' ? 1 : 0);
+    expect(rootCalls).toBe(2); expect(childCalls).toBe(mode === 'failed-child' ? 1 : 2); expect(readCalls).toBe(isRead ? 1 : 0);
     expect(agentCalls).toBe(1); expect(requests).toHaveLength(mode === 'failed-child' ? 3 : 4);
-    expect(JSON.stringify(requests.at(-1))).toContain(mode === 'read' ? 'Verified source page one for invoice eleven.'
+    expect(JSON.stringify(requests.at(-1))).toContain(isRead ? 'Verified source page one for invoice eleven.'
       : mode === 'failed-child' ? 'Original child failed' : 'Nested delegation was refused.');
-    expect(feedback.map(item => item.name).sort()).toEqual(mode === 'read' ? ['Agent', 'read_invoice_document'] : ['Agent']);
+    expect(feedback.map(item => item.name).sort()).toEqual(isRead ? ['Agent', 'read_invoice_document'] : ['Agent']);
     expect(consumed).toHaveLength(1);
     const observation = need(await runtime.observeSubagent(plan!));
     expect(observation).toMatchObject({ creation: 'created', creatorExecution: 'closed', status: mode === 'failed-child' ? 'unanswered' : 'done', execution: 'closed',
-      answer: mode === 'read' ? 'Verified source page one for invoice eleven.' : mode === 'failed-child' ? null : 'Nested delegation was refused.',
+      answer: isRead ? 'Verified source page one for invoice eleven.' : mode === 'failed-child' ? null : 'Nested delegation was refused.',
       parentToolResultEntryId: consumed[0]!.nativeToolResultEntryId, parentModelTaskId: consumed[0]!.nativeModelTaskId,
       parentModelReceivedAt: consumed[0]!.observedAt });
-    const child = { ...query, childRunId: plan!.childRunId, childSessionId: plan!.childSessionId,
+    const child = { ...phaseQuery, childRunId: plan!.childRunId, childSessionId: plan!.childSessionId,
       originToolCallId: plan!.originToolCallId, nativeToolTaskId: plan!.nativeToolTaskId };
     const requestCount = requests.length, page = need(await runtime.queryHistoryPage({ workId: owner.workId, sessionId: owner.sessionId, child }));
     expect(page.owner).toEqual({ runtimeKind: 'durable', workId: owner.workId, sessionId: child.childSessionId, childRunId: child.childRunId });

@@ -9,6 +9,17 @@ const profile = { workspaceId, target: { host: '127.0.0.1', port: 22, username: 
 const owner = { workId: 7, sessionId: 8, attemptId: 9 };
 const command = { type: 'cloud_queue_read' as const, input: owner };
 
+test('cloud queue and result responses must retain the selected invoice identity', () => {
+  const invoice = { ...owner, itemId: 11 }, other = { ...owner, itemId: 12 };
+  const queue = { type: 'cloud_queue_read' as const, input: invoice };
+  expect(parseCloudDesktopResult(queue, ok({ ...invoice, version: 1, items: [] }))).toMatchObject({ ok: true });
+  expect(parseCloudDesktopResult(queue, ok({ ...other, version: 1, items: [] }))).toBeNull();
+  const query = { type: 'cloud_queue_query_control' as const, input: { ...invoice, controlRequestId: 'original' } };
+  expect(parseCloudDesktopResult(query, ok({ ...other, controlRequestId: 'original', status: 'applied', version: 1 }))).toBeNull();
+  const retry = { type: 'cloud_delivery_retry' as const, input: { ...invoice, requestId: 'phase', nativeSubmissionId: 17 } };
+  expect(parseCloudDesktopResult(retry, ok({ ...retry.input, itemId: other.itemId, state: 'pending' }))).toBeNull();
+});
+
 test('desktop cloud requests require the connected workspace and only expose the allowed protocol', async () => {
   let calls = 0, closes = 0, uploads = 0;
   const session = { request: async () => { calls++; return ok({ ...owner, version: 1, items: [] }); },

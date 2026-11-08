@@ -1,0 +1,3 @@
+d /run/flowmate-openviking-p 2750 flowmate-authority flowmate-openviking-p -
+d /run/flowmate-openviking-a 2750 flowmate-authority flowmate-openviking-a -
+d /run/flowmate-openviking-s 2750 flowmate-authority flowmate-openviking-s -

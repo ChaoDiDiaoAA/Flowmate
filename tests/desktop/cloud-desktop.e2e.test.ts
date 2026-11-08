@@ -186,6 +186,7 @@ test('desktop chooses cloud explicitly and creates work from the uploaded cloud 
       const work = { workId: 7, personalAgentId: 1, sessionId: 8, runtimeKind: 'durable', revision: 0, goal: 'Review cloud invoice.', status: 'open',
         createdAt: at, updatedAt: at, counts: { total: 1, unresolved: 1, accepted: 0, rejected: 0, excluded: 0 },
         execution: { attempt, runStatus: 'running', queued: false, requiresContinue: false, stopUnconfirmed: false, waitingReason: null, ownedChildRunIds: [] }, actions: [] };
+      Reflect.set(globalThis, 'cloudUseItemLanes', () => Reflect.set(work.execution, 'itemLanes', true));
       const item = { workId: 7, itemId: 9, revision: 0, documentRef: { id: 101, version: 'v1' }, jobId: 4,
         candidateRef: { id: 5, sequence: 1 }, disposition: 'unresolved', decision: null, disposedAt: null, todoCount: 0, latestInputId: null, updatedAt: at };
       const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
@@ -220,6 +221,8 @@ test('desktop chooses cloud explicitly and creates work from the uploaded cloud 
             execution: { kind: 'waiting', authorizationAccepted: false, attempt: null, reason: 'Waiting for the original work.', todoIds: [] } } };
           case 'invoice_work_get': return command.input.view === 'item' ? { ok: true, data: { view: 'item', work, item, todos: [], nextAfterTodoId: null } }
             : { ok: true, data: { view: 'work', work, items: [item], nextAfterItemId: null } };
+          case 'invoice_work_desktop_list': case 'invoice_work_browser_list': return { ok: true,
+            data: { workId: 7, itemId: command.input.itemId, items: [], nextAfterProposalId: null } };
           case 'personal_task_list': return { ok: true, data: { workId: 7, items: [task, olderTask], nextBeforeAttemptId: null } };
           case 'personal_task_get': if (command.input.attemptId === 1) return { ok: true, data: { task: olderTask, children: [], nextAfterChildRunId: null, stopReceipt: null } };
             return { ok: true, data: { task, children: [{ runtimeKind: 'durable', kind: 'subagent', workId: 7,
@@ -228,7 +231,8 @@ test('desktop chooses cloud explicitly and creates work from the uploaded cloud 
             delivery: { version: 1, state: 'message_observed', messageObservedAt: at, includedInCallSequence: null, requestDispatchedAt: null, error: null } }],
             nextAfterChildRunId: null, stopReceipt: null } };
           case 'invoice_work_timeline': return { ok: true, data: { workId: 7, semantics: 'live-facts', entries: [], nextBefore: null } };
-          case 'cloud_queue_read': return { ok: true, data: { workId: 7, sessionId: 8, attemptId: 2, version: queueVersion,
+          case 'cloud_queue_read': return { ok: true, data: { workId: 7, sessionId: 8, attemptId: 2,
+            ...(command.input.itemId === undefined ? {} : { itemId: command.input.itemId }), version: queueVersion,
             activePhaseRequestId: 'original-phase', items: queueItems } };
           case 'cloud_queue_control': {
             queueVersion++; const isNew = command.input.action.kind === 'enqueue', isEdit = command.input.action.kind === 'edit';
@@ -377,7 +381,11 @@ test('desktop chooses cloud explicitly and creates work from the uploaded cloud 
       .filter(value => value.command?.type === 'personal_task_get').length).toBeGreaterThan(beforeReportRefresh);
     await expect(page.getByText(/Original cloud child report/)).toBeVisible();
     await page.getByRole('tab', { name: 'Invoices', exact: true }).click();
+    await app.evaluate(() => (Reflect.get(globalThis, 'cloudUseItemLanes') as () => void)());
+    await page.getByRole('button', { name: 'Refresh saved work', exact: true }).click();
     await page.getByRole('button', { name: /Cloud invoice 101/ }).click();
+    await expect.poll(async () => (await app.evaluate(() => Reflect.get(globalThis, 'cloudWorkFrames')) as Array<{ command?: { type: string; input?: { itemId?: number } } }>)
+      .some(value => value.command?.type === 'cloud_queue_read' && value.command.input?.itemId === 9)).toBe(true);
     await page.getByLabel('Disposition reason').fill('My unsent disposition reason.');
     await expect.poll(async () => app.evaluate(() => Reflect.get(globalThis, 'cloudProgressPending'))).toBe(true);
     const beforeItemRefresh = (await app.evaluate(() => Reflect.get(globalThis, 'cloudWorkFrames')) as Array<{ command?: { type: string } }>)

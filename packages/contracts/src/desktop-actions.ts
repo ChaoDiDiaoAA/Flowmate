@@ -26,6 +26,12 @@ export const DesktopActionProposalSchema = z.union([
 ]);
 export type DesktopActionProposal = z.infer<typeof DesktopActionProposalSchema>;
 
+export const DesktopActionRebindSchema = z.object({ workId: id, itemId: id, proposalId: id,
+  confirmedAction: DesktopActionProposalSchema, confirmedTarget: DesktopActionTargetSchema,
+  currentAction: DesktopActionProposalSchema.optional(), currentTarget: DesktopActionTargetSchema.optional(), resume: z.literal(true).optional(),
+}).strict().refine(value => (value.currentAction === undefined) === (value.currentTarget === undefined));
+export type DesktopActionRebind = z.infer<typeof DesktopActionRebindSchema>;
+
 export const DesktopActionExecuteSchema = z.object({ proposalId: id }).strict();
 export type DesktopActionExecute = z.infer<typeof DesktopActionExecuteSchema>;
 export const DesktopActionDiscardSchema = DesktopActionExecuteSchema.extend({ workId: id, itemId: id }).strict();
@@ -86,7 +92,7 @@ export const DesktopActionViewSchema = z.object({
   proposalId: id, workId: id, itemId: id, proposalToolCallId: id,
   target: DesktopActionTargetSchema, action: DesktopActionProposalSchema,
   status: z.enum(['waiting', 'approved', 'rejected', 'claimed', 'dispatched', 'unknown', 'invalidated']),
-  canDecide: z.boolean(), canReject: z.boolean(), executionToolCallId: id.nullable(),
+  canDecide: z.boolean(), canReject: z.boolean(), resumeOriginal: z.literal(true).optional(), executionToolCallId: id.nullable(),
   createdAt: z.string().datetime({ offset: true }), updatedAt: z.string().datetime({ offset: true }),
 }).strict().refine(value => ['claimed', 'dispatched', 'unknown'].includes(value.status) === (value.executionToolCallId !== null)
   && (!value.canDecide || value.canReject) && (!value.canReject || value.status === 'waiting')

@@ -16,7 +16,7 @@ import { formatInvoiceWorkContext } from './context.ts';
 import type { createDurableCompactionRuntime } from './compaction.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER), requestId = z.string().min(1).max(128);
-const identitySchema = z.object({ workId: id, sessionId: id, attemptId: id, requestId,
+const identitySchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId,
   childRunId: id, childSessionId: id, originToolCallId: id, nativeToolTaskId: id }).strict();
 const thinking = PersonalAgentConfigurationSchema.unwrap().innerType().shape.thinkingLevel;
 const planSchema = identitySchema.extend({ role: z.literal(SUBAGENT_ROLE), binding: durableModelBindingSchema, thinkingLevel: thinking,
@@ -34,7 +34,8 @@ export type ParentChildConsumption = { identity: DurableSubagentIdentity; entryI
 type ChildRecord = { conversation: ConversationRecord; state: Readonly<ChildState>; plan: DurableSubagentPlan };
 class ChildFailure extends Error { constructor(readonly fact: AppError) { super(fact.code); } }
 const need = <T>(result: Result<T>): T => { if (!result.ok) throw new ChildFailure(result.error); return result.data; };
-const parent = ({ workId, sessionId, attemptId, requestId }: DurableSubmissionQuery): DurableSubmissionQuery => ({ workId, sessionId, attemptId, requestId });
+const parent = ({ workId, sessionId, itemId, attemptId, requestId }: DurableSubmissionQuery): DurableSubmissionQuery =>
+  ({ workId, sessionId, ...(itemId === undefined ? {} : { itemId }), attemptId, requestId });
 const identity = (plan: DurableSubagentIdentity): DurableSubagentIdentity => identitySchema.parse({ ...parent(plan), childRunId: plan.childRunId,
   childSessionId: plan.childSessionId, originToolCallId: plan.originToolCallId, nativeToolTaskId: plan.nativeToolTaskId });
 const childOwner = (plan: DurableSubagentIdentity) => ({ childRunId: plan.childRunId, childSessionId: plan.childSessionId, originToolCallId: plan.originToolCallId });
@@ -101,7 +102,7 @@ export function createDurableSubagentRuntime(options: DurableSubagentRuntimeOpti
     const receipt = await options.read(() => storage.submissionByRequest(task.conversationId, JSON.stringify([input.attemptId, input.requestId]), context));
     if (receipt?.type !== 'input' || receipt.entry === undefined) throw Error('state_conflict');
     const entry = (await options.read(() => storage.entry(receipt.entry!, context)))?.entry;
-    if (entry?.kind !== 'flowmate.input' || !isDeepStrictEqual(parent(z.object({ workId: id, sessionId: id, attemptId: id, requestId }).parse(entry.data)), parent(input)))
+    if (entry?.kind !== 'flowmate.input' || !isDeepStrictEqual(parent(z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId }).parse(entry.data)), parent(input)))
       throw Error('state_conflict');
     const conversation = await harness.conversation(task.conversationId, context); if (!conversation) throw Error('storage_corrupt');
     const view = await conversation.context(context, { at: assistant.id });

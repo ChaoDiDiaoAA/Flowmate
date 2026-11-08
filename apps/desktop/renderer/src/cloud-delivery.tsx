@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { CloudRuntimeRetryReceiptSchema, CloudRuntimeStatusSchema, type CloudDesktopUserCommand,
   type CloudQueueOwner, type CloudRuntimeStatus } from '@flowmate/contracts';
 
-export function CloudDeliveryPanel(props: { workspaceId: string; owner: CloudQueueOwner | null; refreshSignal: number }) {
+export function CloudDeliveryPanel(props: { workspaceId: string; owner: Omit<CloudQueueOwner, 'itemId'> | null; refreshSignal: number }) {
   const [status, setStatus] = useState<CloudRuntimeStatus | null>(null);
   const [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [message, setMessage] = useState<string | null>(null);
   const generation = useRef(0), active = useRef(false), owner = props.owner;
@@ -10,7 +10,7 @@ export function CloudDeliveryPanel(props: { workspaceId: string; owner: CloudQue
     const result = await window.flowmate.cloudDesktop.request({ workspaceId: props.workspaceId, command });
     if (!result.ok) throw Error(result.error.message); return result.data;
   }
-  async function load(target: CloudQueueOwner, token: number, afterSubmissionId?: number) {
+  async function load(target: Omit<CloudQueueOwner, 'itemId'>, token: number, afterSubmissionId?: number) {
     const data = CloudRuntimeStatusSchema.parse(await request({ type: 'cloud_delivery_status', input: { ...target, limit: 50,
       ...(afterSubmissionId === undefined ? {} : { afterSubmissionId }) } }));
     if (token !== generation.current) return;
@@ -44,12 +44,12 @@ export function CloudDeliveryPanel(props: { workspaceId: string; owner: CloudQue
       {status?.wake?.active && !status.wake.blocked && <p>Automatic wake is active{status.wake.at === null ? '.' : ` · ${new Date(status.wake.at).toLocaleString()}`}</p>}
       {status?.results.items.map(item => <article key={item.nativeSubmissionId}>
         <p>Result {item.nativeSubmissionId} · {item.state} · {item.attempts} delivery attempts</p>
-        <p>Original phase {item.requestId} · {item.nativeStatus}</p>
+        <p>Original phase {item.requestId} · {item.nativeStatus}{item.itemId === undefined ? '' : ` · Invoice item ${item.itemId}`}</p>
         {item.blockedReason === 'size_limit' && <p>The original result exceeds the delivery limit and remains in its native record.</p>}
         {item.state === 'pending' && item.nextAt && <p>Next delivery attempt: {item.nextAt}</p>}
         {item.state === 'blocked' && <button type="button" disabled={busy} onClick={() => void run(async token => {
           CloudRuntimeRetryReceiptSchema.parse(await request({ type: 'cloud_delivery_retry', input: { ...owner,
-            requestId: item.requestId, nativeSubmissionId: item.nativeSubmissionId } }));
+            ...(item.itemId === undefined ? {} : { itemId: item.itemId }), requestId: item.requestId, nativeSubmissionId: item.nativeSubmissionId } }));
           if (token === generation.current) { setMessage('The original result was queued for delivery.'); await load(owner, token); }
         })}>Retry original result {item.nativeSubmissionId}</button>}
       </article>)}

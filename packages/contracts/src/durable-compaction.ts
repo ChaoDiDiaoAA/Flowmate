@@ -5,11 +5,12 @@ import { DurableModelBindingSchema } from './durable-runtime.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const requestId = z.string().min(1).max(128).refine(value => value.trim().length > 0);
-const phase = z.object({ workId: id, sessionId: id, attemptId: id, requestId }).strict();
+const phase = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId }).strict();
 const child = phase.extend({ childRunId: id, childSessionId: id, originToolCallId: id, nativeToolTaskId: id });
 const identity = phase.extend({ operationId: requestId, child: child.optional() });
 const ownsChild = (value: z.infer<typeof identity>) => !value.child || value.child.workId === value.workId
-  && value.child.sessionId === value.sessionId && value.child.attemptId === value.attemptId && value.child.requestId === value.requestId;
+  && value.child.sessionId === value.sessionId && value.child.itemId === value.itemId
+  && value.child.attemptId === value.attemptId && value.child.requestId === value.requestId;
 export const DurableCompactionIdentitySchema = identity.refine(ownsChild, 'The summary belongs to another phase.');
 export type DurableCompactionIdentity = z.infer<typeof DurableCompactionIdentitySchema>;
 const request = identity.extend({ reason: z.enum(['manual', 'threshold', 'overflow']), expectedTailEntryId: id,

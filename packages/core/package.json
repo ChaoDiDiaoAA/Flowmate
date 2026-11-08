@@ -4,7 +4,8 @@
   "type": "module",
   "dependencies": {
     "@flowmate/contracts": "workspace:*",
-    "@flowmate/shared": "workspace:*"
+    "@flowmate/shared": "workspace:*",
+    "@openviking/sdk": "0.1.0"
   },
   "exports": {
     ".": "./src/index.ts"

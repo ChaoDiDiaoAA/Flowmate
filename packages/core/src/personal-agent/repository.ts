@@ -32,7 +32,8 @@ export type InvoiceWorkAdmission = { kind: 'ready' | 'queued' }
 type CommandOptions = { at: string; admission: InvoiceWorkAdmission };
 export type InvoiceWorkTodoDefinition = Omit<InvoiceWorkTodoView, 'todoId' | 'workId' | 'itemId' | 'revision' | 'applicable'>;
 export type InvoiceWorkPhaseBasis = { contextSnapshotId: number | null; inputIds: readonly number[];
-  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null; desktopProposalId?: number; desktopRejectedProposalId?: number; browserProposalId?: number; browserRejectedProposalId?: number };
+  documentRefs: readonly DocumentRef[]; configurationRevision: number; itemRevision: number | null; executionMode?: 'item-lane-approval-v1';
+  desktopProposalId?: number; desktopRejectedProposalId?: number; browserProposalId?: number; browserRejectedProposalId?: number };
 export type InvoiceWorkPhase = { phaseId: number; workId: number; attemptId: number; itemId: number | null;
   requestId: string; kind: 'prompt'; basis: InvoiceWorkPhaseBasis; createdAt: string;
   nativeConversationId: number | null; nativeSubmissionId: number | null; consumedAt: string | null };
@@ -96,10 +97,11 @@ const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const atSchema = z.string().datetime({ offset: true });
 const basisSchema = z.object({ contextSnapshotId: id.nullable(), inputIds: z.array(id).refine(ids => new Set(ids).size === ids.length),
   documentRefs: z.array(DocumentRefSchema), configurationRevision: revision, itemRevision: revision.nullable(),
+  executionMode: z.literal('item-lane-approval-v1').optional(),
   desktopProposalId: id.optional(), desktopRejectedProposalId: id.optional(), browserProposalId: id.optional(), browserRejectedProposalId: id.optional() }).strict();
 const phaseInputSchema = z.object({ workId: id, attemptId: id, itemId: id.nullable(), requestId: z.string().min(1).max(128),
   kind: z.literal('prompt'), basis: basisSchema, at: atSchema }).strict();
-const observationSchema = z.object({ workId: id, sessionId: id, attemptId: id, requestId: phaseInputSchema.shape.requestId,
+const observationSchema = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId: phaseInputSchema.shape.requestId,
   nativeConversationId: id, nativeSubmissionId: id, nativeEntryId: id.nullable(),
   status: z.enum(['queued', 'placed', 'done', 'unanswered']), consumedAt: atSchema.nullable(),
   execution: z.enum(['active', 'closed', 'unknown']) }).strict();
@@ -180,12 +182,16 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
     const count = db.query<TodoRow, [number]>(
       'SELECT * FROM invoice_work_todos WHERE item_id=? AND superseded_at IS NULL').all(row.id)
       .filter(todo => todoView(todo).applicable).length;
+    const lane = db.query<{ scheduler_state: 'active' | 'waiting_approval' | 'ready'; closed_at: string | null }, [number, number]>(
+      "SELECT scheduler_state,closed_at FROM invoice_work_phases WHERE work_id=? AND item_id=? AND scheduler_state!='legacy' ORDER BY id DESC LIMIT 1")
+      .get(row.work_id, row.id);
     return InvoiceWorkItemViewSchema.parse({ workId: row.work_id, itemId: row.id, revision: row.revision,
       documentRef: { id: row.document_id, version: row.document_version }, jobId: row.job_id,
       candidateRef: row.candidate_id === null ? null : { id: row.candidate_id, sequence: row.candidate_sequence },
       disposition: row.disposition, decision: row.decision_json === null ? null : JSON.parse(row.decision_json),
       disposedAt: row.disposed_at, todoCount: row.disposition === 'unresolved' && work(row.work_id).status === 'open' ? count : 0,
-      latestInputId: row.latest_input_id, updatedAt: row.updated_at });
+      latestInputId: row.latest_input_id, updatedAt: row.updated_at,
+      ...(lane ? { execution: { state: lane.closed_at === null ? lane.scheduler_state : 'closed' } } : {}) });
   }
   function todoView(row: TodoRow): InvoiceWorkTodoView {
     const selected = item(row.work_id, row.item_id);
@@ -208,6 +214,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
     const counts = db.query<{ total: number; unresolved: number; accepted: number; rejected: number; excluded: number }, [number]>(
       "SELECT COUNT(*) total,SUM(disposition='unresolved') unresolved,SUM(disposition='accepted') accepted,SUM(disposition='rejected') rejected,SUM(disposition='excluded') excluded FROM invoice_work_items WHERE work_id=?").get(row.id)!;
     const current = attempt(row), status = current ? runStatus(current) : null;
+    const itemLanes = current && db.query("SELECT id FROM invoice_work_phases WHERE attempt_id=? AND scheduler_state!='legacy' LIMIT 1").get(current.id);
     const unknown = current !== null && current.stopped_at === null
       && (current.stop_requested_at !== null || status === 'failed' || status === 'cancelled');
     const requiresContinue = row.status === 'open' && current !== null
@@ -220,6 +227,7 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
       runtimeKind: 'durable', revision: row.revision, goal: row.goal, status: row.status,
       createdAt: row.created_at, updatedAt: row.updated_at, counts,
       execution: { attempt: current ? attemptReference(current) : null, runStatus: status,
+        ...(itemLanes ? { itemLanes: true } : {}),
         queued: open && current !== null && current.run_id === null && current.stop_requested_at === null && current.stopped_at === null,
         requiresContinue, stopUnconfirmed: unknown, waitingReason: unknown ? 'Original execution stop is unconfirmed.' : null,
         ownedChildRunIds: current ? ownedChildren(current) : [] },
@@ -688,7 +696,12 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         }
         const current = attempt(row);
         requireFact(row.status === 'open' && current?.id === input.attemptId && current.stop_requested_at === null && current.stopped_at === null);
-        requireFact(!db.query('SELECT id FROM invoice_work_phases WHERE attempt_id=? AND closed_at IS NULL LIMIT 1').get(current.id),
+        const itemLane = input.basis.executionMode === 'item-lane-approval-v1';
+        if (itemLane) {
+          requireFact(input.itemId !== null, 'input_invalid', 'An item phase needs its original invoice.');
+          requireFact(!db.query("SELECT id FROM invoice_work_phases WHERE attempt_id=? AND closed_at IS NULL AND (scheduler_state IN ('legacy','active','ready') OR item_id=?) LIMIT 1")
+            .get(current.id, input.itemId), 'state_conflict', 'The original active, ready or invoice phase must be reconciled first.');
+        } else requireFact(!db.query('SELECT id FROM invoice_work_phases WHERE attempt_id=? AND closed_at IS NULL LIMIT 1').get(current.id),
           'state_conflict', 'The original phase must be reconciled before another phase is frozen.');
         requireFact(db.query("SELECT id FROM invoice_work_items WHERE work_id=? AND disposition='unresolved' LIMIT 1").get(row.id));
         requireFact(input.basis.configurationRevision === row.agent_revision);
@@ -726,8 +739,8 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         }
         const session = requireResult(sessions.get(row.session_id));
         requireFact(session.runtimeKind === 'durable');
-        const inserted = db.query('INSERT INTO invoice_work_phases(work_id,attempt_id,item_id,request_id,kind,basis_json,durable_runtime_id,created_at) VALUES(?,?,?,?,?,?,?,?)')
-          .run(row.id, current.id, input.itemId, input.requestId, input.kind, JSON.stringify(input.basis), session.durableRuntimeId, input.at);
+        const inserted = db.query('INSERT INTO invoice_work_phases(work_id,attempt_id,item_id,request_id,kind,basis_json,durable_runtime_id,created_at,scheduler_state) VALUES(?,?,?,?,?,?,?,?,?)')
+          .run(row.id, current.id, input.itemId, input.requestId, input.kind, JSON.stringify(input.basis), session.durableRuntimeId, input.at, itemLane ? 'active' : 'legacy');
         return phase(db.query<PhaseRow, [number]>('SELECT * FROM invoice_work_phases WHERE id=?').get(Number(inserted.lastInsertRowid))!);
       });
     },
@@ -738,7 +751,18 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
         const stored = db.query<PhaseRow, [number, number, number]>('SELECT * FROM invoice_work_phases WHERE work_id=? AND attempt_id=? AND id=?')
           .get(row.id, input.attemptId, phaseId);
         requireFact(stored);
-        requireResult(sessions.bindDurableConversation(row.session_id, input.nativeConversationId, input.at));
+        const basis = basisSchema.parse(JSON.parse(stored.basis_json));
+        if (basis.executionMode === 'item-lane-approval-v1') {
+          const session = requireResult(sessions.get(row.session_id));
+          requireFact(session.runtimeKind === 'durable' && stored.item_id !== null);
+          requireFact(!db.query('SELECT id FROM sessions WHERE durable_runtime_id=? AND durable_conversation_id=? LIMIT 1')
+            .get(session.durableRuntimeId, input.nativeConversationId), 'state_conflict', 'The item conversation already belongs to a product Session.');
+          const owners = db.query<{ work_id: number; item_id: number | null; native_conversation_id: number }, [string, number, number, number]>(
+            `SELECT work_id,item_id,native_conversation_id FROM invoice_work_phases WHERE durable_runtime_id=? AND native_conversation_id IS NOT NULL
+             AND (native_conversation_id=? OR (work_id=? AND item_id=? AND scheduler_state!='legacy'))`).all(session.durableRuntimeId, input.nativeConversationId, row.id, stored.item_id);
+          requireFact(owners.every(owner => owner.work_id === row.id && owner.item_id === stored.item_id
+            && owner.native_conversation_id === input.nativeConversationId), 'state_conflict', 'The item conversation belongs to another invoice.');
+        } else requireResult(sessions.bindDurableConversation(row.session_id, input.nativeConversationId, input.at));
         if (stored.native_submission_id !== null) {
           requireFact(stored.native_submission_id === input.nativeSubmissionId && stored.native_conversation_id === input.nativeConversationId);
           return phase(stored);
@@ -765,8 +789,9 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
           'SELECT * FROM invoice_work_phases WHERE work_id=? AND attempt_id=? AND request_id=?')
           .get(row.id, observed.attemptId, observed.requestId);
         const session = requireResult(sessions.get(row.session_id));
-        requireFact(row.session_id === observed.sessionId && session.runtimeKind === 'durable'
-          && session.durableConversationId === observed.nativeConversationId && stored
+        requireFact(row.session_id === observed.sessionId && session.runtimeKind === 'durable' && stored
+          && (basisSchema.parse(JSON.parse(stored.basis_json)).executionMode === 'item-lane-approval-v1'
+            ? stored.item_id === observed.itemId : observed.itemId === undefined && session.durableConversationId === observed.nativeConversationId)
           && stored.native_conversation_id === observed.nativeConversationId && stored.native_submission_id === observed.nativeSubmissionId,
         'source_invalid', 'The native observation is not bound to this original invoice phase.');
         if (observed.consumedAt !== null) {
@@ -938,7 +963,8 @@ export function createInvoiceWorkRepository(db: SynchronousDatabaseExecutor): In
           authorizedInputs: frozen.basis.inputIds.map(inputId => originalInput(inputId, current.id)), historicalInputReferences, todos,
           confirmedBusinessReferences, conflicts, modelReports, evidenceRefs: todos.flatMap(todo => todo.basis.sourceRefs),
           allowedTools: PersonalAgentConfigurationSchema.parse(JSON.parse(row.configuration_json)).tools.filter(name =>
-            name !== (frozen.basis.browserProposalId === undefined ? 'browser_read_approved' : 'browser_request_read')), remainingBudget: input.remainingBudget });
+            frozen.basis.executionMode === 'item-lane-approval-v1'
+              || name !== (frozen.basis.browserProposalId === undefined ? 'browser_read_approved' : 'browser_request_read')), remainingBudget: input.remainingBudget });
       });
     },
     replaceTodos(input) {

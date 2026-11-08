@@ -9,6 +9,7 @@ import { parseHostCommand, parseCompactionNotification, type HostCommand, type H
 import { SERVICE_DATA_VERSION, SERVICE_PROTOCOL_VERSION, parseServiceConnect, parseServiceHandshake, servicePipeName,
   ServicePrepareDisconnectSchema, parseForegroundDisconnectResult, type ForegroundDisconnectReport } from '../../service/protocol.ts';
 import { parseServicePrivateCommand, parseServicePrivateResult, type ServicePrivateCommandType } from '../../service/protocol.ts';
+import type { ServiceMemoryConfigurationRequest, ServiceMemoryOperationQuery, ServiceMemoryOperationReceipt } from '../../../packages/core/src/configuration/service-memory-credentials.ts';
 import type { ServicePrepareActivationRequest } from '../../service/protocol.ts';
 import type { ServiceCredentialStatus, ServiceCredentialOperationReceipt, ServiceCredentialMigrationRequest,
   ServiceCredentialOperationQuery, ServiceCredentialSettingsRequest } from '../../../packages/core/src/configuration/service-credentials.ts';
@@ -161,6 +162,12 @@ export class ServiceClient {
   public async saveServiceSettings(input: ServiceCredentialSettingsRequest, timeoutMs = 10_000): Promise<Result<ServiceCredentialOperationReceipt>> {
     return this.serviceRequest('service_settings_save', input, timeoutMs) as Promise<Result<ServiceCredentialOperationReceipt>>;
   }
+  public async configureMemory(input: ServiceMemoryConfigurationRequest, timeoutMs = 30_000): Promise<Result<ServiceMemoryOperationReceipt>> {
+    return this.serviceRequest('service_memory_configure', input, timeoutMs) as Promise<Result<ServiceMemoryOperationReceipt>>;
+  }
+  public async queryMemoryOperation(input: ServiceMemoryOperationQuery, timeoutMs = 10_000): Promise<Result<ServiceMemoryOperationReceipt | null>> {
+    return this.serviceRequest('service_memory_query', input, timeoutMs) as Promise<Result<ServiceMemoryOperationReceipt | null>>;
+  }
   public async activateService(input: ServiceCredentialOperationQuery, timeoutMs = 10_000): Promise<Result<{ installationId: string; operationId: string; active: true }>> {
     return this.serviceRequest('service_activate', input, timeoutMs) as Promise<Result<{ installationId: string; operationId: string; active: true }>>;
   }
@@ -220,7 +227,7 @@ export class ServiceClient {
   }
 
   public async request(command: ServiceCommandInput, timeoutMs = 10_000): Promise<unknown> {
-    if (['close', 'credential_response', 'invoice_form_response', 'desktop_response'].includes(command.type)) throw Error('service_command_forbidden');
+    if (['close', 'credential_response', 'invoice_form_response', 'desktop_response', 'memory_configure', 'memory_inspect_configuration'].includes(command.type)) throw Error('service_command_forbidden');
     if (!this.isConnected) throw Error('host_not_writable');
     return this.sendRequest(command, timeoutMs);
   }

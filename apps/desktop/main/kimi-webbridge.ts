@@ -8,14 +8,13 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
-import { appError, browserTabGroup, fail, ok, type AppError, type BrowserPage, type BrowserTarget, type DesktopBridgeRequest, type DesktopBridgeResult, type Result } from '@flowmate/contracts';
+import { appError, BrowserPageSchema, browserTabGroup, fail, ok, type AppError, type BrowserPage, type BrowserTarget, type DesktopBridgeRequest, type DesktopBridgeResult, type Result } from '@flowmate/contracts';
 
 type Owner = { workId: number; itemId: number; workspaceId?: string };
 type Binding = { target: BrowserTarget; session: string; tabId: number | null; workspaceId?: string };
 
 const unavailable = () => fail(appError('browser_unavailable', 'runtime', 'The selected browser page is unavailable.'));
-const page = z.object({ url: z.string().url().max(2048), title: z.string().max(2048),
-  text: z.string().max(22000), truncated: z.boolean() }).strict();
+const page = BrowserPageSchema.extend({ text: z.string().max(22000) });
 class BrowserStatusFailure extends Error { constructor(readonly fact: AppError) { super(fact.code); } }
 
 export function resolveKimiWebBridgeExecutable(userDataRoot: string, env: NodeJS.ProcessEnv): string | null {
@@ -127,14 +126,15 @@ export function createKimiWebBridge(port: number) {
         const envelope = z.object({ type: z.literal('object'), value: z.unknown() }).passthrough().parse(
           await command(binding.session, 'evaluate', { tabId: binding.tabId, code }, signal));
         const result = page.parse(envelope.value);
-        if (new URL(result.url).origin !== binding.target.origin || closed || signal.aborted || bindings.get(key(owner)) !== binding)
+        const url = new URL(result.url);
+        if (url.origin !== binding.target.origin || closed || signal.aborted || bindings.get(key(owner)) !== binding)
           throw Error('Browser target changed.');
         let text = '', bytes = 0;
         for (const character of result.text) {
           const length = Buffer.byteLength(character, 'utf8'); if (bytes + length > 22000) break;
           text += character; bytes += length;
         }
-        return ok({ url: result.url, title: result.title, text, truncated: result.truncated || text.length < result.text.length });
+        return ok({ url: url.origin + url.pathname, title: result.title, text, truncated: result.truncated || text.length < result.text.length });
       } catch {
         if (bindings.get(key(owner)) === binding) revoke(owner);
         return unavailable();

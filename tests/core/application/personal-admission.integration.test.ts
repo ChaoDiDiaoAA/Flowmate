@@ -20,6 +20,7 @@ import { CloudModelAttempts } from '../../../packages/core/src/personal-agent/cl
 import { CloudDeepSeekProxy } from '../../../apps/cloud-deepseek-proxy.ts';
 import { callCloudModelSocket, listenCloudModelSocket } from '../../../apps/cloud-model-socket.ts';
 import { createCloudRuntimeAuthorizer } from '../../../apps/cloud-runtime-authority.ts';
+import { CloudNativeResultReceiver } from '../../../apps/cloud-native-result-receiver.ts';
 import { createCloudDesktopAuthorizer, createCloudProgressReader } from '../../../apps/cloud-desktop-authority.ts';
 import { CloudProgressHub } from '../../../apps/cloud-progress.ts';
 import { createCloudAuthorityCallbacksClient, createCloudAuthorityRpcClient, createCloudAuthorityRpcHandler } from '../../../apps/cloud-authority-rpc.ts';
@@ -384,6 +385,57 @@ test('Authority records the original queue control and recovers a lost Runtime r
   } finally { await f.database.close(); }
 });
 
+test('Authority keeps queue controls and receipts bound to the selected invoice', async () => {
+  const { f, owner, request, work } = await cloudModelFixture(2);
+  try {
+    const items = (await f.view(work.workId)).items;
+    await f.database.transaction(store => store.db.query('UPDATE invoice_work_phases SET closed_at=? WHERE id=?').run(at, request.phaseId));
+    const phases = await f.database.transaction(store => items.map((item, index) => {
+      if (index === 1) store.db.query("UPDATE invoice_work_phases SET scheduler_state='waiting_approval' WHERE request_id='invoice-queue-one'").run();
+      const phase = need(store.invoiceWorks.freezePhase({ workId: work.workId, attemptId: owner.attemptId, itemId: item.itemId,
+        requestId: index === 0 ? 'invoice-queue-one' : 'invoice-queue-two', kind: 'prompt', at,
+        basis: { contextSnapshotId: null, inputIds: [], documentRefs: [item.documentRef], configurationRevision: 0,
+          itemRevision: item.revision, executionMode: 'item-lane-approval-v1' } }));
+      need(store.invoiceWorks.linkPhase({ workId: work.workId, attemptId: owner.attemptId, phaseId: phase.phaseId,
+        nativeConversationId: 45 + index, nativeSubmissionId: 55 + index, at }));
+      return phase;
+    }));
+    let applied = 0, foreign = false;
+    const runtime: import('@flowmate/contracts').CloudQueuePort = {
+      read: async input => { const index = items.findIndex(item => item.itemId === input.itemId);
+        return ok({ ...input, ...(foreign ? { itemId: items[1]!.itemId } : {}), version: 3, items: index < 0 ? [] : [{
+          submissionId: 55 + index, requestId: phases[index]!.requestId, mode: 'followUp', content: 'Original invoice input.' }] }); },
+      queryControl: async () => ok(null),
+      apply: async input => { applied++; return ok({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId,
+        ...(input.itemId === undefined ? {} : { itemId: input.itemId }), controlRequestId: input.controlRequestId, status: 'applied', version: 4 }); },
+    };
+    const authority = new CloudQueueAuthority({ database: f.database, workspaceId: request.workspaceId, runtime, now: () => at,
+      authorize: () => ok(undefined) });
+    const first = { ...owner, itemId: items[0]!.itemId }, second = { ...owner, itemId: items[1]!.itemId };
+    expect(need(await authority.read(first))).toMatchObject({ itemId: first.itemId, activePhaseRequestId: phases[0]!.requestId });
+    expect(need(await authority.read(second))).toMatchObject({ itemId: second.itemId, activePhaseRequestId: phases[1]!.requestId });
+    foreign = true; expect(await authority.read(first)).toMatchObject({ ok: false }); foreign = false;
+    const input = { ...first, controlRequestId: 'item-cancel', expectedVersion: 3, action: { kind: 'cancel' as const, submissionId: 55 } };
+    expect(need(await authority.apply(input))).toMatchObject({ itemId: first.itemId, status: 'applied' });
+    expect(await authority.queryControl({ ...second, controlRequestId: input.controlRequestId })).toMatchObject({ ok: false });
+    expect(need(await authority.queryControl({ ...first, controlRequestId: input.controlRequestId }))).toMatchObject({ itemId: first.itemId });
+    expect(applied).toBe(1);
+    let retried = 0;
+    const delivery = new CloudDeliveryAuthority({ database: f.database, workspaceId: request.workspaceId, runtime: {
+      status: async () => ok({ ...owner, runtimeGeneration: '11111111-1111-4111-8111-111111111111', observationRevision: 1,
+        native: { conversationId: 17, tasks: [], moreTasks: false, submissions: [], moreSubmissions: false }, wake: null,
+        results: { items: [{ requestId: phases[0]!.requestId, itemId: first.itemId, nativeSubmissionId: 55,
+          state: 'blocked', attempts: 8, nextAt: at, nativeStatus: 'done' }], nextAfterSubmissionId: null } }),
+      retry: async input => { retried++; return ok({ ...input, state: 'pending' }); },
+    } });
+    expect(await delivery.status({ ...owner, limit: 10 })).toMatchObject({ ok: true, data: { results: { items: [{ itemId: first.itemId }] } } });
+    const retry = { ...first, requestId: phases[0]!.requestId, nativeSubmissionId: 55 };
+    expect(await delivery.retry({ ...retry, itemId: second.itemId })).toMatchObject({ ok: false });
+    expect(await delivery.retry(retry)).toMatchObject({ ok: true, data: { itemId: first.itemId, state: 'pending' } });
+    expect(retried).toBe(1);
+  } finally { await f.database.close(); }
+});
+
 test('Authority links an authorized follow-up to its original phase only after the native receipt is recovered', async () => {
   const { f, owner, request } = await cloudModelFixture();
   let receipt: import('@flowmate/contracts').CloudQueueReceipt | null = null, applied = 0, foreign = false;
@@ -711,8 +763,8 @@ test('cloud Work keeps its explicitly authorized 24-hour budget through Run, chi
   expect(InvoiceWorkContextBuildInputSchema.unwrap().shape.remainingBudget.safeParse(remaining).success).toBe(true);
 });
 
-async function cloudModelFixture() {
-  const f = await fixture(), workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+async function cloudModelFixture(members = 1) {
+  const f = await fixture(members), workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const cloudRuntimeId = '11111111-1111-4111-8111-111111111111';
   const work = need(await f.database.transaction(store => store.invoiceWorks.create(f.request('cloud-model-reservation'),
     { at, admission: { kind: 'queued' }, runtimeOwner: { workspaceId, cloudRuntimeId } })));
@@ -748,6 +800,26 @@ test('cloud model attempt reserves once and an uncertain send cannot be replayed
     expect(await reopened.read(store => store.db.query('SELECT count FROM invoice_work_model_reservations WHERE run_id=?').get(runId)))
       .toEqual({ count: 1 });
   } finally { await reopened.close(); }
+});
+
+test('cloud model reservation belongs to the original invoice phase rather than the root conversation', async () => {
+  const { f, work, owner, request, ledger } = await cloudModelFixture();
+  try {
+    const item = (await f.view(work.workId)).items[0]!;
+    await f.database.transaction(store => store.db.query('UPDATE invoice_work_phases SET closed_at=? WHERE id=?').run(at, request.phaseId));
+    const phase = need(await f.database.transaction(store => store.invoiceWorks.freezePhase({ workId: work.workId, attemptId: owner.attemptId,
+      itemId: item.itemId, requestId: 'invoice-model', kind: 'prompt', at, basis: { contextSnapshotId: null, inputIds: [],
+        documentRefs: [item.documentRef], configurationRevision: 0, itemRevision: item.revision, executionMode: 'item-lane-approval-v1' } })));
+    need(await f.database.transaction(store => store.invoiceWorks.linkPhase({ workId: work.workId, attemptId: owner.attemptId,
+      phaseId: phase.phaseId, nativeConversationId: 45, nativeSubmissionId: 46, at })));
+    const original = { ...request, itemId: item.itemId, phaseId: phase.phaseId, requestId: phase.requestId,
+      nativeConversationId: 45, nativeSubmissionId: 46 };
+    expect(await ledger.reserve({ ...original, itemId: item.itemId + 999 })).toMatchObject({ ok: false });
+    expect(await ledger.reserve({ ...original, nativeConversationId: 17 })).toMatchObject({ ok: false });
+    expect(await ledger.reserve(original)).toEqual({ ok: true, data: { state: 'reserved' } });
+    expect(await ledger.reserve(original)).toEqual({ ok: true, data: { state: 'reserved' } });
+    expect(await ledger.begin(original)).toEqual({ ok: true, data: undefined });
+  } finally { await f.database.close(); }
 });
 
 test('cloud model retry needs a confirmed retryable response and reserves a new request only once', async () => {
@@ -791,6 +863,51 @@ test('Authority grants only the original cloud Work and stops scheduling it afte
   expect(await authorize('submit', query)).toMatchObject({ ok: false });
   expect(await authorize('getSubmission', query)).toMatchObject({ ok: true, data: { state: 'ready' } });
   expect(await authorize('queryHistory', { workId: work.workId, sessionId: work.sessionId })).toMatchObject({ ok: true });
+});
+
+test('Authority checks invoice and phase ownership for item-scoped cloud operations', async () => {
+  const { f, work, owner, request } = await cloudModelFixture();
+  try {
+    const authorize = createCloudRuntimeAuthorizer(f.database), itemId = (await f.view(work.workId)).items[0]!.itemId;
+    const root = { workId: work.workId, sessionId: work.sessionId }, phase = { ...owner, requestId: request.requestId };
+    expect(await authorize('queryHistoryPage', { ...root, itemId })).toMatchObject({ ok: true });
+    expect(await authorize('queryHistoryPage', { ...root, itemId: 999999 })).toMatchObject({ ok: false });
+    expect(await authorize('submit', { ...phase, itemId })).toMatchObject({ ok: false });
+    await f.database.transaction(store => store.db.query("UPDATE invoice_work_phases SET scheduler_state='active' WHERE id=?").run(request.phaseId));
+    expect(await authorize('submit', phase)).toMatchObject({ ok: false });
+    expect(await authorize('submit', { ...phase, itemId })).toMatchObject({ ok: true });
+    expect(await authorize('submit', { ...phase, itemId: 999999 })).toMatchObject({ ok: false });
+  } finally { await f.database.close(); }
+});
+
+test('Authority accepts and deduplicates only the original invoice native result', async () => {
+  const { f, work, owner, request } = await cloudModelFixture();
+  try {
+    const item = (await f.view(work.workId)).items[0]!;
+    await f.database.transaction(store => store.db.query('UPDATE invoice_work_phases SET closed_at=? WHERE id=?').run(at, request.phaseId));
+    const phase = need(await f.database.transaction(store => store.invoiceWorks.freezePhase({ workId: work.workId, attemptId: owner.attemptId,
+      itemId: item.itemId, requestId: 'invoice-result', kind: 'prompt', at, basis: { contextSnapshotId: null, inputIds: [],
+        documentRefs: [item.documentRef], configurationRevision: 0, itemRevision: item.revision, executionMode: 'item-lane-approval-v1' } })));
+    need(await f.database.transaction(store => store.invoiceWorks.linkPhase({ workId: work.workId, attemptId: owner.attemptId,
+      phaseId: phase.phaseId, nativeConversationId: 45, nativeSubmissionId: 46, at })));
+    const query = { ...owner, itemId: item.itemId, requestId: phase.requestId };
+    const event = { version: 1 as const, workspaceId: request.workspaceId, cloudRuntimeId: request.cloudRuntimeId, ...query,
+      nativeConversationId: 45, nativeSubmissionId: 46, nativeInputEntryId: null, nativeAnswerEntryId: null, consumedAt: null,
+      status: 'unanswered' as const, answer: null, reason: 'aborted' };
+    const received: unknown[] = [];
+    const native = { getSubmission: async (value: unknown) => { received.push(value); return ok({ ...query,
+      nativeConversationId: 45, nativeSubmissionId: 46, status: 'unanswered' as const, answer: null, reason: 'aborted' }); },
+      observeSubmission: async (value: unknown) => { received.push(value); return ok({ ...query, nativeConversationId: 45,
+        nativeSubmissionId: 46, nativeEntryId: null, status: 'unanswered' as const, consumedAt: null, execution: 'closed' as const }); },
+      queryHistoryEntry: async () => fail(appError('unused', 'runtime', 'Unused.')) };
+    const receiver = new CloudNativeResultReceiver(f.database, native, () => at);
+    expect(await receiver.receive({ ...event, itemId: item.itemId + 999 })).toMatchObject({ ok: false });
+    const receipt = need(await receiver.receive(event));
+    expect(receipt).toMatchObject({ itemId: item.itemId, nativeConversationId: 45, nativeSubmissionId: 46 });
+    expect(need(await receiver.receive(event))).toEqual(receipt);
+    expect(received).toHaveLength(2); expect(received[0]).toMatchObject({ itemId: item.itemId });
+    expect(await receiver.receive({ ...event, nativeConversationId: 47 })).toMatchObject({ ok: false });
+  } finally { await f.database.close(); }
 });
 
 test.skipIf(process.platform !== 'linux')('Runtime obtains and rechecks the original Authority grant over a Unix socket', async () => {

@@ -50,6 +50,7 @@ export function createBrowserExecutionTool(options: {
   now: () => string;
   resolveTarget: (context: ProductToolContext, signal: AbortSignal) => Promise<Result<BrowserTarget>>;
   read: (target: BrowserTarget, context: ProductToolContext, signal: AbortSignal, proposalId: number) => Promise<Result<BrowserPage>>;
+  approvedTarget?: (context: ProductToolContext, proposal: BrowserReadView) => BrowserTarget | undefined;
 }): ToolDefinition<z.infer<typeof BrowserToolInputSchema>, BrowserPage> {
   return {
     name: 'browser_read_approved', version: '1', label: 'Read approved browser page',
@@ -62,17 +63,24 @@ export function createBrowserExecutionTool(options: {
         const authorized = verifyInvoiceWorkToolScope(scope.db, context); if (!authorized.ok) return authorized;
         const phase = scope.db.query<{ basis_json: string }, [number]>('SELECT basis_json FROM invoice_work_phases WHERE id=?').get(work.phaseId);
         const basis = phase && InvoiceWorkPhaseBasisSchema.safeParse(JSON.parse(phase.basis_json));
-        if (!basis || !basis.success || !basis.data.browserProposalId)
+        if (!basis || !basis.success)
           throw new ToolExecutionFailure(appError('tool_access_denied', 'runtime', 'The current phase has no approved browser read.'));
-        return scope.invoiceWorkBrowserReads.get({ workId: work.workId, itemId: work.itemId, proposalId: basis.data.browserProposalId });
+        const saved = basis.data.executionMode === 'item-lane-approval-v1'
+          ? scope.db.query<{ id: number }, [number]>(`SELECT a.id FROM invoice_work_browser_reads a
+              JOIN invoice_work_tool_calls b ON b.tool_call_id=a.proposal_tool_call_id WHERE b.phase_id=? AND a.status='approved'`).get(work.phaseId)?.id
+          : basis.data.browserProposalId;
+        if (!saved) throw new ToolExecutionFailure(appError('tool_access_denied', 'runtime', 'The current phase has no approved browser read.'));
+        return scope.invoiceWorkBrowserReads.get({ workId: work.workId, itemId: work.itemId, proposalId: saved });
       });
       if (!original.ok) throw new ToolExecutionFailure(original.error);
       if (original.data.status !== 'approved') throw new ToolExecutionFailure(appError('tool_access_denied', 'runtime', 'The browser read is not approved.'));
       const query = { workId: work.workId, itemId: work.itemId, proposalId: original.data.proposalId };
+      const expected = options.approvedTarget?.(context, original.data) ?? original.data.target;
       let target: Result<BrowserTarget>;
       try { target = await options.resolveTarget(context, call.signal); }
       catch { target = { ok: false, error: appError('browser_target_changed', 'runtime', 'The browser target is unavailable.') }; }
-      if (!target.ok || !isDeepStrictEqual(target.data, original.data.target)) {
+      if (!target.ok) throw new ToolExecutionFailure(target.error);
+      if (!isDeepStrictEqual(target.data, expected)) {
         const invalidated = await options.database.transaction(scope => scope.invoiceWorkBrowserReads.revoke({ ...query, at: options.now() }));
         if (!invalidated.ok) throw new ToolExecutionFailure(invalidated.error);
         throw new ToolExecutionFailure(appError('browser_target_changed', 'runtime', 'The approved browser target changed; bind and confirm it again.'));
@@ -95,7 +103,7 @@ export function createBrowserExecutionTool(options: {
         throw error;
       }
       if (!claimed.ok) throw new ToolExecutionFailure(claimed.error);
-      const result = await options.read(claimed.data.target, context, call.signal, query.proposalId);
+      const result = await options.read(expected, context, call.signal, query.proposalId);
       if (!result.ok) throw new ToolExecutionFailure(result.error);
       return result.data;
     },

@@ -9,6 +9,44 @@ import { mkdtempSync } from '../support/resources.ts';
 
 function need<T>(value: Result<T>): T { if (!value.ok) throw Error(value.error.code); return value.data; }
 
+test('Authority RPC retains the invoice identity on phase context and product tool calls', async () => {
+  const seen: unknown[] = [];
+  const callbacks = { readWorkingContext: async (input: unknown) => { seen.push(input); return ok({}); },
+    executeTool: async (input: DurableProductToolExecution) => { seen.push(input); return ok({ status: 'succeeded', data: {} }); } } as unknown as CloudAuthorityCallbacks;
+  const handle = createCloudAuthorityRpcHandler(async () => fail(appError('cloud_runtime_forbidden', 'runtime', 'Unused.')), callbacks);
+  const phase = { workId: 1, sessionId: 2, itemId: 9, attemptId: 3, requestId: 'phase' };
+  const call = { ...phase, nativeConversationId: 4, nativeTaskId: 5, nativeToolCallId: 'original', name: 'read_invoice_document', arguments: {} };
+  expect(await handle({ version: 1, method: 'readWorkingContext', request: phase })).toMatchObject({ ok: true });
+  expect(await handle({ version: 1, method: 'executeTool', request: call })).toMatchObject({ ok: true });
+  expect(seen).toHaveLength(2);
+  expect(seen[0]).toMatchObject({ itemId: 9 }); expect(seen[1]).toMatchObject({ itemId: 9, nativeTaskId: 5 });
+});
+
+test('Authority RPC reads only the original approval wait identity', async () => {
+  const seen: unknown[] = [];
+  const callbacks = { approvalWait: { begin: async (input: unknown) => { seen.push(input); return ok({ status: 'waiting', scheduling: 'waiting_approval', decisionRequestId: null }); },
+    read: async (input: unknown) => { seen.push(input); return ok({ status: 'approved', scheduling: 'ready', decisionRequestId: 'original' }); } } } as unknown as CloudAuthorityCallbacks;
+  const handle = createCloudAuthorityRpcHandler(async () => fail(appError('cloud_runtime_forbidden', 'runtime', 'Unused.')), callbacks);
+  const identity = { workId: 1, sessionId: 2, attemptId: 3, phaseId: 4, requestId: 'phase', itemId: 5,
+    nativeConversationId: 6, nativeTaskId: 7, proposalId: 8, kind: 'browser' as const };
+  expect(await handle({ version: 1, method: 'beginApprovalWait', request: identity })).toMatchObject({ ok: true, data: { status: 'waiting' } });
+  expect(await handle({ version: 1, method: 'readApprovalWait', request: identity })).toMatchObject({ ok: true, data: { status: 'approved' } });
+  expect(await handle({ version: 1, method: 'readApprovalWait', request: { ...identity, itemId: 0 } })).toMatchObject({ ok: false });
+  expect(seen).toEqual([identity, identity]);
+});
+
+test('Authority memory RPC accepts only the original phase identity', async () => {
+  const seen: unknown[] = [];
+  const callbacks = { readMemory: async (input: unknown) => { seen.push(input); return ok({ status: 'ready',
+    items: [{ uri: 'viking://user/alice/memories/fact.md', revision: 1, content: 'Authorized fact', truncated: false }] }); } } as unknown as CloudAuthorityCallbacks;
+  const handle = createCloudAuthorityRpcHandler(async () => fail(appError('cloud_runtime_forbidden', 'runtime', 'Unused.')), callbacks);
+  const phase = { workId: 1, sessionId: 2, itemId: 9, attemptId: 3, requestId: 'phase' };
+  expect(await handle({ version: 1, method: 'readMemory', request: phase })).toMatchObject({ ok: true,
+    data: { identity: phase, result: { status: 'ready', items: [{ content: 'Authorized fact' }] } } });
+  expect(await handle({ version: 1, method: 'readMemory', request: { ...phase, ownerId: 'other-owner' } })).toMatchObject({ ok: false });
+  expect(seen).toEqual([phase]);
+});
+
 test.skipIf(process.platform !== 'linux')('duplicate original delegation calls share one native child invocation', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-delegation-rpc-')), socketPath = join(root, 'authority.sock');
   const config = { version: 1 as const, name: 'controlled', revision: 1, modelRef: { provider: 'controlled', model: 'fixture' },

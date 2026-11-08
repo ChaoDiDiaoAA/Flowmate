@@ -164,6 +164,8 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   | 'queryRunExtensions' | 'executeExtensionCommand' | 'disposeSessionExtensions' | 'listSubagents' | 'querySubagent' | 'cancelSubagent' | 'listInputCommands' | 'listSubagentDefinitions' | 'getSubagentDefinition' | 'saveSubagentDefinition'> & {
   runEvaluationWorkflow(input: import('./evaluation-workflow.ts').EvaluationWorkflowRequest): Promise<import('./runtime.ts').Result<import('./evaluation-workflow.ts').EvaluationWorkflowResult>>;
   personalAgent: import('./personal-agent.ts').PersonalAgentApi;
+  memory: import('./openviking-memory.ts').MemoryApi & { configureFromFile(): Promise<import('./runtime.ts').Result<import('zod').z.infer<typeof import('./openviking-memory.ts').MemorySetupResultSchema>>> };
+  openVikingManagement: import('./openviking-management.ts').OpenVikingManagementApi;
   startBrowserUse(): Promise<import('./runtime.ts').Result<void>>;
   startDesktopUse(): Promise<import('./runtime.ts').Result<void>>;
   desktopWindows(): Promise<import('./runtime.ts').Result<import('./desktop-actions.ts').DesktopActionTarget['window'][]>>;

@@ -1,4 +1,5 @@
 import { bootstrapDatabase } from './bootstrap.ts';
+import type { MemoryIntegrationRepository } from '../openviking/repository.ts';
 import { appError, fail, ok } from '@flowmate/contracts';
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
@@ -23,6 +24,7 @@ import type { DocumentRepository, ToolCallRepository, BusinessEventRepository, J
 export type SqlDatabaseStore = {
   db: SynchronousDatabaseExecutor;
   memory: Pick<MemoryStore, 'load' | 'commit'>;
+  memoryIntegration: MemoryIntegrationRepository;
   runs: RunRepository;
   sessions: SessionRepository;
   sessionInputs: SessionInputLedger;

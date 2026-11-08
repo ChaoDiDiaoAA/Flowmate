@@ -31,6 +31,7 @@ export class CloudQueueAuthority {
     const session = need(scope.sessions.get(input.sessionId));
     if (!row || row.session_id !== input.sessionId || session.runtimeKind !== 'durable' || session.durableRuntimeId === 'local'
       || session.cloudWorkspaceId !== this.workspaceId) conflict();
+    if (input.itemId !== undefined && !scope.db.query('SELECT id FROM invoice_work_items WHERE work_id=? AND id=?').get(input.workId, input.itemId)) conflict();
     if (active) {
       if (row.status !== 'open' || row.current_attempt_id !== input.attemptId || row.stop_requested_at !== null || row.stopped_at !== null
         || row.run_id === null || session.status !== 'active' || session.deletePending || session.modelUseBlocked) conflict();
@@ -44,7 +45,7 @@ export class CloudQueueAuthority {
   }
   private original(row: Row, input: CloudQueueControlQuery): CloudQueueControl {
     const value = CloudQueueControlSchema.parse(JSON.parse(row.request_json));
-    if (value.workId !== input.workId || value.sessionId !== input.sessionId || value.attemptId !== input.attemptId
+    if (value.workId !== input.workId || value.sessionId !== input.sessionId || value.itemId !== input.itemId || value.attemptId !== input.attemptId
       || value.controlRequestId !== input.controlRequestId) conflict();
     return value;
   }
@@ -78,7 +79,7 @@ export class CloudQueueAuthority {
     catch { return fail(appError('cloud_queue_unavailable', 'runtime', 'The original native queue could not be read.', true)); }
     if (!result.ok) return result;
     const view = CloudQueueViewSchema.safeParse(result.data);
-    if (!view.success || view.data.workId !== owner.workId || view.data.sessionId !== owner.sessionId || view.data.attemptId !== owner.attemptId
+    if (!view.success || view.data.workId !== owner.workId || view.data.sessionId !== owner.sessionId || view.data.itemId !== owner.itemId || view.data.attemptId !== owner.attemptId
       || new Set(view.data.items.map(item => item.submissionId)).size !== view.data.items.length)
       return fail(appError('cloud_queue_unavailable', 'runtime', 'The original native queue response is invalid.', true));
     const verified = await this.run(() => this.options.database.read(scope => {
@@ -86,24 +87,29 @@ export class CloudQueueAuthority {
       const session = need(scope.sessions.get(owner.sessionId));
       if (session.runtimeKind !== 'durable' || session.durableConversationId === null) conflict();
       for (const item of view.data.items) {
-        const phase = scope.db.query<{ native_submission_id: number }, [number, number, string, number]>(`SELECT native_submission_id FROM invoice_work_phases
-          WHERE work_id=? AND attempt_id=? AND request_id=? AND native_conversation_id=? AND native_submission_id IS NOT NULL AND closed_at IS NULL`)
-          .get(owner.workId, owner.attemptId, item.requestId, session.durableConversationId);
+        const phase = scope.db.query<{ native_submission_id: number; native_conversation_id: number; item_id: number | null; scheduler_state: string }, [number, number, string]>(
+          `SELECT native_submission_id,native_conversation_id,item_id,scheduler_state FROM invoice_work_phases
+          WHERE work_id=? AND attempt_id=? AND request_id=? AND native_conversation_id IS NOT NULL AND native_submission_id IS NOT NULL AND closed_at IS NULL`)
+          .get(owner.workId, owner.attemptId, item.requestId);
         if (!phase) throw new QueueFault(appError('source_invalid', 'runtime', 'A queued input is not linked to its original invoice phase.'));
+        if (phase.scheduler_state === 'legacy' ? owner.itemId !== undefined || phase.native_conversation_id !== session.durableConversationId
+          : owner.itemId === undefined || phase.item_id !== owner.itemId) conflict();
         if (phase.native_submission_id === item.submissionId) continue;
         const controls = scope.db.query<Row, [number, number]>('SELECT request_json,receipt_json FROM cloud_queue_controls WHERE work_id=? AND attempt_id=? ORDER BY id')
           .all(owner.workId, owner.attemptId);
         const matched = controls.some(row => {
           const input = CloudQueueControlSchema.parse(JSON.parse(row.request_json));
           const receipt = this.receipt(row, input);
-          return input.workId === owner.workId && input.sessionId === owner.sessionId && input.attemptId === owner.attemptId
+          return input.workId === owner.workId && input.sessionId === owner.sessionId && input.itemId === owner.itemId && input.attemptId === owner.attemptId
             && input.action.kind === 'enqueue' && input.action.phaseRequestId === item.requestId && receipt?.status === 'applied'
             && receipt.submissionId === item.submissionId;
         });
         if (!matched) throw new QueueFault(appError('source_invalid', 'runtime', 'A queued input has no original authorized control receipt.'));
       }
-      const phases = scope.db.query<{ request_id: string }, [number, number]>(`SELECT request_id FROM invoice_work_phases
-        WHERE work_id=? AND attempt_id=? AND native_submission_id IS NOT NULL AND closed_at IS NULL ORDER BY id LIMIT 2`).all(owner.workId, owner.attemptId);
+      const phases = scope.db.query<{ request_id: string }, [number, number, number | null, number | null]>(`SELECT request_id FROM invoice_work_phases
+        WHERE work_id=? AND attempt_id=? AND native_submission_id IS NOT NULL AND closed_at IS NULL
+          AND ((? IS NULL AND scheduler_state='legacy') OR (item_id=? AND scheduler_state!='legacy')) ORDER BY id LIMIT 2`)
+        .all(owner.workId, owner.attemptId, owner.itemId ?? null, owner.itemId ?? null);
       if (phases.length > 1) conflict();
       return phases[0]?.request_id ?? null;
     }));
@@ -128,8 +134,8 @@ export class CloudQueueAuthority {
   }
   private async resolveReceipt(entry: { input: CloudQueueControl; receipt: CloudQueueReceipt | null }): Promise<Result<CloudQueueReceipt | null>> {
     if (entry.receipt) return ok(entry.receipt);
-    const { workId, sessionId, attemptId, controlRequestId } = entry.input;
-    const key = { workId, sessionId, attemptId, controlRequestId };
+    const { workId, sessionId, itemId, attemptId, controlRequestId } = entry.input;
+    const key = { workId, sessionId, ...(itemId === undefined ? {} : { itemId }), attemptId, controlRequestId };
     const active = this.pending.get(JSON.stringify([workId, controlRequestId]));
     if (active && isDeepStrictEqual(active.input, entry.input)) {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -149,13 +155,14 @@ export class CloudQueueAuthority {
     const found = await this.run(() => this.options.database.read(scope => {
       this.owner(scope, query, false);
       const phase = need(scope.invoiceWorks.getPhase({ workId: query.workId, attemptId: query.attemptId, requestId: query.requestId }));
-      if (!phase || phase.nativeSubmissionId !== query.nativeSubmissionId) conflict();
+      if (!phase || phase.nativeSubmissionId !== query.nativeSubmissionId
+        || (phase.basis.executionMode === 'item-lane-approval-v1' ? phase.itemId !== query.itemId : query.itemId !== undefined)) conflict();
       return scope.db.query<Row, [number, number]>('SELECT request_json,receipt_json FROM cloud_queue_controls WHERE work_id=? AND attempt_id=? ORDER BY id')
         .all(query.workId, query.attemptId).map(row => {
           const input = CloudQueueControlSchema.parse(JSON.parse(row.request_json));
           if (input.workId !== query.workId || input.sessionId !== query.sessionId || input.attemptId !== query.attemptId) conflict();
           return { input, receipt: this.receipt(row, input) };
-        }).filter(value => value.input.action.kind === 'cancel' && value.input.action.submissionId === query.nativeSubmissionId);
+        }).filter(value => value.input.itemId === query.itemId && value.input.action.kind === 'cancel' && value.input.action.submissionId === query.nativeSubmissionId);
     }));
     if (!found.ok) return found;
     for (const entry of found.data) {
@@ -172,13 +179,14 @@ export class CloudQueueAuthority {
     const found = await this.run(() => this.options.database.read(scope => {
       this.owner(scope, query, false);
       const phase = need(scope.invoiceWorks.getPhase({ workId: query.workId, attemptId: query.attemptId, requestId: query.requestId }));
-      if (!phase || phase.nativeSubmissionId === null) conflict();
+      if (!phase || phase.nativeSubmissionId === null
+        || (phase.basis.executionMode === 'item-lane-approval-v1' ? phase.itemId !== query.itemId : query.itemId !== undefined)) conflict();
       return scope.db.query<Row, [number, number]>('SELECT request_json,receipt_json FROM cloud_queue_controls WHERE work_id=? AND attempt_id=? ORDER BY id')
         .all(query.workId, query.attemptId).map(row => {
           const input = CloudQueueControlSchema.parse(JSON.parse(row.request_json));
           if (input.workId !== query.workId || input.sessionId !== query.sessionId || input.attemptId !== query.attemptId) conflict();
           return { input, receipt: this.receipt(row, input) };
-        });
+        }).filter(value => value.input.itemId === query.itemId);
     }));
     if (!found.ok) return found;
     const verified: CloudQueueInstruction[] = [];
@@ -211,14 +219,14 @@ export class CloudQueueAuthority {
     const found = await this.run(() => this.options.database.read(scope => {
       this.owner(scope, query, false);
       const phase = need(scope.invoiceWorks.getPhase({ workId: query.workId, attemptId: query.attemptId, requestId: query.requestId }));
-      if (!phase) conflict();
+      if (!phase || (phase.basis.executionMode === 'item-lane-approval-v1' ? phase.itemId !== query.itemId : query.itemId !== undefined)) conflict();
       if (phase.nativeSubmissionId === null) return [];
       return scope.db.query<Row, [number, number]>('SELECT request_json,receipt_json FROM cloud_queue_controls WHERE work_id=? AND attempt_id=? ORDER BY id')
         .all(query.workId, query.attemptId).map(row => {
           const input = CloudQueueControlSchema.parse(JSON.parse(row.request_json));
           if (input.workId !== query.workId || input.sessionId !== query.sessionId || input.attemptId !== query.attemptId) conflict();
           return { input, receipt: this.receipt(row, input) };
-        }).filter(value => value.input.action.kind === 'edit' && value.input.action.submissionId === phase.nativeSubmissionId);
+        }).filter(value => value.input.itemId === query.itemId && value.input.action.kind === 'edit' && value.input.action.submissionId === phase.nativeSubmissionId);
     }));
     if (!found.ok) return found;
     let current: { controlRequestId: string; content: string } | null = null;
@@ -240,7 +248,7 @@ export class CloudQueueAuthority {
     this.pending.set(id, { input: structuredClone(input), result }); return result;
   }
   private async applyOriginal(input: CloudQueueControl): Promise<Result<CloudQueueReceipt>> {
-    const owner = { workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId },
+    const owner = { workId: input.workId, sessionId: input.sessionId, ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId },
       key = { ...owner, controlRequestId: input.controlRequestId };
     let original = await this.run(() => this.options.database.read(scope => {
       this.owner(scope, input, false); const row = this.row(scope, key);

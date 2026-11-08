@@ -1,8 +1,10 @@
 import { createInputDefinitions } from '../packages/core/src/prompt-templates.ts';
+import { verifyOpenVikingIdentity } from '../packages/core/src/openviking/identity.ts';
 import { createPersonalAgentRuntime, type PersonalAgentRuntime, type PersonalAgentRuntimeOptions } from './personal-agent.ts';
 import { CloudMaterialExport } from './cloud-material-export.ts';
 import { CloudResourceExport } from './cloud-resource-export.ts';
 import { startCloudAuthorityEndpoints } from './cloud-authority-service.ts';
+import type { CloudOpenVikingManagementRoleBinding } from './cloud-openviking-authority.ts';
 import { CloudDesktopRelay } from './cloud-desktop-relay.ts';
 import { createBrowserBridge } from './browser-bridge.ts';
 import type { InvoiceEditServiceOptions } from '../packages/core/src/invoice-edit/service.ts';
@@ -19,7 +21,7 @@ import type { PackagedRelease } from '@flowmate/shared';
 import { readResearchEvidence, exportResearchReport } from '@flowmate/core';
 import { ResearchEvidenceRequestSchema } from '@flowmate/contracts';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createWorkspaceService, createWorkspaceVerifier, makeApplication,
-  ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool, createResearchPlanTool, createResearchReadTools, createResearchSynthesisTools } from '@flowmate/core';
+  ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool, createResearchPlanTool, createResearchReadTools, createResearchSynthesisTools, createMemoryRuntime, createMemoryManager } from '@flowmate/core';
 import { createDocumentService } from '@flowmate/data';
 import { createInvoiceTools, fillInvoiceForm, listSkillResources, readSkillResource, projectInvoiceDocumentPage, validateHumanInvoiceCandidate } from '@flowmate/employee-invoice';
 import { createPromptTraceBuffer, createRuntimeLogBuffer, createProductTraceRecorder } from '@flowmate/logging';
@@ -33,9 +35,18 @@ import type { AgentPort, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest
 import type { SafeLogger } from '@flowmate/shared';
 
 export type ApplicationOptions = {
+  memory?: { owner: { environment: 'local'; ownerId: string | null } | { environment: 'cloud'; ownerId: string };
+    readCredential(reference: string): Promise<string | undefined>; fetch?: typeof fetch; deferStart?: boolean;
+    initialConnection?: { endpoint: string; accountId: string; userId: string; peerId: string; credentialRef: string;
+      recallEnabled: boolean; captureMode: 'off' | 'explicit' | 'auto' } };
+  onMemoryController?: (controller: { configure(input: import('zod').z.infer<typeof import('@flowmate/contracts').MemoryConnectionConfigurationSchema>):
+    Promise<Result<import('zod').z.infer<typeof import('@flowmate/contracts').MemorySettingsViewSchema>>>;
+    inspect(input: import('zod').z.infer<typeof import('@flowmate/contracts').MemoryConnectionConfigurationSchema>):
+      Promise<Result<import('zod').z.infer<typeof import('@flowmate/contracts').MemorySettingsViewSchema> | null>>; wake(): void }) => void;
   onCloudMaterialReady?: (material: CloudMaterialExport) => void;
   onCloudResourceReady?: (resource: CloudResourceExport) => void;
   cloudAuthority?: { workspaceId: string; runtimeSocket: string; desktopSocket: string; authoritySocket: string; modelSocket: string;
+    openVikingManagement?: readonly CloudOpenVikingManagementRoleBinding[];
     readApiKey(): string | undefined | Promise<string | undefined>; fetch?: (url: string, init: RequestInit) => Promise<Response> };
   personalAgent?: Pick<PersonalAgentRuntimeOptions, 'resolveConfiguration' | 'readApiKey' | 'defaultConfiguration' | 'desktop' | 'browser'> & {
     onReady?: (control: Pick<PersonalAgentRuntime, 'start' | 'conditionsChanged'>) => void;
@@ -69,6 +80,10 @@ export type ApplicationOptions = {
 };
 
 export async function createApplication(options: ApplicationOptions): Promise<Result<Application>> {
+  if (options.memory && (options.cloudAuthority
+    ? options.memory.owner.environment !== 'cloud' || options.memory.owner.ownerId !== options.cloudAuthority.workspaceId
+    : options.memory.owner.environment !== 'local'))
+    return fail(appError('input_invalid', 'input', 'The memory owner does not match this application.'));
   if (options.cloudAuthority && (!options.personalAgent || new Set([options.cloudAuthority.runtimeSocket, options.cloudAuthority.desktopSocket,
     options.cloudAuthority.authoritySocket, options.cloudAuthority.modelSocket]).size !== 4))
     return fail(appError('input_invalid', 'input', 'The cloud Authority configuration is invalid.'));
@@ -101,6 +116,105 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   let loggerClosed = false;
   let databaseClosed = false;
   const now = () => new Date().toISOString();
+  const memoryOwner = options.memory ? { environment: options.memory.owner.environment, ownerId: options.memory.owner.ownerId ?? 'unconfigured' } : undefined;
+  let ownerUnassigned = options.memory?.owner.environment === 'local' && options.memory.owner.ownerId === null, ownerAmbiguous = false;
+  if (ownerUnassigned && memoryOwner) {
+    try {
+      const owners = await database.data.read(scope => scope.db.query<{ owner_id: string }, []>(
+        "SELECT DISTINCT owner_id FROM memory_identities WHERE environment='local' LIMIT 2").all());
+      if (owners.length === 1) { memoryOwner.ownerId = owners[0]!.owner_id; ownerUnassigned = false; }
+      else if (owners.length > 1) ownerAmbiguous = true;
+    } catch { ownerAmbiguous = true; }
+  }
+  const memory = options.memory && memoryOwner ? { owner: memoryOwner, runtime: createMemoryRuntime({ database: database.data,
+    readCredential: options.memory.readCredential, fetch: options.memory.fetch, now, owner: memoryOwner }) } : undefined;
+  let memoryManager = options.memory && memoryOwner ? createMemoryManager({ database: database.data, owner: memoryOwner,
+    readCredential: options.memory.readCredential, now }) : undefined;
+  if (memoryManager && options.memory?.initialConnection) {
+    const current = await memoryManager.get();
+    if (current.ok && current.data.settings.revision === 0)
+      await memoryManager.configure({ ...options.memory.initialConnection, expectedRevision: 0 });
+  }
+  let configuringMemory = false;
+  if (memory && options.memory && memoryOwner) options.onMemoryController?.({ wake: () => memory.runtime.sync.wake(), async inspect(input) {
+    try {
+      const view = await memoryManager!.get(); if (!view.ok) return view;
+      const settings = view.data.settings, identity = view.data.identity;
+      if (settings.revision !== input.expectedRevision + 1 || settings.provider !== 'openviking' || settings.endpoint !== input.endpoint
+        || settings.recallEnabled !== input.recallEnabled || settings.captureMode !== input.captureMode
+        || identity?.accountId !== input.accountId || identity.userId !== input.userId || identity.peerId !== input.peerId) return ok(null);
+      const matches = await database.data.read(scope => scope.db.query(`SELECT id FROM memory_identities WHERE environment=? AND owner_id=?
+        AND account_id=? AND user_id=? AND peer_id=? AND credential_ref=? AND state='active'`).get(memoryOwner.environment, memoryOwner.ownerId,
+        input.accountId, input.userId, input.peerId, input.credentialRef));
+      return ok(matches ? view.data : null);
+    } catch { return fail(appError('storage_read_failed', 'storage', 'The original memory configuration could not be inspected.', true)); }
+  }, async configure(input) {
+    if (configuringMemory || ownerAmbiguous || memoryOwner.environment !== 'local')
+      return fail(appError('state_conflict', 'runtime', 'The original local memory identity is unavailable.', true));
+    configuringMemory = true;
+    const previous = memoryOwner.ownerId, assigned = ownerUnassigned;
+    try {
+      let cancel = () => {};
+      const timeout = new Promise<undefined>(resolve => { const timer = setTimeout(resolve, 5000); cancel = () => clearTimeout(timer); });
+      let key: string | undefined;
+      try { key = await Promise.race([options.memory!.readCredential(input.credentialRef), timeout]); }
+      finally { cancel(); }
+      if (!key || !await verifyOpenVikingIdentity({ endpoint: input.endpoint, apiKey: key, accountId: input.accountId, userId: input.userId,
+        role: 'user', fetch: options.memory!.fetch ?? globalThis.fetch, signal: AbortSignal.timeout(5000) }))
+        return fail(appError('memory_identity_unavailable', 'runtime', 'The original OpenViking user identity could not be confirmed.', true));
+      if (assigned) memoryOwner.ownerId = randomUUID();
+      const candidate = createMemoryManager({ database: database.data, owner: memoryOwner, readCredential: options.memory!.readCredential, now });
+      const result = await candidate.configure(input);
+      if (result.ok) { memoryManager = candidate; ownerUnassigned = false; memory.runtime.sync.wake(); }
+      else if (assigned) memoryOwner.ownerId = previous;
+      return result;
+    } catch {
+      if (assigned) memoryOwner.ownerId = previous;
+      return fail(appError('memory_unavailable', 'runtime', 'The original memory connection could not be configured.', true));
+    } finally { configuringMemory = false; }
+  } });
+  const remember = async (input: import('@flowmate/contracts').MemoryRememberRequest, reconcile: boolean) => {
+    if (!memory) return fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.'));
+    const source = input.source;
+    const binding = await database.data.read(scope => source.kind === 'session'
+      ? scope.memoryIntegration.getSessionInputBinding({ sessionId: source.sessionId, inputId: source.inputId })
+      : scope.memoryIntegration.getWorkBinding({ workId: source.workId, itemId: source.itemId, branch: 0 }));
+    if (!binding.ok) return binding;
+    if (!binding.data) return fail(appError('memory_scope_denied', 'runtime', 'The original memory source is unavailable.'));
+    const original = { bindingId: binding.data.id, inputId: source.kind === 'session' ? source.inputId : null,
+      phaseId: source.kind === 'work' ? source.phaseId : null, owner: memory.owner,
+      requestId: input.requestId, content: input.content, scope: input.scope, confirmed: input.confirmed };
+    return reconcile ? memory.runtime.reconcileRemember(original) : memory.runtime.remember(original);
+  };
+  const searchMemory = async (input: import('zod').z.infer<typeof import('@flowmate/contracts').MemorySearchRequestSchema>) => {
+    if (!memory) return fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.'));
+    const source = input.source;
+    const binding = await database.data.read(scope => source.kind === 'session'
+      ? scope.memoryIntegration.getSessionInputBinding({ sessionId: source.sessionId, inputId: source.inputId })
+      : scope.memoryIntegration.getWorkBinding({ workId: source.workId, itemId: source.itemId, branch: 0 }));
+    if (!binding.ok) return binding;
+    if (!binding.data) return fail(appError('memory_scope_denied', 'runtime', 'The original memory source is unavailable.'));
+    return memory.runtime.search({ bindingId: binding.data.id, inputId: source.kind === 'session' ? source.inputId : null,
+      phaseId: source.kind === 'work' ? source.phaseId : null, owner: memory.owner, query: input.query, timeoutMs: 2000 });
+  };
+  const recoverRemember = async (input: import('zod').z.infer<typeof import('@flowmate/contracts').MemoryRememberRecoveryRequestSchema>) => {
+    if (!memory) return fail(appError('memory_unavailable', 'runtime', 'Memory management is unavailable.'));
+    try {
+      const row = await database.data.read(scope => scope.db.query<{ binding_id: number; input_id: number | null; phase_id: number | null;
+        request_id: string; content: string; scope_kind: 'personal' | 'session' | 'work'; scope_id: string; state: string }, [number, string, string, string]>(
+        `SELECT r.* FROM memory_remember_requests r JOIN memory_identities i ON i.id=r.identity_id
+         WHERE r.id=? AND r.request_id=? AND i.environment=? AND i.owner_id=?`)
+        .get(input.operationId, input.requestId, memory.owner.environment, memory.owner.ownerId));
+      if (!row || row.state === 'forgotten') return fail(appError('memory_scope_denied', 'runtime', 'The original memory operation is unavailable.'));
+      const scope = row.scope_kind === 'personal' && row.scope_id === memory.owner.ownerId ? { kind: 'personal' as const }
+        : row.scope_kind === 'session' ? { kind: 'session' as const, sessionId: Number(row.scope_id) }
+          : row.scope_kind === 'work' ? { kind: 'work' as const, workId: Number(row.scope_id) } : null;
+      if (!scope) return fail(appError('memory_scope_denied', 'runtime', 'The original memory scope is unavailable.'));
+      const result = await memory.runtime.reconcileRemember({ bindingId: row.binding_id, inputId: row.input_id, phaseId: row.phase_id,
+        owner: memory.owner, requestId: row.request_id, content: row.content, scope, confirmed: true });
+      return result.ok ? ok({ operationId: input.operationId, result: result.data }) : result;
+    } catch { return fail(appError('storage_read_failed', 'storage', 'The original memory operation could not be read.', true)); }
+  };
   const files = createFileStore(options.paths, database.data);
   const documents = createDocumentService({ paths: options.paths,
     allowedSourceRoot: options.invoiceSourceRoot ?? resolve(process.cwd(), 'data', 'invoices', 'agent-input'),
@@ -213,6 +327,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   let cloudEndpoints: { stopDesktop(): Promise<Result<void>>; close(): Promise<Result<void>> } | undefined;
   const runtime = new RuntimeService({
     database: database.data,
+    ...(memory ? { memory } : {}),
     recoveryError: database.data.recoveryError,
     workspaceVerifier,
     contextService,
@@ -247,6 +362,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const jobService = createJobService(database.data, now);
   if (options.personalAgent) {
     const personal = await createPersonalAgentRuntime({ ...options.personalAgent, database: database.data, definitions,
+      ...(memory ? { memory } : {}),
       ...(cloudDesktop ? { desktop: cloudDesktop } : {}),
       ...(cloudDesktopRelay ? { browser: createBrowserBridge((request, signal) => cloudDesktopRelay.request(request, signal)) } : {}),
       ...(invoiceForms && options.personalAgent.observeInvoiceForm ? { form: { service: invoiceForms, observe: options.personalAgent.observeInvoiceForm } } : {}),
@@ -337,6 +453,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       .catch(() => fail(appError('storage_read_failed', 'storage', 'Child Run could not be read.', true))),
   }, async () => {
     const errors = [];
+    await memory?.runtime.sync.close();
     detachTrace?.(); await traceFlush; await flushTraces();
     personalRuntime = undefined;
     if (!loggerClosed) {
@@ -353,6 +470,21 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     }
     return { stopped: true, closed: loggerClosed && databaseClosed && lockReleased, errors };
   }, sessionService, promptTrace, workspaceService, jobService, {
+    memory: memory && memoryManager ? {
+      getSettings: () => memoryManager!.get(),
+      listEntries: input => memoryManager!.listEntries(input),
+      readEntry: input => memoryManager!.readEntry(input),
+      listOperations: input => memoryManager!.listOperations(input),
+      search: input => searchMemory(input),
+      updatePolicy: async input => { const result = await memoryManager!.updatePolicy(input); if (result.ok) memory.runtime.sync.wake(); return result; },
+      remember: input => remember(input, false), reconcileRemember: input => remember(input, true),
+      reconcileRememberById: input => recoverRemember(input),
+      forget: input => memory.runtime.forget({ ...input, owner: memory.owner }),
+      reconcileSync: async (syncId, abandonConfirmed) => {
+        const result = await memory.runtime.sync.reconcile(syncId, abandonConfirmed);
+        return result.ok ? ok({ syncId, ...result.data }) : result;
+      },
+    } : undefined,
     personal: personalRuntime ? { ...personalRuntime.personal, close: async () => {
       const desktop = await cloudEndpoints?.stopDesktop() ?? ok(undefined);
       const stopped = await personalRuntime!.close();
@@ -518,7 +650,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     try {
       if (!existsSync(join(options.paths.root, 'data/settings.json'))) write('settings.json', installedSettings.data);
       write('installed-release.json', { version: 1, releaseId: options.installedRelease.releaseId,
-        productVersion: options.installedRelease.productVersion, schemaVersion: 25, settingsVersion: 7 });
+        productVersion: options.installedRelease.productVersion, schemaVersion: 27, settingsVersion: 7 });
     } catch {
       await application.close();
       return fail(appError('maintenance_release_record_failed', 'storage', 'The installed release could not be recorded; original data and backups were retained.', true));
@@ -527,7 +659,9 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   if (options.cloudAuthority && personalRuntime) {
     const cloud = options.cloudAuthority;
     const endpoints = await startCloudAuthorityEndpoints({ workspaceId: cloud.workspaceId, database: database.data, personal: personalRuntime,
-      desktopRelay: cloudDesktopRelay,
+      desktopRelay: cloudDesktopRelay, memory: memory ? application.memory : undefined,
+      openVikingManagement: cloud.openVikingManagement
+        ? { productRoot: options.paths.root, roles: cloud.openVikingManagement } : undefined,
       runtime: cloudRuntime!,
       files, now, readApiKey: cloud.readApiKey, fetch: cloud.fetch, desktopSocket: cloud.desktopSocket,
       readOriginal: (documentId, page) => application.readDocumentOriginal(documentId, page),
@@ -552,5 +686,6 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       files: { read: (artifact, name) => files.read(artifact, name, scope.contents) } }) }));
   options.onCloudResourceReady?.(new CloudResourceExport({ database: database.data,
     resourceRoot: options.resourceRoot ?? fileURLToPath(new URL('../resources/', import.meta.url)), inspectNativeResources, now }));
+  if (!options.memory?.deferStart) memory?.runtime.sync.wake();
   return ok(application);
 }

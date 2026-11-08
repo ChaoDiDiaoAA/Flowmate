@@ -47,7 +47,8 @@ export function createDurableQueueController(options: { harness: Harness; resolv
       if (item.mode === 'write') continue;
       const auxiliary = item.entry?.kind === 'flowmate.queue-input', original = (auxiliary ? queuedInput : originalInput).safeParse(item.entry?.data);
       if ((!auxiliary && item.entry?.kind !== 'flowmate.input') || !original.success || original.data.workId !== owner.workId
-        || original.data.sessionId !== owner.sessionId || original.data.attemptId !== owner.attemptId || typeof item.content !== 'string')
+        || original.data.sessionId !== owner.sessionId || original.data.itemId !== owner.itemId
+        || original.data.attemptId !== owner.attemptId || typeof item.content !== 'string')
         throw Error('state_conflict');
       const controlId = auxiliary ? queuedInput.parse(original.data).controlRequestId : null;
       const saved = await tx.submissionByRequest(conversationId, controlId === null ? JSON.stringify([owner.attemptId, original.data.requestId]) : queueSubmissionKey(owner.attemptId, controlId));
@@ -74,19 +75,22 @@ export function createDurableQueueController(options: { harness: Harness; resolv
     }),
     queryControl: (raw: CloudQueueControlQuery): Promise<Result<CloudQueueReceipt | null>> => safe(async () => {
       const parsed = CloudQueueControlQuerySchema.safeParse(raw); if (!parsed.success) throw Error('input_invalid');
-      const input = parsed.data, owner = { workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId };
+      const input = parsed.data, owner = { workId: input.workId, sessionId: input.sessionId,
+        ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId };
       const id = await conversation(owner), saved = await options.harness.snapshot(Control, id, input.controlRequestId, BACKGROUND_CONTEXT);
       if (!saved) return null;
       if (!saved.request || !saved.receipt) throw Error('state_conflict');
       const original = CloudQueueControlSchema.parse(JSON.parse(saved.request)), receipt = CloudQueueReceiptSchema.parse(JSON.parse(saved.receipt));
       if (original.workId !== owner.workId || original.sessionId !== owner.sessionId || original.attemptId !== owner.attemptId
-        || receipt.workId !== owner.workId || receipt.sessionId !== owner.sessionId || receipt.attemptId !== owner.attemptId
+        || original.itemId !== owner.itemId || receipt.workId !== owner.workId || receipt.sessionId !== owner.sessionId
+        || receipt.itemId !== owner.itemId || receipt.attemptId !== owner.attemptId
         || receipt.controlRequestId !== input.controlRequestId) throw Error('state_conflict');
       return receipt;
     }),
     apply: (raw: CloudQueueControl): Promise<Result<CloudQueueReceipt>> => safe(async () => {
       const parsed = CloudQueueControlSchema.safeParse(raw); if (!parsed.success) throw Error('input_invalid');
-      const input = parsed.data, owner = { workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId };
+      const input = parsed.data, owner = { workId: input.workId, sessionId: input.sessionId,
+        ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId };
       const id = await conversation(owner);
       return options.harness.commit(async tx => {
         const inbox = await tx.doc(InboxDoc, id), state = await tx.doc(Queue, id), control = await tx.doc(Control, id, input.controlRequestId, null);

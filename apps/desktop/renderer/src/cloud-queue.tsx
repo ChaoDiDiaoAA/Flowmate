@@ -12,7 +12,9 @@ export function CloudQueuePanel(props: { workspaceId: string; owner: CloudQueueO
   const [busy, setBusy] = useState(false), [retryReady, setRetryReady] = useState(false), active = useRef(false), generation = useRef(0);
   const owner = props.owner;
   const ownerRef = useRef(owner), loadedOwner = useRef<string | null>(null), displayedOwner = useRef<string | null>(null);
-  useEffect(() => { ownerRef.current = owner; }, [owner?.workId, owner?.sessionId, owner?.attemptId]);
+  const instructions = useRef(new Map<string, string>());
+  const ownerKey = (value: CloudQueueOwner) => JSON.stringify([value.workId, value.sessionId, value.attemptId, value.itemId ?? null]);
+  useEffect(() => { ownerRef.current = owner; }, [owner?.workId, owner?.sessionId, owner?.attemptId, owner?.itemId]);
   async function request(command: CloudDesktopUserCommand) {
     const result = await window.flowmate.cloudDesktop.request({ workspaceId: props.workspaceId, command });
     if (!result.ok) throw Error(result.error.message); return result.data;
@@ -20,7 +22,9 @@ export function CloudQueuePanel(props: { workspaceId: string; owner: CloudQueueO
   async function load(target: CloudQueueOwner, token = generation.current) {
     const view = CloudQueueViewSchema.parse(await request({ type: 'cloud_queue_read', input: target }));
     if (token !== generation.current) return;
-    const key = JSON.stringify([target.workId, target.sessionId, target.attemptId]), sameOwner = loadedOwner.current === key;
+    if (view.workId !== target.workId || view.sessionId !== target.sessionId || view.attemptId !== target.attemptId || view.itemId !== target.itemId)
+      throw Error('The queue belongs to another invoice.');
+    const key = ownerKey(target), sameOwner = loadedOwner.current === key;
     loadedOwner.current = key; setQueue(view);
     setEdits(previous => Object.fromEntries(view.items.map(item => {
       const saved = sameOwner ? previous[item.submissionId] : undefined;
@@ -28,11 +32,11 @@ export function CloudQueuePanel(props: { workspaceId: string; owner: CloudQueueO
     })));
   }
   useEffect(() => {
-    const token = ++generation.current, key = owner ? JSON.stringify([owner.workId, owner.sessionId, owner.attemptId]) : null;
-    if (displayedOwner.current !== key) { displayedOwner.current = key; setQueue(null); setEdits({}); }
+    const token = ++generation.current, key = owner ? ownerKey(owner) : null;
+    if (displayedOwner.current !== key) { displayedOwner.current = key; setQueue(null); setEdits({}); setInstruction(key ? instructions.current.get(key) ?? '' : ''); }
     if (owner) void load(owner, token).catch(cause => { if (token === generation.current) setError(cause instanceof Error ? cause.message : 'Cloud queue is unavailable.'); });
     return () => { generation.current++; };
-  }, [props.workspaceId, owner?.workId, owner?.sessionId, owner?.attemptId, props.refreshSignal]);
+  }, [props.workspaceId, owner?.workId, owner?.sessionId, owner?.attemptId, owner?.itemId, props.refreshSignal]);
   async function run(action: () => Promise<void>) {
     if (active.current) return; active.current = true; setBusy(true); setError(null); setMessage(null);
     try { await action(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'The original queue control could not be confirmed.'); }
@@ -41,12 +45,15 @@ export function CloudQueuePanel(props: { workspaceId: string; owner: CloudQueueO
   async function received(raw: unknown, original: CloudQueueControl) {
     const receipt = CloudQueueReceiptSchema.parse(raw);
     if (receipt.workId !== original.workId || receipt.sessionId !== original.sessionId || receipt.attemptId !== original.attemptId
-      || receipt.controlRequestId !== original.controlRequestId) throw Error('The queue receipt belongs to another control.');
+      || receipt.itemId !== original.itemId || receipt.controlRequestId !== original.controlRequestId) throw Error('The queue receipt belongs to another control.');
     if (!clearCloudQueueControl(localStorage, props.workspaceId)) throw Error('The confirmed control could not be cleared from this device.');
     pendingRef.current = null; setPending(null); setRetryReady(false);
-    if (receipt.status === 'applied' && original.action.kind === 'enqueue') setInstruction('');
+    if (receipt.status === 'applied' && original.action.kind === 'enqueue' && instructions.current.get(ownerKey(original)) === original.action.content) {
+      instructions.current.delete(ownerKey(original));
+      if (ownerRef.current && ownerKey(ownerRef.current) === ownerKey(original)) setInstruction('');
+    }
     if (receipt.status === 'applied' && original.action.kind === 'edit' && ownerRef.current?.workId === original.workId
-      && ownerRef.current.sessionId === original.sessionId && ownerRef.current.attemptId === original.attemptId) {
+      && ownerRef.current.sessionId === original.sessionId && ownerRef.current.attemptId === original.attemptId && ownerRef.current.itemId === original.itemId) {
       const action = original.action;
       setEdits(previous => previous[action.submissionId]?.text === action.content ? { ...previous,
         [action.submissionId]: { base: action.content, text: action.content } } : previous);
@@ -64,7 +71,7 @@ export function CloudQueuePanel(props: { workspaceId: string; owner: CloudQueueO
   async function recover(retry = false) {
     const original = pendingRef.current; if (!original) return;
     const receipt = await request({ type: 'cloud_queue_query_control', input: { workId: original.workId, sessionId: original.sessionId,
-      attemptId: original.attemptId, controlRequestId: original.controlRequestId } });
+      ...(original.itemId === undefined ? {} : { itemId: original.itemId }), attemptId: original.attemptId, controlRequestId: original.controlRequestId } });
     if (receipt !== null) { await received(receipt, original); return; }
     setRetryReady(true); setMessage('No saved control receipt was found. The original control remains available.');
     if (retry) await received(await request({ type: 'cloud_queue_control', input: original }), original);
@@ -80,11 +87,13 @@ export function CloudQueuePanel(props: { workspaceId: string; owner: CloudQueueO
     {pending && <div className="notice"><p>Original control for Work {pending.workId}, attempt {pending.attemptId} awaits confirmation.</p>
       <button type="button" disabled={busy} onClick={() => void run(() => recover())}>Check queue control receipt</button>
       {retryReady && <button type="button" disabled={busy} onClick={() => void run(() => recover(true))}>Retry original queue control</button>}</div>}
-    {!owner ? <p>Select a cloud Work with an execution attempt to inspect its queue.</p> : <>
+    {!owner ? <p>Select a cloud Work and invoice with an execution attempt to inspect its queue.</p> : <>
       <button type="button" disabled={busy} onClick={() => void run(() => load(owner))}>Refresh cloud queue</button>
       {queue && <><p>Queue version {queue.version} · {queue.items.length} pending input(s)</p>
         {queue.activePhaseRequestId && <div><label className="field"><span>New cloud queue instruction</span><textarea maxLength={22000}
-          value={instruction} disabled={busy || !!pending || !initial.ok} onChange={event => setInstruction(event.target.value)} /></label>
+          value={instruction} disabled={busy || !!pending || !initial.ok} onChange={event => {
+            instructions.current.set(ownerKey(owner), event.target.value); setInstruction(event.target.value);
+          }} /></label>
           <p>This instruction stays within the current invoice and its existing tool permissions.</p><div className="button-row">
             <button type="button" disabled={busy || !!pending || !initial.ok || !instruction.trim()} onClick={() => void run(() => apply({ kind: 'enqueue',
               phaseRequestId: queue.activePhaseRequestId!, mode: 'steer', content: instruction }))}>Send steer</button>

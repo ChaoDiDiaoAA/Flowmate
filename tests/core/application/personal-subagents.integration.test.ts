@@ -138,10 +138,12 @@ test.each([
   const requests = wire.length; need(await app.close()); app = need(await createApplication(options));
   expect(need(await app.personalTasks.get({ workId: created.workId, attemptId }))).toEqual(final);
   const rootHistory = need(await app.personalTasks.history({ target: { workId: created.workId }, limit: 100 }));
+  const invoiceHistory = need(await app.personalTasks.history({ target: { workId: created.workId, itemId: view.items[0]!.itemId }, limit: 100 }));
   const childHistory = need(await app.personalTasks.history({ target: { workId: created.workId, childRunId: childRun.runId }, limit: 100 }));
   expect(rootHistory.owner).toEqual({ runtimeKind: 'durable', workId: created.workId, sessionId: final.task.sessionId, childRunId: null });
   expect(childHistory.owner).toEqual({ runtimeKind: 'durable', workId: created.workId, sessionId: childRun.sessionId, childRunId: childRun.runId });
-  expect(rootHistory.entries.length).toBeGreaterThan(0); expect(childHistory.entries.length).toBeGreaterThan(0);
+  expect(rootHistory.entries).toHaveLength(0); expect(invoiceHistory.owner).toMatchObject({ itemId: view.items[0]!.itemId });
+  expect(invoiceHistory.entries.length).toBeGreaterThan(0); expect(childHistory.entries.length).toBeGreaterThan(0);
   const entry = childHistory.entries[0]!;
   const detail = need(await app.personalTasks.historyEntry({ target: { workId: created.workId, childRunId: childRun.runId },
     throughEntryId: childHistory.throughEntryId, entryId: entry.entryId, limit: 100 }));

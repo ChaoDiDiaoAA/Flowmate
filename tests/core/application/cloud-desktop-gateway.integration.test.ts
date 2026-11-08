@@ -16,6 +16,43 @@ const snapshot = { personalAgentId: 1, revision: 0, runtimeKind: 'durable', conf
 const envelope = { version: 1, workspaceId, requestId, command: { type: 'personal_agent_get', input: {} } };
 function need<T>(result: Result<T>): T { if (!result.ok) throw Error(result.error.code); return result.data; }
 
+test('cloud memory commands retain the original Work and never accept a caller owner', async () => {
+  const input = { requestId: 'original-memory', source: { kind: 'work' as const, workId: 7, itemId: 8, phaseId: 9 },
+    content: 'Controlled preference.', scope: { kind: 'work' as const, workId: 7 }, confirmed: true as const };
+  let writes = 0;
+  const memory = { getSettings: async () => fail(appError('memory_unavailable', 'runtime', 'Not used.')),
+    listEntries: async () => ok({ items: [], nextAfterId: null }),
+    readEntry: async () => fail(appError('memory_unavailable', 'runtime', 'Not used.')),
+    listOperations: async () => ok({ items: [], nextAfterId: null }),
+    search: async () => ok({ status: 'empty' as const, items: [] }),
+    updatePolicy: async () => fail(appError('memory_unavailable', 'runtime', 'Not used.')),
+    remember: async () => { writes++; return ok({ requestId: input.requestId, state: 'completed' as const,
+      uri: 'viking://user/alice/memories/one.md', entryId: 1, contentConfirmed: true }); },
+    reconcileRemember: async () => fail(appError('memory_unavailable', 'runtime', 'Not used.')),
+    reconcileRememberById: async () => fail(appError('memory_unavailable', 'runtime', 'Not used.')),
+    forget: async (value: { entryId: number; requestId: string }) => ok({ entryId: value.entryId, requestId: value.requestId, state: 'unknown' as const }),
+    reconcileSync: async () => fail(appError('memory_unavailable', 'runtime', 'Not used.')) };
+  const handle = createCloudDesktopHandler({ workspaceId, authorize: async () => ok(undefined), dispatch: async () => ok(snapshot), memory });
+  const command = { type: 'cloud_memory_remember', input };
+  expect(await handle({ ...envelope, command })).toMatchObject({ ok: true, data: { requestId: input.requestId, state: 'completed' } });
+  expect(await handle({ ...envelope, command: { ...command, input: { ...input, ownerId: 'forged' } } })).toMatchObject({ ok: false });
+  expect(await handle({ ...envelope, command: { ...command, input: { ...input, source: { kind: 'session', sessionId: 1, inputId: 2 } } } }))
+    .toMatchObject({ ok: false });
+  expect(await handle({ ...envelope, workspaceId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', command })).toMatchObject({ ok: false });
+  expect(writes).toBe(1);
+  const search = { type: 'cloud_memory_search', input: { query: 'invoice', source: input.source } };
+  expect(await handle({ ...envelope, command: search })).toEqual(ok({ status: 'empty', items: [] }));
+  expect(await handle({ ...envelope, workspaceId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', command: search })).toMatchObject({ ok: false });
+  expect(await handle({ ...envelope, command: { ...search, input: { ...search.input, source: { kind: 'session', sessionId: 1, inputId: 2 } } } }))
+    .toMatchObject({ ok: false });
+  const forget = { type: 'cloud_memory_forget', input: { entryId: 1, expectedRevision: 1, requestId: 'original-forget', confirmed: true } };
+  expect(await handle({ ...envelope, command: forget })).toMatchObject({ ok: true, data: { entryId: 1, requestId: 'original-forget', state: 'unknown' } });
+  const wrong = createCloudDesktopHandler({ workspaceId, authorize: async () => ok(undefined), dispatch: async () => ok(snapshot),
+    memory: { ...memory, remember: async () => ok({ requestId: 'another', state: 'completed' as const,
+      uri: 'viking://user/alice/memories/one.md', entryId: 1, contentConfirmed: true }) } });
+  expect(await wrong({ ...envelope, command })).toMatchObject({ ok: false, error: { code: 'operation_result_unknown' } });
+});
+
 test('cloud relay commands deliver a request and validate the original receiver and reply', async () => {
   const relay = new CloudDesktopRelay(), connectionId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
   const handle = createCloudDesktopHandler({ workspaceId, authorize: async () => ok(undefined), dispatch: async () => ok(snapshot), desktopRelay: relay });

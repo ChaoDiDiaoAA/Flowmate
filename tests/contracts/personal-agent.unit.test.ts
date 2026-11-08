@@ -185,6 +185,7 @@ describe('P18 public business command contracts', () => {
   });
 
   it('projects work and item facts without treating cancellation, a candidate reference or an enabled action as authority', () => {
+    expect(contracts.InvoiceWorkExecutionViewSchema.safeParse({ ...work.execution, itemLanes: true }).success).toBe(false);
     expect(contracts.InvoiceWorkViewSchema).toBeDefined(); expect(contracts.InvoiceWorkItemViewSchema).toBeDefined();
     expect(contracts.InvoiceWorkViewSchema.parse(work)).toEqual(work);
     expect(contracts.InvoiceWorkItemViewSchema.parse(item)).toEqual(item);

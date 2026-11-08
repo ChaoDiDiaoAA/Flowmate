@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { CLOUD_WORK_TIMEOUT_MS_MAX, CloudChildReportSchema, CloudDesktopConnectionSchema, CloudProgressEventSchema, CloudReviewAcceptReceiptSchema, compareInvoiceWorkTimelineCursor, ok, type CloudDesktopConnection, type DesktopBridge, type DocumentSnapshot, type InvoiceWorkView, type InvoiceWorkItemView,
-  type BrowserReadView, type DesktopActionView, type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
+  type BrowserReadView, type BrowserTarget, type DesktopActionView, type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
   type PersonalAgentSnapshot, type PersonalHistoryPage, type PersonalHistoryEntry, type PersonalHistoryTarget,
   type PersonalTaskView, type PersonalTaskGetResult, type Result } from '@flowmate/contracts';
 import { capturePersonalWrite, emptyPersonalDraft, executePersonalWrite, readPersonalDraft, recoverPersonalWrite,
@@ -139,7 +139,11 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   useEffect(() => { selectedItemRef.current = selectedItem; }, [selectedItem]);
   const [todos, setTodos] = useState<readonly InvoiceWorkTodoView[]>([]), [todoCursor, setTodoCursor] = useState<number | null>(null);
   const [desktopActions, setDesktopActions] = useState<readonly DesktopActionView[]>([]), [desktopCursor, setDesktopCursor] = useState<number | null>(null);
+  const [selectedDesktop, setSelectedDesktop] = useState<{ workId: number; itemId: number; hostEpoch: number; workspaceId?: string; window: DesktopActionView['target']['window'] } | null>(null);
+  const [desktopRebound, setDesktopRebound] = useState<{ workId: number; itemId: number; proposalId: number; hostEpoch: number; workspaceId?: string } | null>(null);
   const [browserReads, setBrowserReads] = useState<readonly BrowserReadView[]>([]), [browserCursor, setBrowserCursor] = useState<number | null>(null);
+  const [selectedBrowser, setSelectedBrowser] = useState<{ workId: number; itemId: number; hostEpoch: number; workspaceId?: string; target: BrowserTarget } | null>(null);
+  const [browserRebound, setBrowserRebound] = useState<{ workId: number; itemId: number; proposalId: number; hostEpoch: number; workspaceId?: string } | null>(null);
   const [desktopOwner, setDesktopOwner] = useState<{ workId: number; itemId: number } | null>(null);
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]), [documentCursor, setDocumentCursor] = useState<number | null>(null);
   const [tasks, setTasks] = useState<readonly PersonalTaskView[]>([]), [taskCursor, setTaskCursor] = useState<number | null>(null);
@@ -173,7 +177,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
       setWork(page.work); setSelectedItem(page.item);
       if (!cloud || selectedItemRef.current?.workId !== workId || selectedItemRef.current.itemId !== itemId) setDecision('');
       setTodos(previous => append ? [...previous, ...page.todos] : page.todos); setTodoCursor(page.nextAfterTodoId);
-      if (!append && (!cloud || props.cloudDesktopReady)) {
+      if (!append) {
         const [result, browser] = await Promise.all([personal.invoiceWorks.listDesktopActions({ workId, itemId, limit: 50 }),
           personal.invoiceWorks.listBrowserReads({ workId, itemId, limit: 50 })]);
         if (token !== itemGeneration.current || workId !== draftRef.current.selectedWorkId) return;
@@ -307,7 +311,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
     const receipt = await submit({ type: 'invoice_work_desktop_decide', input: { workId: action.workId, itemId: action.itemId,
       proposalId: action.proposalId, expectedRevision: work.revision, requestId: requestId(), decision,
       ...(decision === 'approve' ? { confirmedAction: action.action, confirmedTarget: action.target } : {}) } });
-    if (decision !== 'approve' || !receipt || !('proposalId' in receipt)) return;
+    if (decision !== 'approve' || action.resumeOriginal || !receipt || !('proposalId' in receipt)) return;
     const current = need(await personal.invoiceWorks.get({ view: 'work', workId: action.workId, limit: 1 }));
     if (draftRef.current.selectedWorkId !== action.workId || current.work.status !== 'open') return;
     await submit({ type: 'invoice_work_continue', input: { workId: action.workId, expectedRevision: current.work.revision,
@@ -319,7 +323,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
     const receipt = await submit({ type: 'invoice_work_browser_decide', input: { workId: read.workId, itemId: read.itemId,
       proposalId: read.proposalId, expectedRevision: work.revision, requestId: requestId(), decision,
       ...(decision === 'approve' ? { confirmedTarget: read.target } : {}) } });
-    if (decision !== 'approve' || !receipt || !('proposalId' in receipt)) return;
+    if (decision !== 'approve' || read.resumeOriginal || !receipt || !('proposalId' in receipt)) return;
     const current = need(await personal.invoiceWorks.get({ view: 'work', workId: read.workId, limit: 1 }));
     if (draftRef.current.selectedWorkId !== read.workId || current.work.status !== 'open') return;
     await submit({ type: 'invoice_work_continue', input: { workId: read.workId, expectedRevision: current.work.revision,
@@ -345,13 +349,16 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
       const page = need(await personal.personalTasks.history({ target, limit: 30,
         ...(append && history?.nextBeforeEntryId ? { throughEntryId: history.throughEntryId, beforeEntryId: history.nextBeforeEntryId } : {}) }));
       if (token !== historyGeneration.current || target.workId !== draftRef.current.selectedWorkId) return;
-      setHistory(previous => append && previous?.owner.sessionId === page.owner.sessionId ? { ...page, entries: [...previous.entries, ...page.entries] } : page);
+      setHistory(previous => append && previous?.owner.sessionId === page.owner.sessionId && previous.owner.itemId === page.owner.itemId
+        && previous.owner.childRunId === page.owner.childRunId && previous.throughEntryId === page.throughEntryId
+        ? { ...page, entries: [...previous.entries, ...page.entries] } : page);
       setHistoryDetail(null); setView('History');
     } catch (cause) { if (token === historyGeneration.current) setError(cause instanceof Error ? cause.message : 'Original history could not be read.'); }
   }
   async function readEntry(entryId: number, offset = 0) {
     if (!history) return; const token = ++historyGeneration.current;
-    const target = { workId: history.owner.workId, ...(history.owner.childRunId === null ? {} : { childRunId: history.owner.childRunId }) };
+    const target = { workId: history.owner.workId, ...(history.owner.childRunId === null ? {} : { childRunId: history.owner.childRunId }),
+      ...(history.owner.itemId === undefined ? {} : { itemId: history.owner.itemId }) };
     const detail = need(await personal.personalTasks.historyEntry({ target, entryId, throughEntryId: history.throughEntryId, offset, limit: 8192 }));
     if (token === historyGeneration.current && target.workId === draftRef.current.selectedWorkId) setHistoryDetail(detail);
   }
@@ -420,8 +427,9 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
     {cloud && liveOutput && work?.execution.runStatus === 'running' && liveOutput.attemptId === work.execution.attempt?.attemptId
       && <section className="panel" aria-label="Live cloud response"><h2>Live cloud response</h2><p>Temporary output may be incomplete; the saved result may differ.</p>
         <pre>{liveOutput.truncated ? '…' : ''}{liveOutput.text}</pre></section>}
-    {cloud && <CloudQueuePanel workspaceId={cloud} owner={work?.execution.attempt ? { workId: work.workId, sessionId: work.sessionId,
-      attemptId: work.execution.attempt.attemptId } : null} refreshSignal={progressVersion} onChanged={() => void refresh()} />}
+    {cloud && <CloudQueuePanel workspaceId={cloud} owner={work?.execution.attempt && (!work.execution.itemLanes || selectedItem?.workId === work.workId)
+      ? { workId: work.workId, sessionId: work.sessionId, attemptId: work.execution.attempt.attemptId,
+        ...(work.execution.itemLanes && selectedItem ? { itemId: selectedItem.itemId } : {}) } : null} refreshSignal={progressVersion} onChanged={() => void refresh()} />}
     {cloud && <CloudDeliveryPanel workspaceId={cloud} owner={work && (task?.task.attempt ?? work.execution.attempt) ? { workId: work.workId, sessionId: work.sessionId,
       attemptId: (task?.task.attempt ?? work.execution.attempt)!.attemptId } : null} refreshSignal={progressVersion} />}
     <PersonalConfiguration ready={props.ready} hostEpoch={props.hostEpoch} disabled={writeDisabled} models={props.models} configuration={configuration} cloud={!!cloud}
@@ -485,9 +493,11 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
             onClick={() => { setView(tab); if (tab === 'History') void readHistory({ workId: work.workId }); }}>{tab}</button>)}</div>
           {view === 'Invoices' && <>
             <ul className="personal-items">{items.map(item => <li key={item.itemId}><button type="button" aria-pressed={selectedItemId === item.itemId} onClick={() => void readItem(item.itemId)}>
-              {displayDocument(item.documentRef.id)} · {item.disposition} · {item.todoCount} Todo</button><span>Candidate {item.candidateRef ? `${item.candidateRef.id}/${item.candidateRef.sequence}` : 'not saved'}</span></li>)}</ul>
+              {displayDocument(item.documentRef.id)} · {item.disposition} · {item.todoCount} Todo</button><span>Candidate {item.candidateRef ? `${item.candidateRef.id}/${item.candidateRef.sequence}` : 'not saved'}
+                {item.execution ? ` · ${item.execution.state === 'waiting_approval' ? 'Waiting for approval' : item.execution.state === 'ready' ? 'Decision saved; waiting for turn' : item.execution.state === 'active' ? 'Active' : 'Phase closed'}` : ''}</span></li>)}</ul>
             {itemCursor && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await personal.invoiceWorks.get({ view: 'work', workId: work.workId, afterItemId: itemCursor, limit: 50 })); if (current(token) && draftRef.current.selectedWorkId === work.workId && page.view === 'work') { setItems(previous => [...previous, ...page.items]); setWork(page.work); setItemCursor(page.nextAfterItemId); } })}>More work invoices</button>}
             {selectedItem && <section className="personal-item-detail" aria-label="Selected Work invoice"><h3>{displayDocument(selectedItem.documentRef.id)}</h3><p>Invoice item {selectedItem.itemId} · version {selectedItem.documentRef.version} · {selectedItem.disposition}</p>
+              <button type="button" onClick={() => void readHistory({ workId: work.workId, itemId: selectedItem.itemId })}>View invoice history</button>
               <button type="button" disabled={!props.ready || saving} onClick={() => void operate(() => props.onOpenInvoice({ workId: work.workId, itemId: selectedItem.itemId,
                 documentRef: selectedItem.documentRef, jobId: selectedItem.jobId, candidateRef: selectedItem.candidateRef }))}>View original invoice / review</button>
               {todos.map(todo => { const key = supplementKey(work.workId, selectedItem.itemId, todo.todoId), value = draft.supplements[key] ?? { text: '', materials: [] };
@@ -503,16 +513,42 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
                 </article>; })}
               {todoCursor && <button type="button" onClick={() => void readItem(selectedItem.itemId, true)}>More invoice Todo</button>}
               {desktopOwner?.workId === work.workId && desktopOwner.itemId === selectedItem.itemId && <PersonalDesktopWindow workId={work.workId} itemId={selectedItem.itemId} hostEpoch={props.hostEpoch} workspaceId={cloud}
+                onSelected={window => { setDesktopRebound(null); setSelectedDesktop(window ? { workId: work.workId, itemId: selectedItem.itemId, hostEpoch: props.hostEpoch, workspaceId: cloud, window } : null); }}
                 disabled={!props.ready || writeDisabled || work.status !== 'open' || selectedItem.disposition !== 'unresolved' || !!cloud && !props.cloudDesktopReady} />}
               <PersonalDesktopActions actions={desktopActions} disabled={writeDisabled || work.status !== 'open' || !!cloud && !props.cloudDesktopReady}
+                selectedWindow={selectedDesktop?.workId === work.workId && selectedDesktop.itemId === selectedItem.itemId
+                  && selectedDesktop.hostEpoch === props.hostEpoch && selectedDesktop.workspaceId === cloud ? selectedDesktop.window : null}
+                reboundProposalId={desktopRebound?.workId === work.workId && desktopRebound.itemId === selectedItem.itemId
+                  && desktopRebound.hostEpoch === props.hostEpoch && desktopRebound.workspaceId === cloud ? desktopRebound.proposalId : null}
                 onDecision={(action, choice) => void operate(() => decideDesktopAction(action, choice))}
+                onRebind={(action, resume) => void operate(async () => {
+                  if (!selectedDesktop || selectedDesktop.workId !== action.workId || selectedDesktop.itemId !== action.itemId
+                    || selectedDesktop.hostEpoch !== props.hostEpoch || selectedDesktop.workspaceId !== cloud) return;
+                  need(await personal.invoiceWorks.rebindDesktopAction({ workId: action.workId, itemId: action.itemId, proposalId: action.proposalId,
+                    confirmedAction: action.action, confirmedTarget: action.target, ...(resume ? { resume: true as const } : {}) }));
+                  setDesktopRebound(resume ? null : { workId: action.workId, itemId: action.itemId, proposalId: action.proposalId, hostEpoch: props.hostEpoch, workspaceId: cloud });
+                  setMessage(resume ? 'The original approved action can resume.' : 'Window confirmed. Choose Resume to continue the original action.'); await readItem(action.itemId);
+                })}
                 onDiscard={action => void operate(async () => { need(await personal.invoiceWorks.discardDesktopAction({
                   workId: action.workId, itemId: action.itemId, proposalId: action.proposalId })); await readItem(action.itemId); })} />
               {desktopCursor !== null && <button type="button" onClick={() => void operate(() => readMoreDesktopActions(selectedItem.itemId))}>More desktop actions</button>}
               {desktopOwner?.workId === work.workId && desktopOwner.itemId === selectedItem.itemId && <PersonalBrowserWindow workId={work.workId} itemId={selectedItem.itemId} hostEpoch={props.hostEpoch} workspaceId={cloud}
+                onBound={target => { setBrowserRebound(null); setSelectedBrowser(target ? { workId: work.workId, itemId: selectedItem.itemId, hostEpoch: props.hostEpoch, workspaceId: cloud, target } : null); }}
                 disabled={!props.ready || writeDisabled || work.status !== 'open' || selectedItem.disposition !== 'unresolved' || !!cloud && !props.cloudDesktopReady} />}
               <PersonalBrowserReads reads={browserReads} cloud={!!cloud} disabled={writeDisabled || work.status !== 'open' || !!cloud && !props.cloudDesktopReady}
+                selectedTarget={selectedBrowser?.workId === work.workId && selectedBrowser.itemId === selectedItem.itemId
+                  && selectedBrowser.hostEpoch === props.hostEpoch && selectedBrowser.workspaceId === cloud ? selectedBrowser.target : null}
+                reboundProposalId={browserRebound?.workId === work.workId && browserRebound.itemId === selectedItem.itemId
+                  && browserRebound.hostEpoch === props.hostEpoch && browserRebound.workspaceId === cloud ? browserRebound.proposalId : null}
                 onDecision={(read, choice) => void operate(() => decideBrowserRead(read, choice))}
+                onRebind={(read, resume) => void operate(async () => {
+                  if (!selectedBrowser || selectedBrowser.workId !== read.workId || selectedBrowser.itemId !== read.itemId
+                    || selectedBrowser.hostEpoch !== props.hostEpoch || selectedBrowser.workspaceId !== cloud) return;
+                  need(await personal.invoiceWorks.rebindBrowserRead({ workId: read.workId, itemId: read.itemId, proposalId: read.proposalId,
+                    confirmedTarget: read.target, currentTarget: selectedBrowser.target, ...(resume ? { resume: true as const } : {}) }));
+                  setBrowserRebound(resume ? null : { workId: read.workId, itemId: read.itemId, proposalId: read.proposalId, hostEpoch: props.hostEpoch, workspaceId: cloud });
+                  setMessage(resume ? 'The original approved read can resume.' : 'Tab confirmed. Choose Resume to continue the original read.'); await readItem(read.itemId);
+                })}
                 onRevoke={read => void operate(async () => {
                   need(await window.flowmate.revokeBrowserPage({ workId: read.workId, itemId: read.itemId, ...(cloud ? { workspaceId: cloud } : {}) }));
                   need(await personal.invoiceWorks.revokeBrowserRead({ workId: read.workId, itemId: read.itemId, proposalId: read.proposalId }));
@@ -548,14 +584,18 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
                     if (token === taskGeneration.current && draftRef.current.selectedWorkId === work.workId) setReport(JSON.stringify(run.output, null, 2)); })}>Read child report {child.childRunId}</button></div></article>)}
               {task.nextAfterChildRunId && <button type="button" onClick={() => void readTask(task.task.attempt.attemptId, true)}>More child results</button>}{report && <pre>{report}</pre>}</>}
           </section>}
-          {view === 'History' && <section aria-label="Durable history"><div className="button-row"><h3>{history?.owner.childRunId ? `Child ${history.owner.childRunId} history` : 'Work history'}</h3><button type="button" onClick={() => void readHistory({ workId: work.workId })}>Read work history</button></div>
+          {view === 'History' && <section aria-label="Durable history"><div className="button-row"><h3>{history?.owner.childRunId ? `Child ${history.owner.childRunId} history`
+            : history?.owner.itemId !== undefined ? `Invoice item ${history.owner.itemId} history` : 'Work history'}</h3><button type="button" onClick={() => void readHistory({ workId: work.workId })}>Read work history</button></div>
             {!history ? <p>Select the saved history to read.</p> : <><p>Saved Entry watermark {history.throughEntryId}. History queries do not resume execution.</p>{history.entries.length === 0 && <p>No native history has been created for this target.</p>}
               {history.entries.map(entry => <article key={entry.entryId}><button type="button" onClick={() => void operate(() => readEntry(entry.entryId))}>Entry {entry.entryId} · {entry.kind} · {entry.role ?? 'metadata'}</button><p>{entry.createdAt ?? 'No recorded timestamp'} · {entry.byteLength} bytes</p><pre>{entry.preview.text}{entry.preview.truncated ? '…' : ''}</pre></article>)}
-              {history.nextBeforeEntryId && <button type="button" onClick={() => void readHistory({ workId: history.owner.workId, ...(history.owner.childRunId === null ? {} : { childRunId: history.owner.childRunId }) }, true)}>Earlier history entries</button>}
+              {history.nextBeforeEntryId && <button type="button" onClick={() => void readHistory({ workId: history.owner.workId,
+                ...(history.owner.childRunId === null ? {} : { childRunId: history.owner.childRunId }),
+                ...(history.owner.itemId === undefined ? {} : { itemId: history.owner.itemId }) }, true)}>Earlier history entries</button>}
               {historyDetail && <section className="personal-history-detail"><h4>Original Entry {historyDetail.entryId}</h4><p>{historyDetail.format} · bytes {historyDetail.offset}–{historyDetail.offset + new TextEncoder().encode(historyDetail.text).byteLength} of {historyDetail.totalBytes}</p><pre>{historyDetail.text}</pre>{historyDetail.nextOffset !== null && <button type="button" onClick={() => void operate(() => readEntry(historyDetail.entryId, historyDetail.nextOffset!))}>Next Entry chunk</button>}</section>}</>}
           </section>}
           {view === 'Timeline' && <section aria-label="Work evidence timeline"><h3>Saved business timeline</h3><p>Activity comes from saved records. Refresh to see late evidence; a finished evidence checker does not accept an invoice.</p>
             {timeline?.entries.map(entry => <article key={entry.key}><h4>{title(entry.kind)}</h4><p>{entry.summary}</p><small>{entry.occurredAt} · {entry.itemId === null ? 'Work' : `Invoice item ${entry.itemId}`}</small>
+              {entry.itemId !== null && <button type="button" onClick={() => void readHistory({ workId: work.workId, itemId: entry.itemId! })}>Read invoice history</button>}
               {entry.refs.candidateRef && <p>Result {entry.refs.candidateRef.id} · version {entry.refs.candidateRef.sequence}</p>}
               {entry.refs.documentRef && <p>Invoice {entry.refs.documentRef.id} · source version {entry.refs.documentRef.version}</p>}
               <details><summary>Original references</summary><pre>{JSON.stringify(entry.refs, null, 2)}</pre></details>

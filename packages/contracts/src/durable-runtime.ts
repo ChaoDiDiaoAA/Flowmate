@@ -15,14 +15,14 @@ export const CloudRuntimeBindingSchema = z.object({ workspaceId: CloudWorkspaceI
   workId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), sessionId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict();
 export type CloudRuntimeBinding = z.infer<typeof CloudRuntimeBindingSchema>;
 
-export type DurableConversationIdentity = { workId: DbId; sessionId: DbId };
+export type DurableConversationIdentity = { workId: DbId; sessionId: DbId; itemId?: DbId };
 export type DurableAttemptIdentity = DurableConversationIdentity & { attemptId: DbId };
 export type DurableSubmissionQuery = DurableAttemptIdentity & { requestId: string };
 /** Existing product tool schemas, projected by composition without native runtime types. */
 export type DurableProductToolDefinition = { name: string; description: string; inputSchema: Record<string, unknown>;
   executionMode: 'parallel' | 'sequential'; effect?: ToolEffect };
 export type DurableProductToolCall = DurableSubmissionQuery & { nativeConversationId: number; nativeTaskId: number;
-  nativeToolCallId: string; name: string; arguments: unknown; child?: DurableChildToolOwner };
+  nativeToolCallId: string; name: string; arguments: unknown; parentNativeTaskId?: number; child?: DurableChildToolOwner };
 /** The exact committed native model message, including its envelope and diagnostics. */
 export type DurableProductToolFeedback = DurableProductToolCall & { nativeEntryId: number; feedbackJson: string };
 /** Credential-free, resolved facts; modelJson is interpreted only by the Durable adapter. */

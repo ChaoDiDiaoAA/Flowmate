@@ -14,7 +14,8 @@ type Method = typeof CLOUD_RUNTIME_RPC_METHODS[number];
 const reply = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: z.unknown().optional() }).strict(),
   z.object({ ok: z.literal(false), error: AppErrorSchema, runId: z.number().int().positive().optional() }).strict()]);
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const owner = { workId: id, sessionId: id }, attempt = { ...owner, attemptId: id }, phase = { ...attempt, requestId: z.string().min(1).max(128) };
+const owner = { workId: id, sessionId: id }, conversation = { ...owner, itemId: id.optional() },
+  attempt = { ...owner, attemptId: id }, phase = { ...attempt, itemId: id.optional(), requestId: z.string().min(1).max(128) };
 const submission = z.object({ ...phase, nativeConversationId: id, nativeSubmissionId: id,
   status: z.enum(['queued', 'placed', 'done', 'unanswered']), answer: z.string().nullable(), reason: z.string().nullable() }).strict();
 const observation = z.object({ ...phase, nativeConversationId: id, nativeSubmissionId: id, nativeEntryId: id.nullable(),
@@ -26,7 +27,7 @@ export const CloudSubagentObservationSchema = z.object({ ...phase, childRunId: i
   consumedAt: z.string().datetime({ offset: true }).nullable(), execution: z.enum(['active', 'closed', 'unknown']),
   creatorExecution: z.enum(['active', 'closed', 'unknown']), parentToolResultEntryId: id.nullable(), parentModelTaskId: id.nullable(),
   parentModelReceivedAt: z.string().datetime({ offset: true }).nullable() }).strict();
-const history = z.object({ ...owner, nativeConversationId: id,
+const history = z.object({ ...conversation, nativeConversationId: id,
   entries: z.array(z.object({ nativeEntryId: id, kind: z.string().min(1).max(256), json: z.string() }).strict()).max(100),
   nextBeforeEntryId: id.nullable() }).strict();
 const invalid = () => fail(appError('cloud_runtime_response_invalid', 'runtime', 'The original Runtime response could not be verified.', true));
@@ -98,11 +99,13 @@ export function createCloudRuntimeRpcClient(socketPath: string): DurableRuntimeP
           if (key in value && key in source && value[key] !== source[key]) return invalid();
         if ('child' in value && 'child' in source && !isDeepStrictEqual(value.child, source.child)) return invalid();
         if ('owner' in value) {
-          const returned = value.owner as { workId: number; sessionId: number; childRunId: number | null };
+          const returned = value.owner as { workId: number; sessionId: number; childRunId: number | null; itemId?: number };
           const expectedChild = source.child as { childRunId: number; childSessionId: number } | undefined;
           if (returned.workId !== input.workId || returned.sessionId !== (expectedChild?.childSessionId ?? input.sessionId)
-            || returned.childRunId !== (expectedChild?.childRunId ?? null)) return invalid();
+            || returned.childRunId !== (expectedChild?.childRunId ?? null) || returned.itemId !== source.itemId) return invalid();
         }
+        if (['openConversation', 'submit', 'getSubmission', 'observeSubmission', 'observeSubagent', 'waitForSubmission', 'queryHistory', 'compact', 'queryCompaction', 'cancelCompaction'].includes(method)
+          && value.itemId !== source.itemId) return invalid();
         if (method === 'queryHistoryEntry' && (value.entryId !== source.entryId || value.throughEntryId !== source.throughEntryId
           || value.offset !== (source.offset ?? 0) || typeof value.text !== 'string'
           || new TextEncoder().encode(value.text).byteLength > Number(source.limit ?? 16384))) return invalid();
@@ -125,8 +128,10 @@ export function createCloudRuntimeRpcClient(socketPath: string): DurableRuntimeP
         }
         if (method === 'readQueue') {
           const items = value.items as Array<{ submissionId: number }>;
-          if (new Set(items.map(item => item.submissionId)).size !== items.length) return invalid();
+          if (value.itemId !== source.itemId || new Set(items.map(item => item.submissionId)).size !== items.length) return invalid();
         }
+        if (method === 'queryQueueControl' && value.itemId !== source.itemId) return invalid();
+        if (method === 'retryResult' && value.itemId !== source.itemId) return invalid();
         if (method === 'resultStatus') {
           const page = value.results as { items: Array<{ nativeSubmissionId: number }> };
           if (page.items.length > Number(source.limit ?? 50) || source.afterSubmissionId !== undefined
@@ -147,7 +152,7 @@ export function createCloudRuntimeRpcClient(socketPath: string): DurableRuntimeP
       apply: input => same('controlQueue', input, CloudQueueReceiptSchema),
       queryControl: input => same('queryQueueControl', input, CloudQueueReceiptSchema.nullable()),
     },
-    openConversation: input => same('openConversation', input, z.object({ ...owner, nativeConversationId: id }).strict()),
+    openConversation: input => same('openConversation', input, z.object({ ...conversation, nativeConversationId: id }).strict()),
     prepareModel: input => same('prepareModel', input, DurableModelBindingSchema),
     restoreModel: input => same('restoreModel', input, voidSchema),
     submit: input => same('submit', input, submission),

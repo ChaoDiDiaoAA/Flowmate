@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels, InMemoryCredentialStore, InMemoryModelsStore } from '@earendil-works/pi-ai';
-import { createRegistry, Harness, InboxDoc, type ConversationId, type SubmissionId } from '@earendil-works/pi-durable';
-import { appError, fail, ok, type Result } from '@flowmate/contracts';
+import { createRegistry, Harness, InboxDoc, MemoryStorage, type ConversationId, type SubmissionId } from '@earendil-works/pi-durable';
+import { appError, fail, matchesCloudQueueReceipt, ok, type Result } from '@flowmate/contracts';
 import { openCloudRuntimeStore } from '../../apps/cloud-runtime-storage.ts';
 import { createCloudRuntimeRouter } from '../../apps/cloud-runtime-router.ts';
 import { createDurableRuntime } from '../../packages/runtime-durable/src/runtime.ts';
@@ -15,6 +15,49 @@ function need<T>(result: Result<T>): T { if (!result.ok) throw Error(result.erro
 const binding = { workspaceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', cloudRuntimeId: '11111111-1111-4111-8111-111111111111', workId: 1, sessionId: 11 };
 const owner = { workId: binding.workId, sessionId: binding.sessionId, attemptId: 7 };
 const models = () => createModels({ credentials: new InMemoryCredentialStore(), modelsStore: new InMemoryModelsStore() });
+
+test('queue controls and their receipts stay with the original invoice conversation', async () => {
+  const harness = await Harness.open(new MemoryStorage(), { models: models(), registry: createRegistry() }, BACKGROUND_CONTEXT);
+  const first = { ...owner, itemId: 101 }, second = { ...owner, itemId: 102 };
+  try {
+    const [a, b] = await harness.commit(async tx => Promise.all([
+      tx.createConversation({ ownership: { kind: 'ownerless' } }), tx.createConversation({ ownership: { kind: 'ownerless' } }),
+    ]), BACKGROUND_CONTEXT);
+    const ids = await harness.commit(async tx => {
+      const values: SubmissionId[] = [];
+      for (const [conversation, target, requestId] of [[a!, first, 'first'], [b!, second, 'second']] as const) {
+        const submission = await tx.createSubmission({ type: 'input', conversationId: conversation.id, status: 'queued',
+          requestId: JSON.stringify([target.attemptId, requestId]) });
+        const inbox = await tx.doc(InboxDoc, conversation.id);
+        inbox.items.push({ id: submission.id, mode: 'followUp', content: requestId,
+          entry: { kind: 'flowmate.input', data: { ...target, requestId, inputText: requestId } } });
+        values.push(submission.id);
+      }
+      return values;
+    }, BACKGROUND_CONTEXT);
+    const queue = createDurableQueueController({ harness, resolve: async target =>
+      target.itemId === first.itemId ? a!.id : target.itemId === second.itemId ? b!.id : undefined });
+    const view = need(await queue.read(first));
+    expect(view.items.map(item => item.submissionId)).toEqual([ids[0]]);
+    const command = { ...first, controlRequestId: 'item-cancel', expectedVersion: view.version,
+      action: { kind: 'cancel' as const, submissionId: ids[0]! } };
+    const receipt = need(await queue.apply(command));
+    expect(receipt).toMatchObject({ itemId: first.itemId, status: 'applied' });
+    expect(need(await queue.queryControl({ ...first, controlRequestId: command.controlRequestId }))).toEqual(receipt);
+    expect(matchesCloudQueueReceipt(command, { ...receipt, itemId: second.itemId })).toBe(false);
+    const other = need(await queue.read(second));
+    expect(need(await queue.apply({ ...second, controlRequestId: 'foreign-cancel', expectedVersion: other.version,
+      action: { kind: 'cancel', submissionId: ids[0]! } })).status).toBe('conflict');
+    expect(need(await queue.read(second)).items.map(item => item.submissionId)).toEqual([ids[1]]);
+    await harness.commit(async tx => {
+      const submission = await tx.createSubmission({ type: 'input', conversationId: a!.id, status: 'queued',
+        requestId: JSON.stringify([first.attemptId, 'foreign-item']) });
+      (await tx.doc(InboxDoc, a!.id)).items.push({ id: submission.id, mode: 'followUp', content: 'foreign',
+        entry: { kind: 'flowmate.input', data: { ...second, requestId: 'foreign-item', inputText: 'foreign' } } });
+    }, BACKGROUND_CONTEXT);
+    expect(await queue.read(first)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+  } finally { await harness.close(BACKGROUND_CONTEXT); }
+});
 
 test('queue controls preserve internal writes, original requests and the same receipt after reopen', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-cloud-queue-')), store = need(await openCloudRuntimeStore(root));

@@ -1,5 +1,7 @@
 import { parseInputDefinitionCommand, isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../../packages/contracts/src/input-commands.ts';
 import { parsePersonalAgentCommand, isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure } from '../../../packages/contracts/src/personal-agent-commands.ts';
+import { memoryHostFailure, parseMemoryCommand, parseMemoryHostResult } from '../../../packages/contracts/src/openviking-commands.ts';
+import { MemorySetupResultSchema } from '../../../packages/contracts/src/openviking-memory.ts';
 import { contextBridge, ipcRenderer } from 'electron';
 import { z } from 'zod';
 import { EvaluationWorkflowRequestSchema, EvaluationWorkflowResultSchema } from '../../../packages/contracts/src/evaluation-workflow.ts';
@@ -118,6 +120,14 @@ async function invokeAssembly<T>(type: string, input?: unknown): Promise<Result<
   } catch { return failure(type) as Result<T>; }
 }
 
+async function invokeMemory<T>(type: string, input: unknown): Promise<Result<T>> {
+  const command = parseMemoryCommand({ type, input });
+  if (!command) return fail(appError('input_invalid', 'input', 'The memory request is invalid.'));
+  try { return (parseMemoryHostResult(command, await ipcRenderer.invoke(`flowmate:${type.replaceAll('_', '-')}`, command.input))
+    ?? memoryHostFailure(command)) as Result<T>; }
+  catch { return memoryHostFailure(command) as Result<T>; }
+}
+
 const bridge: DesktopBridge = {
   async startBrowserUse() {
     try {
@@ -203,14 +213,38 @@ const bridge: DesktopBridge = {
     queryActivation: input => invokeServiceActivation('query-service-activation', input, BackgroundServiceActivationViewSchema) },
   personalAgent: { get: () => invokeAssembly('personal_agent_get', {}), update: input => invokeAssembly('personal_agent_update', input),
     openConversation: input => invokeAssembly('personal_agent_open_conversation', input) },
+  openVikingManagement: {
+    connect: () => ipcRenderer.invoke('flowmate:openviking-management-connect'),
+    disconnect: id => ipcRenderer.invoke('flowmate:openviking-management-disconnect', id),
+    execute: input => ipcRenderer.invoke('flowmate:openviking-management-execute', input),
+    receipt: id => ipcRenderer.invoke('flowmate:openviking-management-receipt', id),
+    resolveReceipt: input => ipcRenderer.invoke('flowmate:openviking-management-resolve-receipt', input),
+  },
+  memory: { getSettings: () => invokeMemory('memory_get_settings', {}), listEntries: input => invokeMemory('memory_list_entries', input),
+    readEntry: input => invokeMemory('memory_read_entry', input), listOperations: input => invokeMemory('memory_list_operations', input),
+    search: input => invokeMemory('memory_search', input),
+    updatePolicy: input => invokeMemory('memory_update_policy', input), remember: input => invokeMemory('memory_remember', input),
+    reconcileRemember: input => invokeMemory('memory_reconcile_remember', input), forget: input => invokeMemory('memory_forget', input),
+    reconcileRememberById: input => invokeMemory('memory_reconcile_remember_by_id', input),
+    reconcileSync: (syncId, abandonConfirmed) => invokeMemory('memory_reconcile_sync', { syncId, abandonConfirmed }),
+    async configureFromFile() {
+      try {
+        const result = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: MemorySetupResultSchema }).strict(),
+          z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(await ipcRenderer.invoke('flowmate:memory-configure-from-file'));
+        if (result.success) return result.data;
+      } catch { /* A lost response must not submit a second configuration. */ }
+      return fail(appError('operation_result_unknown', 'runtime', 'The original memory configuration could not be confirmed.', true));
+    } },
   invoiceWorks: { create: input => invokeAssembly('invoice_work_create', input), list: input => invokeAssembly('invoice_work_list', input),
     get: input => invokeAssembly('invoice_work_get', input), supplement: input => invokeAssembly('invoice_work_supplement', input),
     disposeItem: input => invokeAssembly('invoice_work_dispose_item', input), continueWork: input => invokeAssembly('invoice_work_continue', input),
     cancelWork: input => invokeAssembly('invoice_work_cancel', input), queryOperation: input => invokeAssembly('invoice_work_query_operation', input),
     listDesktopActions: input => invokeAssembly('invoice_work_desktop_list', input), decideDesktopAction: input => invokeAssembly('invoice_work_desktop_decide', input),
+    rebindDesktopAction: input => invokeAssembly('invoice_work_desktop_rebind', input),
     discardDesktopAction: input => invokeAssembly('invoice_work_desktop_discard', input),
     queryDesktopDecision: input => invokeAssembly('invoice_work_desktop_query_decision', input),
     listBrowserReads: input => invokeAssembly('invoice_work_browser_list', input), decideBrowserRead: input => invokeAssembly('invoice_work_browser_decide', input),
+    rebindBrowserRead: input => invokeAssembly('invoice_work_browser_rebind', input),
     revokeBrowserRead: input => invokeAssembly('invoice_work_browser_revoke', input), queryBrowserDecision: input => invokeAssembly('invoice_work_browser_query_decision', input),
     timeline: input => invokeAssembly('invoice_work_timeline', input) },
   personalTasks: { list: input => invokeAssembly('personal_task_list', input), get: input => invokeAssembly('personal_task_get', input),

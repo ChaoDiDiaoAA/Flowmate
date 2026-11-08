@@ -20,7 +20,7 @@ export type PersonalTasksServiceOptions = {
   reconcileChildren?: (identity: DurableAttemptIdentity) => Promise<Result<void>>;
   history?: PersonalHistoryApi;
 };
-type PhaseRow = { request_id: string };
+type PhaseRow = { request_id: string; item_id: number | null; scheduler_state: string };
 const cleanupSchema = z.object({ version: z.literal(1), stopped: z.boolean(), stopReason: z.string().nullable(),
   errors: z.array(AppErrorSchema), lateObservationRequired: z.boolean() }).strict();
 const invalid = () => fail(appError('input_invalid', 'input', 'The personal task request is invalid.'));
@@ -72,7 +72,7 @@ export class PersonalTasksService implements PersonalTasksApi {
       if (!original) return readFailure();
       const budget = DurableWorkBudgetSchema.parse(JSON.parse(original.budget_json));
       const phases = scope.db.query<PhaseRow, [number, number]>(
-        'SELECT request_id FROM invoice_work_phases WHERE work_id=? AND attempt_id=? ORDER BY id').all(input.workId, input.attemptId);
+        'SELECT request_id,item_id,scheduler_state FROM invoice_work_phases WHERE work_id=? AND attempt_id=? ORDER BY id').all(input.workId, input.attemptId);
       return ok({ task: task.data.task, work: work.data.work, phases, stopGraceMs: budget.limits.stopGraceMs,
         identity: { ...input, sessionId: task.data.task.sessionId } });
     });
@@ -127,7 +127,8 @@ export class PersonalTasksService implements PersonalTasksApi {
       let stopResult: DurableAttemptStopResult | undefined;
       if (task.stoppedAt === null && phases.length > 0) {
         for (const phase of phases) {
-          const observed = await this.options.phaseObserver.reconcile({ ...identity, requestId: phase.request_id });
+          const observed = await this.options.phaseObserver.reconcile({ ...identity, requestId: phase.request_id,
+            ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}) });
           if (!observed.ok) return observed;
         }
         const stopped = await this.options.runtime.stopAttempt({ ...identity, stopGraceMs });
@@ -137,7 +138,8 @@ export class PersonalTasksService implements PersonalTasksApi {
           return fail(appError('source_invalid', 'runtime', 'The native stop belongs to another attempt.'));
         if (!stopResult.stopped) return ok({ closed: false, task, reason: 'root-stop-unconfirmed' });
         for (const phase of phases) {
-          const query = { ...identity, requestId: phase.request_id };
+          const query = { ...identity, requestId: phase.request_id,
+            ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}) };
           if (stopResult.reason === 'not-started') {
             const submitted = await this.options.runtime.getSubmission(query); if (!submitted.ok) return submitted;
             if (submitted.data !== null)

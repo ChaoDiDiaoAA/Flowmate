@@ -6,7 +6,7 @@ import { RUNTIME_CONFIG } from './runtime-config.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const bytes = (value: string) => new TextEncoder().encode(value).byteLength;
-export const CloudNativeResultSchema = CloudRuntimeBindingSchema.extend({ version: z.literal(1), attemptId: id,
+export const CloudNativeResultSchema = CloudRuntimeBindingSchema.extend({ version: z.literal(1), itemId: id.optional(), attemptId: id,
   requestId: z.string().min(1).max(128), nativeConversationId: id, nativeSubmissionId: id,
   nativeInputEntryId: id.nullable(), nativeAnswerEntryId: id.nullable(), consumedAt: z.string().datetime({ offset: true }).nullable(),
   status: z.enum(['done', 'unanswered']), answer: z.string().refine(value => bytes(value) <= RUNTIME_CONFIG.llmPayload.maxOutputTextBytes).nullable(),
@@ -15,7 +15,7 @@ export const CloudNativeResultSchema = CloudRuntimeBindingSchema.extend({ versio
     : value.nativeAnswerEntryId === null && value.answer === null, 'A terminal result must retain its actual native answer or unanswered reason.')
   .refine(value => value.consumedAt === null || value.nativeInputEntryId !== null, 'Consumption requires the original native input.');
 export type CloudNativeResult = z.infer<typeof CloudNativeResultSchema>;
-const oversizedIdentity = CloudRuntimeBindingSchema.extend({ version: z.literal(1), attemptId: id,
+const oversizedIdentity = CloudRuntimeBindingSchema.extend({ version: z.literal(1), itemId: id.optional(), attemptId: id,
   requestId: z.string().min(1).max(128), nativeConversationId: id, nativeSubmissionId: id,
   consumedAt: z.string().datetime({ offset: true }).nullable() });
 export const CloudNativeOversizedResultSchema = z.discriminatedUnion('status', [
@@ -26,7 +26,7 @@ export const CloudNativeOversizedResultSchema = z.discriminatedUnion('status', [
 ]).refine(value => value.consumedAt === null || value.nativeInputEntryId !== null);
 export type CloudNativeOversizedResult = z.infer<typeof CloudNativeOversizedResultSchema>;
 export const CloudNativeResultReceiptSchema = z.object({ receiptId: z.string().uuid(), cloudRuntimeId: z.string().uuid(),
-  workId: id, sessionId: id, nativeConversationId: id, nativeSubmissionId: id }).strict();
+  workId: id, sessionId: id, itemId: id.optional(), nativeConversationId: id, nativeSubmissionId: id }).strict();
 export type CloudNativeResultReceipt = z.infer<typeof CloudNativeResultReceiptSchema>;
 const requestId = z.string().min(1).max(128);
 export const CloudRuntimeNoticeSchema = CloudRuntimeBindingSchema.extend({ runtimeGeneration: z.string().uuid(),
@@ -34,7 +34,7 @@ export const CloudRuntimeNoticeSchema = CloudRuntimeBindingSchema.extend({ runti
 export type CloudRuntimeNotice = z.infer<typeof CloudRuntimeNoticeSchema>;
 export const CloudResultPageRequestSchema = z.object({ attemptId: id, afterSubmissionId: id.optional(),
   limit: z.number().int().min(1).max(100).default(50) }).strict();
-export const CloudResultDeliverySchema = z.object({ requestId, nativeSubmissionId: id,
+export const CloudResultDeliverySchema = z.object({ requestId, itemId: id.optional(), nativeSubmissionId: id,
   state: z.enum(['pending', 'blocked', 'delivered']), attempts: z.number().int().min(0).max(8),
   nextAt: z.string().datetime({ offset: true }).nullable(), nativeStatus: z.enum(['done', 'unanswered']),
   blockedReason: z.enum(['size_limit', 'retry_limit']).optional() }).strict()
@@ -42,10 +42,11 @@ export const CloudResultDeliverySchema = z.object({ requestId, nativeSubmissionI
 export const CloudResultPageSchema = z.object({ items: z.array(CloudResultDeliverySchema).max(100), nextAfterSubmissionId: id.nullable() }).strict()
   .refine(value => value.items.every((item, index) => index === 0 || item.nativeSubmissionId > value.items[index - 1]!.nativeSubmissionId)
     && (value.nextAfterSubmissionId === null || value.items.length > 0 && value.nextAfterSubmissionId === value.items.at(-1)!.nativeSubmissionId));
-export const CloudResultRetryIdentitySchema = z.object({ attemptId: id, requestId, nativeSubmissionId: id }).strict();
-export const CloudRuntimeStatusRequestSchema = CloudQueueOwnerSchema.extend({ afterSubmissionId: id.optional(),
+export const CloudResultRetryIdentitySchema = z.object({ attemptId: id, itemId: id.optional(), requestId, nativeSubmissionId: id }).strict();
+const deliveryOwner = CloudQueueOwnerSchema.omit({ itemId: true });
+export const CloudRuntimeStatusRequestSchema = deliveryOwner.extend({ afterSubmissionId: id.optional(),
   limit: z.number().int().min(1).max(100).default(50) }).strict();
-export const CloudRuntimeStatusSchema = CloudQueueOwnerSchema.extend({
+export const CloudRuntimeStatusSchema = deliveryOwner.extend({
   runtimeGeneration: z.string().uuid(), observationRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   native: z.object({ conversationId: id, tasks: z.array(z.object({ taskId: id, kind: z.string().min(1).max(256),
     status: z.enum(['pending', 'running', 'waiting', 'sleeping', 'completing', 'terminal']), abortRequested: z.boolean() }).strict()).max(50),

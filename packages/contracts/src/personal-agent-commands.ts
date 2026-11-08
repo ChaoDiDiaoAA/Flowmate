@@ -26,10 +26,12 @@ const commandSchemas = [
   z.object({ type: z.literal('invoice_work_query_operation'), input: P.InvoiceWorkQueryOperationRequestSchema }).strict(),
   z.object({ type: z.literal('invoice_work_desktop_list'), input: D.DesktopActionListRequestSchema }).strict(),
   z.object({ type: z.literal('invoice_work_desktop_decide'), input: D.DesktopActionDecisionRequestSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_desktop_rebind'), input: D.DesktopActionRebindSchema }).strict(),
   z.object({ type: z.literal('invoice_work_desktop_discard'), input: D.DesktopActionDiscardSchema }).strict(),
   z.object({ type: z.literal('invoice_work_desktop_query_decision'), input: D.DesktopActionDecisionQuerySchema }).strict(),
   z.object({ type: z.literal('invoice_work_browser_list'), input: B.BrowserReadListRequestSchema }).strict(),
   z.object({ type: z.literal('invoice_work_browser_decide'), input: B.BrowserReadDecisionRequestSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_browser_rebind'), input: B.BrowserReadRebindSchema }).strict(),
   z.object({ type: z.literal('invoice_work_browser_revoke'), input: B.BrowserReadRevokeSchema }).strict(),
   z.object({ type: z.literal('invoice_work_browser_query_decision'), input: B.BrowserReadDecisionQuerySchema }).strict(),
   z.object({ type: z.literal('personal_task_list'), input: P.PersonalTaskListRequestSchema }).strict(),
@@ -65,10 +67,12 @@ const resultSchemas = {
   invoice_work_query_operation: result(P.InvoiceWorkOperationReceiptSchema.nullable()),
   invoice_work_desktop_list: result(D.DesktopActionListResultSchema),
   invoice_work_desktop_decide: result(D.DesktopActionDecisionReceiptSchema),
+  invoice_work_desktop_rebind: result(D.DesktopActionViewSchema),
   invoice_work_desktop_discard: result(D.DesktopActionViewSchema),
   invoice_work_desktop_query_decision: result(D.DesktopActionDecisionReceiptSchema.nullable()),
   invoice_work_browser_list: result(B.BrowserReadListResultSchema),
   invoice_work_browser_decide: result(B.BrowserReadDecisionReceiptSchema),
+  invoice_work_browser_rebind: result(B.BrowserReadViewSchema),
   invoice_work_browser_revoke: result(B.BrowserReadViewSchema),
   invoice_work_browser_query_decision: result(B.BrowserReadDecisionReceiptSchema.nullable()),
   personal_task_list: result(P.PersonalTaskListResultSchema),
@@ -123,11 +127,13 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
   switch (captured.type) {
     case 'personal_task_history': return 'owner' in data && 'entries' in data
       && data.owner.workId === captured.input.target.workId && data.owner.childRunId === (captured.input.target.childRunId ?? null)
+      && data.owner.itemId === captured.input.target.itemId
       && (captured.input.throughEntryId === undefined || data.throughEntryId === captured.input.throughEntryId)
       && data.entries.length <= captured.input.limit && data.entries.every(entry => captured.input.beforeEntryId === undefined
         || entry.entryId < captured.input.beforeEntryId);
     case 'personal_task_history_entry': return 'owner' in data && 'entryId' in data
       && data.owner.workId === captured.input.target.workId && data.owner.childRunId === (captured.input.target.childRunId ?? null)
+      && data.owner.itemId === captured.input.target.itemId
       && data.throughEntryId === captured.input.throughEntryId && data.entryId === captured.input.entryId
       && data.offset === captured.input.offset && new TextEncoder().encode(data.text).byteLength <= captured.input.limit;
     case 'invoice_work_timeline': return 'semantics' in data && data.workId === captured.input.workId
@@ -169,6 +175,9 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
       && data.decision === captured.input.decision && data.expectedRevision === captured.input.expectedRevision
       && JSON.stringify('confirmedAction' in data ? data.confirmedAction : undefined) === JSON.stringify(captured.input.confirmedAction)
       && JSON.stringify(data.confirmedTarget) === JSON.stringify(captured.input.confirmedTarget);
+    case 'invoice_work_desktop_rebind': return 'proposalId' in data && 'target' in data && 'action' in data && data.workId === captured.input.workId
+      && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && data.status === 'approved' && data.resumeOriginal === true
+      && JSON.stringify(data.action) === JSON.stringify(captured.input.confirmedAction) && JSON.stringify(data.target) === JSON.stringify(captured.input.confirmedTarget);
     case 'invoice_work_desktop_discard': return 'proposalId' in data && 'status' in data && data.workId === captured.input.workId
       && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && data.status === 'invalidated';
     case 'invoice_work_desktop_query_decision': return 'proposalId' in data && 'decision' in data && data.workId === captured.input.workId
@@ -180,6 +189,9 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
       && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && data.requestId === captured.input.requestId
       && data.decision === captured.input.decision && data.expectedRevision === captured.input.expectedRevision
       && JSON.stringify(data.confirmedTarget) === JSON.stringify(captured.input.confirmedTarget);
+    case 'invoice_work_browser_rebind': return 'proposalId' in data && 'target' in data && data.workId === captured.input.workId
+      && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && data.status === 'approved'
+      && data.resumeOriginal === true && JSON.stringify(data.target) === JSON.stringify(captured.input.confirmedTarget);
     case 'invoice_work_browser_revoke': return 'proposalId' in data && 'status' in data && data.workId === captured.input.workId
       && data.itemId === captured.input.itemId && data.proposalId === captured.input.proposalId && ['invalidated', 'unknown', 'revoked'].includes(data.status);
     case 'invoice_work_browser_query_decision': return 'proposalId' in data && 'decision' in data && data.workId === captured.input.workId
@@ -201,8 +213,8 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
 
 export function personalAgentHostFailure(type: string) {
   const write = ['personal_agent_update', 'invoice_work_create', 'invoice_work_supplement', 'invoice_work_dispose_item',
-    'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_discard',
-    'invoice_work_browser_decide', 'invoice_work_browser_revoke', 'personal_task_stop'].includes(type);
+    'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_rebind', 'invoice_work_desktop_discard',
+    'invoice_work_browser_decide', 'invoice_work_browser_rebind', 'invoice_work_browser_revoke', 'personal_task_stop'].includes(type);
   return { ok: false as const, error: { code: write ? 'operation_result_unknown' : 'storage_read_failed',
     category: write ? 'runtime' as const : 'storage' as const, retryable: true,
     message: write ? 'The operation result is unknown. Refresh the original saved request before retrying.'

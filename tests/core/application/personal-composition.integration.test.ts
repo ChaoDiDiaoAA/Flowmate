@@ -208,5 +208,7 @@ test('the formal Application runs fixed invoice work through Durable and the ori
     expect(audit.query('SELECT count(*) count FROM invoice_work_model_bindings').get()).toEqual({ count: 1 });
     expect(audit.query('SELECT count(*) count FROM invoice_work_context_snapshots').get()).toEqual({ count: 2 });
     expect(audit.query('SELECT count(*) count FROM invoice_work_phases WHERE consumed_at IS NOT NULL AND closed_at IS NOT NULL').get()).toEqual({ count: 2 });
+    expect(audit.query("SELECT provider FROM memory_bindings WHERE runtime_kind='durable' AND work_id=? ORDER BY item_id").all(receipt.workId))
+      .toEqual([{ provider: 'native' }, { provider: 'native' }]);
   } finally { audit.close(); }
 }, 30_000);

@@ -14,6 +14,7 @@ import { createCloudDesktopHandler } from './cloud-desktop-gateway.ts';
 import { CloudMaterialUpload } from './cloud-material-upload.ts';
 import { listenCloudModelSocket } from './cloud-model-socket.ts';
 import { CloudNativeResultReceiver } from './cloud-native-result-receiver.ts';
+import { startCloudOpenVikingManagement, type CloudOpenVikingManagementRoleBinding } from './cloud-openviking-authority.ts';
 import { CloudQueueAuthority } from './cloud-queue-authority.ts';
 import { CloudDesktopReview } from './cloud-desktop-review.ts';
 import { CloudResourceUpload } from './cloud-resource-upload.ts';
@@ -24,6 +25,8 @@ import type { CloudDesktopRelay } from './cloud-desktop-relay.ts';
 import type { PersonalAgentRuntime } from './personal-agent.ts';
 
 type Options = { workspaceId: string; database: DbHandle; personal: PersonalAgentRuntime; runtime: DurableRuntimePort & { queue?: CloudQueuePort; delivery?: CloudRuntimeDeliveryPort };
+  memory?: import('@flowmate/contracts').MemoryApi;
+  openVikingManagement?: { productRoot: string; roles: readonly CloudOpenVikingManagementRoleBinding[] };
   files: Pick<ReturnType<typeof createFileStore>, 'publish' | 'read'>;
   inspect(ref: DocumentRef, scope: SqlDatabaseStore): Result<WorkspaceMaterialInspection>;
   now(): string; readApiKey(): string | undefined | Promise<string | undefined>;
@@ -38,8 +41,10 @@ type Options = { workspaceId: string; database: DbHandle; personal: PersonalAgen
 /** Runs only under the existing product owner; each socket carries a separate limited protocol. */
 export async function startCloudAuthorityEndpoints(options: Options): Promise<Result<{ stopDesktop(): Promise<Result<void>>; close(): Promise<Result<void>> }>> {
   const workspace = CloudWorkspaceIdSchema.safeParse(options.workspaceId), cloud = options.personal.cloudAuthority;
+  const sockets = [options.desktopSocket, options.authoritySocket, options.modelSocket,
+    ...(options.openVikingManagement?.roles.map(role => role.socketPath) ?? [])];
   if (!workspace.success || !cloud || cloud.workspaceId !== workspace.data || !CloudRuntimeToolsSchema.safeParse(cloud.tools).success
-    || new Set([options.desktopSocket, options.authoritySocket, options.modelSocket]).size !== 3)
+    || new Set(sockets).size !== sockets.length)
     return fail(appError('input_invalid', 'input', 'The cloud Authority configuration is invalid.'));
   const ledger = new CloudModelAttempts(options.database, cloud.governor, options.now);
   const progress = new CloudProgressHub();
@@ -50,13 +55,15 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
     const grant = await originalAuthorize(operation, request);
     return !grant.ok ? grant : grant.data.binding.workspaceId === workspace.data ? grant : forbidden();
   };
-  const guard = async <T>(owner: { workId: number; sessionId: number }, action: () => Promise<Result<T>>): Promise<Result<T>> => {
-    const grant = await authorizeRuntime('queryHistory', { workId: owner.workId, sessionId: owner.sessionId });
+  const guard = async <T>(owner: { workId: number; sessionId: number; itemId?: number }, action: () => Promise<Result<T>>): Promise<Result<T>> => {
+    const grant = await authorizeRuntime('queryHistory', { workId: owner.workId, sessionId: owner.sessionId,
+      ...(owner.itemId === undefined ? {} : { itemId: owner.itemId }) });
     return grant.ok ? action() : grant;
   };
   const source = cloud.callbacks, child = source.subagents, compact = source.compactions;
   const callbacks: CloudAuthorityCallbacks = {
     readWorkingContext: input => guard(input, () => source.readWorkingContext(input)),
+    readMemory: source.readMemory ? input => guard(input, () => source.readMemory!(input)) : undefined,
     verifyQueueInputs: input => guard(input, () => source.verifyQueueInputs ? source.verifyQueueInputs(input) : Promise.resolve(forbidden())),
     verifyWorkingContext: input => guard(input, () => source.verifyWorkingContext(input)),
     verifyModelUse: input => guard(input, () => source.verifyModelUse(input)),
@@ -64,6 +71,8 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
     executeTool: input => guard(input, () => source.executeTool(input)),
     readToolResult: input => guard(input, () => source.readToolResult(input)),
     onToolFeedback: input => guard(input, () => source.onToolFeedback(input)),
+    approvalWait: source.approvalWait ? { begin: input => guard(input, () => source.approvalWait!.begin(input)),
+      read: input => guard(input, () => source.approvalWait!.read(input)) } : undefined,
     subagents: child ? { readPlan: input => guard(input, () => child.readPlan(input)), verify: input => guard(input, () => child.verify(input)),
       adopt: input => guard(input, () => child.adopt(input)), reserveModelRequest: input => guard(input, () => child.reserveModelRequest(input)),
       onParentConsumed: input => guard(input, () => child.onParentConsumed(input)) } : undefined,
@@ -76,7 +85,9 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
     runtime: options.runtime.queue ?? { read: async () => missingQueue(), apply: async () => missingQueue(), queryControl: async () => missingQueue() },
     now: options.now, onChanged: () => options.personal.conditionsChanged(), authorize: (input, view, scope) => {
       if (input.action.kind === 'enqueue') return scope.db.query(`SELECT id FROM invoice_work_phases WHERE work_id=? AND attempt_id=?
-        AND request_id=? AND native_submission_id IS NOT NULL AND closed_at IS NULL`).get(input.workId, input.attemptId, input.action.phaseRequestId)
+        AND request_id=? AND native_submission_id IS NOT NULL AND closed_at IS NULL
+        AND ((? IS NULL AND scheduler_state='legacy') OR (item_id=? AND scheduler_state!='legacy'))`)
+        .get(input.workId, input.attemptId, input.action.phaseRequestId, input.itemId ?? null, input.itemId ?? null)
         ? ok(undefined) : fail(appError('source_invalid', 'input', 'The original invoice phase is unavailable.'));
       const ids = input.action.kind === 'reorder' ? input.action.submissionIds : [input.action.submissionId];
       for (const id of ids) if (!view.items.some(item => item.submissionId === id))
@@ -111,10 +122,12 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
       case 'invoice_work_query_operation': return works.queryOperation(command.input);
       case 'invoice_work_desktop_list': return works.listDesktopActions(command.input);
       case 'invoice_work_desktop_decide': return works.decideDesktopAction(command.input);
+      case 'invoice_work_desktop_rebind': return works.rebindDesktopAction(command.input);
       case 'invoice_work_desktop_discard': return works.discardDesktopAction(command.input);
       case 'invoice_work_desktop_query_decision': return works.queryDesktopDecision(command.input);
       case 'invoice_work_browser_list': return works.listBrowserReads(command.input);
       case 'invoice_work_browser_decide': return works.decideBrowserRead(command.input);
+      case 'invoice_work_browser_rebind': return works.rebindBrowserRead(command.input);
       case 'invoice_work_browser_revoke': return works.revokeBrowserRead(command.input);
       case 'invoice_work_browser_query_decision': return works.queryBrowserDecision(command.input);
       case 'personal_task_list': return tasks.list(command.input);
@@ -137,22 +150,33 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
   const model = await listenCloudModelSocket({ socketPath: options.modelSocket, proxy, allowStaleSocket: true, prepare: async input => {
     if (input.workspaceId !== workspace.data) return forbidden();
     const grant = await authorizeRuntime('observeSubmission', { workId: input.workId, sessionId: input.sessionId,
-      attemptId: input.attemptId, requestId: input.requestId });
+      ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId, requestId: input.requestId });
     if (!grant.ok) return grant;
     if (grant.data.binding.cloudRuntimeId !== input.cloudRuntimeId) return forbidden();
-    const phase = await cloud.reconcilePhase({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId, requestId: input.requestId });
+    const phase = await cloud.reconcilePhase({ workId: input.workId, sessionId: input.sessionId,
+      ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId, requestId: input.requestId });
     return !phase.ok ? phase : phase.data ? ok(undefined)
       : fail(appError('source_invalid', 'runtime', 'The original model phase could not be reconciled.'));
   } });
   if (!model.ok) { const closed = await authority.data.close(); return closed.ok ? model : closed; }
   const desktop = await listenCloudUnixRpc({ socketPath: options.desktopSocket, allowStaleSocket: true,
-    handle: createCloudDesktopHandler({ workspaceId: workspace.data, authorize: createCloudDesktopAuthorizer(options.database, workspace.data), dispatch, material, resources, queue, review, delivery,
+    handle: createCloudDesktopHandler({ workspaceId: workspace.data, authorize: createCloudDesktopAuthorizer(options.database, workspace.data), dispatch, material, resources, queue, review, delivery, memory: options.memory,
       desktopRelay: options.desktopRelay,
       childReport: createCloudChildReportReader(options.database, workspace.data), progress: createCloudProgressReader(options.database, workspace.data, progress) }) });
   if (!desktop.ok) { const modelClosed = await model.data.close(), authorityClosed = await authority.data.close();
     return !modelClosed.ok ? modelClosed : !authorityClosed.ok ? authorityClosed : desktop; }
+  const management = options.openVikingManagement
+    ? await startCloudOpenVikingManagement({ ...options.openVikingManagement, workspaceId: workspace.data }) : ok(null);
+  if (!management.ok) {
+    const closed = await Promise.all([desktop.data.close(), model.data.close(), authority.data.close()]);
+    return closed.find(result => !result.ok) ?? management;
+  }
   let desktopClosing: Promise<Result<void>> | undefined, closing: Promise<Result<void>> | undefined;
-  const stopDesktop = () => { progress.close(); options.desktopRelay?.close(); return desktopClosing ??= desktop.data.close(); };
+  const stopDesktop = () => {
+    progress.close(); options.desktopRelay?.close();
+    return desktopClosing ??= Promise.all([desktop.data.close(), management.data?.close()]).then(results =>
+      results.find(result => result && !result.ok) ?? ok(undefined));
+  };
   return ok({ stopDesktop, close() {
     closing ??= (async () => {
       const first = await stopDesktop(), second = await model.data.close(), third = await authority.data.close();

@@ -14,8 +14,11 @@ test.skipIf(process.platform !== 'win32' || !root || !runtime)('the installed Ki
     const codex = windows.find(window => /codex/i.test(`${window.app} ${window.title}`));
     if (codex) {
       const state = await session.api.observe(codex, new AbortController().signal);
-      expect(state.window).toEqual(codex);
-      expect(typeof state.tree).toBe('string');
+      if ('protected' in state) expect(state).toEqual({ protected: true });
+      else {
+        expect(state.window).toEqual(codex);
+        expect(typeof state.tree).toBe('string');
+      }
     }
   } finally { await session.api.close(); }
 });

@@ -1,5 +1,5 @@
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
-import { ToolTask, type ConversationId, type EntryId, type TaskId } from '@earendil-works/pi-durable';
+import { ToolTask, type ConversationId, type Cursor, type EntryId, type TaskId } from '@earendil-works/pi-durable';
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -129,6 +129,8 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
           return fault('cloud_runtime_owner_conflict', 'The authorized owner does not match the original Session.');
         if (grant.state !== 'ready' && operation !== 'openConversation')
           return fault('cloud_runtime_not_ready', 'The original cloud Session has not been confirmed by the Authority.');
+        if (grant.state !== 'ready' && identity.data.itemId !== undefined)
+          return fault('cloud_runtime_not_ready', 'The original cloud Session must be confirmed before opening an invoice.');
         if (conflicts(grant.binding)) return fault('cloud_runtime_owner_conflict', 'The cloud runtime already belongs to another Session.');
         let entry = entries.get(grant.binding.cloudRuntimeId);
         if (!entry) {
@@ -161,7 +163,7 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
           if (!isDeepStrictEqual(latest.data, grant)) return fault('cloud_runtime_owner_conflict', 'The original scheduling authorization changed.');
         }
         const result = await call(opened.data.runtime, request);
-        if (result.ok && operation === 'openConversation') {
+        if (result.ok && operation === 'openConversation' && request.itemId === undefined) {
           const nativeId = (result.data as { nativeConversationId: number }).nativeConversationId;
           if (entry.nativeConversationId !== null && entry.nativeConversationId !== nativeId)
             return fault('cloud_runtime_owner_conflict', 'The native Session identity changed.');
@@ -186,9 +188,10 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
     const submission = await storage.submissionByRequest(root, JSON.stringify([input.attemptId, input.requestId]), BACKGROUND_CONTEXT);
     if (submission?.type !== 'input' || submission.entry === undefined) throw Error('state_conflict');
     const entry = (await storage.entry(submission.entry, BACKGROUND_CONTEXT))?.entry;
-    const original = z.object({ workId: id, sessionId: id, attemptId: id, requestId: z.string() }).passthrough().safeParse(entry?.data);
+    const original = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId: z.string() }).passthrough().safeParse(entry?.data);
     if (entry?.kind !== 'flowmate.input' || entry.conversationId !== root || !original.success || original.data.workId !== input.workId
-      || original.data.sessionId !== input.sessionId || original.data.attemptId !== input.attemptId || original.data.requestId !== input.requestId)
+      || original.data.sessionId !== input.sessionId || original.data.itemId !== input.itemId
+      || original.data.attemptId !== input.attemptId || original.data.requestId !== input.requestId)
       throw Error('state_conflict');
     const found = await storage.scanConversations({ ownerTaskId: task.id }, 2, undefined, BACKGROUND_CONTEXT);
     if (found.next || found.items.length > 1) throw Error('state_conflict');
@@ -197,9 +200,9 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
     const document = await storage.findDocument({ kind: 'flowmate.runtime.child', scope: { kind: 'conversation', conversationId: child.id } }, 'current', BACKGROUND_CONTEXT);
     const state = document && await storage.document(document.id, 'current', BACKGROUND_CONTEXT);
     if (!state || state.version !== 1 || typeof state.value.planJson !== 'string') throw Error('state_conflict');
-    const plan = z.object({ workId: id, sessionId: id, attemptId: id, requestId: z.string(), childRunId: id, childSessionId: id,
+    const plan = z.object({ workId: id, sessionId: id, itemId: id.optional(), attemptId: id, requestId: z.string(), childRunId: id, childSessionId: id,
       originToolCallId: id, nativeToolTaskId: id }).passthrough().parse(JSON.parse(state.value.planJson));
-    const identity = { workId: plan.workId, sessionId: plan.sessionId, attemptId: plan.attemptId, requestId: plan.requestId,
+    const identity = { workId: plan.workId, sessionId: plan.sessionId, ...(plan.itemId === undefined ? {} : { itemId: plan.itemId }), attemptId: plan.attemptId, requestId: plan.requestId,
       childRunId: plan.childRunId, childSessionId: plan.childSessionId, originToolCallId: plan.originToolCallId, nativeToolTaskId: plan.nativeToolTaskId };
     if (!isDeepStrictEqual(identity, input)) throw Error('state_conflict');
     return child.id;
@@ -230,11 +233,35 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
     inFlight.add(action); void action.then(() => inFlight.delete(action), () => inFlight.delete(action)); return action;
   }
 
+  async function invoiceConversation(session: CloudRuntimeSession, input: DurableConversationIdentity): Promise<ConversationId | undefined> {
+    let cursor: Cursor | undefined, found: ConversationId | undefined;
+    do {
+      const page = await session.storage.scanConversations({}, 100, cursor, BACKGROUND_CONTEXT);
+      for (const conversation of page.items) {
+        if (conversation.owner) continue;
+        const document = await session.storage.findDocument({ kind: 'flowmate.runtime.binding',
+          scope: { kind: 'conversation', conversationId: conversation.id } }, 'current', BACKGROUND_CONTEXT);
+        const state = document && await session.storage.document(document.id, 'current', BACKGROUND_CONTEXT);
+        if (state?.version !== 2 || state.value.workId !== input.workId || state.value.sessionId !== input.sessionId
+          || state.value.itemId !== input.itemId) continue;
+        if (found !== undefined) throw Error('state_conflict');
+        found = conversation.id;
+      }
+      cursor = page.next;
+    } while (cursor);
+    return found;
+  }
+
   function reader(session: CloudRuntimeSession, root: ConversationId) {
     return createDurableHistoryReader({ storage: session.storage, read: action => action(), resolveOwner: async input => ({
       owner: { runtimeKind: 'durable', workId: input.workId, sessionId: input.child?.childSessionId ?? input.sessionId,
-        childRunId: input.child?.childRunId ?? null },
-      conversationId: input.child ? await childConversation(session, root, input.child) : root,
+        childRunId: input.child?.childRunId ?? null, ...(input.itemId === undefined ? {} : { itemId: input.itemId }) },
+      conversationId: input.child ? await (async () => {
+        const parent = input.child!.itemId === undefined ? root : await invoiceConversation(session, { workId: input.workId,
+          sessionId: input.sessionId, itemId: input.child!.itemId });
+        return parent === undefined ? undefined : childConversation(session, parent, input.child!);
+      })()
+        : input.itemId === undefined ? root : await invoiceConversation(session, input),
     }) });
   }
 
@@ -257,7 +284,7 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
       retry: input => history('retryResult', input, async (session, _root, raw, binding) => {
         const parsed = CloudRuntimeRetryRequestSchema.safeParse(raw); if (!parsed.success) return fault('input_invalid', 'The cloud result retry request is invalid.');
         const original = await session.retryResultByIdentity({ attemptId: parsed.data.attemptId, requestId: parsed.data.requestId,
-          nativeSubmissionId: parsed.data.nativeSubmissionId });
+          ...(parsed.data.itemId === undefined ? {} : { itemId: parsed.data.itemId }), nativeSubmissionId: parsed.data.nativeSubmissionId });
         if (!original.ok) return original;
         if (!options.onResultRetry) return fault('cloud_result_unavailable', 'The original result retry could not be scheduled.');
         const scheduled = await options.onResultRetry(binding, session); if (!scheduled.ok) return scheduled;
@@ -280,17 +307,20 @@ export function createCloudRuntimeRouter(options: Options): DurableRuntimePort &
     stopAttempt: input => invoke('stopAttempt', input, (runtime, request) => runtime.stopAttempt(request)),
     resumeAttempt: input => invoke('resumeAttempt', input, (runtime, request) => runtime.resumeAttempt(request)),
     queryHistory: input => history('queryHistory', input, async (session, root, raw) => {
-      const parsed = z.object({ workId: id, sessionId: id, limit: z.number().int().min(1).max(100).default(50), beforeEntryId: id.optional() }).strict().safeParse(raw);
+      const parsed = z.object({ workId: id, sessionId: id, itemId: id.optional(), limit: z.number().int().min(1).max(100).default(50), beforeEntryId: id.optional() }).strict().safeParse(raw);
       if (!parsed.success) return fault('input_invalid', 'The native history request is invalid.');
       const request = parsed.data, before = request.beforeEntryId;
+      const conversationId = request.itemId === undefined ? root : await invoiceConversation(session, request);
+      if (conversationId === undefined) return fault('session_not_found', 'The original invoice conversation is unavailable.');
       if (before !== undefined) {
         const entry = (await session.storage.entry(before as EntryId, BACKGROUND_CONTEXT))?.entry;
-        if (!entry || entry.conversationId !== root) return fault('state_conflict', 'The native history cursor does not belong to this Session.');
+        if (!entry || entry.conversationId !== conversationId) return fault('state_conflict', 'The native history cursor does not belong to this Session.');
       }
-      const page = await session.storage.scanEntries({ conversationId: root, order: 'descending',
+      const page = await session.storage.scanEntries({ conversationId, order: 'descending',
         ...(before === undefined ? {} : { maxEntryId: before as EntryId }) }, request.limit + (before === undefined ? 0 : 1), undefined, BACKGROUND_CONTEXT);
       const entries = page.items.filter(entry => entry.id !== before).map(entry => ({ nativeEntryId: entry.id, kind: entry.kind, json: JSON.stringify(entry) }));
-      return ok({ workId: request.workId, sessionId: request.sessionId, nativeConversationId: root, entries,
+      return ok({ workId: request.workId, sessionId: request.sessionId, ...(request.itemId === undefined ? {} : { itemId: request.itemId }),
+        nativeConversationId: conversationId, entries,
         nextBeforeEntryId: page.next && entries.length ? entries.at(-1)!.nativeEntryId : null });
     }),
     queryHistoryPage: input => history('queryHistoryPage', input, (session, root, request) => reader(session, root).queryHistoryPage(request)),

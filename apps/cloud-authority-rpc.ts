@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
-import { appError, AppErrorSchema, CloudNativeResultReceiptSchema, CloudNativeResultSchema, CloudQueueInstructionSchema, CloudQueueVerifyInputsSchema, CloudRuntimeBindingSchema, CloudRuntimeNoticeSchema, DurableCompactionPlanSchema, DurableCompactionRequestSchema, DurableModelBindingSchema, InvoiceWorkWorkingContextSchema,
+import { appError, AppErrorSchema, CloudNativeResultReceiptSchema, CloudNativeResultSchema, CloudQueueInstructionSchema, CloudQueueVerifyInputsSchema, CloudRuntimeBindingSchema, CloudRuntimeNoticeSchema, DurableApprovalWaitIdentitySchema, DurableApprovalWaitStateSchema, DurableCompactionPlanSchema, DurableCompactionRequestSchema, DurableModelBindingSchema, InvoiceWorkWorkingContextSchema, MemoryRecallResultSchema,
   INVOICE_REVIEW_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_BROWSER_TOOL_NAMES, PersonalAgentConfigurationSchema, RegisteredToolNameSchema, SKILL_RESOURCE_TOOL_NAMES, SUBAGENT_ROLE, ToolEffectSchema, fail, ok,
-  type CloudNativeResult, type CloudNativeResultReceipt, type CloudQueueInstruction, type CloudQueueVerifyInputs, type CloudRuntimeBinding, type CloudRuntimeNotice, type DurableAttemptIdentity, type DurableConversationIdentity, type DurableProductToolCall, type DurableProductToolDefinition, type DurableWorkingContextQuery,
+  type CloudNativeResult, type CloudNativeResultReceipt, type CloudQueueInstruction, type CloudQueueVerifyInputs, type CloudRuntimeBinding, type CloudRuntimeNotice, type DurableApprovalWaitCallbacks, type DurableAttemptIdentity, type DurableConversationIdentity, type DurableProductToolCall, type DurableProductToolDefinition, type DurableWorkingContextQuery,
   type DurableCompactionCallbacks, type DurableCompactionPlan, type DurableProductToolExecution, type DurableProductToolFeedback,
   type DurableSubagentCallbacks, type DurableSubagentObservation, type DurableSubagentPlan,
   type InvoiceWorkWorkingContext, type Result, type ToolResult } from '@flowmate/contracts';
@@ -13,12 +13,12 @@ import type { CloudRuntimeGrant, CloudRuntimeOperation } from './cloud-runtime-r
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const identity = z.object({ workId: id, sessionId: id, attemptId: id }).strict();
 const child = z.object({ childRunId: id, childSessionId: id, originToolCallId: id }).strict();
-const query = identity.extend({ requestId: z.string().min(1).max(128), child: child.optional() }).strict();
+const query = identity.extend({ itemId: id.optional(), requestId: z.string().min(1).max(128), child: child.optional() }).strict();
 const jsonValue = z.union([z.null(), z.boolean(), z.number().finite(), z.string(), z.array(z.unknown()), z.record(z.unknown())]);
 const tool = query.extend({ nativeConversationId: id, nativeTaskId: id, nativeToolCallId: z.string().min(1).max(256),
-  name: z.string().min(1).max(128), arguments: jsonValue }).strict();
+  name: z.string().min(1).max(128), arguments: jsonValue, parentNativeTaskId: id.optional() }).strict();
 const feedback = tool.extend({ nativeEntryId: id, feedbackJson: z.string().min(1).max(1_100_000) }).strict();
-const childIdentity = identity.extend({ requestId: z.string().min(1).max(128), childRunId: id, childSessionId: id,
+const childIdentity = identity.extend({ itemId: id.optional(), requestId: z.string().min(1).max(128), childRunId: id, childSessionId: id,
   originToolCallId: id, nativeToolTaskId: id }).strict();
 const plan = childIdentity.extend({ role: z.literal(SUBAGENT_ROLE), binding: DurableModelBindingSchema,
   thinkingLevel: PersonalAgentConfigurationSchema.unwrap().innerType().shape.thinkingLevel,
@@ -36,6 +36,9 @@ const requestSchema = z.discriminatedUnion('method', [
   z.object({ version: z.literal(1), method: z.literal('authorize'), operation: z.enum(CLOUD_RUNTIME_RPC_METHODS), request: z.record(z.unknown()) }).strict(),
   z.object({ version: z.literal(1), method: z.literal('runtimeTools'), request: z.object({}).strict() }).strict(),
   z.object({ version: z.literal(1), method: z.literal('readWorkingContext'), request: query }).strict(),
+  z.object({ version: z.literal(1), method: z.literal('readMemory'), request: query }).strict(),
+  z.object({ version: z.literal(1), method: z.literal('beginApprovalWait'), request: DurableApprovalWaitIdentitySchema }).strict(),
+  z.object({ version: z.literal(1), method: z.literal('readApprovalWait'), request: DurableApprovalWaitIdentitySchema }).strict(),
   z.object({ version: z.literal(1), method: z.literal('verifyQueueInputs'), request: CloudQueueVerifyInputsSchema }).strict(),
   z.object({ version: z.literal(1), method: z.literal('verifyWorkingContext'), request: query }).strict(),
   z.object({ version: z.literal(1), method: z.literal('verifyModelUse'), request: identity }).strict(),
@@ -66,6 +69,7 @@ const delegationKey = (call: DurableProductToolCall) => JSON.stringify([call.wor
   call.nativeConversationId, call.nativeTaskId]);
 export type CloudAuthorityCallbacks = {
   readWorkingContext(input: DurableWorkingContextQuery): Promise<Result<InvoiceWorkWorkingContext>>;
+  readMemory?(input: DurableWorkingContextQuery): Promise<Result<import('@flowmate/contracts').MemoryRecallResult>>;
   verifyQueueInputs?(input: CloudQueueVerifyInputs): Promise<Result<CloudQueueInstruction[]>>;
   verifyWorkingContext(input: DurableWorkingContextQuery): Promise<Result<void>>;
   verifyModelUse(input: DurableAttemptIdentity): Promise<Result<void>>;
@@ -73,6 +77,7 @@ export type CloudAuthorityCallbacks = {
   executeTool(input: DurableProductToolExecution): Promise<Result<ToolResult<unknown>>>;
   readToolResult(input: DurableProductToolCall): Promise<Result<ToolResult<unknown> | null>>;
   onToolFeedback(input: DurableProductToolFeedback): Promise<Result<void>>;
+  approvalWait?: DurableApprovalWaitCallbacks;
   subagents?: DurableSubagentCallbacks;
   compactions?: DurableCompactionCallbacks;
 };
@@ -121,6 +126,12 @@ export function createCloudAuthorityRpcHandler(authorize: (operation: CloudRunti
       if (!callbacks) return unavailable();
       switch (parsed.data.method) {
         case 'readWorkingContext': return await callbacks.readWorkingContext(parsed.data.request);
+        case 'readMemory': {
+          const result = callbacks.readMemory ? await callbacks.readMemory(parsed.data.request) : unavailable();
+          return result.ok ? ok({ identity: parsed.data.request, result: result.data }) : result;
+        }
+        case 'beginApprovalWait': return callbacks.approvalWait ? await callbacks.approvalWait.begin(parsed.data.request) : unavailable();
+        case 'readApprovalWait': return callbacks.approvalWait ? await callbacks.approvalWait.read(parsed.data.request) : unavailable();
         case 'verifyQueueInputs': return callbacks.verifyQueueInputs ? await callbacks.verifyQueueInputs(parsed.data.request) : unavailable();
         case 'verifyWorkingContext': return await callbacks.verifyWorkingContext(parsed.data.request);
         case 'verifyModelUse': return await callbacks.verifyModelUse(parsed.data.request);
@@ -216,10 +227,17 @@ export function createCloudAuthorityCallbacksClient(socketPath: string): CloudAu
       const value = result.data, expected = captured.data;
       if (value.work.workId !== expected.workId || value.work.sessionId !== expected.sessionId || value.phase.attemptId !== expected.attemptId
         || value.phase.requestId !== expected.requestId || value.item.workId !== expected.workId
+        || expected.itemId !== undefined && value.item.itemId !== expected.itemId
         || (expected.child ? value.delegation?.childRunId !== expected.child.childRunId
           || value.delegation.childSessionId !== expected.child.childSessionId || value.delegation.originToolCallId !== expected.child.originToolCallId
           : value.delegation !== undefined)) return unavailable();
       return result;
+    },
+    async readMemory(input) {
+      const captured = query.safeParse(input); if (!captured.success) return fail(appError('input_invalid', 'input', 'The cloud memory request is invalid.'));
+      const result = await call<{ identity: z.infer<typeof query>; result: import('@flowmate/contracts').MemoryRecallResult }>(
+        'readMemory', captured.data, z.object({ identity: query, result: MemoryRecallResultSchema }).strict());
+      return !result.ok ? result : isDeepStrictEqual(result.data.identity, captured.data) ? ok(result.data.result) : unavailable();
     },
     async verifyQueueInputs(input) {
       const captured = CloudQueueVerifyInputsSchema.safeParse(input); if (!captured.success) return fail(appError('input_invalid', 'input', 'The cloud queue inputs are invalid.'));
@@ -230,6 +248,8 @@ export function createCloudAuthorityCallbacksClient(socketPath: string): CloudAu
           && item.content === captured.data.items[index]!.content) ? result : unavailable();
     },
     verifyWorkingContext: input => call('verifyWorkingContext', input, z.undefined()),
+    approvalWait: { begin: input => call('beginApprovalWait', input, DurableApprovalWaitStateSchema),
+      read: input => call('readApprovalWait', input, DurableApprovalWaitStateSchema) },
     verifyModelUse: input => call('verifyModelUse', input, z.undefined()),
     verifySchedulingUse: (input, pending) => call('verifySchedulingUse', { identity: input, pendingFeedback: pending }, z.undefined()),
     executeTool: async input => {
@@ -275,6 +295,7 @@ export function createCloudAuthorityCallbacksClient(socketPath: string): CloudAu
       if (!result.ok) return result;
       const event = captured.data, receipt = result.data;
       return receipt.cloudRuntimeId === event.cloudRuntimeId && receipt.workId === event.workId && receipt.sessionId === event.sessionId
+        && receipt.itemId === event.itemId
         && receipt.nativeConversationId === event.nativeConversationId && receipt.nativeSubmissionId === event.nativeSubmissionId ? result : unavailable();
     },
     subagents: {

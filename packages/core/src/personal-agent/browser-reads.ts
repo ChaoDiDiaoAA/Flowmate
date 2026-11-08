@@ -5,6 +5,7 @@ import { appError, BrowserPageSchema, BrowserReadDecisionQuerySchema, BrowserRea
   type AppError, type BrowserReadDecisionQuery, type BrowserReadDecisionRequest, type BrowserReadListRequest, type BrowserReadListResult, type BrowserReadView, type BrowserTarget, type Result } from '@flowmate/contracts';
 import { createToolCallRepository } from '../storage/repositories.ts';
 import { readTransaction } from '../storage/reads.ts';
+import { approvalWithinBudget } from './approval-wait.ts';
 import { desktopActionContinuationAuthorized } from './desktop-actions.ts';
 import type { SynchronousDatabaseExecutor } from '../storage/write-coordinator.ts';
 
@@ -14,6 +15,7 @@ type Row = { id: number; work_id: number; item_id: number; item_revision: number
   status: BrowserReadView['status']; decision_request_id: string | null; decision_request_json: string | null;
   decision_receipt_json: string | null; execution_tool_call_id: number | null; created_at: string; updated_at: string };
 type Owner = { phase_id: number; work_id: number; item_id: number; closed_at: string | null; scope_json: string;
+  basis_json: string; scheduler_state: string;
   run_kind: string; run_status: string; cancel_requested_at: string | null; stop_requested_at: string | null; stopped_at: string | null;
   work_status: string; current_attempt_id: number | null; attempt_id: number; disposition: string; item_revision: number; runtime_kind: string;
   durable_runtime_id: string; phase_runtime_id: string; cloud_workspace_id: string | null; session_status: string };
@@ -46,7 +48,7 @@ export function createInvoiceWorkBrowserReadRepository(db: SynchronousDatabaseEx
   }
   function owner(toolCallId: number, workId: number, itemId: number, name: string, active: boolean) {
     const call = need(tools.getById(toolCallId));
-    const found = db.query<Owner, [number]>(`SELECT p.id phase_id,p.work_id,p.item_id,p.closed_at,b.scope_json,
+    const found = db.query<Owner, [number]>(`SELECT p.id phase_id,p.work_id,p.item_id,p.closed_at,p.basis_json,p.scheduler_state,b.scope_json,
       r.kind run_kind,r.status run_status,r.cancel_requested_at,a.stop_requested_at,a.stopped_at,w.status work_status,
       w.current_attempt_id,a.id attempt_id,i.disposition,i.revision item_revision,s.runtime_kind,s.durable_runtime_id,
       p.durable_runtime_id phase_runtime_id,s.cloud_workspace_id,s.status session_status
@@ -75,12 +77,17 @@ export function createInvoiceWorkBrowserReadRepository(db: SynchronousDatabaseEx
     requireFact(isDeepStrictEqual(original.call.args.raw, args), 'storage_corrupt', 'The browser request differs from its original call.');
     const result = original.call.result?.status === 'succeeded'
       ? z.object({ proposalId: id }).passthrough().safeParse(original.call.result.data) : null;
-    const canReject = found.status === 'waiting' && original.owner.closed_at !== null
+    const itemLane = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(original.owner.basis_json)).executionMode === 'item-lane-approval-v1';
+    const decisionWindow = itemLane ? original.owner.closed_at === null && original.owner.scheduler_state === 'waiting_approval'
+      && original.owner.run_status === 'running' && original.owner.session_status === 'active'
+      && original.owner.current_attempt_id === original.owner.attempt_id && original.owner.cancel_requested_at === null
+      && original.owner.stop_requested_at === null && original.owner.stopped_at === null : original.owner.closed_at !== null;
+    const canReject = found.status === 'waiting' && decisionWindow
       && original.owner.work_status === 'open' && original.owner.disposition === 'unresolved';
     const canDecide = canReject && original.call.status === 'succeeded' && result?.success === true && result.data.proposalId === found.id
       && original.owner.item_revision === found.item_revision;
     return BrowserReadViewSchema.parse({ proposalId: found.id, workId: found.work_id, itemId: found.item_id,
-      proposalToolCallId: found.proposal_tool_call_id, target, status: found.status, canDecide, canReject,
+      proposalToolCallId: found.proposal_tool_call_id, target, status: found.status, canDecide, canReject, ...(itemLane ? { resumeOriginal: true } : {}),
       canRevoke: found.status === 'approved' || found.status === 'claimed' || found.status === 'completed', executionToolCallId: found.execution_tool_call_id,
       createdAt: found.created_at, updatedAt: found.updated_at });
   }
@@ -154,6 +161,8 @@ export function createInvoiceWorkBrowserReadRepository(db: SynchronousDatabaseEx
         const work = db.query<{ revision: number }, [number]>("SELECT revision FROM invoice_works WHERE id=? AND status='open'").get(input.workId);
         requireFact(work && work.revision === input.expectedRevision && work.revision < Number.MAX_SAFE_INTEGER);
         const original = owner(found.proposal_tool_call_id, found.work_id, found.item_id, 'browser_request_read', false);
+        const itemLane = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(original.owner.basis_json)).executionMode === 'item-lane-approval-v1';
+        requireFact(!itemLane || approvalWithinBudget(db, input.workId, time), 'agent_timeout', 'The original Work time budget ended.');
         requireFact(original.owner.item_revision < Number.MAX_SAFE_INTEGER);
         const receipt = BrowserReadDecisionReceiptSchema.parse({ ...input, revision: work.revision + 1, receivedAt: time });
         requireFact(db.query("UPDATE invoice_works SET revision=?,updated_at=? WHERE id=? AND revision=? AND status='open'")
@@ -163,6 +172,8 @@ export function createInvoiceWorkBrowserReadRepository(db: SynchronousDatabaseEx
         requireFact(db.query(`UPDATE invoice_work_browser_reads SET status=?,decision_request_id=?,decision_request_json=?,
           decision_receipt_json=?,updated_at=? WHERE id=? AND status='waiting'`).run(input.decision === 'approve' ? 'approved' : 'rejected',
           input.requestId, JSON.stringify(input), JSON.stringify(receipt), time, found.id).changes === 1);
+        if (itemLane) requireFact(db.query("UPDATE invoice_work_phases SET scheduler_state='ready' WHERE id=? AND scheduler_state='waiting_approval' AND closed_at IS NULL")
+          .run(original.owner.phase_id).changes === 1);
         return receipt;
       });
     },
@@ -175,11 +186,16 @@ export function createInvoiceWorkBrowserReadRepository(db: SynchronousDatabaseEx
         requireFact(decision.request.decision === 'approve', 'storage_corrupt', 'The original browser read was not approved.');
         const execution = owner(input.executionToolCallId, input.workId, input.itemId, 'browser_read_approved', true);
         requireFact(execution.owner.item_revision === found.item_revision + 1, 'browser_item_changed', 'The invoice changed after approval.');
-        requireFact(desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision),
-          'tool_access_denied', 'The browser approval has no explicit continuation for this attempt.');
         const phase = db.query<{ basis_json: string }, [number]>('SELECT basis_json FROM invoice_work_phases WHERE id=?').get(execution.owner.phase_id);
-        requireFact(phase && InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json)).browserProposalId === found.id,
-          'tool_access_denied', 'The browser approval is not part of the original execution phase.');
+        requireFact(phase);
+        const basis = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json));
+        if (basis.executionMode === 'item-lane-approval-v1') {
+          const original = owner(found.proposal_tool_call_id, input.workId, input.itemId, 'browser_request_read', false);
+          requireFact(original.owner.phase_id === execution.owner.phase_id && execution.owner.scheduler_state === 'active'
+            && approvalWithinBudget(db, input.workId, input.at), 'tool_access_denied', 'The original browser approval is no longer active.');
+        } else requireFact(basis.browserProposalId === found.id
+          && desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision),
+        'tool_access_denied', 'The browser approval has no explicit continuation for this attempt.');
         const args = BrowserToolInputSchema.parse(execution.call.args.final);
         requireFact(isDeepStrictEqual(execution.call.args.raw, args));
         requireFact(db.query("UPDATE invoice_work_browser_reads SET status='claimed',execution_tool_call_id=?,updated_at=? WHERE id=? AND status='approved'")
@@ -220,11 +236,16 @@ export function createInvoiceWorkBrowserReadRepository(db: SynchronousDatabaseEx
         requireFact(decision.request.decision === 'approve' && isDeepStrictEqual(decision.request.confirmedTarget, target)
           && new URL(input.page.url).origin === target.origin && execution.owner.item_revision === found.item_revision + 1,
         'tool_access_denied', 'The browser result no longer matches its approval.');
-        requireFact(desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision),
-          'tool_access_denied', 'The browser continuation is unavailable.');
         const phase = db.query<{ basis_json: string }, [number]>('SELECT basis_json FROM invoice_work_phases WHERE id=?').get(execution.owner.phase_id);
-        requireFact(phase && InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json)).browserProposalId === found.id,
-          'tool_access_denied', 'The browser result belongs to another phase.');
+        requireFact(phase);
+        const basis = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json));
+        if (basis.executionMode === 'item-lane-approval-v1') {
+          const original = owner(found.proposal_tool_call_id, input.workId, input.itemId, 'browser_request_read', false);
+          requireFact(original.owner.phase_id === execution.owner.phase_id && execution.owner.scheduler_state === 'active'
+            && approvalWithinBudget(db, input.workId, input.at), 'tool_access_denied', 'The original browser approval is no longer active.');
+        } else requireFact(basis.browserProposalId === found.id
+          && desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision),
+        'tool_access_denied', 'The browser continuation is unavailable.');
         requireFact(db.query("UPDATE invoice_work_browser_reads SET status='completed',updated_at=? WHERE id=? AND status='claimed'")
           .run(input.at, found.id).changes === 1);
         return snapshot(row(input.workId, input.itemId, input.proposalId));
@@ -242,10 +263,16 @@ export function createInvoiceWorkBrowserReadRepository(db: SynchronousDatabaseEx
         const page = BrowserPageSchema.parse(execution.call.result.data);
         const target = BrowserTargetSchema.parse(JSON.parse(found.target_json)), decision = savedDecision(found);
         const phase = db.query<{ basis_json: string }, [number]>('SELECT basis_json FROM invoice_work_phases WHERE id=?').get(execution.owner.phase_id);
+        requireFact(phase);
+        const basis = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json));
+        const original = owner(found.proposal_tool_call_id, input.workId, input.itemId, 'browser_request_read', false);
+        const authorized = basis.executionMode === 'item-lane-approval-v1'
+          ? original.owner.phase_id === execution.owner.phase_id && execution.owner.scheduler_state === 'active'
+            && execution.owner.work_status === 'open' && execution.owner.current_attempt_id === execution.owner.attempt_id
+            && execution.owner.stop_requested_at === null && execution.owner.stopped_at === null && execution.owner.cancel_requested_at === null
+          : basis.browserProposalId === found.id && desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision);
         requireFact(decision.request.decision === 'approve' && isDeepStrictEqual(decision.request.confirmedTarget, target)
-          && new URL(page.url).origin === target.origin && execution.owner.item_revision === found.item_revision + 1
-          && phase && InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json)).browserProposalId === found.id
-          && desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision),
+          && new URL(page.url).origin === target.origin && execution.owner.item_revision === found.item_revision + 1 && authorized,
         'tool_access_denied', 'The browser result no longer matches its approval.');
       });
     },

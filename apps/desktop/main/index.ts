@@ -1,6 +1,11 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from '../../host/protocol.ts';
 import { isResearchHostCommand, parseResearchHostResult, matchesResearchResponse, researchHostFailure, researchOperations } from '../../../packages/contracts/src/research-commands.ts';
 import { isPersonalAgentHostCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse, personalAgentHostFailure, personalAgentHostCommandTypes } from '../../../packages/contracts/src/personal-agent-commands.ts';
+import { memoryHostCommandTypes, memoryHostFailure, parseMemoryCommand, parseMemoryHostResult } from '../../../packages/contracts/src/openviking-commands.ts';
+import { MemoryConnectionConfigurationSchema, MemorySettingsViewSchema } from '../../../packages/contracts/src/openviking-memory.ts';
+import { ServiceMemoryConfigurationRequestSchema } from '../../../packages/core/src/configuration/service-memory-credentials.ts';
+import { verifyOpenVikingIdentity } from '../../../packages/core/src/openviking/identity.ts';
+import { createDesktopOpenVikingManagement } from './openviking-management.ts';
 import { ResourceRefSchema } from '@flowmate/contracts';
 import { BrowserOwnerSchema, BrowserSelectionSchema, CloudDesktopWorkspaceSchema, DesktopOwnerSchema, DesktopWindowSelectionSchema, InvoiceWorkGetResultSchema, type BrowserReadView, type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult } from '@flowmate/contracts';
 import { connectKimiMcp, resolveKimiPaths } from './kimi-mcp.ts';
@@ -362,6 +367,7 @@ const runtimeBindings = new Map<string, RuntimeBinding>();
 const runtimeReleased = new Map<string, string>();
 const runtimeQueries = new Set<string>();
 const credentialStores = new Map<string, CredentialStore>();
+const memoryCredentialStores = new Map<string, CredentialStore>();
 const serviceActivation = createServiceActivation({ client: serviceClient, dataRoot: () => userDataRoot, runtimeLayout: () => runtimeLayout,
   installation: () => { const selected = serviceSelection(); return selected.ok ? ok(selected.data.installation) : selected; },
   readSettings: async () => {
@@ -488,6 +494,77 @@ function serviceSelection() {
     ...(app.isPackaged && runtimeLayout ? { runtimeRoot: runtimeLayout.runtimeRoot, releaseId: runtimeLayout.release?.releaseId } : {}) });
 }
 function serviceSettingsRequestFile(): string { return join(userDataRoot, 'data', 'desktop-service-settings-request.json'); }
+const localMemoryPendingSchema = MemoryConnectionConfigurationSchema.extend({ operationId: z.string().uuid(),
+  credentialRef: z.string().regex(/^memory_[a-f0-9]{32}$/) }).strict();
+type LocalMemoryPending = z.infer<typeof localMemoryPendingSchema>;
+function localMemoryPendingFile(): string { return join(userDataRoot, 'data', 'desktop-memory-request.json'); }
+async function readLocalMemoryPending(): Promise<Result<LocalMemoryPending | null>> {
+  try {
+    const file = localMemoryPendingFile(), stat = await lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384) throw Error('invalid_request');
+    const parsed = localMemoryPendingSchema.safeParse(JSON.parse(await readFile(file, 'utf8')));
+    if (!parsed.success) throw Error('invalid_request');
+    return ok(parsed.data);
+  } catch (cause) {
+    if (cause && typeof cause === 'object' && 'code' in cause && cause.code === 'ENOENT') return ok(null);
+    return fail(appError('memory_request_invalid', 'storage', 'The original memory request is unavailable and has been retained.', true));
+  }
+}
+async function saveLocalMemoryPending(request: LocalMemoryPending): Promise<Result<void>> {
+  const existing = await readLocalMemoryPending(); if (!existing.ok) return existing;
+  if (existing.data) return isDeepStrictEqual(existing.data, request) ? ok(undefined)
+    : fail(appError('state_conflict', 'input', 'The original memory request is still pending.'));
+  const file = localMemoryPendingFile(), temporary = file + '.' + randomUUID() + '.tmp';
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, 'wx', 0o600); await handle.writeFile(JSON.stringify(request) + '\n'); await handle.sync();
+    await handle.close(); handle = undefined; await rename(temporary, file); return ok(undefined);
+  } catch {
+    await handle?.close().catch(() => {}); await rm(temporary, { force: true }).catch(() => {});
+    return fail(appError('memory_request_write_failed', 'storage', 'The original memory request could not be saved. No connection was submitted.', true));
+  }
+}
+async function clearLocalMemoryPending(request: LocalMemoryPending): Promise<Result<void>> {
+  const current = await readLocalMemoryPending(); if (!current.ok) return current;
+  if (current.data && !isDeepStrictEqual(current.data, request)) return fail(appError('state_conflict', 'input', 'The original memory request changed.'));
+  try { await rm(localMemoryPendingFile(), { force: true }); return ok(undefined); }
+  catch { return fail(appError('memory_request_clear_failed', 'storage', 'The original memory request could not be cleared.', true)); }
+}
+const serviceMemoryPendingSchema = ServiceMemoryConfigurationRequestSchema.omit({ apiKey: true });
+type ServiceMemoryPending = z.infer<typeof serviceMemoryPendingSchema>;
+function serviceMemoryPendingFile(): string { return join(userDataRoot, 'data', 'desktop-service-memory-request.json'); }
+async function readServiceMemoryPending(): Promise<Result<ServiceMemoryPending | null>> {
+  try {
+    const file = serviceMemoryPendingFile(), stat = await lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16384) throw Error('invalid_request');
+    const parsed = serviceMemoryPendingSchema.safeParse(JSON.parse(await readFile(file, 'utf8')));
+    if (!parsed.success || parsed.data.installationId !== serviceInstallation?.installationId) throw Error('invalid_request');
+    return ok(parsed.data);
+  } catch (cause) {
+    if (cause && typeof cause === 'object' && 'code' in cause && cause.code === 'ENOENT') return ok(null);
+    return fail(appError('service_memory_request_invalid', 'storage', 'The original service memory request is unavailable and has been retained.', true));
+  }
+}
+async function saveServiceMemoryPending(request: ServiceMemoryPending): Promise<Result<void>> {
+  const existing = await readServiceMemoryPending(); if (!existing.ok) return existing;
+  if (existing.data) return isDeepStrictEqual(existing.data, request) ? ok(undefined)
+    : fail(appError('service_memory_operation_conflict', 'input', 'The original service memory request is still pending.'));
+  const file = serviceMemoryPendingFile(), temporary = file + '.' + randomUUID() + '.tmp';
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, 'wx', 0o600); await handle.writeFile(JSON.stringify(request) + '\n'); await handle.sync();
+    await handle.close(); handle = undefined; await rename(temporary, file); return ok(undefined);
+  } catch {
+    await handle?.close().catch(() => {}); await rm(temporary, { force: true }).catch(() => {});
+    return fail(appError('service_memory_request_write_failed', 'storage', 'The original memory request could not be saved. No service write was submitted.', true));
+  }
+}
+async function clearServiceMemoryPending(request: ServiceMemoryPending): Promise<Result<void>> {
+  const current = await readServiceMemoryPending(); if (!current.ok) return current;
+  if (current.data && !isDeepStrictEqual(current.data, request)) return fail(appError('service_memory_operation_conflict', 'input', 'The original memory request changed.'));
+  try { await rm(serviceMemoryPendingFile(), { force: true }); return ok(undefined); }
+  catch { return fail(appError('service_memory_request_clear_failed', 'storage', 'The original memory request could not be cleared.', true)); }
+}
 async function readServiceSettingsRequest(): Promise<Result<ServiceSettingsRequest | null>> {
   try {
     const file = serviceSettingsRequestFile(), stat = await lstat(file);
@@ -940,6 +1017,23 @@ async function assemblyIpcQuery(type: string, input?: unknown) {
     return epoch === transportEpoch && checked !== null && matches(command, checked) ? checked : failure(type);
   } catch { return failure(type); }
 }
+async function memoryIpcQuery(type: string, input: unknown) {
+  const captured = parseMemoryCommand({ type, input });
+  if (!captured) return fail(appError('input_invalid', 'input', 'The memory request is invalid.'));
+  if (['memory_update_policy', 'memory_remember', 'memory_reconcile_remember', 'memory_reconcile_remember_by_id', 'memory_forget', 'memory_reconcile_sync'].includes(type)) {
+    const pending = serviceMode ? await readServiceMemoryPending() : await readLocalMemoryPending();
+    if (!pending.ok) return pending;
+    if (pending.data) return fail(appError('memory_configuration_pending', 'runtime', 'Check the original memory connection request before making changes.', true));
+  }
+  const command = parseHostCommand({ version: 1, requestId: randomUUID(), ...captured });
+  if (!command) return memoryHostFailure(captured);
+  const epoch = transportEpoch;
+  try {
+    const { version: _version, requestId: _requestId, ...request } = command;
+    const result = parseMemoryHostResult(captured, await requestProduct(request));
+    return epoch === transportEpoch && result ? result : memoryHostFailure(captured);
+  } catch { return memoryHostFailure(captured); }
+}
 async function compactionIpcRequest(command: HostCommand) {
   const epoch = transportEpoch;
   try {
@@ -958,7 +1052,7 @@ function registerIpc(): void {
   if (ipcRegistered) return;
   ipcRegistered = true;
   const configurationWrites = new Set([channels.saveSettings, 'flowmate:save-evaluation-settings',
-    'flowmate:update-resource-selection', 'flowmate:update-extension-selection']);
+    'flowmate:update-resource-selection', 'flowmate:update-extension-selection', 'flowmate:memory-configure-from-file', 'flowmate:memory-update-policy']);
   const handle = (channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: unknown[]) => Promise<unknown>) => {
     ipcMain.handle(channel, async (event, ...args) => {
       const failure = (error: import('@flowmate/contracts').AppError) => [channels.compactSession, channels.querySessionCompaction, channels.cancelSessionCompaction].some(value => value === channel)
@@ -1252,6 +1346,15 @@ function registerIpc(): void {
     'list_extensions', 'update_extension_selection', 'query_session_extensions', 'query_run_extensions', 'execute_extension_command', 'dispose_session_extensions',
     'list_subagents', 'query_subagent', 'cancel_subagent', 'list_input_commands', 'list_subagent_definitions', 'get_subagent_definition', 'save_subagent_definition'] as const)
     handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => assemblyIpcQuery(type, raw));
+  for (const type of memoryHostCommandTypes())
+    handle(`flowmate:${type.replaceAll('_', '-')}`, async (_event, raw) => memoryIpcQuery(type, raw));
+  handle('flowmate:memory-configure-from-file', async () => configureLocalMemoryFromFile());
+  const management = createDesktopOpenVikingManagement(() => mainWindow, () => userDataRoot);
+  handle('flowmate:openviking-management-connect', async () => management.connect());
+  handle('flowmate:openviking-management-disconnect', async (_event, id) => management.disconnect(id));
+  handle('flowmate:openviking-management-execute', async (_event, request) => management.execute(request));
+  handle('flowmate:openviking-management-receipt', async (_event, id) => management.receipt(id));
+  handle('flowmate:openviking-management-resolve-receipt', async (_event, request) => management.resolveReceipt(request));
   handle(channels.listContextSnapshots, async (_event, raw) => {
     const input = ContextSnapshotsRequestSchema.safeParse(raw);
     if (!input.success) return fail(appError('input_invalid', 'input', 'Context snapshot list request is invalid.'));
@@ -2070,7 +2173,159 @@ function credentialStore(reference: string): CredentialStore {
   return store;
 }
 
+function memoryCredentialStore(reference: string): CredentialStore {
+  if (!/^memory_[a-f0-9]{32}$/.test(reference)) throw new Error('invalid_memory_credential_reference');
+  let store = memoryCredentialStores.get(reference);
+  if (!store) {
+    store = createCredentialStore(join(userDataRoot, 'security', 'memory-credentials', `${reference}.json`), systemSecureStorage);
+    memoryCredentialStores.set(reference, store);
+  }
+  return store;
+}
+
+async function configureLocalMemoryFromFile(): Promise<Result<import('zod').z.infer<typeof import('@flowmate/contracts').MemorySetupResultSchema>>> {
+  if (!mainWindow || mainWindow.isDestroyed()) return fail(appError('desktop_not_ready', 'runtime', 'The connection file picker is unavailable.', true));
+  const epoch = transportEpoch, originalServiceMode = serviceMode;
+  let pending: ServiceMemoryPending | null = null;
+  let localPending: LocalMemoryPending | null = null;
+  if (originalServiceMode) {
+    if (!serviceInstallation || !serviceClient.isConnected) return fail(appError('service_operation_unavailable', 'runtime', 'The background service is not connected.', true));
+    const stored = await readServiceMemoryPending(); if (!stored.ok) return stored;
+    pending = stored.data;
+    if (pending) {
+      const prior = await serviceClient.queryMemoryOperation({ installationId: pending.installationId, operationId: pending.operationId });
+      if (!prior.ok || epoch !== transportEpoch || !serviceMode || serviceInstallation?.installationId !== pending.installationId)
+        return fail(appError('operation_result_unknown', 'runtime', `The original service memory request ${pending.operationId} could not be checked.`, true));
+      if (prior.data?.phase === 'committed' && prior.data.settings) {
+        const cleared = await clearServiceMemoryPending(pending); return cleared.ok ? ok({ cancelled: false, settings: prior.data.settings }) : cleared;
+      }
+      if (prior.data?.phase === 'failed') {
+        const cleared = await clearServiceMemoryPending(pending); return cleared.ok
+          ? fail(appError('memory_identity_unavailable', 'runtime', 'The original service memory identity could not be confirmed.', true)) : cleared;
+      }
+    }
+  } else {
+    const stored = await readLocalMemoryPending(); if (!stored.ok) return stored;
+    localPending = stored.data;
+    if (localPending) {
+      const { operationId: _operation, ...original } = localPending;
+      try {
+        const value = await requestProduct({ type: 'memory_inspect_configuration', input: original });
+        const checked = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: MemorySettingsViewSchema.nullable() }).strict(),
+          z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(value);
+        if (!checked.success || !checked.data.ok || epoch !== transportEpoch || serviceMode) throw Error('memory_inspection_unconfirmed');
+        const view = checked.data.data;
+        if (view) {
+          if (view.settings.revision !== original.expectedRevision + 1 || view.settings.provider !== 'openviking'
+            || view.settings.endpoint !== original.endpoint || view.settings.recallEnabled !== original.recallEnabled || view.settings.captureMode !== original.captureMode
+            || view.identity?.accountId !== original.accountId || view.identity.userId !== original.userId || view.identity.peerId !== original.peerId)
+            throw Error('memory_inspection_unconfirmed');
+          const cleared = await clearLocalMemoryPending(localPending); return cleared.ok ? ok({ cancelled: false, settings: view }) : cleared;
+        }
+      } catch { return fail(appError('operation_result_unknown', 'runtime', `The original memory request ${localPending.operationId} could not be checked.`, true)); }
+    }
+  }
+  const selected = await dialog.showOpenDialog(mainWindow, { title: 'Choose an OpenViking connection file',
+    properties: ['openFile', 'dontAddToRecent'], filters: [{ name: 'JSON', extensions: ['json'] }] });
+  if (selected.canceled || !selected.filePaths[0]) return ok({ cancelled: true });
+  const fileSchema = MemoryConnectionConfigurationSchema.omit({ expectedRevision: true, credentialRef: true }).extend({
+    apiKey: z.string().min(1).max(4096).refine(value => /^[\x21-\x7e]+$/.test(value)) }).strict();
+  let input: z.infer<typeof fileSchema>;
+  try {
+    const info = await lstat(selected.filePaths[0]);
+    if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > 16384) throw Error('invalid_file');
+    input = fileSchema.parse(JSON.parse(await readFile(selected.filePaths[0], 'utf8')));
+  } catch { return fail(appError('input_invalid', 'input', 'The OpenViking connection file is invalid.')); }
+  const confirmation = await dialog.showMessageBox(mainWindow, { type: 'question', title: 'Connect OpenViking',
+    message: 'Connect this Flowmate installation to the selected memory service?',
+    detail: `Endpoint: ${input.endpoint}\nAccount: ${input.accountId}\nUser: ${input.userId}\nAgent: ${input.peerId}\nRecall: ${input.recallEnabled ? 'on' : 'off'}\nCapture: ${input.captureMode}`
+      + (input.captureMode === 'auto' ? '\nCompleted chats will be sent to OpenViking for extraction. Extracted memories may be recalled across authorized conversations in this location. Invoice Work capture remains off.' : ''),
+    buttons: ['Cancel', 'Connect'], defaultId: 0, cancelId: 0 });
+  if (confirmation.response !== 1) return ok({ cancelled: true });
+  if (epoch !== transportEpoch || serviceMode !== originalServiceMode) return fail(appError('memory_unavailable', 'runtime', 'The original desktop connection changed.', true));
+  const { apiKey, ...connection } = input;
+  registerSecrets([apiKey]);
+  if (originalServiceMode && pending) {
+    const { installationId: _installation, operationId: _operation, expectedRevision: _revision, ...original } = pending;
+    if (!isDeepStrictEqual(original, connection)) return fail(appError('service_memory_operation_conflict', 'input',
+      `Select the original connection file for service memory request ${pending.operationId}.`));
+  }
+  if (!originalServiceMode && localPending) {
+    const { operationId: _operation, expectedRevision: _revision, credentialRef: _reference, ...original } = localPending;
+    if (!isDeepStrictEqual(original, connection)) return fail(appError('state_conflict', 'input',
+      `Select the original connection file for memory request ${localPending.operationId}.`));
+  }
+  if (!await verifyOpenVikingIdentity({ endpoint: input.endpoint, apiKey, accountId: input.accountId, userId: input.userId,
+    role: 'user', fetch: globalThis.fetch, signal: AbortSignal.timeout(5000) }))
+    return fail(appError('memory_identity_unavailable', 'runtime', 'The selected OpenViking user identity could not be confirmed.', true));
+  const query = parseMemoryCommand({ type: 'memory_get_settings', input: {} })!;
+  let current: Result<unknown> | null;
+  try { current = parseMemoryHostResult(query, await requestProduct(query)); }
+  catch { current = null; }
+  if (!current) return fail(appError('memory_unavailable', 'runtime', 'The original memory settings could not be read.', true));
+  if (!current.ok) return current;
+  const view = MemorySettingsViewSchema.safeParse(current.data);
+  if (!view.success || epoch !== transportEpoch) return fail(appError('memory_unavailable', 'runtime', 'The original memory settings could not be confirmed.', true));
+  if (!originalServiceMode && localPending && view.data.settings.revision !== localPending.expectedRevision)
+    return fail(appError('operation_result_unknown', 'runtime', `The original memory request ${localPending.operationId} requires review before retrying.`, true));
+  if (originalServiceMode) {
+    if (!serviceInstallation || !serviceClient.isConnected) return fail(appError('service_operation_unavailable', 'runtime', 'The background service is not connected.', true));
+    const original = pending ?? { installationId: serviceInstallation.installationId, operationId: randomUUID(), expectedRevision: view.data.settings.revision, ...connection };
+    if (!pending) { const saved = await saveServiceMemoryPending(original); if (!saved.ok) return saved; }
+    const result = await serviceClient.configureMemory({ ...original, apiKey });
+    if (!result.ok || epoch !== transportEpoch) {
+      if (!result.ok && result.error.code === 'memory_identity_unavailable' && epoch === transportEpoch) {
+        const checked = await serviceClient.queryMemoryOperation({ installationId: original.installationId, operationId: original.operationId });
+        if (checked.ok && checked.data === null && epoch === transportEpoch) {
+          const cleared = await clearServiceMemoryPending(original); return cleared.ok ? result : cleared;
+        }
+      }
+      return fail(appError('operation_result_unknown', 'runtime',
+        `The original service memory request ${original.operationId} could not be confirmed. Check it before retrying.`, true));
+    }
+    if (result.data.phase === 'committed' && result.data.settings) {
+      const cleared = await clearServiceMemoryPending(original); return cleared.ok ? ok({ cancelled: false, settings: result.data.settings }) : cleared;
+    }
+    if (result.data.phase === 'failed') {
+      const cleared = await clearServiceMemoryPending(original); return cleared.ok
+        ? fail(appError('memory_identity_unavailable', 'runtime', 'The original service memory identity could not be confirmed.', true)) : cleared;
+    }
+    return fail(appError('operation_result_unknown', 'runtime', `The original service memory request ${original.operationId} is pending.`, true));
+  }
+  const original = localPending ?? { operationId: randomUUID(), expectedRevision: view.data.settings.revision,
+    credentialRef: `memory_${randomUUID().replaceAll('-', '')}`, ...connection };
+  if (!localPending) { const saved = await saveLocalMemoryPending(original); if (!saved.ok) return saved; }
+  const store = memoryCredentialStore(original.credentialRef), existing = await store.read();
+  if (!existing.ok) return existing;
+  if (existing.data !== null && existing.data !== apiKey) return fail(appError('state_conflict', 'input', 'The original memory request used another user key.'));
+  if (existing.data === null) { const written = await store.write(apiKey); if (!written.ok) return written; }
+  try {
+    const { operationId: _operation, ...request } = original;
+    const value = await requestProduct({ type: 'memory_configure', input: request }, 30000);
+    const envelope = z.discriminatedUnion('ok', [z.object({ ok: z.literal(true), data: MemorySettingsViewSchema }).strict(),
+      z.object({ ok: z.literal(false), error: AppErrorSchema }).strict()]).safeParse(value);
+    if (!envelope.success || epoch !== transportEpoch) throw Error('memory_configure_unconfirmed');
+    if (!envelope.data.ok) {
+      if (envelope.data.error.code === 'memory_identity_unavailable') { const cleared = await clearLocalMemoryPending(original); return cleared.ok ? envelope.data : cleared; }
+      return envelope.data;
+    }
+    const result = envelope.data.data;
+    if (result.settings.revision !== view.data.settings.revision + 1 || result.settings.endpoint !== input.endpoint
+      || result.identity?.accountId !== input.accountId || result.identity.userId !== input.userId || result.identity.peerId !== input.peerId)
+      throw Error('memory_configure_unconfirmed');
+    const cleared = await clearLocalMemoryPending(original); return cleared.ok ? ok({ cancelled: false, settings: result }) : cleared;
+  } catch { return fail(appError('operation_result_unknown', 'runtime', 'The original memory configuration could not be confirmed. Refresh its settings before retrying.', true)); }
+}
+
 async function handleHostCredentialRequest(request: HostCredentialRequest): Promise<{ ok: boolean; credential?: unknown }> {
+  if (request.purpose === 'memory') {
+    if (request.operation !== 'read' || !/^memory_[a-f0-9]{32}$/.test(request.credentialRef)) return { ok: false };
+    const result = await memoryCredentialStore(request.credentialRef).read();
+    if (!result.ok) return { ok: false };
+    if (!result.data) return { ok: true };
+    registerSecrets([result.data]); return { ok: true, credential: { type: 'api_key', key: result.data } };
+  }
+  if (request.purpose !== undefined) return { ok: false };
   const settings = host.state?.settings as ProductSettings | undefined;
   if (!settings?.models.some((model) => model.credentialRef === request.credentialRef)) return { ok: false };
   const store = credentialStore(request.credentialRef);

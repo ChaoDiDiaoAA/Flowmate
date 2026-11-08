@@ -1,5 +1,5 @@
 import { AppErrorSchema, CloudDesktopEnvelopeSchema, CloudWorkspaceIdSchema, appError, cloudDesktopFailure, fail,
-  isCloudChildReportCommand, isCloudDeliveryCommand, isCloudDesktopRelayCommand, isCloudMaterialCommand, isCloudProgressCommand, isCloudQueueCommand, isCloudResourceCommand, isCloudReviewCommand, parseCloudDesktopResult, type Result } from '@flowmate/contracts';
+  isCloudChildReportCommand, isCloudDeliveryCommand, isCloudDesktopRelayCommand, isCloudMaterialCommand, isCloudMemoryCommand, isCloudProgressCommand, isCloudQueueCommand, isCloudResourceCommand, isCloudReviewCommand, parseCloudDesktopResult, type Result } from '@flowmate/contracts';
 import type { PersonalAgentCommand } from '../packages/contracts/src/personal-agent-commands.ts';
 import type { CloudMaterialUpload } from './cloud-material-upload.ts';
 import type { CloudQueueAuthority } from './cloud-queue-authority.ts';
@@ -13,6 +13,7 @@ export function createCloudDesktopHandler(options: {
   workspaceId: string;
   authorize(command: PersonalAgentCommand): Promise<Result<void>>;
   dispatch(command: PersonalAgentCommand): Promise<unknown>;
+  memory?: import('@flowmate/contracts').MemoryApi;
   material?: Pick<CloudMaterialUpload, 'begin' | 'append' | 'status' | 'finish'>;
   resources?: Pick<CloudResourceUpload, 'begin' | 'append' | 'status' | 'finish'>;
   queue?: Pick<CloudQueueAuthority, 'read' | 'apply' | 'queryControl'>;
@@ -28,6 +29,23 @@ export function createCloudDesktopHandler(options: {
     if (!envelope.success) return fail(appError('input_invalid', 'input', 'The cloud desktop request is invalid.'));
     if (envelope.data.workspaceId !== workspaceId) return fail(appError('cloud_workspace_forbidden', 'input', 'The cloud workspace is unavailable.'));
     const command = envelope.data.command;
+    if (isCloudMemoryCommand(command)) {
+      if (!options.memory) return cloudDesktopFailure(command);
+      try {
+        const input = structuredClone(command.input);
+        const value = command.type === 'cloud_memory_get_settings' ? await options.memory.getSettings()
+          : command.type === 'cloud_memory_list_entries' ? await options.memory.listEntries(input as typeof command.input)
+          : command.type === 'cloud_memory_read_entry' ? await options.memory.readEntry(input as typeof command.input)
+          : command.type === 'cloud_memory_list_operations' ? await options.memory.listOperations(input as typeof command.input)
+          : command.type === 'cloud_memory_search' ? await options.memory.search(input as typeof command.input)
+          : command.type === 'cloud_memory_update_policy' ? await options.memory.updatePolicy(input as typeof command.input)
+          : command.type === 'cloud_memory_remember' ? await options.memory.remember(input as typeof command.input)
+          : command.type === 'cloud_memory_reconcile_remember' ? await options.memory.reconcileRemember(input as typeof command.input)
+          : command.type === 'cloud_memory_reconcile_remember_by_id' ? await options.memory.reconcileRememberById(input as typeof command.input)
+          : await options.memory.forget(input as typeof command.input);
+        return parseCloudDesktopResult(command, value) ?? cloudDesktopFailure(command);
+      } catch { return cloudDesktopFailure(command); }
+    }
     if (isCloudDesktopRelayCommand(command)) {
       const relay = options.desktopRelay; if (!relay) return cloudDesktopFailure(command);
       const input = command.input;

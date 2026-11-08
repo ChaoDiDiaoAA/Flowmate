@@ -10,7 +10,8 @@ export function isOwnDesktopWindow(id: number, handles: readonly Buffer[]): bool
 }
 type KimiApi = {
   listWindows(signal: AbortSignal): Promise<Window[]>;
-  observe(window: Window, signal: AbortSignal): Promise<{ window: Window; tree: string; focused: string | null; truncated?: boolean }>;
+  observe(window: Window, signal: AbortSignal): Promise<{ protected: true }
+    | { window: Window; tree: string; focused: string | null; truncated?: boolean }>;
   click(window: Window, index: number, signal: AbortSignal): Promise<void>;
   setValue(window: Window, index: number, value: string, signal: AbortSignal): Promise<void>;
   typeText(window: Window, value: string, signal: AbortSignal): Promise<void>;
@@ -51,9 +52,16 @@ export function createKimiDesktop(api: KimiApi, lock?: <T>(signal: AbortSignal, 
     if (!line) return fail(appError('desktop_target_changed', 'runtime', 'The observed control is unavailable.'));
     return ok({ connectionId, window: selected, element: line });
   };
+  const forgetObservations = (owner: Owner) => {
+    for (const [id, value] of observations) if (isDeepStrictEqual(value.owner, owner)) observations.delete(id);
+  };
+  const protectedWindow = (owner: Owner, code = 'desktop_protected_content') => {
+    forgetObservations(owner);
+    return fail(appError(code, 'runtime', 'This window contains a protected field. Ask the user to handle it manually in the original application.'));
+  };
   const revoke = (owner: Owner) => {
     selections.delete(key(owner));
-    for (const [id, value] of observations) if (isDeepStrictEqual(value.owner, owner)) observations.delete(id);
+    forgetObservations(owner);
   };
   return {
     listWindows: (signal: AbortSignal): Promise<Result<Window[]>> => run(signal, async valid => {
@@ -79,6 +87,7 @@ export function createKimiDesktop(api: KimiApi, lock?: <T>(signal: AbortSignal, 
     observe: (owner: Owner, signal: AbortSignal): Promise<Result<{ observationId: string; window: Window; tree: string; truncated: boolean }>> => run(signal, async valid => {
       const selected = selections.get(key(owner)); if (!selected) return unavailable();
       const state = await api.observe(selected, signal);
+      if ('protected' in state) return protectedWindow(owner);
       if (closed || !valid() || !isDeepStrictEqual(selections.get(key(owner)), selected)
         || !isDeepStrictEqual(selected, state.window) || typeof state.tree !== 'string' || !state.tree) return unavailable();
       const lines: string[] = []; let bytes = 0, truncated = state.truncated === true;
@@ -95,7 +104,9 @@ export function createKimiDesktop(api: KimiApi, lock?: <T>(signal: AbortSignal, 
     resolveTarget: (owner: Owner, action: DesktopActionProposal, signal: AbortSignal): Promise<Result<DesktopActionTarget>> =>
       run(signal, async valid => {
         const original = resolve(owner, action); if (!original.ok) return original;
-        const current = await api.observe(original.data.window, signal), stillAuthorized = resolve(owner, action);
+        const current = await api.observe(original.data.window, signal);
+        if ('protected' in current) return protectedWindow(owner, 'desktop_target_changed');
+        const stillAuthorized = resolve(owner, action);
         if (closed || !valid() || !stillAuthorized.ok || !isDeepStrictEqual(stillAuthorized.data, original.data)
           || !isDeepStrictEqual(current.window, original.data.window) || element(current.tree, action.elementIndex) !== original.data.element)
           return fail(appError('desktop_target_changed', 'runtime', 'The observed desktop target changed; observe it again.'));
@@ -105,6 +116,7 @@ export function createKimiDesktop(api: KimiApi, lock?: <T>(signal: AbortSignal, 
       const original = resolve(owner, action);
       if (!original.ok || !isDeepStrictEqual(original.data, target)) return unavailable();
       const current = await api.observe(target.window, signal);
+      if ('protected' in current) return protectedWindow(owner);
       const stillAuthorized = resolve(owner, action);
       if (closed || !valid() || !stillAuthorized.ok || !isDeepStrictEqual(stillAuthorized.data, target)
         || !isDeepStrictEqual(current.window, target.window) || element(current.tree, action.elementIndex) !== target.element)

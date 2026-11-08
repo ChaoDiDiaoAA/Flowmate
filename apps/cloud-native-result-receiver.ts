@@ -19,8 +19,13 @@ export class CloudNativeResultReceiver {
     const row = store.db.query<{ session_id: number }, [number]>('SELECT session_id FROM invoice_works WHERE id=?').get(event.workId);
     const session = need(store.sessions.get(event.sessionId));
     if (!row || row.session_id !== event.sessionId || session.runtimeKind !== 'durable'
-      || session.durableRuntimeId !== event.cloudRuntimeId || session.cloudWorkspaceId !== event.workspaceId
-      || session.durableConversationId !== event.nativeConversationId) conflict();
+      || session.durableRuntimeId !== event.cloudRuntimeId || session.cloudWorkspaceId !== event.workspaceId) conflict();
+    const phase = need(store.invoiceWorks.getPhase({ workId: event.workId, attemptId: event.attemptId, requestId: event.requestId }));
+    if (!phase || (phase.basis.executionMode === 'item-lane-approval-v1'
+      ? phase.itemId === null || phase.itemId !== event.itemId
+      : event.itemId !== undefined || session.durableConversationId !== event.nativeConversationId)
+      || phase.nativeConversationId !== null && phase.nativeConversationId !== event.nativeConversationId
+      || phase.nativeSubmissionId !== null && phase.nativeSubmissionId !== event.nativeSubmissionId) conflict();
   }
 
   private prior(store: SqlDatabaseStore, event: CloudNativeResult): CloudNativeResultReceipt | null {
@@ -30,13 +35,15 @@ export class CloudNativeResultReceiver {
     if (!row) return null;
     if (!isDeepStrictEqual(CloudNativeResultSchema.parse(JSON.parse(row.event_json)), event)) conflict();
     return CloudNativeResultReceiptSchema.parse({ receiptId: row.receipt_id, cloudRuntimeId: event.cloudRuntimeId,
-      workId: event.workId, sessionId: event.sessionId, nativeConversationId: event.nativeConversationId, nativeSubmissionId: event.nativeSubmissionId });
+      workId: event.workId, sessionId: event.sessionId, ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
+      nativeConversationId: event.nativeConversationId, nativeSubmissionId: event.nativeSubmissionId });
   }
 
   async receive(raw: unknown): Promise<Result<CloudNativeResultReceipt>> {
     const parsed = CloudNativeResultSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'The cloud native result is invalid.'));
-    const event = parsed.data, query = { workId: event.workId, sessionId: event.sessionId, attemptId: event.attemptId, requestId: event.requestId };
+    const event = parsed.data, query = { workId: event.workId, sessionId: event.sessionId,
+      ...(event.itemId === undefined ? {} : { itemId: event.itemId }), attemptId: event.attemptId, requestId: event.requestId };
     try {
       const saved = await this.database.read(store => { this.owner(store, event); return this.prior(store, event); });
       if (saved) return ok(saved);
@@ -51,8 +58,9 @@ export class CloudNativeResultReceiver {
         let offset = 0, total: number | undefined; const pieces: string[] = [];
         for (;;) {
           const entry = PersonalHistoryEntrySchema.parse(need(await this.runtime.queryHistoryEntry({ workId: event.workId, sessionId: event.sessionId,
-            entryId: answerEntryId, throughEntryId: answerEntryId, offset, limit: 16384 })));
+            ...(event.itemId === undefined ? {} : { itemId: event.itemId }), entryId: answerEntryId, throughEntryId: answerEntryId, offset, limit: 16384 })));
           if (entry.owner.workId !== event.workId || entry.owner.sessionId !== event.sessionId || entry.owner.childRunId !== null
+            || entry.owner.itemId !== event.itemId
             || entry.entryId !== answerEntryId || entry.throughEntryId !== answerEntryId || entry.offset !== offset || entry.kind !== 'pi.assistant'
             || entry.totalBytes > 14 * 1024 * 1024 || total !== undefined && entry.totalBytes !== total) conflict();
           total = entry.totalBytes; pieces.push(entry.text);
@@ -78,7 +86,8 @@ export class CloudNativeResultReceiver {
           native_submission_id,event_json,received_at) VALUES(?,?,?,?,?,?,?,?)`).run(receiptId, event.cloudRuntimeId, event.workId, event.attemptId,
           event.nativeConversationId, event.nativeSubmissionId, JSON.stringify(event), at);
         return ok(CloudNativeResultReceiptSchema.parse({ receiptId, cloudRuntimeId: event.cloudRuntimeId, workId: event.workId,
-          sessionId: event.sessionId, nativeConversationId: event.nativeConversationId, nativeSubmissionId: event.nativeSubmissionId }));
+          sessionId: event.sessionId, ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
+          nativeConversationId: event.nativeConversationId, nativeSubmissionId: event.nativeSubmissionId }));
       });
     } catch (error) {
       return fail(error instanceof ReceiptFault ? error.detail

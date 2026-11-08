@@ -44,16 +44,27 @@ export function createKimiMcpApi(client: Client) {
   };
   const write = (expression: string) => `nodeRepl.write(${JSON.stringify(marker)} + JSON.stringify(${expression}), "flowmate-result");`;
   const windowSchema = DesktopActionTargetSchema.shape.window;
-  const observeSchema = z.object({ window: windowSchema, tree: z.string(), focused: z.string().nullable(), truncated: z.boolean() }).strict();
+  const observeSchema = z.union([z.object({ protected: z.literal(true) }).strict(),
+    z.object({ window: windowSchema, tree: z.string(), focused: z.string().nullable(), truncated: z.boolean() }).strict()]);
+  // shortcut: Windows KimiCU exposes formatted text, use structured protection flags when the API exposes them.
+  const protectedContent = /\b(?:IsPassword\s*[:=]\s*(?:true|1)|password|passcode|pin\s+code|verification\s+code)\b|密码|口令|验证码/i;
   return {
     listWindows: async (signal: AbortSignal): Promise<Window[]> => z.array(windowSchema).parse(await call(
       `var flowmateValue = await kimiCU.list_windows();\n${write('flowmateValue')}`, {}, signal)),
     observe: async (window: Window, signal: AbortSignal) => observeSchema.parse(await call(
-      `var flowmateValue = await kimiCU.get_window_state({window: flowmateArgs.window, include_screenshot: false, include_text: true});\n`
-      + `var flowmateTree = flowmateValue.accessibility?.tree ?? null;\n`
-      + `var flowmateTruncated = !!flowmateTree && flowmateTree.length > 30000;\n`
-      + `if (flowmateTruncated) flowmateTree = flowmateTree.slice(0, 30000).replace(/[^\\n]*$/, "");\n`
-      + write('{window: flowmateValue.window, tree: flowmateTree, focused: flowmateValue.accessibility?.focused_element ?? null, truncated: flowmateTruncated}'), { window }, signal)),
+      `{
+        const flowmateValue = await kimiCU.get_window_state({window: flowmateArgs.window, include_screenshot: false, include_text: true});
+        let flowmateTree = flowmateValue.accessibility?.tree ?? null;
+        const flowmateFocus = flowmateValue.accessibility?.focused_element ?? null;
+        const flowmateProtected = ${protectedContent};
+        if (flowmateProtected.test(flowmateTree ?? '') || flowmateProtected.test(flowmateFocus ?? '')) {
+          ${write('{protected: true}')}
+        } else {
+          const flowmateTruncated = !!flowmateTree && flowmateTree.length > 30000;
+          if (flowmateTruncated) flowmateTree = flowmateTree.slice(0, 30000).replace(/[^\\n]*$/, "");
+          ${write('{window: flowmateValue.window, tree: flowmateTree, focused: flowmateFocus, truncated: flowmateTruncated}')}
+        }
+      }`, { window }, signal)),
     click: async (window: Window, index: number, signal: AbortSignal) => { await call(
       `await kimiCU.click({window: flowmateArgs.window, element_index: flowmateArgs.index});\n${write('true')}`, { window, index }, signal); },
     setValue: async (window: Window, index: number, value: string, signal: AbortSignal) => { await call(

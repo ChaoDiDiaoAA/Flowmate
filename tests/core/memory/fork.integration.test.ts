@@ -56,6 +56,30 @@ function noExecutionChanges(before: ReturnType<typeof facts>, f: ReturnType<type
   f.quiet();
 }
 
+it('a fork retains its original external memory identity and receives a distinct remote Session', async () => {
+  const f = fixture(), db = f.store.db, endpoint = 'http://127.0.0.1:19338';
+  db.query("INSERT INTO memory_identities(id,environment,owner_id,account_id,user_id,peer_id,credential_ref,state,created_at,updated_at) VALUES(1,'local','owner','account','alice','peer','synthetic-reference','active',?,?)").run(at, at);
+  db.query("INSERT INTO memory_bindings(runtime_kind,session_id,branch,provider,identity_id,remote_session_id,endpoint,remote_state,created_at) VALUES('agent_session',?,0,'openviking',1,'original-remote',?,'ready',?)")
+    .run(f.session.sessionId, endpoint, at);
+  db.query("INSERT INTO memory_entries(id,identity_id,endpoint,uri,revision,state,source_json,created_at,updated_at) VALUES(1,1,?,'viking://user/alice/memories/fact.md',1,'active',?,?,?)")
+    .run(endpoint, JSON.stringify({ version: 1, approvedContent: 'Original fact.' }), at, at);
+  db.query("INSERT INTO memory_grants(entry_id,scope_kind,scope_id,revision) VALUES(1,'session',?,1)").run(String(f.session.sessionId));
+  const fork = need(await f.service.forkSession(f.request));
+  const original = db.query<{ remote_session_id: string }, [number]>("SELECT remote_session_id FROM memory_bindings WHERE session_id=?").get(f.session.sessionId)!;
+  const child = db.query<{ provider: string; identity_id: number; endpoint: string; remote_session_id: string; remote_state: string }, [number]>(
+    'SELECT provider,identity_id,endpoint,remote_session_id,remote_state FROM memory_bindings WHERE session_id=?').get(fork.session.sessionId);
+  expect(child).toMatchObject({ provider: 'openviking', identity_id: 1, endpoint, remote_state: 'pending' });
+  expect(child!.remote_session_id).not.toBe(original.remote_session_id);
+  expect(db.query('SELECT scope_id FROM memory_grants WHERE entry_id=1 AND scope_kind=\'session\' ORDER BY scope_id').all())
+    .toEqual([{ scope_id: String(f.session.sessionId) }, { scope_id: String(fork.session.sessionId) }]);
+  expect(need(await f.service.forkSession(f.request)).session.sessionId).toBe(fork.session.sessionId);
+  expect(db.query('SELECT * FROM memory_sync').all()).toEqual([]);
+  expect(need(await f.service.deleteSession(fork.session.sessionId)).disposition).toBe('permanent');
+  expect(db.query('SELECT scope_id FROM memory_grants WHERE entry_id=1 AND scope_kind=\'session\'').all())
+    .toEqual([{ scope_id: String(f.session.sessionId) }]);
+  f.quiet();
+});
+
 // Seed genuine P8 ownership through the ContextRepository and MemoryStore, not NULL legacy associations.
 function appendOwnedInput(f: ReturnType<typeof fixture>, sessionId: number, entryId: string) {
   const row = need(f.store.sessions.get(sessionId)), db = f.store.db;

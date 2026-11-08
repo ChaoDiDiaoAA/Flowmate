@@ -27,6 +27,23 @@ test.skipIf(process.platform !== 'linux')('Authority routes only typed original 
   } finally { need(await client.close()); need(await server.close()); }
 });
 
+test.skipIf(process.platform !== 'linux')('child observations crossing Runtime RPC retain the original invoice identity', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowmate-child-owner-rpc-')), socketPath = join(root, 'runtime.sock');
+  const owner = { workId: 7, sessionId: 8, itemId: 10, attemptId: 9, requestId: 'phase', childRunId: 11,
+    childSessionId: 12, originToolCallId: 13, nativeToolTaskId: 14 };
+  let itemId = owner.itemId;
+  const runtime = { observeSubagent: async () => ok({ ...owner, itemId, creation: 'created', nativeConversationId: 15,
+    nativeSubmissionId: 16, status: 'done', answer: 'Saved', reason: null, consumedAt: null, execution: 'closed', creatorExecution: 'closed',
+    parentToolResultEntryId: null, parentModelTaskId: null, parentModelReceivedAt: null }) } as unknown as DurableRuntimePort;
+  const server = need(await listenCloudUnixRpc({ socketPath, handle: createCloudRuntimeRpcHandler(runtime) }));
+  const client = createCloudRuntimeRpcClient(socketPath);
+  try {
+    expect(await client.observeSubagent(owner)).toMatchObject({ ok: true, data: { itemId: owner.itemId } });
+    itemId++;
+    expect(await client.observeSubagent(owner)).toMatchObject({ ok: false, error: { code: 'cloud_runtime_response_invalid' } });
+  } finally { need(await client.close()); need(await server.close()); }
+});
+
 test.skipIf(process.platform !== 'linux')('Runtime history receipts must match the original entry and watermark', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-runtime-history-rpc-')), socketPath = join(root, 'runtime.sock');
   const runtime = { async queryHistoryEntry() { return ok({ owner: { runtimeKind: 'durable', workId: 7, sessionId: 8, childRunId: null },

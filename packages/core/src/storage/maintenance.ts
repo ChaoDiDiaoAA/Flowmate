@@ -22,11 +22,11 @@ export type BackupManifest = { version: 1; backupId: string; createdAt: string; 
 export type BackupReceipt = { directory: string; manifest: BackupManifest };
 
 export const InstalledReleaseSchema = z.object({ version: z.literal(1), releaseId: z.string().uuid(),
-  productVersion: z.string().min(1).max(128), schemaVersion: z.number().int().min(1).max(25),
+  productVersion: z.string().min(1).max(128), schemaVersion: z.number().int().min(1).max(27),
   settingsVersion: z.number().int().min(1).max(7) }).strict();
 const backupSchema = z.object({ version: z.literal(1), backupId: z.string().uuid(), createdAt: z.string().datetime(),
   productVersion: z.string().max(128).nullable(), releaseId: z.string().uuid().nullable(),
-  schemaVersion: z.number().int().min(1).max(25).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
+  schemaVersion: z.number().int().min(1).max(27).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
   files: z.array(z.object({ path: z.string().min(1).max(1024), byteLength: z.number().int().nonnegative().safe() }).strict()).min(1),
   gaps: z.array(z.string().max(256)) }).strict();
 
@@ -69,7 +69,7 @@ function inspectDatabase(db: Database): { schemaVersion: number | null; journalM
   let schemaVersion: number | null = null;
   if (migrationTable) {
     const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
-    if (!rows.length || rows.length > 25 || rows.some((row, index) => row.version !== index + 1)) throw Error('maintenance_store_incompatible');
+    if (!rows.length || rows.length > 27 || rows.some((row, index) => row.version !== index + 1)) throw Error('maintenance_store_incompatible');
     schemaVersion = rows.length;
   } else if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get())
     throw Error('maintenance_store_incompatible');
@@ -119,8 +119,9 @@ function persistentFiles(paths: ProductPaths): string[] {
   }
   // Electron's Windows DPAPI provider needs the original encrypted key in Local State after restoring credentials.
   for (const path of ['Local State', 'service-installation.json', 'data/app.sqlite', 'data/settings.json', 'data/installed-release.json',
-    'data/desktop-service-settings-request.json', 'artifacts', 'outputs',
-    'runtime/resource-bundles', 'runtime/subagents', 'security/credentials', 'security/service-credentials', 'imports/invoices',
+    'data/desktop-service-settings-request.json', 'data/desktop-service-memory-request.json', 'data/desktop-memory-request.json', 'artifacts', 'outputs',
+    'runtime/resource-bundles', 'runtime/subagents', 'security/credentials', 'security/service-credentials',
+    'security/memory-credentials', 'security/service-memory-credentials', 'imports/invoices',
     'evaluation/agent-eval/runs', 'evaluation/agent-eval/calibration-runs']) {
     if (existsSync(join(paths.root, path))) visit(path);
   }
@@ -129,7 +130,7 @@ function persistentFiles(paths: ProductPaths): string[] {
 
 async function checkReferences(paths: ProductPaths, version: number | null): Promise<string[]> {
   const gaps: string[] = [];
-  if (version !== 20 && version !== 21 && version !== 22 && version !== 23 && version !== 24 && version !== 25) { if (version !== null) gaps.push('matching_old_program_or_explicit_upgrade_required'); return gaps; }
+  if (version !== 20 && version !== 21 && version !== 22 && version !== 23 && version !== 24 && version !== 25 && version !== 26 && version !== 27) { if (version !== null) gaps.push('matching_old_program_or_explicit_upgrade_required'); return gaps; }
   const db = new Database(paths.databaseFile, { readonly: true });
   try {
     const documents = createDocumentRepository(db), contentsReader = createManagedFileContents(db);
@@ -210,6 +211,19 @@ async function checkReferences(paths: ProductPaths, version: number | null): Pro
         throw Error('maintenance_store_incompatible');
       if (!history.ok || session.data.nativeUnusable || session.data.modelUseBlocked) gaps.push(`session_execution_requires_recheck:${row.id}`);
     }
+    if (version === 27) {
+      const identities = db.query<{ id: number; environment: string; credential_ref: string }, []>(
+        'SELECT id,environment,credential_ref FROM memory_identities').all();
+      if (identities.length || db.query("SELECT id FROM memory_bindings WHERE provider='openviking' LIMIT 1").get())
+        gaps.push('openviking_external_backup_required');
+      for (const identity of identities) {
+        if (identity.environment === 'cloud') { gaps.push(`openviking_external_credentials_backup_required:${identity.id}`); continue; }
+        const safe = /^[A-Za-z0-9_-]{16,80}$/.test(identity.credential_ref);
+        if (!safe || !['security/memory-credentials', 'security/service-memory-credentials']
+          .some(directory => existsSync(join(paths.root, directory, identity.credential_ref + '.json'))))
+          gaps.push(`memory_credential_backup_required:${identity.id}`);
+      }
+    }
     if (inspectRuntimeRecovery(db)) gaps.push('runtime_stop_or_required_observation_unconfirmed');
     return [...new Set(gaps)];
   } catch (error) {
@@ -263,7 +277,7 @@ export async function backupStore(input: ProductPaths, destination: string): Pro
     const inspection = inspectStore(paths); if (!inspection.ok) return inspection;
     const gaps = await checkReferences(paths, inspection.data.schemaVersion), selected = persistentFiles(paths);
     if (!selected.some(path => path !== 'Local State')) throw Error('maintenance_backup_failed');
-    for (const path of selected.filter(path => path.startsWith('security/credentials/'))) {
+    for (const path of selected.filter(path => /^(security\/credentials|security\/memory-credentials|security\/service-memory-credentials)\/[^/]+\.json$/.test(path))) {
       const envelope = jsonFile(paths.root, path);
       if (!envelope || typeof envelope !== 'object' || Object.keys(envelope).sort().join(',') !== 'ciphertext,version'
         || !('version' in envelope) || envelope.version !== 1 || !('ciphertext' in envelope)
@@ -314,7 +328,8 @@ export async function prepareStoreUpgrade(input: ProductPaths, rawRelease: Packa
     const selected = persistentFiles(paths);
     if (!selected.some(path => path !== 'Local State')) return ok(null);
     if (inspection.data.schemaVersion === null && selected.some(path => path === 'data/settings.json'
-      || /^(artifacts|outputs|security\/credentials|runtime\/(resource-bundles|subagents))\//.test(path)))
+      || path === 'data/desktop-service-memory-request.json' || path === 'data/desktop-memory-request.json'
+      || /^(artifacts|outputs|security\/(credentials|memory-credentials|service-memory-credentials)|runtime\/(resource-bundles|subagents))\//.test(path)))
       return errorResult('maintenance_store_incompatible');
     if (inspection.data.installedReleaseId === release.releaseId && inspection.data.schemaVersion === release.schemaVersion
       && inspection.data.settingsVersion === release.settingsVersion) { await checkReferences(paths, inspection.data.schemaVersion); return ok(null); }

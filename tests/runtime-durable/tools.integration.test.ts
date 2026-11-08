@@ -128,6 +128,170 @@ test.each(['single', 'mixed'] as const)('a browser request ends its phase and ca
   } finally { need(await runtime.close()); server.stop(true); }
 }, 10_000);
 
+test('a rejected invoice approval resumes the same native tool without executing an external action', async () => {
+  let requests = 0, executions = 0, decision = false;
+  const began = Promise.withResolvers<void>();
+  const server = Bun.serve({ port: 0, fetch: async request => {
+    requests++; const body = await request.json() as { messages: Array<{ role: string }> };
+    const call = !body.messages.some(message => message.role === 'tool');
+    const delta = call ? { role: 'assistant', tool_calls: [{ index: 0, id: 'original-browser-request', type: 'function',
+      function: { name: 'browser_request_read', arguments: '{}' } }] } : { role: 'assistant', content: 'Original rejection received.' };
+    const chunk = { id: 'wait-rejection', object: 'chat.completion.chunk', created: 1, model: 'tool-model',
+      choices: [{ index: 0, delta, finish_reason: call ? 'tool_calls' : 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const tool = { name: 'browser_request_read', description: 'Request a page read.', executionMode: 'sequential' as const,
+    effect: 'LOCAL_WRITE' as const, inputSchema: { type: 'object', properties: {}, additionalProperties: false } };
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined), readWorkingContext: query => {
+      const context = working(query, [tool.name]); return ok({ ...context, phase: { ...context.phase,
+        basis: { ...context.phase.basis, executionMode: 'item-lane-approval-v1' } } });
+    }, verifyWorkingContext: () => ok(undefined), tools: [tool], executeTool: () => { executions++; return ok({ status: 'succeeded', data: { proposalId: 9 } }); },
+    readToolResult: () => ok({ status: 'succeeded', data: { proposalId: 9 } }), onToolFeedback: () => ok(undefined),
+    approvalWait: { begin: async input => { expect(input).toMatchObject({ itemId: 71, proposalId: 9, kind: 'browser' }); began.resolve();
+      return ok({ status: 'waiting', scheduling: 'waiting_approval', decisionRequestId: null }); },
+    read: async () => ok(decision ? { status: 'rejected', scheduling: 'active', decisionRequestId: 'reject-original' }
+      : { status: 'waiting', scheduling: 'waiting_approval', decisionRequestId: null }) } }));
+  const query = { ...owner, itemId: 71, requestId: 'waiting-browser' };
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: query.itemId }));
+    need(await runtime.submit({ ...query, text: 'Read this page only after confirmation.', config: config(server.port!) }));
+    await Promise.race([began.promise, new Promise<never>((_resolve, reject) => setTimeout(() => reject(Error('Original approval did not begin.')), 2_000))]);
+    expect(need(await runtime.getSubmission(query))).toMatchObject({ status: 'placed' });
+    expect(requests).toBe(1); expect(executions).toBe(1);
+    decision = true;
+    expect(need(await runtime.waitForSubmission(query))).toMatchObject({ status: 'done', answer: 'Original rejection received.' });
+    expect(requests).toBe(2); expect(executions).toBe(1);
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 15_000);
+
+test('memory is projected only to the original invoice phase request', async () => {
+  const requests: string[] = [], lookedUp: number[] = [];
+  const server = Bun.serve({ port: 0, fetch: async request => { requests.push(await request.text()); return response(false); } });
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined),
+    readWorkingContext: query => { const context = working(query, []); return ok({ ...context,
+      item: { ...context.item, itemId: query.itemId! }, phase: { ...context.phase,
+        basis: { ...context.phase.basis, executionMode: 'item-lane-approval-v1' } } }); },
+    verifyWorkingContext: () => ok(undefined), readMemory: query => {
+      lookedUp.push(query.itemId!);
+      return ok({ status: 'ready' as const, items: [{ uri: `viking://user/alice/memories/${query.itemId}.md`,
+        revision: 1, content: `Invoice memory ${query.itemId}`, truncated: false }] });
+    } }));
+  const first = { ...owner, itemId: 71, requestId: 'memory-first' }, second = { ...owner, itemId: 72, requestId: 'memory-second' };
+  try {
+    for (const query of [first, second]) {
+      need(await runtime.openConversation({ workId: query.workId, sessionId: query.sessionId, itemId: query.itemId }));
+      need(await runtime.submit({ ...query, text: 'Process the invoice.', config: config(server.port!) }));
+      expect(need(await runtime.waitForSubmission(query)).status).toBe('done');
+    }
+    expect(lookedUp).toEqual([71, 72]);
+    expect(requests[0]).toContain('Invoice memory 71'); expect(requests[0]).not.toContain('Invoice memory 72');
+    expect(requests[1]).toContain('Invoice memory 72'); expect(requests[1]).not.toContain('Invoice memory 71');
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 15_000);
+
+test('a waiting original approval does not block another invoice in the same Work', async () => {
+  let decision = false, executions = 0;
+  const began = Promise.withResolvers<void>();
+  const server = Bun.serve({ port: 0, fetch: async request => {
+    const body = await request.json() as { messages: Array<{ role: string; content?: string }> };
+    const context = JSON.parse(body.messages.find(message => message.role === 'user')!.content!) as { phase: { requestId: string } };
+    const first = context.phase.requestId === 'first-wait', tool = first && !body.messages.some(message => message.role === 'tool');
+    const delta = tool ? { role: 'assistant', tool_calls: [{ index: 0, id: 'original-wait', type: 'function',
+      function: { name: 'browser_request_read', arguments: '{}' } }] } : { role: 'assistant', content: first ? 'First resumed.' : 'Second completed.' };
+    const chunk = { id: 'parallel-item', object: 'chat.completion.chunk', created: 1, model: 'tool-model',
+      choices: [{ index: 0, delta, finish_reason: tool ? 'tool_calls' : 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const tool = { name: 'browser_request_read', description: 'Request a page read.', executionMode: 'sequential' as const,
+    effect: 'LOCAL_WRITE' as const, inputSchema: { type: 'object', properties: {}, additionalProperties: false } };
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined), readWorkingContext: query => {
+      const context = working(query, [tool.name]); return ok({ ...context, item: { ...context.item, itemId: query.itemId! },
+        phase: { ...context.phase, basis: { ...context.phase.basis, executionMode: 'item-lane-approval-v1' } } });
+    }, verifyWorkingContext: () => ok(undefined), tools: [tool], executeTool: () => { executions++; return ok({ status: 'succeeded', data: { proposalId: 9 } }); },
+    readToolResult: () => ok({ status: 'succeeded', data: { proposalId: 9 } }), onToolFeedback: () => ok(undefined),
+    approvalWait: { begin: async () => { began.resolve(); return ok({ status: 'waiting', scheduling: 'waiting_approval', decisionRequestId: null }); },
+      read: async () => ok(decision ? { status: 'rejected', scheduling: 'active', decisionRequestId: 'reject-original' }
+        : { status: 'waiting', scheduling: 'waiting_approval', decisionRequestId: null }) } }));
+  const first = { ...owner, itemId: 71, requestId: 'first-wait' }, second = { ...owner, itemId: 72, requestId: 'second-item' };
+  try {
+    need(await runtime.openConversation({ workId: first.workId, sessionId: first.sessionId, itemId: first.itemId }));
+    need(await runtime.openConversation({ workId: second.workId, sessionId: second.sessionId, itemId: second.itemId }));
+    need(await runtime.submit({ ...first, text: 'First invoice.', config: config(server.port!) }));
+    await Promise.race([began.promise, new Promise<never>((_resolve, reject) => setTimeout(() => reject(Error('Original approval did not begin.')), 2_000))]);
+    need(await runtime.submit({ ...second, text: 'Second invoice.', config: config(server.port!) }));
+    const completed = await Promise.race([runtime.waitForSubmission(second),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(Error('Second invoice remained blocked.')), 2_000))]);
+    expect(need(completed)).toMatchObject({ status: 'done', answer: 'Second completed.' });
+    expect(need(await runtime.getSubmission(first))).toMatchObject({ status: 'placed' });
+    decision = true;
+    expect(need(await runtime.waitForSubmission(first))).toMatchObject({ status: 'done', answer: 'First resumed.' });
+    expect(executions).toBe(1);
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 15_000);
+
+test('an approved invoice request invokes only its original nested browser tool and resumes the model', async () => {
+  const calls: DurableProductToolCall[] = [], offered: string[][] = [];
+  const server = Bun.serve({ port: 0, fetch: async request => {
+    const body = await request.json() as { messages: Array<{ role: string }>; tools?: Array<{ function: { name: string } }> };
+    offered.push((body.tools ?? []).map(tool => tool.function.name));
+    const call = !body.messages.some(message => message.role === 'tool');
+    const delta = call ? { role: 'assistant', tool_calls: [{ index: 0, id: 'original-browser-request', type: 'function',
+      function: { name: 'browser_request_read', arguments: '{}' } }] } : { role: 'assistant', content: 'Original page received.' };
+    const chunk = { id: 'wait-approved', object: 'chat.completion.chunk', created: 1, model: 'tool-model',
+      choices: [{ index: 0, delta, finish_reason: call ? 'tool_calls' : 'stop' }] };
+    return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const requestTool = { name: 'browser_request_read', description: 'Request a page read.', executionMode: 'sequential' as const,
+    effect: 'LOCAL_WRITE' as const, inputSchema: { type: 'object', properties: {}, additionalProperties: false } };
+  const executeTool = { ...requestTool, name: 'browser_read_approved', description: 'Read the confirmed page.' };
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined), readWorkingContext: query => {
+      const context = working(query, [requestTool.name, executeTool.name]); return ok({ ...context, phase: { ...context.phase,
+        basis: { ...context.phase.basis, executionMode: 'item-lane-approval-v1' } } });
+    }, verifyWorkingContext: () => ok(undefined), tools: [requestTool, executeTool], executeTool: call => {
+      calls.push(call); return ok(call.name === requestTool.name ? { status: 'succeeded', data: { proposalId: 9 } }
+        : { status: 'succeeded', data: { text: 'untrusted original page' } });
+    }, readToolResult: call => ok(call.name === requestTool.name ? { status: 'succeeded', data: { proposalId: 9 } } : null),
+    onToolFeedback: () => ok(undefined), approvalWait: { begin: async () => ok({ status: 'approved', scheduling: 'active', decisionRequestId: 'approve-original' }),
+      read: async () => ok({ status: 'approved', scheduling: 'active', decisionRequestId: 'approve-original' }) } }));
+  const query = { ...owner, itemId: 71, requestId: 'approved-browser' };
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: query.itemId }));
+    need(await runtime.submit({ ...query, text: 'Read this page only after confirmation.', config: config(server.port!) }));
+    expect(need(await runtime.waitForSubmission(query))).toMatchObject({ status: 'done', answer: 'Original page received.' });
+    expect(calls.map(call => call.name)).toEqual(['browser_request_read', 'browser_read_approved']);
+    expect(calls[1]!.nativeTaskId).not.toBe(calls[0]!.nativeTaskId);
+    expect(calls[1]!.nativeToolCallId).toBe('original-browser-request/approved-execution');
+    expect(calls[1]).toMatchObject({ ...query, arguments: {} });
+    expect(offered.every(names => names.includes('browser_request_read') && !names.includes('browser_read_approved'))).toBe(true);
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 15_000);
+
+test('an invoice tool call and its native feedback retain the original item identity', async () => {
+  const calls: DurableProductToolCall[] = [], feedback: DurableProductToolFeedback[] = [];
+  const server = Bun.serve({ port: 0, fetch: async request => {
+    const body = await request.json() as { messages: Array<{ role: string }> };
+    return response(!body.messages.some(message => message.role === 'tool'));
+  } });
+  const runtime = need(await createDurableRuntime({ storage: new MemoryStorage(), readApiKey: () => 'synthetic-tool-key',
+    verifyModelUse: () => ok(undefined), reserveModelRequest: () => ok(undefined), readWorkingContext: query => ok(working(query)),
+    verifyWorkingContext: () => ok(undefined), tools: [definition],
+    executeTool: call => { calls.push(call); return ok({ status: 'succeeded', data: { invoiceText: 'original' } }); },
+    readToolResult: () => ok(null), onToolFeedback: value => { feedback.push(value); return ok(undefined); } }));
+  const query = { ...owner, itemId: 71, requestId: 'item-tool' };
+  try {
+    need(await runtime.openConversation({ workId: owner.workId, sessionId: owner.sessionId, itemId: query.itemId }));
+    need(await runtime.submit({ ...query, text: 'Read this invoice.', config: config(server.port!) }));
+    expect(need(await runtime.waitForSubmission(query))).toMatchObject({ status: 'done', answer: 'Original tool receipt consumed.' });
+    expect(calls).toHaveLength(1); expect(feedback).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ itemId: query.itemId, requestId: query.requestId });
+    expect(feedback[0]).toMatchObject({ itemId: query.itemId, nativeTaskId: calls[0]!.nativeTaskId });
+  } finally { need(await runtime.close()); server.stop(true); }
+}, 15_000);
+
 test('native tools consume one product result and exact feedback per original phase despite identical input and provider call IDs', async () => {
   const calls: DurableProductToolCall[] = [], feedback: DurableProductToolFeedback[] = [], seen: string[] = [];
   const checked: string[] = [];

@@ -9,7 +9,8 @@ const invalid = () => fail(appError('input_invalid', 'input', 'The Personal Agen
 const conflict = () => fail(appError('state_conflict', 'input', 'The history does not belong to the requested invoice Work.'));
 const unavailable = () => fail(appError('storage_read_failed', 'storage', 'The original Personal Agent history could not be read.', true));
 const publicOwner = (owner: DurableHistoryOwner): PersonalHistoryOwner => ({ runtimeKind: 'durable', workId: owner.workId,
-  sessionId: owner.child?.childSessionId ?? owner.sessionId, childRunId: owner.child?.childRunId ?? null });
+  sessionId: owner.child?.childSessionId ?? owner.sessionId, childRunId: owner.child?.childRunId ?? null,
+  ...(owner.itemId === undefined ? {} : { itemId: owner.itemId }) });
 
 /** Resolve saved business ownership before crossing the native read boundary; no live execution is required. */
 export function createPersonalHistoryService(options: {
@@ -22,6 +23,11 @@ export function createPersonalHistoryService(options: {
       const session = store.sessions.get(found.data.work.sessionId); if (!session.ok) return session;
       if (session.data.runtimeKind !== 'durable') return conflict();
       const parent = { workId: target.workId, sessionId: session.data.sessionId };
+      if (target.itemId !== undefined) {
+        const item = store.invoiceWorks.get({ view: 'item', workId: target.workId, itemId: target.itemId, limit: 1 });
+        if (!item.ok) return item;
+        return item.data.view === 'item' && item.data.item.itemId === target.itemId ? ok({ ...parent, itemId: target.itemId }) : conflict();
+      }
       if (target.childRunId === undefined) return ok(parent);
       const child = store.runs.get(target.childRunId); if (!child.ok) return child;
       const run = child.data;
@@ -32,8 +38,8 @@ export function createPersonalHistoryService(options: {
         || config.data.durable.workId !== target.workId || config.data.durable.attemptId !== scope.data.attemptId
         || !isDeepStrictEqual(config.data.subagent, { parentRunId: scope.data.parentRunId, originToolCallId: scope.data.originToolCallId,
           phaseId: scope.data.phaseId, itemId: scope.data.itemId, parentRequestId: scope.data.parentRequestId, role: scope.data.role })) return conflict();
-      const source = store.db.query<{ plugin_agent_id: string | null }, [number, number, number, number, string, number]>(
-        `SELECT r.plugin_agent_id FROM runs r JOIN invoice_work_attempts a ON a.run_id=r.parent_run_id
+      const source = store.db.query<{ plugin_agent_id: string | null; scheduler_state: string }, [number, number, number, number, string, number]>(
+        `SELECT r.plugin_agent_id,p.scheduler_state FROM runs r JOIN invoice_work_attempts a ON a.run_id=r.parent_run_id
          JOIN invoice_work_phases p ON p.work_id=a.work_id AND p.attempt_id=a.id
          WHERE r.id=? AND a.work_id=? AND a.id=? AND p.id=? AND p.request_id=? AND p.item_id=?`)
         .get(run.runId, target.workId, scope.data.attemptId, scope.data.phaseId, scope.data.parentRequestId, scope.data.itemId);
@@ -46,6 +52,7 @@ export function createPersonalHistoryService(options: {
       const childSession = store.sessions.get(run.sessionId); if (!childSession.ok) return childSession;
       if (childSession.data.runtimeKind !== 'durable') return conflict();
       return ok({ ...parent, child: { ...parent, attemptId: scope.data.attemptId, requestId: scope.data.parentRequestId,
+        ...(source.scheduler_state === 'legacy' ? {} : { itemId: scope.data.itemId }),
         childRunId: run.runId, childSessionId: run.sessionId, originToolCallId: scope.data.originToolCallId, nativeToolTaskId: Number(native[1]) } });
     }); } catch { return unavailable(); }
   }

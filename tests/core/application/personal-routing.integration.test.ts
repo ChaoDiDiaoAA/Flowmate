@@ -19,9 +19,9 @@ function fixture(assembled = true) {
     works: { create: mock(async () => denied()), list: mock(async () => denied()), get: mock(async () => denied()),
       supplement: mock(async () => denied()), disposeItem: mock(async () => denied()), continueWork: mock(async () => denied()),
       cancelWork: mock(async () => denied()), queryOperation: mock(async () => denied()), timeline: mock(async () => denied()),
-      listDesktopActions: mock(async () => denied()), decideDesktopAction: mock(async () => denied()), discardDesktopAction: mock(async () => denied()),
+      listDesktopActions: mock(async () => denied()), decideDesktopAction: mock(async () => denied()), rebindDesktopAction: mock(async () => denied()), discardDesktopAction: mock(async () => denied()),
       queryDesktopDecision: mock(async () => denied()), listBrowserReads: mock(async () => denied()), decideBrowserRead: mock(async () => denied()),
-      revokeBrowserRead: mock(async () => denied()), queryBrowserDecision: mock(async () => denied()) },
+      rebindBrowserRead: mock(async () => denied()), revokeBrowserRead: mock(async () => denied()), queryBrowserDecision: mock(async () => denied()) },
     tasks: { list: mock(async () => denied()), get: mock(async () => denied()), stop: mock(async () => denied()), resume: mock(async () => ok(undefined)),
       history: mock(async () => denied()), historyEntry: mock(async () => denied()) },
   };

@@ -1,12 +1,13 @@
 import { isInputDefinitionHostCommand, parseInputDefinitionHostResult, matchesInputDefinitionResponse, inputDefinitionHostFailure } from './protocol.ts';
 import { isResearchHostCommand, parseResearchCommand, parseResearchHostResult, matchesResearchResponse, researchOperations } from '../../packages/contracts/src/research-commands.ts';
+import { isMemoryHostCommand, memoryHostFailure, parseMemoryCommand, parseMemoryHostResult } from '../../packages/contracts/src/openviking-commands.ts';
 import { randomUUID } from 'node:crypto';
 import type { EvaluationAgentOverrides } from '../../packages/contracts/src/runtime-evaluation.ts';
 import { readObservabilitySettings } from '../../agent-eval/src/observability-settings.ts';
 import { controlledReplayTools } from '../../agent-eval/src/adapters/replay-policy.ts';
 import { dirname, join, resolve } from 'node:path';
 import type { Credential, CredentialStore } from '@earendil-works/pi-ai';
-import { RUNTIME_CONFIG, appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest,
+import { RUNTIME_CONFIG, MemorySettingsViewSchema, appError, fail, normalizeAgentRunRequest, normalizeProviderRequest, ok, serializeDesktopPromptRequest, serializeDesktopInvoiceFormRequest,
   RuntimeEventsAvailableSchema, EMPTY_RESOURCE_SELECTION, ResourceSelectionSchema, EMPTY_EXTENSION_SELECTION, ExtensionSelectionSchema,
   } from '@flowmate/contracts';
 import type { AgentRunEvent, Application, CloseReport, DesktopState, InvoiceFormApplicationReceipt, InvoiceFormBridgeRequest, ModelProfile, ProductSettings, ProviderConfig, Result } from '@flowmate/contracts';
@@ -37,6 +38,8 @@ import type { ServiceCredentialSettingsAuthority, ServiceCredentialSettingsScope
 import { createDesktopBridge } from './desktop-bridge.ts';
 
 export type ProductCommandDispatcherOptions = {
+  memory?: import('../composition.ts').ApplicationOptions['memory'];
+  memoryCredentialRead?: (reference: string) => Promise<string | undefined>;
   userDataRoot: string;
   invoiceSourceRoot: string;
   runtimeRoot?: string;
@@ -56,6 +59,10 @@ export type ProductCommandDispatcher = {
   dispatch(raw: unknown, control?: { signal?: AbortSignal }): Promise<void>;
   readForegroundStop(reference: ForegroundReference): Promise<Result<boolean>>;
   settingsAuthority: ProductSettingsAuthority;
+  configureMemory(input: import('zod').z.infer<typeof import('@flowmate/contracts').MemoryConnectionConfigurationSchema>):
+    Promise<Result<import('zod').z.infer<typeof import('@flowmate/contracts').MemorySettingsViewSchema>>>;
+  inspectMemory(input: import('zod').z.infer<typeof import('@flowmate/contracts').MemoryConnectionConfigurationSchema>):
+    Promise<Result<import('zod').z.infer<typeof import('@flowmate/contracts').MemorySettingsViewSchema> | null>>;
   startRecovery(expectedSettingsRevision?: number): Promise<Result<void>>;
   close(): Promise<Result<CloseReport>>;
   // Owner-wide teardown for stdio failure or owner shutdown, never a service client disconnect.
@@ -86,6 +93,8 @@ const closingReads: readonly HostCommand['type'][] = [
   'invoice_work_query_operation', 'invoice_work_desktop_list', 'invoice_work_desktop_query_decision', 'invoice_work_browser_list',
   'invoice_work_browser_query_decision', 'personal_task_list', 'personal_task_get',
   'personal_task_history', 'personal_task_history_entry', 'invoice_work_timeline',
+  'memory_get_settings', 'memory_list_entries', 'memory_read_entry', 'memory_list_operations',
+  'memory_inspect_configuration',
 ];
 
 /** One product owner and command implementation, independent of transport and process exit. */
@@ -116,6 +125,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
   const seenOrder: string[] = [];
   let application: Application;
   let personalControl: Pick<PersonalAgentRuntime, 'start' | 'conditionsChanged'> | undefined;
+  let memoryController: Parameters<NonNullable<import('../composition.ts').ApplicationOptions['onMemoryController']>>[0] | undefined;
   let cloudMaterial: CloudMaterialExport | undefined;
   let cloudResource: CloudResourceExport | undefined;
   let credentialRecoveryHook: ((scope: ProductSettingsWriteScope) => Promise<Result<void>>) | undefined;
@@ -186,9 +196,9 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
   const traceSecrets = new Set<string>();
   const collect = (value: unknown): void => { if (typeof value === 'string' && value.length >= 8) traceSecrets.add(value);
     else if (value && typeof value === 'object') for (const item of Object.values(value)) collect(item); };
-  const credentialRequest = (ref: string, operation: 'read' | 'write' | 'delete', credential?: Credential): Promise<Credential | undefined> => {
+  const credentialRequest = (ref: string, operation: 'read' | 'write' | 'delete', credential?: Credential, purpose?: 'memory'): Promise<Credential | undefined> => {
     collect(credential);
-    const direct = options.credentials;
+    const direct = purpose ? undefined : options.credentials;
     if (direct) return (async () => {
       let value: Credential | undefined;
       if (operation === 'read') value = await direct.read(ref);
@@ -213,6 +223,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         }
       });
       send({ version: 1, type: 'credential_request', requestId, credentialRef: ref, operation,
+        ...(purpose ? { purpose } : {}),
         ...(credential === undefined ? {} : { credential }) });
     });
   };
@@ -256,6 +267,13 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
     parameters: { ...RUNTIME_CONFIG.provider },
   });
   const created = await createApplication({
+    memory: options.memory ?? { owner: { environment: 'local', ownerId: null }, deferStart: true,
+      readCredential: options.memoryCredentialRead ?? (async ref => {
+        if (options.credentials || !/^memory_[a-f0-9]{32}$/.test(ref)) return undefined;
+        try { const value = await credentialRequest(ref, 'read', undefined, 'memory');
+          return value?.type === 'api_key' && typeof value.key === 'string' ? value.key : undefined; } catch { return undefined; }
+      }) },
+    onMemoryController: controller => { memoryController = controller; },
     onCloudMaterialReady: material => { cloudMaterial = material; },
     onCloudResourceReady: resource => { cloudResource = resource; },
     logger: hostLog,
@@ -526,10 +544,12 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         case 'invoice_work_query_operation': value = await application.invoiceWorks.queryOperation(captured.input); break;
         case 'invoice_work_desktop_list': value = await application.invoiceWorks.listDesktopActions(captured.input); break;
         case 'invoice_work_desktop_decide': value = await application.invoiceWorks.decideDesktopAction(captured.input); break;
+        case 'invoice_work_desktop_rebind': value = await application.invoiceWorks.rebindDesktopAction(captured.input); break;
         case 'invoice_work_desktop_discard': value = await application.invoiceWorks.discardDesktopAction(captured.input); break;
         case 'invoice_work_desktop_query_decision': value = await application.invoiceWorks.queryDesktopDecision(captured.input); break;
         case 'invoice_work_browser_list': value = await application.invoiceWorks.listBrowserReads(captured.input); break;
         case 'invoice_work_browser_decide': value = await application.invoiceWorks.decideBrowserRead(captured.input); break;
+        case 'invoice_work_browser_rebind': value = await application.invoiceWorks.rebindBrowserRead(captured.input); break;
         case 'invoice_work_browser_revoke': value = await application.invoiceWorks.revokeBrowserRead(captured.input); break;
         case 'invoice_work_browser_query_decision': value = await application.invoiceWorks.queryBrowserDecision(captured.input); break;
         case 'personal_task_list': value = await application.personalTasks.list(captured.input); break;
@@ -792,6 +812,38 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
       const saved = await enqueueSettingsWrite(() => settingsScope.save(command.settings));
       send({ version: 1, type: 'response', requestId: command.requestId, value: saved });
       return;
+    }
+    if (command.type === 'memory_configure') {
+      const value = memoryController ? await memoryController.configure(command.input)
+        : fail(appError('memory_unavailable', 'runtime', 'The local memory controller is unavailable.'));
+      const checked = value.ok ? MemorySettingsViewSchema.safeParse(value.data) : null;
+      const matches = checked?.success && checked.data.settings.revision === command.input.expectedRevision + 1
+        && checked.data.settings.endpoint === command.input.endpoint && checked.data.identity?.accountId === command.input.accountId
+        && checked.data.identity.userId === command.input.userId && checked.data.identity.peerId === command.input.peerId;
+      send({ version: 1, type: 'response', requestId: command.requestId, value: !value.ok ? value : matches ? value
+        : fail(appError('operation_result_unknown', 'runtime', 'The original memory configuration could not be confirmed.', true)) }); return;
+    }
+    if (command.type === 'memory_inspect_configuration') {
+      const value = memoryController ? await memoryController.inspect(command.input)
+        : fail(appError('memory_unavailable', 'runtime', 'The local memory controller is unavailable.'));
+      send({ version: 1, type: 'response', requestId: command.requestId, value }); return;
+    }
+    if (isMemoryHostCommand(command.type)) {
+      const captured = parseMemoryCommand({ type: command.type, input: 'input' in command ? command.input : undefined });
+      if (!captured) { send({ version: 1, type: 'response', requestId: command.requestId, value: fail(appError('input_invalid', 'input', 'The memory request is invalid.')) }); return; }
+      const memory = application.memory;
+      const value = captured.type === 'memory_get_settings' ? await memory.getSettings()
+        : captured.type === 'memory_list_entries' ? await memory.listEntries(captured.input)
+        : captured.type === 'memory_read_entry' ? await memory.readEntry(captured.input)
+        : captured.type === 'memory_list_operations' ? await memory.listOperations(captured.input)
+        : captured.type === 'memory_search' ? await memory.search(captured.input)
+        : captured.type === 'memory_update_policy' ? await memory.updatePolicy(captured.input)
+        : captured.type === 'memory_remember' ? await memory.remember(captured.input)
+        : captured.type === 'memory_reconcile_remember' ? await memory.reconcileRemember(captured.input)
+        : captured.type === 'memory_reconcile_remember_by_id' ? await memory.reconcileRememberById(captured.input)
+        : captured.type === 'memory_forget' ? await memory.forget(captured.input)
+          : await memory.reconcileSync(captured.input.syncId, captured.input.abandonConfirmed);
+      send({ version: 1, type: 'response', requestId: command.requestId, value: parseMemoryHostResult(captured, value) ?? memoryHostFailure(captured) }); return;
     }
     if (isInputDefinitionHostCommand(command.type)) {
       const value = command.type === 'list_input_commands' ? await application.listInputCommands(command.input)
@@ -1233,6 +1285,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         if (expectedSettingsRevision !== undefined && currentSettings.revision !== expectedSettingsRevision)
           return fail(appError('config_revision_conflict', 'input', 'The original activation configuration changed before recovery.', true));
         startInvoked = true;
+        memoryController?.wake();
         return personalControl?.start() ?? ok(undefined);
       }).then(result => {
         if (!result.ok) {
@@ -1247,6 +1300,8 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
       });
       return recovery;
     },
+    configureMemory: input => memoryController?.configure(input) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory is unavailable.'))),
+    inspectMemory: input => memoryController?.inspect(input) ?? Promise.resolve(fail(appError('memory_unavailable', 'runtime', 'Memory is unavailable.'))),
     close,
     releaseRuntimeObservations: closeRuntimeObservations,
   });

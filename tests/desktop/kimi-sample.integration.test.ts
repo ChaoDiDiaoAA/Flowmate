@@ -30,5 +30,21 @@ test.skipIf(process.platform !== 'win32' || !root || !runtime)('KimiCU can obser
     const target = await desktop.resolveTarget(owner, action, signal); if (!target.ok) throw Error(target.error.code);
     expect(await desktop.dispatch(owner, action, target.data, signal)).toEqual({ ok: true, data: undefined });
     expect(await page.locator('#amount').inputValue()).toBe('113.00');
+    await page.evaluate(() => {
+      const field = document.createElement('input');
+      field.type = 'password';
+      field.setAttribute('aria-label', 'Sample Password');
+      field.value = 'synthetic-only';
+      document.querySelector('main')!.append(field);
+      field.focus();
+    });
+    let protectedObservation = await desktop.observe(owner, signal);
+    for (let attempt = 0; protectedObservation.ok && attempt < 5; attempt++) {
+      await new Promise(resolveWait => setTimeout(resolveWait, 200));
+      protectedObservation = await desktop.observe(owner, signal);
+    }
+    expect(protectedObservation).toMatchObject({ ok: false, error: { code: 'desktop_protected_content' } });
+    expect(await desktop.dispatch(owner, { ...action, value: '999.00' }, target.data, signal)).toMatchObject({ ok: false });
+    expect(await page.locator('#amount').inputValue()).toBe('113.00');
   } finally { await desktop.close(); await app.close(); }
 }, 30000);

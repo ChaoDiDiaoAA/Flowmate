@@ -125,7 +125,8 @@ export function formatInvoiceWorkContext(raw: unknown): Result<string> {
   if (new TextEncoder().encode(JSON.stringify(parsed.data)).byteLength > RUNTIME_CONFIG.llmPayload.maxWorkspaceContextBytes)
     return fail(appError('context_evidence_too_large', 'runtime', 'The invoice working context exceeds its UTF-8 byte limit.'));
   const { instructions: _instructions, ...facts } = parsed.data;
-  return ok(JSON.stringify(facts));
+  return ok(JSON.stringify(facts.phase.basis.executionMode === 'item-lane-approval-v1' ? { ...facts,
+    actions: { ...facts.actions, tools: facts.actions.tools.filter(name => name !== 'browser_read_approved' && name !== 'desktop_execute_approved') } } : facts));
 }
 
 const invoiceMasterV1 = `You are Flowmate's Invoice Master for the current admitted invoice phase.

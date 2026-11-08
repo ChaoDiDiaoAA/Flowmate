@@ -56,9 +56,12 @@ test.skipIf(process.platform !== 'linux')('Authority process reads a private sys
   const desktopSocket = join(root, 'desktop.sock'), authoritySocket = join(root, 'authority.sock'), modelSocket = join(root, 'model.sock');
   const config = join(root, 'authority-config.json'), workspaceId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   writeFileSync(join(credentials, 'deepseek-api-key'), 'synthetic-process-secret\n', { mode: 0o600 });
+  writeFileSync(join(credentials, 'openviking-user-key'), 'synthetic-memory-secret\n', { mode: 0o600 });
   writeFileSync(config, JSON.stringify({ version: 1, productRoot: root, resourceRoot: resourceRoot(),
     workspaceId, desktopSocket, authoritySocket, modelSocket, runtimeSocket: join(root, 'runtime.sock'),
-    model: { id: 'controlled-deepseek', name: 'deepseek-chat', contextWindow: 64000, maxTokens: 8192, reasoning: false } }));
+    model: { id: 'controlled-deepseek', name: 'deepseek-chat', contextWindow: 64000, maxTokens: 8192, reasoning: false },
+    memory: { endpoint: 'http://127.0.0.1:19338', accountId: 'account', userId: 'alice', peerId: 'flowmate.alice.agent',
+      recallEnabled: true, captureMode: 'explicit' } }));
   const executable = entry('authority');
   const child = spawn(process.execPath, ['--no-env-file', executable, config], { stdio: ['ignore', 'pipe', 'pipe'],
     env: { PATH: process.env.PATH ?? '', CREDENTIALS_DIRECTORY: credentials }, windowsHide: true });
@@ -70,12 +73,21 @@ test.skipIf(process.platform !== 'linux')('Authority process reads a private sys
     const result = await callCloudUnixRpc(desktopSocket, { version: 1, workspaceId, requestId: '11111111-1111-4111-8111-111111111111',
       command: { type: 'personal_agent_get', input: {} } });
     expect(result).toMatchObject({ ok: true, data: { ok: true, data: { configuration: { modelId: 'controlled-deepseek' } } } });
+    expect(await callCloudUnixRpc(desktopSocket, { version: 1, workspaceId, requestId: '22222222-2222-4222-8222-222222222222',
+      command: { type: 'cloud_memory_get_settings', input: {} } })).toMatchObject({ ok: true, data: { ok: true, data: {
+        settings: { provider: 'openviking', recallEnabled: true }, identity: { accountId: 'account', userId: 'alice' } } } });
   } finally {
     child.kill('SIGTERM');
     expect(await Promise.race([exited, new Promise(resolve => setTimeout(() => resolve({ code: null, signal: 'timeout' }), 10_000))]))
       .toEqual({ code: 0, signal: null });
   }
   expect(output).not.toContain('synthetic-process-secret');
+  expect(output).not.toContain('synthetic-memory-secret');
+  const database = new Database(join(root, 'data/app.sqlite'), { readonly: true });
+  try {
+    expect(database.query('SELECT environment,owner_id,credential_ref FROM memory_identities').all())
+      .toEqual([{ environment: 'cloud', owner_id: workspaceId, credential_ref: 'openviking-user-key' }]);
+  } finally { database.close(); }
 }, 30_000);
 
 test.skipIf(process.platform !== 'linux')('Authority refuses a readable credential or a non-private product root before opening sockets', async () => {
@@ -98,6 +110,11 @@ test.skipIf(process.platform !== 'linux')('Authority refuses a readable credenti
     if (outcome === 'running') { insecureRoot.kill('SIGTERM'); await insecureRoot.exited; }
     expect(outcome).toBe(1); expect(existsSync(desktopSocket)).toBe(false);
     expect(await new Response(insecureRoot.stderr).text()).not.toContain('synthetic-process-secret');
+    chmodSync(root, 0o700); chmodSync(config, 0o666);
+    const insecureConfig = launch();
+    const configOutcome = await Promise.race([insecureConfig.exited, new Promise<'running'>(resolve => setTimeout(() => resolve('running'), 3000))]);
+    if (configOutcome === 'running') { insecureConfig.kill('SIGTERM'); await insecureConfig.exited; }
+    expect(configOutcome).toBe(1); expect(existsSync(desktopSocket)).toBe(false);
   } finally { chmodSync(root, 0o700); }
 }, 30_000);
 
@@ -223,7 +240,12 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
     try { await waitFor(async () => wire.length > 0, 10_000); }
     catch { throw Error(JSON.stringify({ errors, runtimeError, created, observed: await desktop.request({ type: 'personal_task_get', input: {
       workId: created.workId, attemptId, limit: 10 } }) })); }
-    const queueOwner = { workId: created.workId, sessionId: created.sessionId, attemptId };
+    const initialWork = InvoiceWorkGetResultSchema.parse(need(await desktop.request({ type: 'invoice_work_get', input: {
+      view: 'work', workId: created.workId, limit: 10 } })));
+    if (initialWork.view !== 'work' || !initialWork.items[0]) throw Error('The original cloud invoice item is unavailable.');
+    expect(initialWork.work.execution.itemLanes).toBe(true);
+    const attemptOwner = { workId: created.workId, sessionId: created.sessionId, attemptId };
+    const queueOwner = { ...attemptOwner, itemId: initialWork.items[0].itemId };
     const progressOwner = { workId: created.workId, sessionId: created.sessionId };
     const firstProgress = CloudProgressEventSchema.parse(need(await desktop.request({ type: 'cloud_progress_wait', input: { ...progressOwner, cursor: null } })));
     expect(firstProgress.resync).toBe(true);
@@ -239,7 +261,7 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
       action: { kind: 'enqueue' as const, phaseRequestId: queue.activePhaseRequestId, mode: 'followUp' as const, content: followupText } };
     expect(need(await desktop.request({ type: 'cloud_queue_control', input: followup }))).toMatchObject({ status: 'applied', submissionId: expect.any(Number) });
     const runtimeClient = createCloudRuntimeRpcClient(runtimeSocket);
-    try { expect(await runtimeClient.resumeAttempt(queueOwner)).toEqual({ ok: true, data: undefined }); }
+    try { expect(await runtimeClient.resumeAttempt(attemptOwner)).toEqual({ ok: true, data: undefined }); }
     finally { need(await runtimeClient.close()); }
     const nextProgress = desktop.request({ type: 'cloud_progress_wait', input: { ...progressOwner, cursor: firstProgress.cursor } }, 45_000);
     release.resolve();
@@ -260,10 +282,13 @@ test.skipIf(process.platform !== 'linux')('the assembled Authority transfers an 
     }
     expect(streamed).toContain('original invoice needs human review');
     expect(live.fragments.every(fragment => fragment.attemptId === attemptId && fragment.requestId === queue.activePhaseRequestId)).toBe(true);
-    const status = CloudRuntimeStatusSchema.parse(need(await desktop.request({ type: 'cloud_delivery_status', input: { ...queueOwner, limit: 10 } })));
+    const status = CloudRuntimeStatusSchema.parse(need(await desktop.request({ type: 'cloud_delivery_status', input: { ...attemptOwner, limit: 10 } })));
     expect(status.observationRevision).toBeGreaterThan(0);
     expect(status.native.conversationId).toBeGreaterThan(0);
-    expect(status.native.tasks.length).toBeGreaterThan(0); expect(status.native.submissions.length).toBeGreaterThan(0);
+    const history = need(await desktop.request({ type: 'personal_task_history', input: {
+      target: { workId: created.workId, itemId: queueOwner.itemId }, limit: 100 } }));
+    expect(history).toMatchObject({ owner: { workId: created.workId, itemId: queueOwner.itemId },
+      entries: expect.arrayContaining([expect.objectContaining({ kind: 'flowmate.input' })]) });
     const work = InvoiceWorkGetResultSchema.parse(need(await desktop.request({ type: 'invoice_work_get', input: { view: 'work', workId: created.workId, limit: 10 } })));
     if (work.view !== 'work' || !work.items[0]) throw Error('The uploaded cloud invoice item is unavailable.');
     const page = need(await desktop.request({ type: 'cloud_review_page', input: { workId: created.workId, itemId: work.items[0].itemId,

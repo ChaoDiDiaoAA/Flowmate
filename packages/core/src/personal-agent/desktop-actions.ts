@@ -7,6 +7,7 @@ import { appError, CloudWorkspaceIdSchema, fail, ok, DesktopActionDecisionReques
   type DesktopActionTarget, type DesktopActionView, type Result } from '@flowmate/contracts';
 import { createToolCallRepository } from '../storage/repositories.ts';
 import { readTransaction } from '../storage/reads.ts';
+import { approvalWithinBudget } from './approval-wait.ts';
 import type { SynchronousDatabaseExecutor } from '../storage/write-coordinator.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -16,6 +17,7 @@ type Row = { id: number; work_id: number; item_id: number; item_revision: number
   status: Status; decision_request_id: string | null; decision_request_json: string | null; decision_receipt_json: string | null;
   execution_tool_call_id: number | null; created_at: string; updated_at: string };
 type CallOwner = { phase_id: number; work_id: number; item_id: number; closed_at: string | null; scope_json: string;
+  basis_json: string; scheduler_state: string;
   run_kind: string; run_status: string; cancel_requested_at: string | null; stop_requested_at: string | null; stopped_at: string | null;
   work_status: string; current_attempt_id: number | null; attempt_id: number; disposition: string; item_revision: number; runtime_kind: string;
   durable_runtime_id: string; phase_runtime_id: string; cloud_workspace_id: string | null; session_status: string };
@@ -67,7 +69,7 @@ export function createInvoiceWorkDesktopActionRepository(db: SynchronousDatabase
   }
   function owner(toolCallId: number, workId: number, itemId: number, name: string, active: boolean) {
     const call = need(tools.getById(toolCallId));
-    const found = db.query<CallOwner, [number]>(`SELECT p.id phase_id,p.work_id,p.item_id,p.closed_at,b.scope_json,
+    const found = db.query<CallOwner, [number]>(`SELECT p.id phase_id,p.work_id,p.item_id,p.closed_at,p.basis_json,p.scheduler_state,b.scope_json,
       r.kind run_kind,r.status run_status,r.cancel_requested_at,a.stop_requested_at,a.stopped_at,w.status work_status,
       w.current_attempt_id,a.id attempt_id,i.disposition,i.revision item_revision,s.runtime_kind,s.durable_runtime_id,
       p.durable_runtime_id phase_runtime_id,s.cloud_workspace_id,s.status session_status
@@ -98,12 +100,18 @@ export function createInvoiceWorkDesktopActionRepository(db: SynchronousDatabase
       'storage_corrupt', 'The desktop target differs from its original proposal.');
     const result = original.call.result?.status === 'succeeded'
       ? z.object({ proposalId: id }).passthrough().safeParse(original.call.result.data) : null;
-    const canReject = found.status === 'waiting' && original.owner.closed_at !== null
+    const itemLane = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(original.owner.basis_json)).executionMode === 'item-lane-approval-v1';
+    const decisionWindow = itemLane ? original.owner.closed_at === null && original.owner.scheduler_state === 'waiting_approval'
+      && original.owner.run_status === 'running' && original.owner.session_status === 'active'
+      && original.owner.current_attempt_id === original.owner.attempt_id && original.owner.cancel_requested_at === null
+      && original.owner.stop_requested_at === null && original.owner.stopped_at === null : original.owner.closed_at !== null;
+    const canReject = found.status === 'waiting' && decisionWindow
       && original.owner.work_status === 'open' && original.owner.disposition === 'unresolved';
     const canDecide = canReject && original.call.status === 'succeeded' && result?.success === true && result.data.proposalId === found.id
       && original.owner.item_revision === found.item_revision;
     return DesktopActionViewSchema.parse({ proposalId: found.id, workId: found.work_id, itemId: found.item_id, proposalToolCallId: found.proposal_tool_call_id,
-      target, action, status: found.status, canDecide, canReject, executionToolCallId: found.execution_tool_call_id, createdAt: found.created_at, updatedAt: found.updated_at });
+      target, action, status: found.status, canDecide, canReject, ...(itemLane ? { resumeOriginal: true } : {}),
+      executionToolCallId: found.execution_tool_call_id, createdAt: found.created_at, updatedAt: found.updated_at });
   }
   function savedDecision(found: Row): { request: DesktopActionDecisionRequest; receipt: DesktopActionDecisionReceipt } {
     requireFact(found.decision_request_id && found.decision_request_json && found.decision_receipt_json,
@@ -193,12 +201,9 @@ export function createInvoiceWorkDesktopActionRepository(db: SynchronousDatabase
         requireFact(!db.query('SELECT id FROM invoice_work_desktop_actions WHERE work_id=? AND decision_request_id=?')
           .get(input.workId, input.requestId));
         const original = owner(found.proposal_tool_call_id, input.workId, input.itemId, 'desktop_propose_action', false);
-        const savedResult = original.call.result;
-        const output = savedResult?.status === 'succeeded' ? z.object({ proposalId: id }).passthrough().safeParse(savedResult.data) : null;
-        requireFact(original.owner.closed_at !== null && original.owner.work_status === 'open' && original.owner.disposition === 'unresolved'
-          && (input.decision === 'reject' || original.call.status === 'succeeded' && output?.success
-            && output.data.proposalId === found.id && original.owner.item_revision === found.item_revision)
-          && original.owner.item_revision < Number.MAX_SAFE_INTEGER);
+        const current = snapshot(found), itemLane = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(original.owner.basis_json)).executionMode === 'item-lane-approval-v1';
+        requireFact((input.decision === 'approve' ? current.canDecide : current.canReject)
+          && (!itemLane || approvalWithinBudget(db, input.workId, time)) && original.owner.item_revision < Number.MAX_SAFE_INTEGER);
         const work = db.query<{ revision: number }, [number]>('SELECT revision FROM invoice_works WHERE id=? AND status=\'open\'').get(input.workId);
         requireFact(work && work.revision === input.expectedRevision && work.revision < Number.MAX_SAFE_INTEGER);
         const receipt: DesktopActionDecisionReceipt = { ...input, revision: work.revision + 1, receivedAt: time };
@@ -209,6 +214,8 @@ export function createInvoiceWorkDesktopActionRepository(db: SynchronousDatabase
         requireFact(db.query(`UPDATE invoice_work_desktop_actions SET status=?,decision_request_id=?,decision_request_json=?,
           decision_receipt_json=?,updated_at=? WHERE id=? AND status='waiting'`).run(input.decision === 'approve' ? 'approved' : 'rejected',
           input.requestId, JSON.stringify(input), JSON.stringify(receipt), time, found.id).changes === 1);
+        if (itemLane) requireFact(db.query("UPDATE invoice_work_phases SET scheduler_state='ready' WHERE id=? AND scheduler_state='waiting_approval' AND closed_at IS NULL")
+          .run(original.owner.phase_id).changes === 1);
         return receipt;
       });
     },
@@ -222,11 +229,16 @@ export function createInvoiceWorkDesktopActionRepository(db: SynchronousDatabase
         const execution = owner(input.executionToolCallId, input.workId, input.itemId, 'desktop_execute_approved', true);
         requireFact(execution.owner.item_revision === found.item_revision + 1, 'desktop_item_changed',
           'The invoice changed after the desktop action was approved.');
-        requireFact(desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision),
-          'tool_access_denied', 'The desktop approval has no explicit continuation for this attempt.');
         const phase = db.query<{ basis_json: string }, [number]>('SELECT basis_json FROM invoice_work_phases WHERE id=?').get(execution.owner.phase_id);
-        requireFact(phase && InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json)).desktopProposalId === found.id,
-          'tool_access_denied', 'The desktop approval is not part of the original execution phase.');
+        requireFact(phase);
+        const basis = InvoiceWorkPhaseBasisSchema.parse(JSON.parse(phase.basis_json));
+        if (basis.executionMode === 'item-lane-approval-v1') {
+          const original = owner(found.proposal_tool_call_id, input.workId, input.itemId, 'desktop_propose_action', false);
+          requireFact(original.owner.phase_id === execution.owner.phase_id && execution.owner.scheduler_state === 'active'
+            && approvalWithinBudget(db, input.workId, input.at), 'tool_access_denied', 'The original desktop approval is no longer active.');
+        } else requireFact(basis.desktopProposalId === found.id
+          && desktopActionContinuationAuthorized(db, input.workId, execution.owner.attempt_id, decision.receipt.revision),
+        'tool_access_denied', 'The desktop approval has no explicit continuation for this attempt.');
         const action = DesktopActionExecuteSchema.parse(execution.call.args.final);
         requireFact(action.proposalId === found.id && isDeepStrictEqual(execution.call.args.raw, action));
         requireFact(db.query("UPDATE invoice_work_desktop_actions SET status='claimed',execution_tool_call_id=?,updated_at=? WHERE id=? AND status='approved'")

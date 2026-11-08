@@ -551,6 +551,7 @@ export type CloseReport = {
 };
 
 export interface Application extends ResearchQueryApi {
+  memory: import('./openviking-memory.ts').MemoryApi;
   personalAgent: PersonalAgentApi;
   invoiceWorks: InvoiceWorksApi;
   personalTasks: PersonalTasksApi;

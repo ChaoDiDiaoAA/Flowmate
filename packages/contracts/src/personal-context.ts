@@ -22,6 +22,7 @@ const sources = z.array(InvoiceWorkSourceLocatorSchema).readonly();
 
 export const InvoiceWorkPhaseBasisSchema = z.object({
   contextSnapshotId: id.nullable(), inputIds, documentRefs: documents, configurationRevision: revision, itemRevision: revision.nullable(),
+  executionMode: z.literal('item-lane-approval-v1').optional(),
   desktopProposalId: id.optional(),
   desktopRejectedProposalId: id.optional(),
   browserProposalId: id.optional(),

@@ -89,6 +89,35 @@ describe('P17 runtime layout', () => {
     expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: false, error: { code: 'installation_runtime_invalid' } });
   });
 
+  it('requires the item-lane migration for a schema26 release while accepting schema25', () => {
+    const fixture = installation();
+    const migrations = ['apps/migrations/023_runtime_scopes.sql', 'apps/migrations/024_desktop_actions.sql',
+      'apps/migrations/025_browser_reads.sql', 'apps/migrations/026_personal_item_lanes.sql'];
+    for (const file of migrations) writeFileSync(join(fixture.runtime, file), 'synthetic package asset');
+    const previous = { ...fixture.release, schemaVersion: 25, files: [...fixture.release.files, ...migrations.slice(0, 3)] };
+    writeFileSync(fixture.manifest, JSON.stringify(previous));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: previous } });
+    const current = { ...fixture.release, schemaVersion: 26, files: [...fixture.release.files, ...migrations] };
+    writeFileSync(fixture.manifest, JSON.stringify(current));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: current } });
+    writeFileSync(fixture.manifest, JSON.stringify({ ...current, files: current.files.filter(file => file !== migrations[3]) }));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: false, error: { code: 'installation_runtime_invalid' } });
+  });
+
+  it('accepts the prior schema26 package and requires the memory migration for schema27', () => {
+    const fixture = installation();
+    const additions = ['apps/migrations/023_runtime_scopes.sql', 'apps/migrations/024_desktop_actions.sql',
+      'apps/migrations/025_browser_reads.sql', 'apps/migrations/026_personal_item_lanes.sql', 'apps/migrations/027_openviking_memory.sql'];
+    for (const file of additions) writeFileSync(join(fixture.runtime, file), 'synthetic package asset');
+    const previous = { ...fixture.release, schemaVersion: 26, files: [...fixture.release.files, ...additions.slice(0, 4)] };
+    writeFileSync(fixture.manifest, JSON.stringify(previous));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: previous } });
+    const current = { ...fixture.release, schemaVersion: 27, files: [...fixture.release.files, ...additions] };
+    writeFileSync(fixture.manifest, JSON.stringify(current));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: current } });
+    writeFileSync(fixture.manifest, JSON.stringify({ ...current, files: current.files.filter(file => file !== additions[4]) }));
+    expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: false, error: { code: 'installation_runtime_invalid' } });
+  });
   it.each(['1.4.0', '1.4.4'])('recognizes only an explicitly supported Bun release for original and target package lookup: %s', bunVersion => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, bunVersion }));
     expect(resolveRuntimeLayout(fixture.input)).toMatchObject({ ok: true, data: { release: { bunVersion } } });
@@ -106,7 +135,7 @@ describe('P17 runtime layout', () => {
     if (!result.ok) expect(result.error.code).toBe('installation_dependency_missing');
   });
 
-  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 26 }, { settingsVersion: 8 },
+  it.each([{ bunVersion: '1.4.3' }, { sdkVersion: '0.84.0' }, { schemaVersion: 20 }, { schemaVersion: 28 }, { settingsVersion: 8 },
     { arch: 'arm64' }, { platform: 'linux' }, { releaseId: 'not-an-id' }, { extra: 'untrusted' }])
   ('rejects an incompatible or malformed release: %j', change => {
     const fixture = installation(); writeFileSync(fixture.manifest, JSON.stringify({ ...fixture.release, ...change }));

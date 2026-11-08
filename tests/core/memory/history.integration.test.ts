@@ -498,6 +498,25 @@ it.each(['user', 'custom_message'] as const)('P9 T05 selects complete nodes on o
   expect(f.store.db.query('SELECT * FROM session_native_entries').all()).toEqual(before); expect(prepares).toBe(0);
 });
 
+it('rewinding an external-memory Session creates a new remote branch only when the leaf changes', async () => {
+  const f = historyFixture([user('first', null, 'first'), user('other', 'first', 'other'), user('current', 'first', 'current')]);
+  const db = f.store.db, endpoint = 'http://127.0.0.1:19338';
+  db.query("INSERT INTO memory_identities(id,environment,owner_id,account_id,user_id,peer_id,credential_ref,state,created_at,updated_at) VALUES(1,'local','owner','account','alice','peer','synthetic-reference','active',?,?)").run(at, at);
+  db.query("INSERT INTO memory_bindings(runtime_kind,session_id,branch,provider,identity_id,remote_session_id,endpoint,remote_state,created_at) VALUES('agent_session',?,0,'openviking',1,'original-remote',?,'ready',?)")
+    .run(f.session.sessionId, endpoint, at);
+  await f.agent.releaseSession(f.session.nativeSessionId);
+  expect(await f.service.branch({ sessionId: f.session.sessionId, expectedCommitRevision: 1, expectedEntryCount: 3,
+    expectedLeafId: 'current', targetEntryId: 'other' })).toMatchObject({ ok: true });
+  const branches = db.query<{ branch: number; endpoint: string; remote_session_id: string; remote_state: string }, [number]>(
+    'SELECT branch,endpoint,remote_session_id,remote_state FROM memory_bindings WHERE session_id=? ORDER BY branch').all(f.session.sessionId);
+  expect(branches).toHaveLength(2);
+  expect(branches[1]).toMatchObject({ branch: 1, endpoint, remote_state: 'pending' });
+  expect(branches[1]!.remote_session_id).not.toBe(branches[0]!.remote_session_id);
+  expect(await f.service.branch({ sessionId: f.session.sessionId, expectedCommitRevision: 2, expectedEntryCount: 3,
+    expectedLeafId: 'other', targetEntryId: 'other' })).toMatchObject({ ok: true });
+  expect(db.query('SELECT id FROM memory_bindings WHERE session_id=?').all(f.session.sessionId)).toHaveLength(2);
+});
+
 it('P9 T05 restores complete history beyond the first page for missing and ready instances', async () => {
   const f = historyFixture(Array.from({ length: 61 }, (_, n) => user(`u${n}`, n ? `u${n - 1}` : null, `question ${n}`)));
   await f.agent.releaseSession(f.session.nativeSessionId);

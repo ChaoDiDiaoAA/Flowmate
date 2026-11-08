@@ -3,6 +3,8 @@ import { InputDefinitionCommandSchema } from '@flowmate/contracts';
 import { ResearchIntentSchema, WorkspaceFocusSchema, PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema, InvoiceSaveReplayReceiptSchema } from '@flowmate/contracts';
 import { researchOperations } from '../../packages/contracts/src/research-commands.ts';
 import { personalAgentHostCommandSchemas, isPersonalAgentHostCommand } from '../../packages/contracts/src/personal-agent-commands.ts';
+import { memoryHostCommandSchemas } from '../../packages/contracts/src/openviking-commands.ts';
+import { MemoryConnectionConfigurationSchema } from '@flowmate/contracts';
 import { cloudMaterialExportHostCommandSchemas } from '../../packages/contracts/src/cloud-material.ts';
 import { cloudResourceExportHostCommandSchemas } from '../../packages/contracts/src/cloud-resource.ts';
 export { isPersonalAgentHostCommand, parsePersonalAgentCommand, parsePersonalAgentHostResult,
@@ -77,6 +79,10 @@ const documentRef = z.object({ id: dbId, version: z.string().min(1).max(512) }).
 const pageInput = z.object({ beforeId: dbId.optional(), limit: pageLimit.optional() }).strict();
 
 const hostCommandSchema = z.discriminatedUnion('type', [
+  z.object({ version: z.literal(1), requestId, type: z.literal('memory_configure'), input: MemoryConnectionConfigurationSchema.extend({
+    credentialRef: z.string().regex(/^memory_[a-f0-9]{32}$/) }).strict() }).strict(),
+  z.object({ version: z.literal(1), requestId, type: z.literal('memory_inspect_configuration'), input: MemoryConnectionConfigurationSchema.extend({
+    credentialRef: z.string().regex(/^memory_[a-f0-9]{32}$/) }).strict() }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('query_diagnostics') }).strict(),
   z.object({ version: z.literal(1), requestId, type: z.literal('compact_session'), input: DesktopSessionCompactionRequestSchema,
     expectedSettingsRevision: dbId, expectedCredentialRef: credentialRef }).strict(),
@@ -131,6 +137,7 @@ const hostCommandSchema = z.discriminatedUnion('type', [
   z.object({ version: z.literal(1), requestId, type: z.literal('query_session_extensions'), input: SessionExtensionQuerySchema }).strict(),
   ...InputDefinitionCommandSchema.options.map(option => option.extend({ version: z.literal(1), requestId })),
   ...personalAgentHostCommandSchemas({ version: z.literal(1), requestId }),
+  ...memoryHostCommandSchemas({ version: z.literal(1), requestId }),
   ...cloudMaterialExportHostCommandSchemas({ version: z.literal(1), requestId }),
   ...cloudResourceExportHostCommandSchemas({ version: z.literal(1), requestId }),
   ...(Object.keys(researchOperations) as (keyof typeof researchOperations)[]).map(type => z.object({ version: z.literal(1), requestId,
@@ -249,7 +256,7 @@ export type HostReady = {
 
 export type HostResponse = { version: 1; type: 'response'; requestId: string; value: unknown };
 export type HostCredentialRequest = { version: 1; type: 'credential_request'; requestId: string;
-  credentialRef: string; operation: 'read' | 'write' | 'delete'; credential?: unknown };
+  credentialRef: string; operation: 'read' | 'write' | 'delete'; purpose?: 'memory'; credential?: unknown };
 export type HostInvoiceFormRequest = { version: 1; type: 'invoice_form_request'; requestId: string; request: InvoiceFormBridgeRequest };
 
 export type HostEvent = {

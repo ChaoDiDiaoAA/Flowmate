@@ -53,6 +53,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .desktop-shell.personal-is-main, .desktop-shell.personal-is-main.chat-is-collapsed { grid-template-columns: var(--sidebar-width, 240px) minmax(0, 1fr); }
 .desktop-shell.personal-is-main .panel-resizer.assistant { display: none; }
 .personal-agent-page { min-width: 0; }
+.memory-panel { display: grid; gap: 12px; min-width: 0; padding: 16px; }
+.memory-panel .panel-head { padding: 0 0 12px; }
+.memory-panel p { margin: 0; overflow-wrap: anywhere; }
+.memory-panel label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.memory-panel :where(select, input:not([type="checkbox"]), textarea) { min-width: 0; padding: 7px 9px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--foreground); background: var(--surface); }
+.memory-panel :where(button) { width: fit-content; min-height: 34px; padding: 6px 10px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--foreground); background: var(--surface); }
+.memory-panel :where(button:not(:disabled)):hover { background: var(--surface-hover); }
+.memory-panel :where(button:disabled) { opacity: .55; }
+.memory-policy, .memory-source-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.memory-policy .memory-checkbox { flex-wrap: nowrap; }
+.memory-panel details { border-top: 1px solid var(--border); padding-top: 10px; }
+.memory-panel details > :not(summary) { margin: 10px 0; }
+.memory-panel summary { cursor: pointer; font-weight: 600; }
+.memory-panel .memory-text { display: grid; }
+.memory-panel textarea { width: 100%; min-height: 100px; resize: vertical; }
+.memory-panel pre { max-height: 300px; overflow: auto; overflow-wrap: anywhere; padding: 10px; border-radius: 6px; background: var(--surface-muted); }
 .personal-agent-page .panel { padding: 16px; }
 .personal-agent-page :where(button:not(.primary-button):not(.text-button)) { min-height: 34px; padding: 6px 10px; border: 1px solid var(--border-strong); border-radius: 6px; color: var(--foreground); background: var(--surface); }
 .personal-agent-page :where(button:not(:disabled):not(.primary-button):not(.text-button)):hover { background: var(--surface-hover); }

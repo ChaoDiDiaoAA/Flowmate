@@ -1,11 +1,11 @@
 import { isDeepStrictEqual } from 'node:util';
 import { appError, BrowserTargetSchema, CloudWorkspaceIdSchema, fail, ok, INVOICE_REVIEW_TOOL_NAMES, SKILL_RESOURCE_TOOL_NAMES, PERSONAL_DESKTOP_TOOL_NAMES, PERSONAL_BROWSER_TOOL_NAMES, PERSONAL_INVOICE_FORM_TOOL_NAMES, DelegateArgsSchema, PersonalAgentConfigurationSchema, resourceRefKey,
-  type AppError, type DurableAttemptIdentity, type DurableProductToolCall, type DurableRuntimePort, type FrozenResources, type ManagedFileContents,
+  type AppError, type BrowserReadRebind, type BrowserReadView, type BrowserTarget, type DesktopActionProposal, type DesktopActionRebind, type DesktopActionTarget, type DesktopActionView, type DurableAttemptIdentity, type DurableProductToolCall, type DurableRuntimePort, type FrozenResources, type ManagedFileContents,
   type PersonalAgentConfiguration, type ProviderConfig, type RuntimeRequestOverrides, type Result } from '@flowmate/contracts';
 import { createResourceService, createToolExecutor, createInvoiceWorkToolBridge, DurableInvoiceGovernor,
   InvoiceWorkModelService, InvoiceWorkPhaseContextService, InvoiceWorkPhaseObserver, PersonalAgentService,
   InvoiceWorkService, PersonalTasksService, InvoiceWorkCoordinator, prepareInvoiceWorkInstructions, createDurableInvoiceSubagentService,
-  createPersonalHistoryService, createInvoiceWorkCompactionCallbacks, createDesktopProposalTool, createDesktopExecutionTool, createDesktopReadTools,
+  createPersonalHistoryService, createInvoiceWorkApprovalWait, createInvoiceWorkCompactionCallbacks, createDesktopProposalTool, createDesktopExecutionTool, createDesktopReadTools,
   createPersonalInvoiceFormTool, createPersonalInvoiceFormObserveTool, createBrowserRequestTool, createBrowserExecutionTool, resolveInvoiceWorkToolScope, type InvoiceFormService } from '@flowmate/core';
 import type { DbHandle } from '../packages/core/src/storage/database.ts';
 import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage, prepareDurableModelBinding, DURABLE_SDK_VERSIONS,
@@ -16,6 +16,7 @@ import type { CloudAuthorityCallbacks } from './cloud-authority-rpc.ts';
 import type { CloudQueueAuthority } from './cloud-queue-authority.ts';
 
 export type PersonalAgentRuntimeOptions = {
+  memory?: { owner: { environment: 'local' | 'cloud'; ownerId: string }; runtime: ReturnType<typeof import('@flowmate/core').createMemoryRuntime> };
   database: DbHandle;
   definitions: Parameters<typeof createToolExecutor>[0]['definitions'];
   resourceRoot: string;
@@ -37,21 +38,34 @@ type OriginalFile = { owner_kind: string; owner_id: string; relative_path: strin
 const resourceKey = (configuration: PersonalAgentConfiguration, revision: number) => JSON.stringify([
   revision, configuration.resources, configuration.tools, configuration.extensions,
 ]);
-const callIdentity = ({ workId, sessionId, attemptId, requestId }: DurableProductToolCall) => ({ workId, sessionId, attemptId, requestId });
+const callIdentity = ({ workId, sessionId, itemId, attemptId, requestId }: DurableProductToolCall) =>
+  ({ workId, sessionId, ...(itemId === undefined ? {} : { itemId }), attemptId, requestId });
 
 /** One product owner assembles both runtime boundaries; only committed commands wake business execution. */
 export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOptions) {
   const { database, now } = options;
   const governor = new DurableInvoiceGovernor(database, now, options.foregroundBusy, options.cloud ? 'cloud' : 'local');
+  const browserRebindings = new Map<string, { original: BrowserTarget; current: BrowserTarget; enabled: boolean }>();
+  const desktopRebindings = new Map<string, { originalAction: DesktopActionProposal; originalTarget: DesktopActionTarget; action: DesktopActionProposal; target: DesktopActionTarget; enabled: boolean }>();
+  const browserKey = (input: { workId: number; itemId: number; proposalId: number }) => JSON.stringify([input.workId, input.itemId, input.proposalId]);
+  const browserApprovedTarget = (_context: unknown, proposal: BrowserReadView) => {
+    const saved = browserRebindings.get(browserKey(proposal));
+    return saved?.enabled && isDeepStrictEqual(saved.original, proposal.target) ? saved.current : undefined;
+  };
+  const desktopApprovedAction = (_context: unknown, proposal: DesktopActionView) => {
+    const saved = desktopRebindings.get(browserKey(proposal));
+    return saved?.enabled && isDeepStrictEqual(saved.originalAction, proposal.action) && isDeepStrictEqual(saved.originalTarget, proposal.target)
+      ? { action: saved.action, target: saved.target } : undefined;
+  };
   let nativeRuntime: DurableRuntimePort | undefined;
   try {
   const subagents = createDurableInvoiceSubagentService({ database, now, governor,
     observeSubagent: identity => nativeRuntime?.observeSubagent(identity)
       ?? Promise.resolve(fail(appError('personal_agent_unavailable', 'runtime', 'The native child observer is not ready.'))) });
   const desktop = options.desktop ? [...createDesktopReadTools(options.desktop), createDesktopProposalTool({ database, now, ...options.desktop }),
-    createDesktopExecutionTool({ database, now, ...options.desktop })] : [];
+    createDesktopExecutionTool({ database, now, ...options.desktop, approvedAction: desktopApprovedAction })] : [];
   const browser = options.browser ? [createBrowserRequestTool({ database, now, ...options.browser }),
-    createBrowserExecutionTool({ database, now, ...options.browser })] : [];
+    createBrowserExecutionTool({ database, now, ...options.browser, approvedTarget: browserApprovedTarget })] : [];
   const form = options.form && !options.cloud ? [createPersonalInvoiceFormObserveTool({ database, observe: options.form.observe }),
     createPersonalInvoiceFormTool(options.form.service)] : [];
   const definitions = options.definitions.filter(tool => (INVOICE_REVIEW_TOOL_NAMES as readonly string[]).includes(tool.name)
@@ -112,6 +126,120 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
         readFrozenFile: (frozen, request) => hub.readFrozenFile(frozen, request, scope.contents) });
     } });
   let coordinator: InvoiceWorkCoordinator | undefined;
+  const approvalWait = createInvoiceWorkApprovalWait({ database, now, onChanged: () => { if (activated) coordinator?.wake(); } });
+  const checkedApproval = { begin: approvalWait.begin, read: async (input: Parameters<typeof approvalWait.read>[0]) => {
+    const state = await approvalWait.read(input);
+    if (!state.ok || state.data.status !== 'approved' || state.data.scheduling !== 'active') return state;
+    try {
+      const original = await database.read(scope => {
+        const attempt = scope.invoiceWorkAttempts.get({ workId: input.workId, attemptId: input.attemptId });
+        if (!attempt.ok || attempt.data.task.attempt.runId === null) return null;
+        const runId = attempt.data.task.attempt.runId;
+        const resolved = resolveInvoiceWorkToolScope(scope.db, { runId, sessionId: input.sessionId, workId: input.workId,
+          itemId: input.itemId, attemptId: input.attemptId, requestId: input.requestId });
+        if (!resolved.ok) return null;
+        const key = { workId: input.workId, itemId: input.itemId, proposalId: input.proposalId };
+        const proposal = input.kind === 'browser' ? scope.invoiceWorkBrowserReads.get(key) : scope.invoiceWorkDesktopActions.get(key);
+        return proposal.ok ? { context: { runId, sessionId: input.sessionId, scope: resolved.data.scope }, proposal: proposal.data } : null;
+      });
+      if (!original) return ok({ ...state.data, deviceReady: false });
+      const held = 'action' in original.proposal ? desktopRebindings.get(browserKey(original.proposal)) : browserRebindings.get(browserKey(original.proposal));
+      if (held && !held.enabled) return ok({ ...state.data, deviceReady: false });
+      const signal = AbortSignal.timeout(5000);
+      const rebound = 'action' in original.proposal ? desktopApprovedAction(original.context, original.proposal) : undefined;
+      const current = input.kind === 'browser' && options.browser ? await options.browser.resolveTarget(original.context, signal)
+        : input.kind === 'desktop' && options.desktop && 'action' in original.proposal
+          ? await options.desktop.resolveTarget(rebound?.action ?? original.proposal.action, original.context, signal) : null;
+      const expected = 'action' in original.proposal ? rebound?.target ?? original.proposal.target
+        : browserApprovedTarget(original.context, original.proposal) ?? original.proposal.target;
+      return ok({ ...state.data, deviceReady: current?.ok === true && isDeepStrictEqual(current.data, expected) });
+    } catch { return ok({ ...state.data, deviceReady: false }); }
+  } };
+  const rebindDesktopAction = async (input: DesktopActionRebind): Promise<Result<DesktopActionView>> => {
+    const denied = () => fail(appError('state_conflict', 'runtime', 'The original approved desktop action cannot be rebound.'));
+    if (!options.desktop) return denied();
+    try {
+      const original = await database.read(scope => {
+        const proposal = scope.invoiceWorkDesktopActions.get({ workId: input.workId, itemId: input.itemId, proposalId: input.proposalId });
+        const row = scope.db.query<{ phase_id: number; attempt_id: number; request_id: string; session_id: number;
+          run_id: number; native_conversation_id: number; native_tool_call_id: string }, [number]>(`SELECT p.id phase_id,p.attempt_id,p.request_id,
+          w.session_id,a.run_id,p.native_conversation_id,t.native_tool_call_id FROM invoice_work_desktop_actions da
+          JOIN invoice_work_tool_calls b ON b.tool_call_id=da.proposal_tool_call_id JOIN tool_calls t ON t.id=b.tool_call_id
+          JOIN invoice_work_phases p ON p.id=b.phase_id JOIN invoice_work_attempts a ON a.id=p.attempt_id
+          JOIN invoice_works w ON w.id=p.work_id WHERE da.id=?`).get(input.proposalId);
+        if (!proposal.ok || proposal.data.status !== 'approved' || !proposal.data.resumeOriginal || proposal.data.executionToolCallId !== null
+          || !isDeepStrictEqual(proposal.data.action, input.confirmedAction) || !isDeepStrictEqual(proposal.data.target, input.confirmedTarget) || !row) return null;
+        const task = /^durable-task:([1-9]\d*)$/.exec(row.native_tool_call_id);
+        if (!task || !Number.isSafeInteger(Number(task[1]))) return null;
+        const identity = { workId: input.workId, itemId: input.itemId, sessionId: row.session_id, attemptId: row.attempt_id,
+          phaseId: row.phase_id, requestId: row.request_id, nativeConversationId: row.native_conversation_id,
+          nativeTaskId: Number(task[1]), proposalId: input.proposalId, kind: 'desktop' as const };
+        const resolved = resolveInvoiceWorkToolScope(scope.db, { runId: row.run_id, sessionId: row.session_id, workId: input.workId,
+          itemId: input.itemId, attemptId: row.attempt_id, requestId: row.request_id });
+        return resolved.ok ? { identity, proposal: proposal.data, context: { runId: row.run_id, sessionId: row.session_id, scope: resolved.data.scope } } : null;
+      });
+      if (!original) return denied();
+      const state = await approvalWait.read(original.identity);
+      if (!state.ok || state.data.status !== 'approved' || !['ready', 'active'].includes(state.data.scheduling)) return denied();
+      let action = input.currentAction;
+      if (!action) {
+        const observed = await options.desktop.observe(original.context, AbortSignal.timeout(5000));
+        if (!observed.ok || observed.data.truncated || !isDeepStrictEqual(observed.data.window, input.confirmedTarget.window)) return denied();
+        action = { ...input.confirmedAction, observationId: observed.data.observationId };
+      }
+      if (!isDeepStrictEqual({ ...action, observationId: input.confirmedAction.observationId }, input.confirmedAction)) return denied();
+      const target = await options.desktop.resolveTarget(action, original.context, AbortSignal.timeout(5000));
+      if (!target.ok || input.currentTarget && !isDeepStrictEqual(target.data, input.currentTarget)
+        || !isDeepStrictEqual(target.data.window, input.confirmedTarget.window) || target.data.element !== input.confirmedTarget.element) return denied();
+      const checked = await approvalWait.read(original.identity);
+      if (!checked.ok || checked.data.status !== 'approved' || !['ready', 'active'].includes(checked.data.scheduling)) return denied();
+      const previous = desktopRebindings.get(browserKey(input));
+      if (input.resume && (!previous || !isDeepStrictEqual(previous.originalAction, input.confirmedAction)
+        || !isDeepStrictEqual(previous.originalTarget, input.confirmedTarget) || !isDeepStrictEqual(previous.target, target.data))) return denied();
+      desktopRebindings.set(browserKey(input), { originalAction: structuredClone(input.confirmedAction), originalTarget: structuredClone(input.confirmedTarget),
+        action: structuredClone(action), target: structuredClone(target.data), enabled: input.resume === true });
+      if (activated && input.resume) coordinator?.wake();
+      return ok(original.proposal);
+    } catch { return denied(); }
+  };
+  const rebindBrowserRead = async (input: BrowserReadRebind): Promise<Result<BrowserReadView>> => {
+    const denied = () => fail(appError('state_conflict', 'runtime', 'The original approved browser target cannot be rebound.'));
+    if (!options.browser || input.currentTarget.origin !== input.confirmedTarget.origin) return denied();
+    try {
+      const original = await database.read(scope => {
+        const proposal = scope.invoiceWorkBrowserReads.get({ workId: input.workId, itemId: input.itemId, proposalId: input.proposalId });
+        const row = scope.db.query<{ phase_id: number; attempt_id: number; request_id: string; session_id: number;
+          run_id: number; native_conversation_id: number; native_tool_call_id: string }, [number]>(`SELECT p.id phase_id,p.attempt_id,p.request_id,
+          w.session_id,a.run_id,p.native_conversation_id,t.native_tool_call_id FROM invoice_work_browser_reads br
+          JOIN invoice_work_tool_calls b ON b.tool_call_id=br.proposal_tool_call_id JOIN tool_calls t ON t.id=b.tool_call_id
+          JOIN invoice_work_phases p ON p.id=b.phase_id JOIN invoice_work_attempts a ON a.id=p.attempt_id
+          JOIN invoice_works w ON w.id=p.work_id WHERE br.id=?`).get(input.proposalId);
+        if (!proposal.ok || proposal.data.status !== 'approved' || !proposal.data.resumeOriginal || proposal.data.executionToolCallId !== null
+          || !isDeepStrictEqual(proposal.data.target, input.confirmedTarget) || !row) return null;
+        const task = /^durable-task:([1-9]\d*)$/.exec(row.native_tool_call_id);
+        if (!task || !Number.isSafeInteger(Number(task[1]))) return null;
+        const identity = { workId: input.workId, itemId: input.itemId, sessionId: row.session_id, attemptId: row.attempt_id,
+          phaseId: row.phase_id, requestId: row.request_id, nativeConversationId: row.native_conversation_id,
+          nativeTaskId: Number(task[1]), proposalId: input.proposalId, kind: 'browser' as const };
+        const resolved = resolveInvoiceWorkToolScope(scope.db, { runId: row.run_id, sessionId: row.session_id, workId: input.workId,
+          itemId: input.itemId, attemptId: row.attempt_id, requestId: row.request_id });
+        return resolved.ok ? { identity, proposal: proposal.data, context: { runId: row.run_id, sessionId: row.session_id, scope: resolved.data.scope } } : null;
+      });
+      if (!original) return denied();
+      const state = await approvalWait.read(original.identity);
+      if (!state.ok || state.data.status !== 'approved' || !['ready', 'active'].includes(state.data.scheduling)) return denied();
+      const target = await options.browser.resolveTarget(original.context, AbortSignal.timeout(5000));
+      if (!target.ok || !isDeepStrictEqual(target.data, input.currentTarget)) return denied();
+      const checked = await approvalWait.read(original.identity);
+      if (!checked.ok || checked.data.status !== 'approved' || !['ready', 'active'].includes(checked.data.scheduling)) return denied();
+      const previous = browserRebindings.get(browserKey(input));
+      if (input.resume && (!previous || !isDeepStrictEqual(previous.original, input.confirmedTarget)
+        || !isDeepStrictEqual(previous.current, input.currentTarget))) return denied();
+      browserRebindings.set(browserKey(input), { original: structuredClone(input.confirmedTarget), current: structuredClone(input.currentTarget), enabled: input.resume === true });
+      if (activated && input.resume) coordinator?.wake();
+      return ok(original.proposal);
+    } catch { return denied(); }
+  };
   let observer: InvoiceWorkPhaseObserver | undefined;
   let cloudQueue: Pick<CloudQueueAuthority, 'currentEdit' | 'wasCancelled' | 'verifyInputs'> | undefined;
   let activated = false;
@@ -138,7 +266,9 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       });
       if (!original.ok) return original;
       const current = await options.browser.resolveTarget(original.data.context, signal);
-      if (!current.ok || signal.aborted || !isDeepStrictEqual(current.data, original.data.target)) {
+      const rebound = browserRebindings.get(browserKey({ workId: call.workId, itemId: original.data.row.item_id, proposalId: original.data.row.id }));
+      const expected = rebound && isDeepStrictEqual(rebound.original, original.data.target) ? rebound.current : original.data.target;
+      if (!current.ok || signal.aborted || !isDeepStrictEqual(current.data, expected)) {
         await database.transaction(scope => scope.invoiceWorkBrowserReads.revoke({ workId: call.workId, itemId: original.data.row.item_id,
           proposalId: original.data.row.id, at: now() }));
         return denied();
@@ -170,6 +300,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
   };
   if (options.cloud) CloudWorkspaceIdSchema.parse(options.cloud.workspaceId);
   const runtimeOptions: Omit<DurableRuntimeOptions, 'storage'> = {
+    approvalWait: checkedApproval,
     readApiKey: (_identity, config) => options.readApiKey(config), verifyModelUse: identity => governor.verifyModelUse(identity),
     verifySchedulingUse: (identity, pendingFeedback) => governor.verifySchedulingUse(identity, pendingFeedback),
     reserveModelRequest: identity => governor.reserveModelRequest(identity),
@@ -179,10 +310,24 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
       const saved = query.child ? await subagents.readWorkingContext(query) : await contexts.get(query);
       if (!saved.ok || !options.cloud) return saved;
       if (!cloudQueue) return fail(appError('cloud_queue_unavailable', 'runtime', 'The cloud queue authority is unavailable.', true));
-      const edit = await cloudQueue.currentEdit({ workId: query.workId, sessionId: query.sessionId, attemptId: query.attemptId, requestId: query.requestId });
+      const edit = await cloudQueue.currentEdit({ workId: query.workId, sessionId: query.sessionId,
+        ...(query.itemId === undefined ? {} : { itemId: query.itemId }), attemptId: query.attemptId, requestId: query.requestId });
       if (!edit.ok) return edit;
       return edit.data ? ok({ ...saved.data, queueInstruction: { provenance: 'user-provided' as const, ...edit.data } }) : saved;
     },
+    ...(options.memory ? { readMemory: async (query: import('@flowmate/contracts').DurableWorkingContextQuery) => {
+      if (query.child) return ok({ status: 'disabled' as const, items: [] });
+      const allowed = await governor.verifyModelUse({ workId: query.workId, sessionId: query.sessionId, attemptId: query.attemptId });
+      if (!allowed.ok) return allowed;
+      const saved = await contexts.get(query); if (!saved.ok) return saved;
+      const budget = await governor.remainingBudget(query.workId); if (!budget.ok) return budget;
+      const timeoutMs = Math.min(2000, Math.floor(budget.data.timeoutMs));
+      if (timeoutMs <= 0) return ok({ status: 'unavailable' as const, items: [] });
+      const context = saved.data, text = [context.work.goal, ...context.userInputs.map(input => input.text)].join('\n').trim().slice(0, 500);
+      return options.memory!.runtime.recallWork({ workId: query.workId, sessionId: query.sessionId, itemId: context.item.itemId,
+        attemptId: query.attemptId, phaseId: context.phase.phaseId, requestId: query.requestId,
+        owner: options.memory!.owner, query: text, timeoutMs });
+    } } : {}),
     verifyWorkingContext: async query => {
       if (!query.child) return contexts.verify(query);
       const context = await subagents.readWorkingContext(query); return context.ok ? ok(undefined) : context;
@@ -224,10 +369,11 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     reconcileChildren: identity => subagents.reconcileAttempt(identity),
     verifyModelUse: identity => governor.verifyModelUse(identity), onChanged: () => { if (activated) coordinator?.wake(); },
     restoreAttempt: async (identity: DurableAttemptIdentity) => {
-      const phases = await database.read(scope => scope.db.query<{ request_id: string }, [number, number]>(
-        'SELECT request_id FROM invoice_work_phases WHERE work_id=? AND attempt_id=? AND native_submission_id IS NOT NULL ORDER BY id')
+      const phases = await database.read(scope => scope.db.query<{ request_id: string; item_id: number | null; scheduler_state: string }, [number, number]>(
+        'SELECT request_id,item_id,scheduler_state FROM invoice_work_phases WHERE work_id=? AND attempt_id=? AND native_submission_id IS NOT NULL ORDER BY id')
         .all(identity.workId, identity.attemptId));
-      for (const phase of phases) { const restored = await modelService.restore({ ...identity, requestId: phase.request_id }); if (!restored.ok) return restored; }
+      for (const phase of phases) { const restored = await modelService.restore({ ...identity, requestId: phase.request_id,
+        ...(phase.scheduler_state !== 'legacy' && phase.item_id !== null ? { itemId: phase.item_id } : {}) }); if (!restored.ok) return restored; }
       return ok(undefined);
     } });
   coordinator = new InvoiceWorkCoordinator({ database, runtime, modelService, contexts, phaseObserver: observer,
@@ -244,8 +390,9 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     const fixed = await prepareDurableModelBinding(config.data); return fixed.ok ? ok(undefined) : fixed;
   } });
   const works = new InvoiceWorkService({ database, now, runtimeDefaults: options.runtimeDefaults, cloudWorkspaceId: options.cloud?.workspaceId,
+    ...(options.memory ? { bindMemoryWork: (scope, work) => options.memory!.runtime.bindWorkInStore(scope, work, options.memory!.owner) } : {}),
     onChanged: () => { if (activated) coordinator?.wake(); },
-    onDesktopChanged: () => { if (activated) coordinator?.wake(); },
+    onDesktopChanged: () => { if (activated) coordinator?.wake(); }, rebindDesktopAction, rebindBrowserRead,
     captureModel: async configuration => {
       if (configuration.modelId === null) return ok(null);
       const config = await options.resolveConfiguration(configuration.modelId); return config.ok ? prepareDurableModelBinding(config.data) : config;
@@ -269,9 +416,11 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
   if (!initialized.ok) { await runtime.close(); return initialized; }
   const callbacks: CloudAuthorityCallbacks = {
     readWorkingContext: async input => runtimeOptions.readWorkingContext!(input),
+    ...(runtimeOptions.readMemory ? { readMemory: async input => runtimeOptions.readMemory!(input) } : {}),
     verifyQueueInputs: async input => {
       if (!options.cloud || !cloudQueue) return fail(appError('cloud_queue_unavailable', 'runtime', 'The cloud queue authority is unavailable.', true));
-      const verified = await contexts.verify({ workId: input.workId, sessionId: input.sessionId, attemptId: input.attemptId, requestId: input.requestId });
+      const verified = await contexts.verify({ workId: input.workId, sessionId: input.sessionId,
+        ...(input.itemId === undefined ? {} : { itemId: input.itemId }), attemptId: input.attemptId, requestId: input.requestId });
       return verified.ok ? cloudQueue.verifyInputs(input) : verified;
     },
     verifyWorkingContext: async input => runtimeOptions.verifyWorkingContext!(input),
@@ -280,6 +429,7 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     executeTool: async input => runtimeOptions.executeTool!(input),
     readToolResult: async input => runtimeOptions.readToolResult!(input),
     onToolFeedback: async input => runtimeOptions.onToolFeedback!(input),
+    approvalWait: checkedApproval,
     subagents: runtimeOptions.subagents, compactions: runtimeOptions.compactions,
   };
   return ok({ personal: { agent, works, tasks }, coordinator,

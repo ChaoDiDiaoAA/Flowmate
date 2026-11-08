@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
-import { appError, BrowserReadViewSchema, CloudDesktopRelayEventSchema, DesktopActionViewSchema, fail, ok, parseCloudDesktopResult, parseDesktopBridgeResult,
-  type BrowserReadView, type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult, type Result } from '@flowmate/contracts';
+import { appError, BrowserReadViewSchema, BrowserTargetSchema, CloudDesktopRelayEventSchema, DesktopActionViewSchema, fail, ok, parseCloudDesktopResult, parseDesktopBridgeResult,
+  type BrowserReadView, type BrowserTarget, type DesktopActionProposal, type DesktopActionTarget, type DesktopActionView, type DesktopBridgeRequest, type DesktopBridgeResult, type Result } from '@flowmate/contracts';
 
 type Session = { request(command: unknown, timeoutMs?: number): Promise<Result<unknown>> };
 type Options = { execute(request: DesktopBridgeRequest, signal: AbortSignal): Promise<DesktopBridgeResult>;
@@ -16,7 +16,10 @@ const key = (workId: number, itemId: number, proposalId: number) => `${workId}:$
 export class CloudKimiBridge {
   private readonly connectionId = randomUUID();
   private readonly approvals = new Map<string, DesktopActionView>();
+  private readonly actionChecks = new Map<string, AbortController>();
+  private readonly actionRebindings = new Map<string, { action: DesktopActionProposal; originalTarget: DesktopActionTarget; target: DesktopActionTarget }>();
   private readonly browserApprovals = new Map<string, BrowserReadView>();
+  private readonly browserRebindings = new Map<string, { original: BrowserTarget; current: BrowserTarget }>();
   private readonly browserPending = new Map<string, AbortController>();
   private readonly browserChecks = new Map<string, AbortController>();
   private readonly pending = new Map<string, AbortController>();
@@ -43,30 +46,83 @@ export class CloudKimiBridge {
     return ok(undefined);
   }
 
-  revoke(workId: number, itemId: number, proposalId: number): void { this.approvals.delete(key(workId, itemId, proposalId)); }
+  async rebindAction(raw: DesktopActionView, activate: boolean): Promise<Result<{ currentAction: DesktopActionProposal; currentTarget: DesktopActionTarget }>> {
+    const parsed = DesktopActionViewSchema.safeParse(raw);
+    if (!this.running || !parsed.success || parsed.data.status !== 'approved' || !parsed.data.resumeOriginal || parsed.data.executionToolCallId !== null) return unavailable();
+    const original = parsed.data, id = key(original.workId, original.itemId, original.proposalId);
+    if (this.actionChecks.has(id)) return unavailable();
+    if (activate && !this.actionRebindings.has(id)) return unavailable();
+    if (!activate) { this.approvals.delete(id); this.actionRebindings.delete(id); }
+    const controller = new AbortController(); this.actionChecks.set(id, controller);
+    try {
+      const observe = { kind: 'observe' as const, workId: original.workId, itemId: original.itemId };
+      const observed = parseDesktopBridgeResult(observe, await this.options.execute(observe, controller.signal));
+      if (!observed?.ok || observed.data.kind !== 'observe' || observed.data.truncated
+        || !isDeepStrictEqual(observed.data.window, original.target.window)) return unavailable();
+      const currentAction = { ...original.action, observationId: observed.data.observationId };
+      const resolve = { kind: 'resolve' as const, workId: original.workId, itemId: original.itemId, action: currentAction };
+      const resolved = parseDesktopBridgeResult(resolve, await this.options.execute(resolve, controller.signal));
+      if (!resolved?.ok || resolved.data.kind !== 'resolve' || !isDeepStrictEqual(resolved.data.target.window, original.target.window)
+        || resolved.data.target.element !== original.target.element) return unavailable();
+      const rebound = { ...original, action: currentAction, target: resolved.data.target };
+      const checked = await this.options.verify(rebound, controller.signal);
+      if (!checked.ok || !this.running || controller.signal.aborted) return checked.ok ? unavailable() : checked;
+      const previous = this.actionRebindings.get(id);
+      if (activate && (!previous || !isDeepStrictEqual(previous.action, original.action)
+        || !isDeepStrictEqual(previous.originalTarget, original.target) || !isDeepStrictEqual(previous.target, resolved.data.target))) return unavailable();
+      if (activate) this.approvals.set(id, structuredClone(rebound));
+      else this.actionRebindings.set(id, { action: structuredClone(original.action), originalTarget: structuredClone(original.target), target: structuredClone(resolved.data.target) });
+      return ok({ currentAction, currentTarget: resolved.data.target });
+    } catch { return unavailable(); }
+    finally { if (this.actionChecks.get(id) === controller) this.actionChecks.delete(id); }
+  }
 
-  async approveBrowser(raw: BrowserReadView): Promise<Result<void>> {
+  revoke(workId: number, itemId: number, proposalId: number): void {
+    const id = key(workId, itemId, proposalId); this.approvals.delete(id); this.actionRebindings.delete(id); this.actionChecks.get(id)?.abort();
+  }
+
+  revokeDesktopWork(workId: number, itemId?: number): void {
+    const prefix = itemId === undefined ? `${workId}:` : `${workId}:${itemId}:`;
+    for (const id of this.approvals.keys()) if (id.startsWith(prefix)) this.approvals.delete(id);
+    for (const id of this.actionRebindings.keys()) if (id.startsWith(prefix)) this.actionRebindings.delete(id);
+    for (const [id, check] of this.actionChecks) if (id.startsWith(prefix)) check.abort();
+  }
+
+  async approveBrowser(raw: BrowserReadView, currentTarget?: BrowserTarget, activate = true): Promise<Result<void>> {
     const parsed = BrowserReadViewSchema.safeParse(raw);
-    if (!this.running || !this.options.verifyBrowser || !parsed.success || !parsed.data.canDecide || parsed.data.status !== 'waiting') return unavailable();
-    const read = parsed.data, id = key(read.workId, read.itemId, read.proposalId);
+    if (!this.running || !this.options.verifyBrowser || !parsed.success) return unavailable();
+    const rebound = currentTarget === undefined ? null : BrowserTargetSchema.safeParse(currentTarget);
+    if (currentTarget === undefined ? !parsed.data.canDecide || parsed.data.status !== 'waiting'
+      : !rebound?.success || parsed.data.status !== 'approved' || !parsed.data.resumeOriginal
+        || parsed.data.executionToolCallId !== null || rebound.data.origin !== parsed.data.target.origin) return unavailable();
+    const read = rebound?.success ? { ...parsed.data, target: rebound.data } : parsed.data;
+    const id = key(read.workId, read.itemId, read.proposalId);
     if (this.browserPending.has(id) || this.browserChecks.has(id)) return unavailable();
+    if (rebound?.success && activate) {
+      const previous = this.browserRebindings.get(id);
+      if (!previous || !isDeepStrictEqual(previous.original, parsed.data.target) || !isDeepStrictEqual(previous.current, rebound.data)) return unavailable();
+    }
+    if (!activate) { this.browserApprovals.delete(id); this.browserRebindings.delete(id); }
     const controller = new AbortController(); this.browserChecks.set(id, controller);
     try {
       const checked = await this.options.verifyBrowser(read, controller.signal);
       if (!checked.ok || !this.running || controller.signal.aborted) return checked.ok ? unavailable() : checked;
-      this.browserApprovals.set(id, structuredClone(read)); return ok(undefined);
+      if (activate) this.browserApprovals.set(id, structuredClone(read));
+      else if (rebound?.success) this.browserRebindings.set(id, { original: structuredClone(parsed.data.target), current: structuredClone(rebound.data) });
+      return ok(undefined);
     } catch { return unavailable(); }
     finally { if (this.browserChecks.get(id) === controller) this.browserChecks.delete(id); }
   }
 
   revokeBrowser(workId: number, itemId: number, proposalId: number): void {
-    const id = key(workId, itemId, proposalId); this.browserApprovals.delete(id);
+    const id = key(workId, itemId, proposalId); this.browserApprovals.delete(id); this.browserRebindings.delete(id);
     this.browserChecks.get(id)?.abort(); this.browserPending.get(id)?.abort();
   }
 
   revokeBrowserWork(workId: number, itemId?: number): void {
     const prefix = itemId === undefined ? `${workId}:` : `${workId}:${itemId}:`;
     for (const id of this.browserApprovals.keys()) if (id.startsWith(prefix)) this.browserApprovals.delete(id);
+    for (const id of this.browserRebindings.keys()) if (id.startsWith(prefix)) this.browserRebindings.delete(id);
     for (const [id, check] of this.browserChecks) if (id.startsWith(prefix)) check.abort();
     for (const [id, pending] of this.browserPending) if (id.startsWith(prefix)) pending.abort();
   }
@@ -92,7 +148,8 @@ export class CloudKimiBridge {
         this.tasks.add(task);
       }
     } catch { /* The original cloud connection is unavailable. */ }
-    this.running = false; this.approvals.clear(); this.browserApprovals.clear();
+    this.running = false; this.approvals.clear(); this.browserApprovals.clear(); this.actionRebindings.clear(); this.browserRebindings.clear();
+    for (const check of this.actionChecks.values()) check.abort();
     for (const check of this.browserChecks.values()) check.abort();
     for (const pending of this.browserPending.values()) pending.abort();
     for (const pending of this.pending.values()) pending.abort();
@@ -123,7 +180,8 @@ export class CloudKimiBridge {
   }
 
   async close(): Promise<void> {
-    this.running = false; this.approvals.clear(); this.browserApprovals.clear();
+    this.running = false; this.approvals.clear(); this.browserApprovals.clear(); this.actionRebindings.clear(); this.browserRebindings.clear();
+    for (const check of this.actionChecks.values()) check.abort();
     for (const check of this.browserChecks.values()) check.abort();
     for (const pending of this.browserPending.values()) pending.abort();
     for (const pending of this.pending.values()) pending.abort();
