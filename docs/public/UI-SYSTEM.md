@@ -9,7 +9,7 @@ The React Renderer uses shared CSS variables and ordinary form elements. It open
 | Area | Purpose |
 |---|---|
 | Main conversation | Default view for composing messages and reading the selected conversation |
-| Personal Agent | Assistant configuration, saved invoice Work, per-invoice Todo and disposition, attempts, history and timeline |
+| Personal Agent | Local and cloud Work, Assistant configuration, per-invoice Todo and approvals, attempts, history and timeline |
 | Invoices / Workspace | Original/parsed/result review and material/candidate context |
 | Processing History | Saved processing Runs and business outcomes |
 | Chats / recent chats | List/manage saved Sessions or open one in the main conversation canvas |
@@ -18,7 +18,7 @@ The React Renderer uses shared CSS variables and ordinary form elements. It open
 | Models | Provider/model setup and explicit connection checks |
 | Evaluation | Dedicated configuration, execution and saved quality results |
 | Prompts / Skills / Extensions | Resource selection, readiness and controlled capabilities |
-| Settings | User/theme, model, runtime and explicitly saved research preferences |
+| Settings | User/theme, model, runtime, research preferences and Long-term memory under Connections |
 
 **New chat** creates a Session and opens the main conversation. Opening a recent chat or an entry in **Chats** also returns to that canvas. The global **Evaluation** entry remains available in both the conversation and business views.
 
@@ -44,7 +44,7 @@ Light, dark and system themes use shared background, surface, text, border, acce
 - Loading, errors, missing evidence, unavailable history and unconfirmed stopping retain their meanings; a missing reply is not success or permission for a new execution.
 - Unsaved invoice edits stay in memory; Save/Discard is explicit when leaving.
 - Long work exposes parent Run, actual child cards, tools and saved identities. Assistant prose is not an execution receipt.
-- Personal Agent separates the current attempt's Stop, Continue work and Cancel entire work; the Invoices, Tasks, History and Timeline tabs expose different saved facts. See [Personal Agent](personal-agent.md).
+- Personal Agent separates **Stop current attempt**, **Continue work** and **Cancel entire work**. **Invoices** shows per-invoice approvals and dispositions, **Tasks** shows attempts, **History** shows native entries, and **Timeline** labels observations and saved receipts separately. Local candidate events can show feedback and a link to the original execution when verified. See [Personal Agent](personal-agent.md).
 
 Child cards show actual lifecycle and single-child Stop; details live in [Subagents](subagents.md). Delivery states are described in [Workflows](workflows.md).
 

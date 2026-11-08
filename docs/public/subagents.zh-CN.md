@@ -4,7 +4,7 @@
 
 ## 子任务是什么
 
-父 Agent 可通过 **`Agent`** 工具委派有界任务。Flowmate 支持两条路径：普通 Chats、Invoices 和 Deep Research 使用受控 AgentSession subagents 扩展；[Personal Agent](personal-agent.zh-CN.md) 使用独立 Durable 适配器处理发票取证。两者都创建关联原父调用的产品子记录，但原生执行、准备及恢复方式不同。无论本地 Host 还是明确选中的 ServiceOwner 持有 Application，父子都在该控制进程内执行。
+父 Agent 可通过 **`Agent`** 工具委派有界任务。Flowmate 支持两条路径：普通 Chats、Invoices 和 Deep Research 使用受控 AgentSession subagents 扩展；[Personal Agent](personal-agent.zh-CN.md) 使用独立 Durable 适配器处理发票取证。两者都创建关联原父调用的产品子记录，但原生执行、准备及恢复方式不同。本地父子共享 Application 控制者，即本地 Host 或明确选中的 ServiceOwner。云端 Durable 执行由云端 Runtime 管理。
 
 角色由系统提示与允许工具列表组成，不是另一个无限制助手。当前子任务只读、共享所属事项或父任务的预算，不能再次委派或使用用户选择的后台选项，也没有独立操作系统沙箱或模型配置。
 
@@ -18,7 +18,11 @@ Core 校验原 Work、Attempt、阶段和 ToolCall，依据获准阶段 Context 
 
 **Stop current attempt** 也会请求停止其归属子任务。应核对实际停止和已保存子事实；取消或回复丢失不等于清理完成。Personal Agent 的 Tasks 视图当前提供子历史和报告，没有单独的子任务停止按钮。后端恢复协调原持久身份和符合条件的原生 Task，不会仅因结果未知就授权替代执行。事项继续、取消和系统服务限制见 [Personal Agent](personal-agent.zh-CN.md)。
 
-以下准备、命令、时序、权限表和生命周期章节描述 **AgentSession 扩展路径**。
+Master 指各自运行线的父任务。Personal Agent 的 **Tasks** 可沿原子调用查看子报告，核对结果是否交给 Master 以及 Master 是否已读取。[独立发票复核](personal-agent.zh-CN.md#personal-peer-review)是另一条按候选版本运行的阶段，由用户预览字段与证据后启动。
+
+以下章节描述 AgentSession 扩展路径。通过子任务卡片查看实际执行并打开保存的子 Session 或 Run。模板已展开或助手声称已委派，都不能代替真实执行记录。
+
+<a id="agentsession-delegation"></a>
 
 ## 准备扩展与角色
 

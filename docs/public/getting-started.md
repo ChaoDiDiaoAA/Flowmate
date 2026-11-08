@@ -41,6 +41,8 @@ On the existing invoice, research and settings pages, the conversation appears i
 
 For local-file work, select the intended working directory or authorized material before sending and state the scope in the request. Available native tools may include file writes and shell commands. Directory selection sets a working location; it is not a filesystem sandbox.
 
+For long chats, use [Session details and history](agent-runtime.md#agentsession-long-sessions) to inspect saved inputs, compact context or continue from a saved point. See [AgentSession authorization](agent-runtime.md#agentsession-approvals) for material selection and confirmation steps.
+
 ## Start ongoing invoice work in Personal Agent
 
 1. Open **Personal Agent** from the left navigation and confirm/save its model, tool and resource configuration. Then select a fixed set of existing parsed invoices, enter the goal and explicitly submit to create the persistent invoice work. This creation flow is available only in Personal Agent; **Invoices** keeps single-invoice selection and editing.
@@ -48,7 +50,9 @@ For local-file work, select the intended working directory or authorized materia
 3. Read the operation receipt to distinguish saved material, authorization to execute, an existing or new attempt, queueing and a blocked condition. Valid material after a normally completed attempt can automatically continue eligible work; material saved after a user stop or failure needs an explicit continue action.
 4. Give each invoice an explicit final disposition: `accepted`, `rejected` or `excluded`. Ordinary **Reject** rejects a candidate; it does not end processing for that invoice. A candidate or a successful Run alone does not complete the work.
 
-Viewing pages/history and desktop reconnection are read-only and make no model or tool calls; they do not trigger backend recovery. Backend startup recovery separately loads the original persisted facts and native records, then checks saved authorization and current eligibility before resuming an eligible original attempt. An `open` work item alone creates no new intent, and stopped or failed attempts are not revived. This engineering delivery covers verified behavior while the application is running; execution after desktop closure, Windows service restart recovery and Windows startup recovery remain system-service goals, with real SCM acceptance deferred. See [Personal Agent](personal-agent.md) for configuration, continuation and review details.
+Choose **Local workspace** for local Work, or follow the [Cloud workspace setup](personal-agent.md#cloud-workspace) before creating a cloud Work. Use **Timeline** to inspect saved receipts and **Tasks** for attempts. Check the original receipt if a response is missing. Viewing history and reconnecting do not replay input. The [Personal Agent guide](personal-agent.md) explains continuation and recovery.
+
+To enable optional long-term memory, open **Settings → Connections → Long-term memory**. Select the location, connect OpenViking, and choose the policy for new chats or Work. Start with [OpenViking memory](agent-runtime.md#openviking-memory) for the capture and recall boundaries.
 
 ## Add capabilities deliberately
 

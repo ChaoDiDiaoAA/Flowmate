@@ -36,6 +36,8 @@ flowchart TB
 
 Host messages carry validated request and ownership identities. Notifications wake readers; saved queries supply authoritative state. A missing or late reply is not permission to re-execute a write. See [Agent runtime](agent-runtime.md) for lifecycle details.
 
+For [cloud Personal Agent Work](personal-agent.md#cloud-workspace), the desktop connects to the restricted SSH Bridge. Authority owns workspace authorization, business persistence and the provider proxy. Runtime owns the native Durable execution and checkpoints. The desktop keeps ownership of window and browser interactions. Use saved business receipts to confirm effects and model observations to inspect execution evidence.
+
 ## Responsibilities
 
 | Location | Responsibility |
@@ -63,13 +65,15 @@ Host messages carry validated request and ownership identities. Notifications wa
 5. Domain services validate business effects. SQLite and managed files preserve execution facts and artifact identities.
 6. The UI queries saved results and displays live progress without treating progress as a durable business commit.
 
-Child tasks follow Core admission into runtime-owned execution in the same Application-owning process. They share their owner's budgets, admit at most four children, prohibit nesting and retain occupied capacity while stopping is unknown. Personal Agent delegates only to the read-only `invoice-evidence-checker` role through its Durable adapter; the AgentSession extension is a separate path. [Subagents](subagents.md) describes each path's permissions, context and stopping; a child is not a separate OS sandbox or an independent write-capable agent.
+Core admits child tasks into the owning runtime. Local children run under the same Application owner as their parent. Cloud Durable children run under the cloud Runtime. They share their owner's budgets, admit at most four children, prohibit nesting and retain occupied capacity while stopping is unknown. Personal Agent delegates only to the read-only `invoice-evidence-checker` role through its Durable adapter; the AgentSession extension is a separate path. [Subagents](subagents.md) describes each path's permissions, context and stopping; a child is not a separate OS sandbox or an independent write-capable agent.
 
 ## Persistence and resources
 
 The Windows user-data root is `%APPDATA%\Flowmate`. `data/app.sqlite` stores product state and Durable native records under one database owner and shared write coordination; `artifacts/`, `outputs/` and `runtime/` hold managed content and run resources. A controller lock prevents competing product owners of the same data root. AgentSession history and Durable native Tasks/checkpoints remain owned by their respective adapters.
 
 AgentSession input snapshots, native conversation history and research step/tool/source records have distinct ownership. Research preferences are explicitly saved in product settings; the desktop's saved page/research focus is navigation state. Restoring that focus does not start a model Run. See [Context and memory layers](agent-runtime.md#context-memory-layers) and [Deep Research](workflows.md#deep-research).
+
+[OpenViking](agent-runtime.md#openviking-memory) is an optional memory service with separate local and cloud identities and stores. Runtime-specific grants determine which sourced entries may be projected into a request. Session history, Durable checkpoints and business receipts remain owned by Flowmate and the corresponding runtime.
 
 ServiceOwner/Node ServiceClient, SID/DACL checks, CurrentUser DPAPI credentials, original-credential migration and maintenance remain implemented. Current engineering delivery covers execution while the Application owner is running, committed facts and eligible recovery. Real Windows SCM installation/startup, boot, upgrade/rollback and continued execution after closing the desktop remain deferred acceptance.
 

@@ -79,14 +79,16 @@ flowchart LR
 
 配置、执行对象和恢复细节见独立的 [Personal Agent 指南](personal-agent.zh-CN.md)。
 
-本次工程版本交付覆盖应用运行期间已验证的能力。关闭桌面后持续执行、Windows 服务重启恢复与开机恢复仍属系统服务目标；真实 Windows SCM 验收延期，这些系统行为尚未验证。
+提交前选择本地工作区，或先[连接云端工作区](personal-agent.zh-CN.md#cloud-workspace)。云端服务运行时，符合条件的云端执行可以继续。本地关闭桌面后执行和 Windows 开机恢复需要单独验收。
 
 1. 打开 **Personal Agent**，先确认并保存其模型、工具与资源配置，再固定选择一组已有解析的发票，填写目标并明确提交事项。创建入口仅在本模块；**Invoices** 保持单票选择与编辑。新增票据另建事项，不静默扩大已保存集合。
 2. 查看事项概览和逐票 Todo，补充所需说明或获准材料，分别检查是否已保存、已授权执行或受阻。尝试停止或失败后，符合条件时使用 **Continue work**。
-3. 通过 **View original invoice / review** 回到 **Invoices**，对照来源复核候选。执行 **Accept result** 后返回事项并点击 **Attach confirmed acceptance**；如需结束该票并标记为拒绝或排除，使用对应的明确处置操作并填写原因。普通拒绝候选不结束该票。
+3. 通过 **View original invoice / review** 对照来源复核候选。本地在 **Invoices** 选择 **Accept result**，云端在复核面板选择 **Accept candidate**。返回事项后点击 **Attach confirmed acceptance**。如需结束该票并标记为拒绝或排除，使用对应处置操作并填写原因。普通拒绝候选不结束该票。
 4. 查看尝试和已保存证据。**Stop current attempt** 与 **Cancel entire work** 是不同操作；每张票都需要最终处置，必要写入与执行收口后事项才能完成。查看历史不会发起模型调用。
 
 父任务可以将发票取证问题委派给有界只读子任务。Durable 路径见 [Subagent](subagents.zh-CN.md)，停止、恢复和关联事项详见 [Personal Agent](personal-agent.zh-CN.md)。
+
+初次尝试结束且原候选和证据可用时，可先预览将共享的内容，再确认[独立发票复核](personal-agent.zh-CN.md#personal-peer-review)。交互工具按[审批与重连流程](personal-agent.zh-CN.md#personal-approvals)处理。在 **Timeline** 分别查看业务回执与模型观测。新聊天或 Work 的记忆授权从[长期记忆](agent-runtime.zh-CN.md#openviking-memory)管理。
 
 ## 何时停止并核对
 

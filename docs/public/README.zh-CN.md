@@ -4,7 +4,7 @@
 
 Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久会话、授权本地资料处理、证据研究、发票复核，以及用于持续发票事项的独立 **Personal Agent**。**Chats**、**Invoices**、**Deep Research** 继续使用 AgentSession，Personal Agent 使用 Pi Durable。这些文档说明仓库中的实际实现，不代表模型质量达标或发行认证。
 
-本次工程版本交付覆盖应用运行期间已验证的能力。关闭桌面后持续执行、Windows 开机恢复仍属系统服务目标；真实 Windows SCM 验收延期，这些系统行为尚未验证。
+本次工程版本交付覆盖应用运行期间已验证的能力。云端服务运行时，符合条件的云端 Work 可以继续。本地关闭桌面后持续执行与 Windows 开机恢复需要单独的 SCM 验收。
 
 ## 从这里开始
 
@@ -13,6 +13,8 @@ Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久�
 本地研究请参考 [Deep Research 流程](workflows.zh-CN.md#deep-research)；[Context 与 Memory 分层](agent-runtime.zh-CN.md#context-memory-layers)说明输入依据、会话历史和研究进度分别如何保存与恢复。
 
 持续整理一组发票时，从 **Personal Agent** 进入[专题指南](personal-agent.zh-CN.md)：固定选择已解析发票，逐票跟踪 Todo、补料和候选复核，直到每张票都有明确最终处置。
+
+可选长期记忆的配置见 [OpenViking 记忆](agent-runtime.zh-CN.md#openviking-memory)。两条运行线的委派方式见 [Subagent](subagents.zh-CN.md)。
 
 开发者路线：[产品范围](PRD.zh-CN.md) → [架构](architecture.zh-CN.md) → [Agent Runtime](agent-runtime.zh-CN.md) → [Personal Agent](personal-agent.zh-CN.md) → [Subagent](subagents.zh-CN.md) → [开发指南](development.zh-CN.md)。[评测指南](EVALUATION.zh-CN.md)解释工程验证与真实模型试验的区别。
 
@@ -24,11 +26,11 @@ Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久�
 | [快速开始](getting-started.zh-CN.md) | 开发启动、配置模型、第一次对话与 Personal Agent 入口 |
 | [架构](architecture.zh-CN.md) | Electron、Bun Host、各包职责及数据流 |
 | [Agent Runtime](agent-runtime.zh-CN.md) | Session、Run、Context／Memory 分层、工具、预算、停止与恢复 |
-| [Personal Agent](personal-agent.zh-CN.md) | Durable 发票事项、Todo、复核、尝试及恢复边界 |
+| [Personal Agent](personal-agent.zh-CN.md) | 本地与云端发票 Work、审批、网页与桌面操作及执行证据 |
 | [Subagent](subagents.zh-CN.md) | 角色准备、委派、父子归属及生命周期 |
 | [业务流程](workflows.zh-CN.md) | 本地问答、Deep Research 步骤和继续、单票复核与 Personal Agent 持续事项 |
 | [Skills 与扩展](skills-and-extensions.zh-CN.md) | 资源发现、依赖就绪、模板与受控扩展 |
-| [评测指南](EVALUATION.zh-CN.md) | 目的、轨迹、评分、双模型 Smoke/Full 与 Baseline/Gate |
+| [评测指南](EVALUATION.zh-CN.md) | Personal Agent 场景评测、轨迹、评分、双模型 Smoke/Full 与 Baseline/Gate |
 | [基准制作](EVALUATION-BENCHMARK.zh-CN.md) | 真实来源候选、独立 Gold、校验与版本发布 |
 | [UI 系统](UI-SYSTEM.zh-CN.md) | 布局、可观察状态、交互与可访问性约定 |
 | [开发指南](development.zh-CN.md) | 仓库结构、测试入口与必要依赖补丁 |

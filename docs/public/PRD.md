@@ -31,9 +31,11 @@ Deep Research currently reads authorized local text, Markdown and registered par
 
 AgentSession captures applicable page focus and authorized Workspace references with the input; temporary page state is projected into the model request separately from conversation history. Research preferences are saved explicitly and captured per Run. These layers do not automatically learn permanent user preferences or grant access to a different task's material. See [Agent runtime](agent-runtime.md#context-memory-layers).
 
+Optional [OpenViking memory](agent-runtime.md#openviking-memory) uses explicit connection and recall or capture policies. Authorized memory is separate from the conversation history and applies within the originating runtime and location.
+
 Invoice processing reads registered original and externally prepared parsed material. The Host does not run an invoice parser or OCR engine. A generated candidate, a successful form fill, a saved human edit and an accepted result have separate records. The user reviews the original, parsed source and field evidence before acceptance.
 
-Personal Agent coordinates a fixed set of parsed invoices through Durable attempts and per-invoice Todo. Accepting a candidate, attaching that acceptance to a Work item and completing the Work are separate steps. Its currently supported child role is a bounded, read-only invoice evidence checker.
+Personal Agent coordinates a fixed set of parsed invoices through Durable attempts and per-invoice Todo in local or cloud Work. It supports bounded read-only evidence delegation, user-confirmed independent review, and approved desktop actions or web reads. Saved receipts record business effects. Model observations record execution evidence. Accepting a candidate, attaching that acceptance to an invoice item and completing the Work remain separate steps. See [Personal Agent](personal-agent.md).
 
 Subagents are foreground, read-only workers with at most four owned child executions. They share the parent budget and cannot create nested/background workers or perform business writes. Ordinary Assistant command tools may write or execute commands; a working directory is not an operating-system sandbox.
 

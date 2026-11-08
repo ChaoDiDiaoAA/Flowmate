@@ -57,6 +57,8 @@ Inspect JSON `result`, `leaseRelease`, exit status and `gaps`. The manifest list
 
 Credentials still depend on the Windows account/system encryption context. Encrypted envelopes and Local State do not guarantee portability to another account or machine.
 
+Flowmate backup can include local memory bindings and supported encrypted memory credentials listed in the manifest. The OpenViking service's data and cloud credentials require separate backups. Check `gaps` for `openviking_external_backup_required`, `openviking_external_credentials_backup_required` or `memory_credential_backup_required` entries. For cloud Work, plan a consistent backup of Authority's database and managed files together with the Runtime Session databases and receipts. See [OpenViking memory](agent-runtime.md#openviking-memory) and the [cloud service instructions](../../deploy/cloud/README.zh-CN.md).
+
 ## Restore and verification boundaries
 
 The CLI offers `backup` and **`verify-restore`**, not an automatic restore command.
@@ -75,6 +77,8 @@ $restoredRoot = '<absolute restored user-data directory>'
 The verifier compares the restored persistent set/content and references to the manifest and checks schema/settings compatibility. An activated service selection requires its original SQLite database; a missing database is rejected rather than replaced with an empty store. Verification does not copy files, replay old calls, repair historical gaps, prove model access or certify business quality. A changed installed release triggers a pre-upgrade backup before opening/migrating state. Failure retains original data rather than claiming successful recovery.
 
 Schema 22 adds research step execution associations. Use a compatible program with an upgraded store; an older plan without steps retains its original flow. Research progress comes from persisted plan, tool and source facts, while the saved page focus is desktop navigation state. Inspect the backup manifest for included files and select the research task again if navigation is unavailable; restoration alone does not continue its model execution. See [Deep Research](workflows.md#deep-research).
+
+The current package declares schema 30. Migrations 27–30 cover OpenViking metadata, independent invoice reviews, invoice Work feedback and local model observations. The manifest describes the installed package. Inspect it before migrating and use a compatible application when checking an upgraded store.
 
 ## Source and verification
 

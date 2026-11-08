@@ -153,6 +153,23 @@ Each command attempts preflight, real execution, deterministic checks and applic
 Use Langfuse for Scores, Traces, Sessions and the User's related execution. Use local `README.md` and `run.json` for comparison and baseline/Gate details. These local decisions are not native Langfuse Gate pages.
 
 
+<a id="personal-agent-evaluation"></a>
+
+## Personal Agent scenario evaluation
+
+Run the local scenario suite from the repository root on the Windows desktop development environment with Bun, Node and the desktop build dependencies.
+
+```powershell
+bun --no-env-file run eval:personal
+bun --no-env-file run eval:personal --suite full
+```
+
+The default smoke suite covers model timing and provider failure, candidate provenance, desktop progress and Work isolation. The full suite also checks approval, stopping and recovery, owned children, memory scope, and observation persistence and retention. The runner uses isolated product data and a synthetic loopback provider.
+
+Open the printed directory under `agent-eval/personal-agent/runs/`. Read `run.json` for the selected suite, stage status and exit codes. In `cases.json`, inspect each scenario's required checks, expected and actual values, original evidence references and gaps. Follow a failing check to its host, desktop or regression output. A failed, missing or duplicate required check prevents a successful exit.
+
+This suite checks behavior and evidence under controlled conditions. Real model quality requires a separate evaluation. This command keeps its reports local. Langfuse upload and readback belong to the separate benchmark workflow described above. For the product views that expose the original execution evidence, see [Personal Agent](personal-agent.md).
+
 ## Execution budgets and scoring recovery
 
 Budgets are Run conditions, not Case, Gold or grading changes. Business defaults are 600 seconds per Trial, 180 seconds per Agent Run and 16 model calls; research defaults are 900 seconds, 300 seconds and 24 calls. Preparation and stopped evidence capture each have 60 seconds; stopping grace remains five seconds. `FLOWMATE_EVAL_BUSINESS_*` and `FLOWMATE_EVAL_RESEARCH_*` configure `TRIAL_TIMEOUT_MS`, `RUN_TIMEOUT_MS` and `MAX_MODEL_CALLS`, shared by both experiment arms. An explicit legacy `timeoutMs` still bounds the complete business execution unless `trialTimeoutMs` separates it. Confirmed research Plan budgets retain precedence.

@@ -57,6 +57,8 @@ $backup = '<absolute new backup directory>'
 
 凭据仍依赖 Windows 账户和系统加密环境，加密封装与 Local State 不保证跨账户、跨机器恢复。
 
+Flowmate 备份可包含 Manifest 列出的本地记忆绑定和受支持的加密记忆凭据。OpenViking 服务的数据和云端凭据需要另行备份。检查 `gaps` 中的 `openviking_external_backup_required`、`openviking_external_credentials_backup_required` 或 `memory_credential_backup_required` 条目。云端 Work 需要一致地备份 Authority 数据库与受管文件，以及 Runtime Session 数据库和回执。见 [OpenViking 记忆](agent-runtime.zh-CN.md#openviking-memory)与[云端服务说明](../../deploy/cloud/README.zh-CN.md)。
+
 ## 恢复与验证边界
 
 CLI 提供 `backup` 与 **`verify-restore`**，不提供自动恢复命令。
@@ -75,6 +77,8 @@ $restoredRoot = '<absolute restored user-data directory>'
 校验器将恢复持久文件集合、内容、引用与 Manifest 核对，并检查 Schema/设置兼容。已启用的服务选择必须具有原 SQLite，缺失时拒绝而非新建空库。校验不复制文件、重放旧调用、修复历史缺口、证明模型连接或认证业务质量。安装发行变化时，在打开、迁移状态前先备份；失败保留原数据，不宣称恢复成功。
 
 Schema 22 增加研究步骤执行关联。升级后的存储应使用兼容版本的程序；旧的无步骤计划保留原流程。研究进度来自持久计划、工具和来源事实，已保存页面焦点则属于桌面导航状态。以备份 Manifest 中的文件为准；导航不可用时重新选择研究任务，恢复本身不会继续模型执行。见 [Deep Research](workflows.zh-CN.md#deep-research)。
+
+当前打包清单声明 schema 30。迁移 27–30 涵盖 OpenViking 元数据、独立发票复核、Work 反馈和本地模型观测。升级前核对实际安装包清单，并用兼容版本的应用检查已升级的存储。
 
 ## 源码与验证
 

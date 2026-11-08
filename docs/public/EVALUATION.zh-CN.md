@@ -153,6 +153,23 @@ bun --no-env-file run eval:full
 Langfuse 用于查看 Score、Trace、Session 及 User 关联执行；本地 `README.md` 与 `run.json` 提供比较及 Baseline/Gate 细节。这些本地结论不是 Langfuse 原生 Gate 页面。
 
 
+<a id="personal-agent-evaluation"></a>
+
+## Personal Agent 场景评测
+
+在准备了 Bun、Node 和桌面构建依赖的 Windows 桌面开发环境中，从仓库根目录运行本地场景评测。
+
+```powershell
+bun --no-env-file run eval:personal
+bun --no-env-file run eval:personal --suite full
+```
+
+默认 smoke 检查模型耗时和 Provider 失败、候选溯源、桌面进度与 Work 隔离。full 另外覆盖审批、停止与恢复、子任务归属、记忆范围，以及观测的持久化与保留规则。运行使用隔离的产品数据和回环模拟 Provider。
+
+打开命令输出中 `agent-eval/personal-agent/runs/` 下的目录。先用 `run.json` 看选集、阶段状态和退出码，再用 `cases.json` 看各场景的必过断言、预期值、实测值、原证据引用与缺口。按失败项定位 Host、桌面或回归输出。必过断言失败、缺失或重复都会阻止命令成功退出。
+
+这套评测验证受控条件下的行为与证据。真实模型质量需要独立评估。此命令只保留本地报告，Langfuse 上传和回读属于上面的独立基准流程。产品里查看原执行的入口见 [Personal Agent](personal-agent.zh-CN.md)。
+
 ## 执行预算与评分故障恢复
 
 预算是 Run 的执行条件，不改变 Case、Gold 或评分标准。业务默认 Trial 600 秒、单 Run 180 秒、模型调用 16 次；研究默认分别为 900 秒、300 秒、24 次。准备和停止后的采证各 60 秒，停止确认沿用 5 秒。环境变量 `FLOWMATE_EVAL_BUSINESS_*`／`FLOWMATE_EVAL_RESEARCH_*` 可覆盖 `TRIAL_TIMEOUT_MS`、`RUN_TIMEOUT_MS`、`MAX_MODEL_CALLS`，同一实验两模型共用解析值。显式旧 `timeoutMs` 仍约束整题的业务执行，指定 `trialTimeoutMs` 后才分开；已确认研究 Plan 的预算继续生效，不被控制器改写。

@@ -10,17 +10,41 @@ Personal Agent is a separate workspace for continuing work on a fixed group of i
 
 ## Prepare and create work
 
+Select **Local workspace** to create local Work. For remote execution, [connect to a cloud workspace](#cloud-workspace) first. Review and disposition always apply to the selected Work item.
+
 1. Prepare the original invoices and externally generated parsing material, then register them through **Invoices**. Flowmate does not itself provide invoice OCR or a parser. Configure a usable model in **Models**.
 2. Open **Personal Agent → Assistant configuration**. Choose a saved model and thinking level; set preferences, working directory, allowed tools, and, if needed, a Prompt and Skills. Refresh resources, resolve unavailable dependencies and select **Save assistant configuration**. Settings saved later apply to new work; accepted work retains its original configuration and resource versions.
 3. Select **New invoice work**, enter an **Invoice work goal**, select one or more available parsed invoices, then choose **Submit invoice work**. The submitted invoice set is fixed; a new set requires new work. The operation receipt and the Work view distinguish acceptance, queueing, waiting and blocking from actual execution.
 4. Select a saved Work and an invoice in **Invoices**. Read its Todo and evidence, then use **Save supplement for Todo** to provide the requested clarification or authorized material. When eligible, a supplement can authorize continuation; after a stopped or failed attempt it is saved without restarting execution, and **Continue work** is required.
-5. Use **View original invoice / review** to compare a candidate with the original and parsed evidence in **Invoices**. After **Accept result**, return to Personal Agent and use **Attach confirmed acceptance** to attach the verified original acceptance to the unresolved Work item. Alternatively, give a reason and explicitly choose **End processing as rejected** or **Exclude invoice from this work**. Rejecting a candidate alone does not end the invoice item.
+5. Use **View original invoice / review** to compare the candidate with the original and parsed evidence. For local Work, use **Accept result** in **Invoices**. For cloud Work, use **Accept candidate** in the cloud review panel. Back in the Work, select **Attach confirmed acceptance** to attach the verified acceptance to the unresolved item. Alternatively, give a reason and explicitly choose **End processing as rejected** or **Exclude invoice from this work**. Rejecting a candidate alone does not end the invoice item.
 
 Every invoice needs an explicit final disposition. Work completes only after the required business writes and execution have settled; a generated candidate or finished child is not itself an accepted invoice. The [workflow guide](workflows.md#personal-agent) summarizes the operations alongside the other invoice paths.
 
+<a id="cloud-workspace"></a>
+
+## Connect to a cloud workspace
+
+1. Open **Personal Agent → Cloud workspace**. Enter the deployed workspace ID, SSH host and port, dedicated non-root SSH user and private key path, and the `known_hosts` path with the verified server key. Select **Connect to cloud** and check **Connected workspace**.
+2. Save **Assistant configuration** in the connected workspace. Saving transfers the selected Prompt and Skill versions. For a new Work, select parsed invoices and check the cloud time limit before choosing **Submit invoice work**. The desktop transfers the selected originals and parsed materials before creating the Work with the cloud document references.
+3. Open the Work in **Saved work**. Use **Refresh saved work** or reconnect to the same workspace to inspect saved results and original receipts. **Live cloud response** is temporary output. Reconnecting and reading saved results do not resubmit the Work.
+
+The restricted SSH Bridge carries desktop requests. Authority checks workspace and material permissions, saves business records and proxies model requests. Runtime executes Pi Durable Tasks. Eligible Work can continue when the desktop disconnects, within its saved authorization and budget and while the server services are running. KimiCU and WebBridge still execute on the connected Windows device and need their applicable user approvals. Selected invoice materials and visible tool feedback may be sent to DeepSeek. See the [cloud deployment guide](../../deploy/cloud/README.zh-CN.md).
+
+<a id="personal-approvals"></a>
+
+## Approval and privacy
+
+Selecting invoices and enabling tools sets the Work's scope. Selecting a desktop window authorizes reading its accessibility text for that invoice. A web read, click or text input each needs a separate approval. Accepting, rejecting or excluding an invoice requires an explicit business decision.
+
+For eligible per-invoice phases, the original tool Task waits for the decision while other eligible invoices can proceed in sequence. A decided phase can resume when the active phase ends or starts waiting. Waiting counts against the original wall-clock budget. After expiry, fresh authorization is required. Older phases and approvals retain their original flow.
+
+If the connection changes after approval but before dispatch, select the same window or a tab with the same origin. Use **Confirm selected window for original approval** or **Confirm current tab for original approval**, then **Resume original approved action** or **Resume original approved read**. This checks the new connection and target against the original decision. If dispatch already happened and the outcome is unknown, check the original receipt and inspect the application or page before acting again. Flowmate does not automatically repeat the operation.
+
 ## Desktop window access
 
-For KimiCU desktop tools, selecting a window authorizes reading its accessibility text for that invoice. The text may enter Work history and reach the selected model provider. Flowmate blocks observation and automated input when KimiCU reports recognizable credential labels. Handle those fields manually in the original application. Clicks and text entry each require approval.
+KimiCU reads the selected Windows window's accessibility text for the current invoice. Text may enter Work history and reach the selected model provider. Flowmate blocks observation and automated input when it recognizes credential markers. Handle those fields manually in the original application.
+
+Flowmate queues KimiCU operations within each connection and serializes observation and input across connections on the same Windows user desktop. If another KimiCU session owns input, wait until it is available. The system checks the selected window and observed control again before an approved action. Observe the target again if it changed. For a disconnected or uncertain action, follow [Approval and privacy](#personal-approvals).
 
 ## Controlled page reading
 
@@ -36,11 +60,7 @@ The path must be absolute; WebBridge keeps its default configuration and logs. A
 
 Enable **Browser page reading** in **Assistant configuration**, save it, and create new Work. Browser reading and KimiCU desktop tools are mutually exclusive within that Work; existing Work keeps its original configuration. The new Work waits initially. Select an invoice, enter an HTTP(S) address in **Page URL for this invoice**, choose **Open dedicated tab**, then select **Continue work**. Bind each invoice separately; a request for an unbound invoice fails and needs a binding and a new continuation. The user opens the page; the model cannot select a URL, tab, script or selector, or navigate, click, fill forms or take screenshots.
 
-When the model requests a read, the interface shows the Work, invoice, dedicated tab and origin. **Approve one read and continue** allows one read; the request can also be rejected or revoked. Approval covers paths in that tab with the same scheme, host and port, including other paths on that origin. The browser can still navigate on its own, but page text from a different origin is refused. A disconnect, rebinding, cancellation or uncertain outcome requires a new confirmation. Revocation cannot recall data already read, saved or sent.
-
-New phases retain the original tool Task while it waits for a decision. Other eligible invoices in the Work can proceed in sequence; the decided phase resumes after the active phase ends or begins waiting. Waiting still consumes the Work's original wall-clock budget, and expiry requires fresh authorization.
-
-If the connection changes after approval but before dispatch, select the same window or same-origin tab and use **Confirm selected window for original approval** or **Confirm current tab for original approval**. The original proposal, current connection and target are checked, and the original decision is reused. Confirmation alone does not execute; choose **Resume original approved action** or **Resume original approved read** afterwards. If an operation was dispatched but its outcome is unknown, inspect the application or page; it is not automatically repeated. Older phases and approvals retain their original flow.
+When the model requests a read, the interface shows the Work, invoice, dedicated tab and origin. **Approve one read and continue** allows one read; the request can also be rejected or revoked. Approval covers paths in that tab with the same scheme, host and port, including other paths on that origin. The browser can still navigate on its own, but page text from a different origin is refused. Handle connection changes and uncertain outcomes through [Approval and privacy](#personal-approvals). Revocation applies to future reads. Data already read, saved or sent follows its existing retention rules.
 
 The result contains the page origin and path, the title and up to 22,000 UTF-8 bytes of text, with a truncation marker. The path, title and text may still contain sensitive information. The result may be retained in local or cloud Work history and sent to the selected model provider. Page text remains untrusted tool output and cannot grant authority or become a system instruction; compaction summaries are also marked as model-generated. Page content can still mislead the model or affect its answer, and later tools retain their own permission and confirmation rules.
 
@@ -66,9 +86,19 @@ flowchart LR
   User -->|reject or exclude item| Work
 ```
 
-The **Invoices**, **Tasks**, **History** and **Timeline** tabs expose different saved facts. Tasks can show the attempt and owned child evidence; History reads native entries; Timeline shows business events and references. Browsing these views or checking a saved receipt does not start a model call or trigger recovery. A child report, a valid source reference and confirmed parent receipt do not by themselves prove the report's meaning or approve a candidate.
+**Invoices** shows each invoice's Todo, candidate and disposition. **Tasks** shows attempts and their owned children. **History** reads saved native entries. **Timeline** distinguishes saved business receipts from model observations. Follow the references for the invoice item, Attempt, Phase and original tool call. **Inspect model attempt** opens the attempt associated with a model observation. A child report, source reference or parent receipt records what was saved or delivered. Check the evidence before relying on the conclusion.
 
-New phases keep a separate native conversation for each invoice. Select an invoice and use **View invoice history** to inspect its history; the older root history remains available. Cloud input queues and result receipts are checked against the invoice owner, and reconnecting or reading results does not resubmit the original input.
+For local Work, open **Candidate feedback** on the saved candidate event and vote **Helpful** or **Not helpful** for that version. **View original execution** appears when the original execution can be associated. If the model call can also be uniquely matched, the view can locate that observation. When an association is unavailable or an observation expires, saved feedback and business receipts remain readable under their own retention rules. Local model observations contain bounded timing and status summaries, with a seven-day read window and a cap of 10,000 records. The feedback controls and persisted observation details described here apply to local Work. See [Personal Agent scenario evaluation](EVALUATION.md#personal-agent-evaluation).
+
+Browsing these views or checking a saved receipt does not start a model call or trigger recovery.
+
+<a id="personal-long-sessions"></a>
+
+### Long conversations
+
+New phases keep a separate native conversation per invoice. Select an invoice and use **View invoice history**. Older root history remains available. The phase context holds the original authorized materials and inputs. Durable checkpoints and receipts retain execution facts. Compaction uses the original phase scope and Work budget. The generated summary is model output and leaves the original evidence and approvals intact.
+
+Cloud input queues and result receipts are checked against the invoice owner. Reconnecting and viewing history do not resubmit input. Recovery, explicit continuation and a new goal use the distinct paths below.
 
 ## Continue, stop and recover
 
@@ -85,6 +115,20 @@ Material supplied during execution is consumed at an eligible phase boundary; it
 If the **Agent** tool is enabled for Personal Agent and the parent decides to delegate, its Durable adapter may create a bounded, read-only `invoice-evidence-checker` child for an invoice evidence question. The child uses the authorized phase scope and shares the Work's model, tool, feedback and time budgets. A Work can hold at most four child executions; unconfirmed stopping keeps a slot occupied. Children cannot delegate again, run as user-selected background tasks, or make business writes. The child reports findings and gaps; the parent and user retain their respective review responsibilities.
 
 This path does not require enabling the AgentSession **subagents** extension. The Personal Agent configuration currently has no Durable adapter for extensions, so extension-dependent Skills are unavailable there. The role, input, ownership and stopping differences between the two runtimes are detailed in [Subagents](subagents.md) and [Skills and extensions](skills-and-extensions.md).
+
+<a id="personal-peer-review"></a>
+
+### Independent invoice review
+
+After the initial attempt closes, select an unresolved invoice with a saved candidate and available evidence. Under **Independent invoice review**, open **Invite reviewer**, inspect the fields and evidence to be shared, and choose **Confirm and run review**. A separate phase tied to that candidate version returns advice. Use it alongside the original invoice to make the final decision in the applicable local or cloud review panel.
+
+<a id="personal-memory"></a>
+
+## OpenViking memory for Work
+
+In **Settings → Connections → Long-term memory**, choose **This device** or **Connected cloud workspace**. Configure the default backend for new Work there and enable authorized recall if needed. Existing Work uses its original binding. Retrieved entries serve as references for the current request and stay within the Work's authorized scope.
+
+For **Save a memory** or **Search authorized memories**, select the original Work, invoice item and phase. Before saving, review the text and confirm the scope for this Work or across authorized Personal Agent Works in the same location. Automatic capture is off for invoice Work. See [OpenViking memory](agent-runtime.md#openviking-memory) for configuration, scopes and reconciliation.
 
 ## Process and recovery boundary
 

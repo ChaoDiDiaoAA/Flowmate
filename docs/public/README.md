@@ -4,7 +4,7 @@
 
 Flowmate is a local-first Agent desktop workbench built on the Pi SDK. It combines persistent conversations, authorized local-material work, evidence-based research, invoice review, and an independent **Personal Agent** for ongoing invoice work. **Chats**, **Invoices** and **Deep Research** continue to use AgentSession; Personal Agent uses Pi Durable. These pages describe the implementation in this repository; they are not a claim of model quality or release certification.
 
-This engineering delivery covers verified capabilities while the application is running. Continued execution after the desktop closes and recovery at Windows startup remain system-service goals; real Windows SCM acceptance is deferred, so those system behaviors are not yet verified.
+This engineering delivery covers verified capabilities while the application is running. Eligible cloud Work can continue while the server services are running. Continued local execution after desktop closure and recovery at Windows startup require separate Windows SCM acceptance.
 
 ## Start here
 
@@ -13,6 +13,8 @@ For users: [Getting started](getting-started.md) → [Workflows](workflows.md) �
 For local research, follow the [Deep Research workflow](workflows.md#deep-research). The [Context and memory layers](agent-runtime.md#context-memory-layers) explain what is captured for an input, retained as history or restored as research progress.
 
 For ongoing invoice work, open **Personal Agent** and follow [the Personal Agent guide](personal-agent.md): select a fixed set of parsed invoices, track per-invoice Todo items, supplement material and review candidates until every invoice has an explicit final disposition.
+
+To configure optional long-term memory, start with [OpenViking memory](agent-runtime.md#openviking-memory). For the two runtimes' delegation paths, see [Subagents](subagents.md).
 
 For developers: [Product scope](PRD.md) → [Architecture](architecture.md) → [Agent runtime](agent-runtime.md) → [Personal Agent](personal-agent.md) → [Subagents](subagents.md) → [Development](development.md). Use [Evaluation](EVALUATION.md) to distinguish engineering checks from real model trials.
 
@@ -24,11 +26,11 @@ For developers: [Product scope](PRD.md) → [Architecture](architecture.md) → 
 | [Getting started](getting-started.md) | Development startup, model configuration, first conversation and Personal Agent entry |
 | [Architecture](architecture.md) | Electron, Bun Host, package responsibilities and data flow |
 | [Agent runtime](agent-runtime.md) | Session, Run, Context/memory layers, tools, budgets, stopping and recovery |
-| [Personal Agent](personal-agent.md) | Durable invoice work, Todo, review, attempts and recovery boundaries |
+| [Personal Agent](personal-agent.md) | Local and cloud invoice Work, approvals, browser and desktop access, and execution evidence |
 | [Subagents](subagents.md) | Role setup, delegation, parent/child ownership and lifecycle |
 | [Workflows](workflows.md) | Local questions, Deep Research steps and continuation, single-invoice review and ongoing Personal Agent work |
 | [Skills and extensions](skills-and-extensions.md) | Resource discovery, readiness, templates and controlled extensions |
-| [Evaluation](EVALUATION.md) | Purpose, traces, scoring, dual-model Smoke/Full and Baseline/Gate |
+| [Evaluation](EVALUATION.md) | Personal Agent scenario evaluation, traces, scoring, dual-model Smoke/Full and Baseline/Gate |
 | [Benchmark authoring](EVALUATION-BENCHMARK.md) | Real-source candidates, independent Gold, validation and versioned publication |
 | [UI system](UI-SYSTEM.md) | Layout, observable states, interaction and accessibility conventions |
 | [Development](development.md) | Repository structure, test commands and required dependency patches |

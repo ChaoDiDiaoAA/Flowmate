@@ -36,6 +36,8 @@ flowchart TB
 
 Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取，持久查询提供权威状态；回复丢失或迟到不授权重执行写入。生命周期详见 [Agent Runtime](agent-runtime.zh-CN.md)。
 
+对于[云端 Personal Agent Work](personal-agent.zh-CN.md#cloud-workspace)，桌面连接受限 SSH Bridge。Authority 负责工作区授权、业务持久化和模型代理，Runtime 负责原生 Durable 执行与检查点。窗口及浏览器交互仍由桌面负责。业务效果通过保存的业务回执核对，模型观测提供执行线索。
+
 ## 职责划分
 
 | 位置 | 职责 |
@@ -63,13 +65,15 @@ Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取
 5. 领域服务核对业务副作用，SQLite 与受管文件保存执行事实和产物身份。
 6. UI 查询已保存结果并显示实时进度，进度本身不等于业务提交。
 
-子任务经 Core 准入，进入同一 Application 控制进程内归属相应运行时的执行。父子共享所属预算，最多四个子任务，禁止嵌套；停止未知时继续占用名额。Personal Agent 通过 Durable 适配器仅委派给只读 `invoice-evidence-checker`，AgentSession 扩展是独立路径。两条路径的权限、上下文和停止规则见 [Subagent](subagents.zh-CN.md)；子执行不是独立操作系统沙箱或可写代理。
+子任务经 Core 准入后由相应运行时执行。本地父子由同一 Application 控制者管理，云端 Durable 子任务由云端 Runtime 管理。父子共享所属预算，最多四个子任务，禁止嵌套；停止未知时继续占用名额。Personal Agent 通过 Durable 适配器仅委派给只读 `invoice-evidence-checker`，AgentSession 扩展是独立路径。两条路径的权限、上下文和停止规则见 [Subagent](subagents.zh-CN.md)；子执行不是独立操作系统沙箱或可写代理。
 
 ## 持久化与资源
 
 Windows 用户数据根为 `%APPDATA%\Flowmate`，`data/app.sqlite` 在同一数据库 owner 和共用写入协调下保存产品状态及 Durable 原生记录，`artifacts/`、`outputs/` 和 `runtime/` 保存受管内容与运行资源。控制者锁避免同一数据根被多个产品控制者同时持有。AgentSession 历史与 Durable 原生 Task/检查点仍各由对应适配器负责。
 
 AgentSession 输入快照、原生会话历史与研究步骤／工具／来源记录分别归属各自层次。研究偏好明确保存在产品设置中，桌面保存的页面／研究焦点属于导航状态；恢复焦点不会启动模型 Run。详见 [Context 与 Memory 分层](agent-runtime.zh-CN.md#context-memory-layers)和 [Deep Research](workflows.zh-CN.md#deep-research)。
+
+[OpenViking](agent-runtime.zh-CN.md#openviking-memory) 是可选记忆服务，本机与云端的身份及存储彼此独立。来源与运行线授权决定哪些记忆可投影到请求。会话历史、Durable 检查点与业务回执仍归属 Flowmate 和相应运行时。
 
 ServiceOwner/Node ServiceClient、SID/DACL 校验、CurrentUser DPAPI 凭据、原凭据迁移与维护实现继续保留。当前工程版以 Application 控制者运行期间的执行、已提交事实和合法恢复为交付边界；真实 Windows SCM 安装/启动、开机、升级/回退及关闭桌面后持续运行统一延期验收。
 

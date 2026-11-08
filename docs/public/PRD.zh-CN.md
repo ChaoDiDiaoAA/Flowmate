@@ -31,9 +31,11 @@ Deep Research 当前读取授权本地文本、Markdown 和已登记解析文档
 
 AgentSession 在受理输入时捕获适用页面焦点和授权 Workspace 引用，临时页面状态与会话历史分开投影到模型请求。研究偏好由用户明确保存，按 Run 捕获。这些层次不会自动学习永久用户偏好，也不能授予其他任务材料的访问权限。见 [Agent Runtime](agent-runtime.zh-CN.md#context-memory-layers)。
 
+可选的 [OpenViking 记忆](agent-runtime.zh-CN.md#openviking-memory)需要明确配置连接及召回或采集策略。获准记忆与会话历史分开，并按来源运行线和位置使用。
+
 发票流程读取已登记的原件与外部预先生成的解析材料，Host 不执行发票解析器或 OCR。模型生成候选、表单填入成功、人工编辑保存、接受结果分别留痕；接受前由用户对照原件、解析内容和字段证据。
 
-Personal Agent 通过 Durable 尝试和逐票 Todo 协调固定的已解析发票集合。接受候选、将该接受操作关联到事项票据、完成整个事项是不同步骤；当前支持的子角色是有界只读发票取证角色。
+Personal Agent 通过 Durable 尝试和逐票 Todo 协调本地或云端 Work 中固定的已解析发票集合。支持有界只读取证委派、用户确认的独立复核，以及获准的桌面操作或网页读取。已保存回执记录业务效果，模型观测记录执行证据。接受候选、关联该接受操作和完成 Work 分别处理。见 [Personal Agent](personal-agent.zh-CN.md)。
 
 Subagent 是前台只读任务，最多同时保有四个子执行，共享父预算，不支持嵌套、后台执行或业务写入。普通 Assistant 命令工具可能写文件或执行命令；选择工作目录不是操作系统沙箱。
 

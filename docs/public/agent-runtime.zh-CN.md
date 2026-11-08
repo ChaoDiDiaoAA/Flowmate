@@ -71,25 +71,46 @@ Flowmate 将当前工作依据与已保存会话、研究事实分开管理。�
 
 控制器读到材料，不如实际模型请求包含材料的证据充分；两者都不能证明模型语义采用。未配置外置记忆时，Flowmate 不从对话自动提炼长期偏好。
 
-可选的 OpenViking 连接默认关闭，旧会话和已有 Work 保持原有绑定，不自动上传历史。本机和云端使用各自独立的服务、账号、凭据和数据，不自动同步，也不使用 WeKnora 的现有实例。新会话或 Work 可选择 OpenViking；请求只在已授权范围内检索有来源的记忆，并将结果作为不可信的当次参考，不替换 Pi 历史或 Durable 工作事实。服务不可用时，外置记忆显示不可用，原有业务执行仍按其授权继续。
+<a id="agentsession-long-sessions"></a>
 
-在桌面 **Settings → Connections → Long-term memory** 中可配置本机连接、选择召回与采集策略、显式保存和遗忘记忆、查看原操作以及手动检索。连接文件需要本机回环地址、account、user、peer 和普通用户密钥；文件不会自动删除，密钥另存入 Windows 安全存储。管理员和 Root 密钥不能用于普通记忆操作。后台服务模式使用服务自己的安全存储，不假定它能读取桌面用户的凭据。
+### AgentSession 长会话
 
-同一页的 **OpenViking management** 使用单独的管理身份文件。本机文件包含回环 `endpoint`、`apiKey` 和 `role`。P 还需 `accountId`、`userId`、`peerId`，A 还需 `accountId` 和 `userId`，S 使用系统管理员密钥。
+中断后，先在 **Session details** 核对保存的输入及其 Context。输入已保存和已被运行时消费是不同状态。回复或回执丢失时，先查询原输入和 Run，再决定是否发送。资料权限撤回或原生历史不可用时，后续执行可能受阻，已保存事实仍可查看。资源刷新影响后续选择。
 
-云端文件包含 `kind: "cloud"`、`workspaceId`、`role` 和 `target`。`target` 包含 `host`、`port`、`username`、`privateKeyPath`、`knownHostsPath`。桌面使用角色专属 SSH 身份连接，Authority 核对工作区、角色和 OpenViking 身份。OpenViking 管理密钥由 Authority 读取。具体权限和凭据配置见[云端服务说明](../../deploy/cloud/README.zh-CN.md)。
+Pi 根据符合条件的 Run 保存的策略自动压缩。符合条件的根 Session 空闲时，可在 **Context compaction** 选择 **Compaction model** 并点击 **Compact context**，再用 **Refresh compaction** 核对摘要是否生成和保存。摘要缩短后续模型上下文，原历史继续保存。容量估计和界面摘要不能代替已保存历史。子 Session 不能通过根 Session 手动压缩。
 
-选择操作后，在 JSON 输入框填写该操作显示的参数。上传、下载、私密 Options 和导出的用户密钥使用系统文件对话框。云端文件按 256 KiB 分块传送，单文件上限为 256 MiB。上传断线后可在同一桌面管理连接中重试原操作，桌面保留原选择并从 Authority 确认的偏移继续。下载可在重连或重开后通过 **Check original target or resume file** 从本机暂存位置继续。写入需在原生对话框确认，并按管理身份加密保存回执。未知结果和异步任务按原操作核对。确认放弃会关闭本地回执，远端操作结果可能仍然未知。
+在对话里用 **Continue from this reply**，或在符合条件的已保存历史条目上用 **Continue here**、**Fork chat**。继续是在原 Session 选择历史位置，fork 是从所选位置创建独立聊天。之后明确提交新输入才启动执行。Personal Agent 的 [Durable 历史与压缩](personal-agent.zh-CN.md#personal-long-sessions) 按 Work 阶段和原生 Task 管理。
 
-自动采集必须单独启用，仅处理启用后成功完成的普通聊天轮次。长期记忆按来源运行线授权，同一身份下的 AgentSession 会话和 Personal Agent Work 分别召回各自范围内的条目。缺少可靠来源的旧条目保留在管理列表中，自动召回会跳过这些条目。发票 Work 的自动采集目前关闭，显式保存可选择原 Work 阶段和授权范围。服务重启后，结果不明的写入保留原操作供核对。禁用或遗忘阻止未来授权召回，已提交的历史和业务结果按原规则保留。切换默认后端只影响新绑定，fork 和继续历史分支使用新的远端会话。fork 继承原会话当前有效的会话级记忆授权。
+<a id="agentsession-approvals"></a>
 
-AgentSession 输入含可识别的凭证标记时，跳过当次 OpenViking 自动召回。任一输入或最终回答含这类标记时，跳过整轮自动采集。识别范围包括明确标注的密码和私钥头。手动检索和显式保存仍使用用户选择的来源和授权范围。
+### AgentSession 的授权与隐私
 
-检索、显式保存及提炼依赖所选 OpenViking 服务和其模型服务可用。本机 WSL2 停止、电脑休眠或关机期间不能执行本机记忆工作。云端连接需要 Authority 单独配置，见[云端服务说明](../../deploy/cloud/README.zh-CN.md)。
+发送前选择本次使用的 Workspace 和资料。受理输入时记录授权范围，工具准入独立核对该范围。研究通过 **Confirm plan version** 授权已保存的计划。发票在 **Invoices** 中核对原件和解析证据，再选择 **Accept result**。生成候选、填表和接受分别记录。见[业务流程](workflows.zh-CN.md)。
 
-资源刷新影响后续选择，不替换历史运行副本。资料权限撤回或原生历史不可用可能阻断继续请求模型，已保存事实仍可查看。自动原生压缩与显式 Session 压缩沿 Pi 历史路径执行，界面摘要不替代缺失的已提交历史。子 Session 不能通过根 Session 操作手动压缩。
+保存记忆前确认文字和授权范围，启用自动采集需要另行确认。凭证标记和记忆写入结果未知的处理见 [OpenViking 记忆](#openviking-memory)。逐票等待与桌面或浏览器审批见 [Personal Agent](personal-agent.zh-CN.md#personal-approvals)。
 
-上述 Session 历史和压缩操作仍由 AgentSession 路径负责；Durable 自行保留原生 Task、entry 与检查点记录。查看或恢复 AgentSession 历史，不会将 `SessionEntry` 变为 Durable 检查点。
+<a id="openviking-memory"></a>
+
+## OpenViking 记忆
+
+OpenViking 为可选功能，默认后端为 Native。改变默认值后，已有 Session 和 Work 保持原绑定，旧历史不会自动上传。本机和云端使用独立服务、账号、凭据与数据，彼此不自动同步，也不复用 WeKnora 的实例。同一位置内，AgentSession 会话和 Personal Agent Work 也分别在自己的授权范围内召回。符合授权且有可靠来源的条目作为当次请求的不可信参考。会话历史、压缩摘要和 Work 事实各自保留。服务不可用时，记忆可能不可用，原有业务仍可按授权继续。
+
+1. 打开 **Settings → Connections → Long-term memory**，选择 **This device** 或 **Connected cloud workspace**。在本机使用 **Connect OpenViking from file**，连接文件需要回环地址、account、user、peer 和普通用户密钥。Flowmate 将密钥复制到 Windows 安全存储，原文件保留在磁盘上。普通记忆操作拒绝管理员和 Root 密钥。后台服务模式使用自己的安全凭据存储。已连接的云端工作区由 Authority 单独配置记忆服务和凭据，见[云端服务说明](../../deploy/cloud/README.zh-CN.md)。
+2. 在 **Backend for new conversations** 选择 OpenViking，保存召回和采集策略。**Recall authorized memories** 控制自动召回。**Completed chats** 需要单独确认，只采集启用后成功完成的普通聊天轮次。Work 使用[自己的显式保存流程](personal-agent.zh-CN.md#personal-memory)。
+3. 用 **Save a memory** 确认文字、原已完成聊天输入或 Work 阶段，以及授权范围。**Search authorized memories** 按所选原输入或阶段手动检索，不启用自动召回。**Saved memories** 可查条目、来源与授权。缺少可验证来源的条目不参与自动召回。
+4. **Forget memory** 阻止未来召回该条目，并向原服务请求移除。结果未知时，在 **Memory operations** 中用 **Check original request** 核对保存，用 **Check original forget request** 核对移除，重启后仍可查。本机自动采集的同步结果未知时，使用 **Check original synchronization**。重试写入前先查原回执。禁用召回或遗忘后，已保存历史和已提交业务记录按各自的规则保留。
+
+AgentSession 输入含可识别的凭证标记时跳过当次自动召回，例如明确标注的密码或私钥头。如果输入或最终回答含这类标记，则跳过整轮自动采集。显式保存与手动搜索仍依据用户选择的来源和范围。从历史继续或 fork 会使用新的远端记忆 Session。fork 继承原聊天当前有效的会话级记忆授权。
+
+检索、保存和提炼依赖所选 OpenViking 服务和其模型服务。本机记忆依赖本机服务及宿主运行，服务部署在 WSL2 时也需要 WSL2 可用。
+
+### OpenViking 管理
+
+同页的 **OpenViking management** 使用单独的身份文件。本机文件包含回环 `endpoint`、`apiKey` 和 `role`。P 还需要 `accountId`、`userId`、`peerId`。A 需要 `accountId` 和 `userId`。S 使用系统管理员密钥。
+
+云端文件包含 `kind: "cloud"`、`workspaceId`、`role` 和 `target`，其中 `target` 包含 `host`、`port`、`username`、`privateKeyPath` 和 `knownHostsPath`。桌面使用角色专属 SSH 身份，Authority 核对工作区、角色和 OpenViking 身份并持有服务凭据。角色设置见[云端服务说明](../../deploy/cloud/README.zh-CN.md)。
+
+选择操作后按界面填写 JSON 参数。上传、下载、私密 Options 和导出的用户密钥使用系统文件对话框。云端文件按 256 KiB 分块传送，单文件上限 256 MiB。上传断线后在同一桌面管理连接中重试原操作，使用原文件选择并从 Authority 已确认的偏移继续。下载可在重连或重开后用 **Check original target or resume file** 从本机暂存文件继续。写入须在原生对话框确认，并为该管理身份保存加密回执。未知结果或异步任务按原操作核对。确认放弃会关闭本地回执，远端结果可能仍然未知。
 
 ## 预算与工具执行
 

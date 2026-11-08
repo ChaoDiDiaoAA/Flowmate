@@ -41,6 +41,8 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 
 处理本地文件前，选择预期工作目录或授权资料，并在请求中说明范围。可用原生工具可能包含写文件和执行 Shell；目录选择只确定工作位置，不是文件系统沙箱。
 
+长会话可以通过 [Session details 与历史](agent-runtime.zh-CN.md#agentsession-long-sessions) 核对已保存输入、压缩上下文或从已保存位置继续。资料选择与确认入口见 [AgentSession 授权](agent-runtime.zh-CN.md#agentsession-approvals)。
+
 ## 在 Personal Agent 创建持续发票事项
 
 1. 从左侧导航打开 **Personal Agent**，先确认并保存其模型、工具与资源配置，再固定选择一组已有解析的发票，填写目标并明确提交，创建持久发票事项。创建入口仅在 Personal Agent；**Invoices** 保持单票选择与编辑。
@@ -48,7 +50,9 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 3. 阅读操作回执，区分资料保存、执行授权受理、原尝试或新尝试、排队与受阻。原尝试正常完成后的有效补料可以自动继续符合条件的工作；用户停止或失败后的补料仅保存，须明确继续。
 4. 逐票明确最终处置为 `accepted`、`rejected` 或 `excluded`。普通 **Reject** 只拒绝候选，不结束该票处理；有候选或 Run 成功均不单独代表事项完成。
 
-查看页面/历史与桌面重连仅纯读，不发起模型或工具调用，也不触发后端恢复。后端启动恢复另行加载原持久事实和原生记录，核已保存授权及当前资格后恢复符合条件的原尝试；不因事项仍 `open` 产生新意图，不复活已停止或失败的尝试。本次工程交付覆盖应用运行期间已验证的行为；关闭桌面后执行、Windows 服务重启恢复与开机恢复仍属系统服务目标，真实 SCM 验收延期。配置、继续和复核细节见 [Personal Agent](personal-agent.zh-CN.md)。
+在 **Local workspace** 创建本地 Work，或先按[云端工作区](personal-agent.zh-CN.md#cloud-workspace)完成连接，再创建云端 Work。用 **Timeline** 查看保存的回执，用 **Tasks** 查看尝试。回复丢失时先查原回执。查看历史和重连不会重放输入。继续与恢复见 [Personal Agent 指南](personal-agent.zh-CN.md)。
+
+如需启用可选长期记忆，打开 **Settings → Connections → Long-term memory**，选择位置、连接 OpenViking，再设置新聊天或 Work 的策略。召回与采集条件见 [OpenViking 记忆](agent-runtime.zh-CN.md#openviking-memory)。
 
 ## 按需启用能力
 

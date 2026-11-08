@@ -4,7 +4,7 @@
 
 ## What a child task is
 
-A parent Agent can call an **`Agent`** tool to delegate a bounded task. Flowmate supports two paths: ordinary Chats, Invoices and Deep Research use the controlled AgentSession subagents extension; [Personal Agent](personal-agent.md) uses a separate Durable adapter for invoice evidence. Both create product child records linked to the original parent call, but their native execution, setup and recovery differ. Parent and child run in the Application-owning process, whether that owner is the local Host or an explicitly selected ServiceOwner.
+A parent Agent can call an **`Agent`** tool to delegate a bounded task. Flowmate supports two paths: ordinary Chats, Invoices and Deep Research use the controlled AgentSession subagents extension; [Personal Agent](personal-agent.md) uses a separate Durable adapter for invoice evidence. Both create product child records linked to the original parent call, but their native execution, setup and recovery differ. Local parent and child share the Application owner, either the local Host or the selected ServiceOwner. Cloud Durable execution runs in the cloud Runtime.
 
 A role is a system prompt and an allowed tool list, not another unrestricted assistant. Current children are read-only, share their owner's budgets, and cannot delegate again or use a user-selected background option. They do not gain an OS sandbox or independent model configuration.
 
@@ -18,7 +18,11 @@ The Work shares model requests, tool calls, feedback capacity and time across it
 
 **Stop current attempt** requests stopping of its owned children as well. Inspect actual stopping and saved child facts; cancellation or a lost reply is not confirmation of cleanup. The Personal Agent Tasks view currently provides child history and reports, not a separate child-stop button. Backend recovery reconciles original persisted identities and eligible native Tasks; it does not authorize a replacement solely because an outcome is unknown. See [Personal Agent](personal-agent.md) for Work continuation, cancellation and system-service limits.
 
-The remaining setup, command, sequence, permission table and lifecycle sections describe the **AgentSession extension path**.
+Master is the parent task in each runtime. On Personal Agent, follow the original child call in **Tasks** and check the child's report, delivery to Master and whether Master consumed it. An [independent invoice review](personal-agent.md#personal-peer-review) is a separate candidate-bound phase that the user starts after previewing the shared fields and evidence.
+
+The remaining sections describe the AgentSession extension path. Use the child cards to follow actual execution and open the saved child Session or Run. A rendered template or an assistant's description is not a child execution record.
+
+<a id="agentsession-delegation"></a>
 
 ## Prepare the extension and roles
 

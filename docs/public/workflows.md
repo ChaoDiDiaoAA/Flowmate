@@ -79,14 +79,16 @@ An optional `invoice-evidence-checker` can inspect fixed-scope source evidence b
 
 For configuration, execution objects and recovery details, see the dedicated [Personal Agent guide](personal-agent.md).
 
-This engineering delivery covers verified capabilities while the application is running. Continued execution after desktop closure, Windows service restart recovery and Windows startup recovery remain system-service goals; real Windows SCM acceptance is deferred and those system behaviors are not yet verified.
+Choose the local workspace or [connect to a cloud workspace](personal-agent.md#cloud-workspace) before submitting Work. Eligible cloud execution can continue while its services are running. Local execution after desktop closure and Windows startup recovery require separate system acceptance.
 
 1. Open **Personal Agent** and confirm/save its model, tool and resource configuration. Then select a fixed set of existing parsed invoices, enter the goal and explicitly submit the work. Creation is available only here; **Invoices** retains single-invoice selection and editing. New invoices require new work rather than silently enlarging the saved set.
 2. Review the Work overview and per-invoice Todo. Provide requested clarification or authorized material and inspect whether it was saved, authorized for execution or blocked. After a stopped or failed attempt, use **Continue work** when eligible.
-3. Use **View original invoice / review** to compare a candidate with its sources in **Invoices**. After **Accept result**, return to the Work and **Attach confirmed acceptance**. To end an item as rejected or excluded, use its explicit disposition action and provide a reason. Rejecting a candidate alone does not end the item.
+3. Use **View original invoice / review** to compare the candidate with its sources. Choose **Accept result** in local **Invoices** or **Accept candidate** in the cloud review panel. Return to the Work and choose **Attach confirmed acceptance**. To end an item as rejected or excluded, use its explicit disposition action and provide a reason. Rejecting a candidate alone does not end the item.
 4. Inspect attempts and saved evidence. **Stop current attempt** and **Cancel entire work** are different actions; each invoice needs a final disposition and required writes and execution must settle before the Work completes. Viewing history does not start a model call.
 
 The parent may delegate an invoice evidence question to a bounded read-only child. See [Subagents](subagents.md) for the Durable path and [Personal Agent](personal-agent.md) for stopping, recovery and related work.
+
+If the initial attempt has closed and the original candidate and evidence are available, preview what an [independent invoice review](personal-agent.md#personal-peer-review) would share before confirming it. For interactive tools, use the [approval and reconnection flow](personal-agent.md#personal-approvals). Use **Timeline** to distinguish business receipts from model observations and [Long-term memory](agent-runtime.md#openviking-memory) to manage authorized memory for new chats or Work.
 
 ## When to stop and inspect
 

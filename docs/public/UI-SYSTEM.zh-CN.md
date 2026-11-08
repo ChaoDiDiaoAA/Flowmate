@@ -9,7 +9,7 @@ React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导
 | 区域 | 用途 |
 |---|---|
 | 对话主区 | 默认视图，用于输入消息与阅读当前会话 |
-| Personal Agent | Assistant 配置、已保存发票事项、逐票 Todo 与处置、尝试、历史和时间线 |
+| Personal Agent | 本地与云端 Work、Assistant 配置、逐票 Todo 和审批、尝试、历史与时间线 |
 | Invoices / Workspace | 原件、解析、结果复核与资料、候选上下文 |
 | Processing History | 保存的处理 Run 和业务结果 |
 | Chats / 最近会话 | 列出、管理已保存 Session，或在对话主区打开会话 |
@@ -18,7 +18,7 @@ React Renderer 使用共享 CSS 变量和普通表单元素，启动后显示导
 | Models | 模型、供应商配置与显式连接检查 |
 | Evaluation | 专用配置、执行与保存质量结果 |
 | Prompts / Skills / Extensions | 资源选择、就绪与受控能力 |
-| Settings | 用户、主题、模型、运行偏好及明确保存的研究偏好 |
+| Settings | 用户、主题、模型、运行偏好、研究偏好及 Connections 中的 Long-term memory |
 
 **New chat** 创建 Session 并进入对话主区；打开最近会话或 **Chats** 中的条目也会回到主区。全局 **Evaluation** 入口在对话和业务视图中均可使用。
 
@@ -44,7 +44,7 @@ Light、dark、system 主题复用背景、表面、正文、边框、强调、�
 - 加载、错误、缺证据、历史不可用、停止未确认分别保留；回复丢失不等于成功，也不授权新执行。
 - 未保存发票编辑仅在内存，离开时显式 Save/Discard。
 - 长任务展示父 Run、真实子卡片、工具与保存身份，助手文字不充当执行回执。
-- Personal Agent 区分停止当前尝试、Continue work 与 Cancel entire work；Invoices、Tasks、History 和 Timeline 分别展示不同保存事实。详见 [Personal Agent](personal-agent.zh-CN.md)。
+- Personal Agent 区分 **Stop current attempt**、**Continue work** 和 **Cancel entire work**。**Invoices** 展示逐票审批和处置，**Tasks** 展示尝试，**History** 展示原生记录，**Timeline** 分别标记观测和已保存回执。本地候选事件可展示反馈，核实关联后可定位原执行。见 [Personal Agent](personal-agent.zh-CN.md)。
 
 子卡片展示真实生命周期和单子 Stop，详细规则见 [Subagent](subagents.zh-CN.md)，交付状态见[业务流程](workflows.zh-CN.md)。
 
