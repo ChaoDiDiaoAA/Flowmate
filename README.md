@@ -5,10 +5,6 @@
 </p>
 
 <p align="center">
-  从持续事项的逐票推进，到研究问题的证据链，以双运行时、预算感知工具和独立评测支撑 Agent 工作流程。
-</p>
-
-<p align="center">
   <code>TypeScript 5.8</code> · <code>Bun 1.4.4</code> · <code>Electron 44</code> · <code>Pi SDK 1.4.0</code>
 </p>
 
@@ -23,38 +19,32 @@
   <a href="#capabilities">当前能力</a>
 </p>
 
-Flowmate 面向需要处理本地资料、保留工作过程并复核交付结果的任务。**Personal Agent** 基于 Pi Durable 持续整理固定的一组发票，跟踪逐票 Todo、补料与最终处置；**Deep Research** 将问题组织为研究计划、子问题、Claim 与证据链；**资料问答**支持连续对话和工具使用；**单票复核**提供候选生成、人工编辑、接受与导出。
+**Personal Agent** 持续整理一组发票；**Deep Research** 从本地资料建立可复核的证据链。桌面同时提供资料问答与单票复核。
 
 ![Flowmate 桌面工作台：会话列表、工作目录与 Assistant](docs/screenshots/Chats.png)
-
-*桌面工作台：左侧切换任务与资源，中央管理会话和工作目录，右侧使用 Assistant。*
 
 <a id="highlights"></a>
 
 ## ✨ 研究与工程亮点
 
-围绕持续事项、本地研究与实际交付，Flowmate 在 Pi AgentSession 与 Pi Durable 提供的执行基础上，实现运行约束、业务状态、证据模型与产品流程。以下重点展示适配层和产品层的自定义能力。
-
 | 能力 | Flowmate 的自定义实现与作用 |
 |---|---|
-| **Personal Agent 持续事项助手** | 基于 Pi Durable，将固定票组组织为持久事项，逐票跟踪 Todo、补料、候选与最终处置；保留原配置、资源和执行依据，通过授权、预算与停止事实控制后续执行。 |
-| **结构化 Deep Research** | 将确认的计划拆为可追踪步骤，以真实工具回执和来源快照推进 Checkpoint；主任务与子代理共享采集名额，手动继续复用成功证据，再以 Claim 与依赖组织覆盖、冲突和报告。 |
-| **Skill Hub 技能管理** | 串联技能发现、依赖检查、显式启用、版本化运行副本和按需读取，让用户与 Agent 明确技能是否可用、缺少什么，以及本次执行使用的资源。 |
-| **Subagent 自定义子代理驱动** | 分别接入 AgentSession 子会话与 Durable 子任务，按角色收紧工具范围，统一管理父子共享预算、并行准入、独立历史、停止确认、结果保存与回送。 |
-| **预算感知的工具 Runtime** | 每次模型请求提供剩余调用数、时间、工具时限和近期诊断；执行器同时落实预算与范围限制，让模型决策与实际约束保持一致。 |
-| **可核验的工具执行** | 执行前检查参数、权限与预算，执行后核验输出、停止及写入回执；以合格历史样本形成有上限的 P95 超时策略。 |
-| **Context / Memory 分层** | 分开管理工作区快照、会话历史、进程内运行态、显式研究偏好与任务 Checkpoint；当前页面投影仅注入本次模型请求，研究进度依据真实执行记录恢复，隔离当前焦点并复用成功证据。 |
-| **独立 Agent 评测闭环** | 从真实轨迹、候选审核和版本化数据集，连接独立评分、配置比较、Baseline / Gate 与反馈回归；保留原执行、证据及评分修订。 |
+| **Personal Agent 持续事项助手** | 基于 Pi Durable 保存固定票组、逐票 Todo、候选与处置，按原配置、授权和预算继续执行。 |
+| **结构化 Deep Research** | 将确认计划拆为可追踪步骤，用工具回执与来源快照记录进度，继续时复用成功证据。 |
+| **Skill Hub 技能管理** | 检查技能依赖，显式启用并固定运行版本；模型先读索引，再按需读取正文。 |
+| **Master + Subagent 协作** | 两套 Runtime 分别接入受限委派，管理并行准入、共享预算、独立历史与停止确认，分别记录结果保存、回送和是否进入父模型请求。 |
+| **预算感知的工具 Runtime** | 让模型看到剩余调用数、时间和可用工具时限，并由执行器落实约束。 |
+| **可核验的工具执行** | 执行前核对参数和权限，执行后核验输出、停止及写入回执；符合条件的工具采用有上限的 P95 时限。 |
+| **Context / Memory 分层** | 分离请求上下文、原生历史和任务进度；支持可插拔式长期记忆，OpenViking 后端可按需启用。 |
+| **独立 Agent 评测闭环** | 从运行证据建立数据集、评分、实验对照和回归；Personal Agent 另有独立的受控场景验证。 |
 
 <a id="personal-agent"></a>
 
 ## 🤖 Personal Agent：基于 Pi Durable 的持续事项助手
 
-整理一组发票往往需要多次补料、逐票复核和明确处置。Personal Agent 将这项工作保存为持续事项：Agent 准备候选、定位缺口并推进可处理的票，用户沿 Todo 补充材料、复核结果，直到每张票都有明确结论。
+固定一组已解析发票和原配置，逐票保存 Todo、补料、候选与处置。某票等待材料或复核时，其他符合条件的票可继续；每张票明确接受、拒绝或排除，且执行与写入均收口后，事项才完成。
 
 ![Personal Agent 配置与新建事项入口：模型、思考级别、偏好、工作目录和工具选择](docs/screenshots/Personal%20Agent.png)
-
-*Personal Agent：配置思考级别、偏好和工具，从 New invoice work 创建持续发票事项；已保存事项沿用原配置与资源版本。*
 
 ### 持续事项流程
 
@@ -79,29 +69,21 @@ flowchart TB
   Restore -->|"恢复符合条件的原尝试"| Execute
 ```
 
+用户停止或执行失败后，补料先保存，由用户明确继续。后端启动仅恢复符合原授权与预算的执行；查看历史、重连和查询原回执均保持只读。停止当前执行和取消事项分别处理。
+
 ### 核心设计与使用边界
 
-- **固定票组与原配置。** 创建时明确票据集合、目标及助手配置。后续配置更新用于新事项，已有事项保留原模型、资源版本和执行依据；新增票据另建事项。
-- **逐票推进与人工复核。** 每张票分别保留材料、候选、Todo 和处置状态。一张票等待补料或复核时，可继续其他符合条件的票；复核动作回到 Invoices，并保留原事项与对话。
-- **补料、执行与恢复分别记录。** 原尝试正常结束且事项仍 open 时，有效补料可受理符合条件的后续执行；用户停止或执行失败后的补料先保存，须明确继续。后端启动按原授权恢复合格原尝试，页面查看、历史读取与桌面重连均保持只读。
-- **协作受预算与停止事实约束。** Master 按需委派只读 `invoice-evidence-checker`，父子共享根预算，最多四个同时拥有的子执行且禁止嵌套。停止未确认仍占用容量，Master 负责综合证据与候选，用户负责明确接受。
-- **以业务处置判断完成。** 每张票最终处置为 `accepted`、`rejected` 或 `excluded`，且必要业务写入与执行均已收口，事项才能完成。普通 **Reject** 只拒绝候选；**Stop** 停止当前执行，取消整个事项是另一项业务动作。
-
-| 基础能力 | Flowmate 的自定义实现 |
-|---|---|
-| Pi Durable 的 Harness、持久任务图、原生执行记录与恢复能力 | 持续发票事项、逐票 Todo、配置与资源绑定、补料受理、业务准入、共享预算、停止确认及结项条件 |
-
-Personal Agent 使用自身已适配的工具、Prompt 与 Skill，不自动沿用 AgentSession 的 Extension 选择。当前工程实现覆盖应用运行期间的持续事项能力；关闭桌面后持续执行、服务重启及开机恢复的真实 Windows 系统验收仍待完成。
+- **观测与协作。** 在 **Tasks / Timeline** 沿事项、发票和执行阶段追溯工具回执、模型观测与候选反馈，本地观测只保存有限的耗时和状态摘要。Master 委派只读取证，子结果保存、回送与父请求接收分别可查；最多同时保有四个子执行，共享预算，停止未确认仍占名额，禁止嵌套。独立复核由用户确认共享字段和证据后启动，建议绑定原候选版本。
+- **审批与操作。** 选材和选窗限定范围；网页读取、桌面点击或输入逐次批准，发票处置单独确认。符合条件的阶段可保留原 Task 等待决定，其他合格发票可按序推进。WebBridge 仅在用户绑定的同源标签页读取，返回地址去掉查询参数和片段，正文作为不可信工具数据；KimiCU 在同一 Windows 用户桌面串行观察和输入，派发前复核控件，遇可识别的凭证字段即拦截。两种模式在同一新事项中互斥，结果未知时先查原回执。
+- **连续性与云端执行。** 按票保存原生会话，Durable 压缩沿用原阶段的授权、模型和预算，原历史与回执保持可查。云端由受限 SSH Bridge 转发，Authority 核验权限、保存业务事实，Runtime 执行持久任务；设备操作仍在本机。云服务运行且原授权与预算有效时，合格事项可在桌面断线后继续，重连读取原事项与保存的回执。云端实时进度与本地持久模型观测分别呈现。
 
 <a id="deep-research"></a>
 
 ## 🔬 Deep Research：从研究问题到可追溯的证据链
 
-研究任务需要回答多个相关问题，并解释结论如何得到。Flowmate 将结构化计划拆为可执行采集步骤，以真实工具记录与来源快照保存进度，再用 Claim 组织结论和证据链。用户能检查资料、补充缺口，并在中断后明确继续，复用已经确认成功的证据。
+用授权的本地文本、Markdown 或已登记解析资料回答研究问题，保留来源、结论与缺口。
 
 ![Deep Research 创建表单：研究问题、范围约束与本地资料选择](docs/screenshots/Deep%20Research.png)
-
-*Deep Research：填写研究问题与范围，导入或选择本地资料；创建任务后在 Assistant 生成并确认研究计划。*
 
 ### 研究流程
 
@@ -129,43 +111,21 @@ flowchart TB
   Continue --> Steps
 ```
 
-1. **提出问题与范围。** 选择本地文本、Markdown 或已登记解析资料，明确允许使用的材料。
-2. **生成并确认计划。** Agent 保存研究维度、子问题、证据需求、预算和停止条件，以及包含稳定步骤 ID、关联子问题与材料参数的采集步骤。用户确认具体计划版本后才进入调查；原授权范围内可修改并重新确认计划，改变授权材料选择需要新建研究任务。
-3. **按步骤读取与调查。** 复用现有读取工具与 SDK 并行执行，调用绑定步骤及材料参数；同一研究的实际采集最多并发 **2** 个，主 Agent 与只读 `research-investigator` 共享名额、资料范围和根预算，排队期间也响应取消。
-4. **保存真实进度。** 来源正文及 Run / ToolCall 身份与计划步骤关联，Checkpoint 依据实际执行记录更新；下一次模型请求提供成功来源、失败原因、剩余步骤和预算，正文按需读取。
-5. **组织结论并检查缺口。** 将发现保存为原子 Claim，关联支持或反驳证据、依赖结论及所回答的子问题；逐项检查覆盖与冲突，采集失败或预算不足时可提交明确标记的部分报告。
-6. **保存与交付。** 报告保存后可在产品中重新查看，导出 Markdown 时再次核验结论、来源身份及原文片段。
+1. **确认计划。** 保存子问题、带材料参数的步骤和预算，确认具体版本后执行。原范围内修改需重新确认；更换授权资料需新建研究任务。
+2. **受控采集。** 复用现有读取工具，主 Agent 与可选只读调查子代理共享 **2** 路采集及根预算，排队可取消。成功由工具成功终态、停止确认和来源快照共同支撑。中断后查看进度，再用 **Continue research** 复用成功来源、处理剩余步骤；停止未确认时继续受阻。
+3. **证据交付。** Claim 关联子问题、依赖结论及支持或反驳它的原文。问题均有覆盖、结论获证据支持且无未解决项时保存完整报告，否则以部分报告保留冲突和缺口。导出 Markdown 时复核来源与原文片段；语义质量由独立评测判断。
 
-步骤展示为 `pending`、`running`、`succeeded`、`failed` 或 `interrupted`。成功需要工具成功终态、停止已确认及对应来源快照共同支撑；模型声明完成或已经出现来源文件，都不能单独把步骤判为成功。
-
-重启后重新查看任务只恢复进度，不请求模型。用户点击 **Continue research** 后，在新的研究 Run 中复用已确认成功的来源，处理待执行、失败和中断步骤；每次继续使用明确的运行预算，停止未确认时仍受阻，不在后台自动重试。旧计划保持可读及原有继续能力，重新生成并确认含步骤的计划后使用新工作流。
-
-### 证据与完整性的约束
-
-| 对象 | 产品实际检查什么 |
-|---|---|
-| **来源** | 资料必须属于当前任务允许的范围；读取后保存正文及来源信息，关联实际 Run / ToolCall。 |
-| **证据定位** | 研究任务、确认的计划、来源执行身份必须匹配；证据片段须与保存正文的对应位置一致。 |
-| **结论** | 记录所回答的子问题、依赖结论、证据关系，以及 Agent 给出的支持、反驳或不足判断。 |
-| **完整报告** | 所有计划问题均有覆盖，关联的结论及依赖满足支持条件，且没有未解决问题；部分报告显式保留缺口。 |
-
-**证据校验确认原文片段及其执行身份；语义支持仍由 Agent 判断，并通过独立评测检验。** Run 完成与报告完整分别记录，避免把执行结束直接解释为研究充分。
-
-当前 Deep Research 使用授权的本地资料，联网搜索与网页抓取尚未接入；无需 Tavily Key。多 Agent 调查在启用 subagents 扩展后可用，并非每次研究都必须委派子任务。
+旧计划仍可读取，重新确认含步骤的计划后使用新工作流。当前研究不联网搜索或抓取网页。
 
 <a id="runtime"></a>
 
 ## ⚙️ Agent Harness 与工具 Runtime
 
-Pi SDK 为 AgentSession 提供 Agent Loop、工具协议和原生调度，Pi Durable 为 Personal Agent 提供持久执行基础。Flowmate 通过 `runtime-pi` 与 `runtime-durable` 分别接入会话和持久执行，产品层执行器落实授权范围、预算、调用记录和业务交付校验。一次业务工具调用经过：
-
-**模型请求 → 参数与范围检查 → 预算和时限检查 → 实际执行 → 输出与副作用核验 → 保存调用记录 → 向模型回送结果与诊断。**
+Pi 提供 Agent Loop 和工具协议；Flowmate 负责授权、预算、执行记录与业务回执。
 
 ### 预算感知：让模型看到实际剩余资源
 
-Flowmate 在每次模型请求中附加剩余模型调用数、工具次数、运行时间、可用工具时限，以及近期诊断和有界工具经验。这些提示只作用于当前请求，执行器独立落实硬约束。
-
-提示指导 Agent 在证据缺失时缩小查询、选择允许的较低成本读取，或明确说明缺口并停止。
+每次模型请求获得剩余调用数、时间、工具时限与近期诊断。执行器据当前预算拦截越界调用。
 
 ```mermaid
 flowchart TB
@@ -183,32 +143,17 @@ flowchart TB
 
 ### 执行检查与自定义 P95 超时策略
 
-Flowmate 对一次调用执行前置、执行中和后置检查，并根据合格的历史计时形成时限策略：
+AgentSession 受理输入时记录资料范围，调用前核对参数、工具权限与预算，调用后核验输出、停止及写入回执。研究执行须确认计划版本，发票结果由用户明确接受。
 
-| 执行位置 | Flowmate 的工程实现 | 作用 |
-|---|---|---|
-| **调用前** | 校验参数和真实工具上下文，检查允许的工具、材料范围、会话权限、取消状态和剩余预算。 | 不让模型给出的参数直接变成未经检查的执行。 |
-| **执行时** | 工具时限结合配置上限、可用统计策略和 Run 剩余时间；并行调用共用计数与反馈预算。 | 约束单次调用及整次运行的资源使用。 |
-| **调用后** | 检查输出结构和领域结果，核验实际停止、候选保存或表单应用回执，并保存终态。 | 区分工具返回成功、实际完成写入及可确认的业务交付。 |
-| **历史校准** | 仅对符合条件的自定义 `PURE` / `READ` 工具，用成功、停止已确认且计时完整的样本计算 P95；排除被 Run 截断等无效样本。 | 形成受配置上限约束的时限；样本不足、近期风险或读取失败时回退到配置策略。 |
-
-P95 统计只调整符合条件工具的执行时限，配置上限和整次运行预算继续生效。
+仅对符合条件的自定义 `PURE` / `READ` 工具，以成功、停止已确认且计时完整的样本计算 P95。配置与 Run 剩余时间仍限制时限；样本不足、近期异常或读取失败时回退到配置值。
 
 ### 诊断反馈与停止确认
 
-Flowmate 把可操作的参数错误、失败位置、输出检查结果和缺少的执行证据反馈给 Agent，辅助后续调整。
-
-用户点击 Stop 后，产品继续核验执行是否真正停止以及必要记录是否保存。停止或写入结果未知时保留阻断状态，避免启动后续任务或自动重放可能已经产生副作用的调用。恢复历史时也沿用原保存事实，不用当前配置补造过去的执行依据。
+参数错误与执行缺口反馈给 Agent。停止或写入结果未确认时保留阻断，恢复后先核对原回执。AgentSession 支持 Pi 自动压缩及空闲根会话手动压缩，保留原历史；从历史位置继续或分支后，明确提交新输入才开始执行。
 
 ### Skill Hub：依赖可见与按需读取
 
-Skill Hub 将技能从作者资源接入到具体运行，形成统一流程：
-
 ![Skill Hub 技能管理：搜索、状态筛选、能力就绪情况与启停](docs/screenshots/Skills.png)
-
-*Skill Hub：集中搜索与筛选技能，查看能力就绪情况，并显式启用或停用。*
-
-**发现资源 → 检查依赖 → 用户启用 → 形成运行副本 → 注入短索引 → 按需读取正文。**
 
 ```mermaid
 flowchart TB
@@ -224,21 +169,11 @@ flowchart TB
   ReadGuard -->|"不匹配"| Denied["拒绝读取并返回诊断"]
 ```
 
-Pi 提供基础 Skill 资源机制；Flowmate 负责资源发现与刷新、显式启停，以及工具、其他 Skill 和扩展依赖的检查。界面展示启用状态、依赖就绪情况和具体缺失原因，执行时再按实际工具与权限范围确定可用技能。
+Flowmate 检查工具、Skill 和扩展依赖，展示缺项与启用状态。每次 Run 保留选定资源版本和授权依据，先提供短索引，再按需读取正文；后续更新只用于新运行。
 
-每次 Run 保留选定版本的资源副本和授权依据。Agent 先获取短索引，再按需要读取正文与附属文件，读取请求绑定原 Run、选定版本和允许范围。刷新或更新作者资源不会用当前文件替换历史执行依据。
-
-Personal Agent 按已保存事项配置装配受支持的 Prompt、Skill 与工具，后续尝试仍使用原资源版本；资源选择必须满足 Durable 路径的适配与授权条件。
-
-### Subagent：由产品 Runtime 驱动的任务委派
-
-Flowmate 自定义子代理驱动分别接入 AgentSession 子会话与 Durable 子任务，将委派纳入产品运行管理。以下展示 AgentSession 路径：
+### Master + Subagent：受控任务委派
 
 ![AgentSession 子代理启用入口：Extensions 中的 subagents 开关与 Manage agents 入口](docs/screenshots/Extensions.png)
-
-*AgentSession 子代理入口：在 Extensions 中启用 subagents，并从 Manage agents 进入角色管理。*
-
-**主 Agent 发起委派 → 核验来源与角色 → 创建独立子会话和子 Run → 执行受限工具 → 保存结果与停止事实 → 回送父 Agent 并更新桌面状态。**
 
 ```mermaid
 flowchart TB
@@ -254,15 +189,9 @@ flowchart TB
   Confirmed -->|"未确认"| Blocked["保留诊断与已保存事实<br/>阻断后续运行"]
 ```
 
-驱动核验真实委派调用、父 Run 和角色身份，为子任务创建独立 Session / Run 与历史，并按角色注册允许的 `PURE` / `READ` 工具。底层模型循环复用 Pi SDK；角色装配、子任务准入、执行绑定和生命周期管理由 Flowmate 完成。
+图示为 AgentSession：在 **Extensions → subagents → Manage agents** 启用并管理角色。Flowmate 核验父调用与角色，创建独立子会话和 Run，限定只读工具及共享预算。最多四个前台子执行，限单层委派；可单独停止，也随父任务停止。Deep Research 的调查角色沿用确认计划的资料范围。
 
-父子任务共享调用预算，子任务时限受父任务剩余时间与委派时限约束。AgentSession 路径当前最多四个前台子执行，不支持后台或嵌套委派；桌面可查看真实执行状态和结果，支持停止单个子任务，也支持父任务停止时联动停止子任务。
-
-驱动分别记录取消请求、实际停止和结果保存。停止未确认时阻断后续运行；已经保存的结果与历史保持可查，不因恢复或重复委派而自动重放原执行。
-
-Deep Research 通过只读调查角色使用这套驱动：子代理返回发现、证据、冲突与缺口，主任务负责综合并保存 Claim 和报告，调查范围与预算沿用用户确认的研究计划。
-
-Personal Agent 的委派通过 `runtime-durable` 接入 Pi Durable 任务图，使用只读 `invoice-evidence-checker` 核查限定来源问题。Flowmate 负责子任务准入、上下文、独立历史、共享预算、停止确认与结果关联；这一入口使用自身的 Durable 适配，不依赖启用上述会话扩展。子任务完成与结果返回分别保存，Master 继续核对证据、综合候选并推进逐票 Todo。
+Durable 委派使用独立适配，两条路径均可查看子结果、保存历史、停止事实，以及结果是否进入父模型请求。查看记录不重放原执行。
 
 <a id="architecture"></a>
 
@@ -272,13 +201,13 @@ Personal Agent 的委派通过 `runtime-durable` 接入 Pi Durable 任务图，�
 
 | 层级 | 技术与职责 |
 |---|---|
-| 语言与契约 | TypeScript strict、Zod：跨层输入、结果和错误契约 |
-| 桌面界面 | Electron、React、Vite：页面、Preload 接口与窗口生命周期 |
-| 应用与存储 | Bun 1.4.4、SQLite：应用组装、领域服务、原生运行记录与业务事实保存 |
-| 会话执行 | Pi SDK 1.4.0、`runtime-pi`：Provider、AgentSession、模型与工具循环，承载 Chats / Invoices / Deep Research |
-| 持久执行 | Pi Durable 1.4.0、`runtime-durable`：Harness、持久任务图、模型与工具适配，承载 Personal Agent |
-| 子代理驱动 | Flowmate 自定义驱动：分别接合子会话与持久子任务，管理角色、共享预算、独立历史和执行状态 |
-| 验证与评测 | Bun Test、Playwright、本地评测 Runner、独立 Judge 与 Langfuse 观察和回读 |
+| 语言与契约 | TypeScript strict、Zod |
+| 桌面界面 | Electron、React、Vite |
+| 应用与存储 | Bun 1.4.4、SQLite |
+| 会话执行 | Pi SDK 1.4.0、`runtime-pi`：Chats / Invoices / Deep Research |
+| 持久执行 | Pi Durable 1.4.0、`runtime-durable`：Personal Agent |
+| 子代理驱动 | Flowmate 管理角色、子执行与共享预算 |
+| 验证与评测 | Bun Test、Playwright、独立 Judge、Langfuse |
 
 ```mermaid
 flowchart TB
@@ -313,21 +242,17 @@ flowchart TB
   Durable --> Model
 ```
 
-Chats、Invoices、Deep Research 保持 AgentSession 流程，Personal Agent 使用 Pi Durable。所选 Bun 后端统一管理该数据根的数据库与运行记录，Renderer 通过公开接口访问产品能力；两类主子执行分别保留对应的原生历史。
-
-默认由本地 Host 承载后端，显式启用服务模式时由 ServiceOwner 承载；服务接入已有工程实现，真实 Windows 服务生命周期仍待系统验收。
+图示为本地后端。默认由 Host 管理数据根，显式服务模式由 ServiceOwner 承载；关闭桌面后持续执行、服务重启及开机恢复仍待 Windows 系统验收。选择工作目录只确定执行位置，不提供沙箱。
 
 ### Context / Memory：分层状态与研究恢复
 
-Flowmate 将当前输入依据、持久历史、进程内对象、显式偏好和任务进度分开管理。Pi 提供原生消息、历史与压缩能力，Flowmate 负责当前请求的投影、授权绑定，以及根据业务执行事实恢复研究进度。
-
 | 层次 | 职责与生命周期 |
 |---|---|
-| **Workspace Context** | 接收输入时捕获页面焦点、材料与选区，形成独立 Context Snapshot。运行中切页不改变已接收任务，页面焦点不扩大资料访问范围。 |
-| **Conversation** | 持久保存用户输入、助手回复、真实工具结果与历史摘要，沿用 Pi 的消息、会话历史及压缩能力。 |
-| **Runtime Session** | 持有活跃 Agent、取消信号、并发执行和进程内对象；退出后根据持久事实重新建立运行对象。 |
-| **Research Preferences** | 显式保存研究关注点、证据与报告偏好，默认空文本；研究 Run 捕获当次文本与版本，设置修改用于后续 Run。 |
-| **Task Checkpoint** | 从确认的计划、步骤执行、工具终态与来源快照投影进度，关联成功证据、失败或中断及报告，不另存一份会话副本。 |
+| **Workspace Context** | 接收输入时保存焦点、选区与授权资料快照；切页不改变已受理任务。 |
+| **Conversation** | 保存原生消息、工具结果与历史摘要。 |
+| **Runtime Session** | 进程内管理 Agent、取消及并发，重启后依据保存事实重建。 |
+| **Research Preferences** | 用户显式保存，研究 Run 捕获当次版本。 |
+| **Task Checkpoint** | 从确认计划、工具终态与来源快照恢复研究进度。 |
 
 ```mermaid
 flowchart TB
@@ -337,6 +262,7 @@ flowchart TB
   Input -->|"用户原文与必要业务输入"| Conversation["Conversation<br/>持久消息、工具结果与摘要"]
   Snapshot --> Request["组装当前模型请求<br/>临时注入投影与研究进度"]
   Conversation --> Request
+  Memory["OpenViking 可选长期记忆<br/>按授权范围与来源召回"] -.-> Request
   Checkpoint["Task Checkpoint<br/>计划 / 步骤 / 来源 / 报告"] --> Request
   Request --> Runtime["Runtime Session<br/>进程内 Agent / 取消 / 并发"]
   Runtime -->|"真实消息与工具结果"| Conversation
@@ -348,26 +274,24 @@ flowchart TB
   Continue --> Capture
 ```
 
-新增自动页面投影只用于当前模型请求，不拼入新的原生用户消息，也不直接进入历史压缩输入；用户显式提交的材料、确认操作、真实工具结果和 Fill Form 必需的业务输入继续保留。历史中已经保存的页面内容保持原样，不追溯重写。
+页面投影仅用于当前模型请求，原生历史与压缩输入保持独立；用户提交的业务输入仍保存。Personal Agent 使用独立的 Durable 阶段上下文。
 
-研究偏好通过 **Settings → General → Research preferences** 显式保存，不自动从对话提炼，也不构成资料访问权限。当前 Run 沿用已捕获版本，下次研究 Run 才接收新的偏好。
+**OpenViking 是可选长期记忆，默认使用 Native。** 在 **Settings → Connections → Long-term memory** 配置新会话或事项的后端，已有记录沿用原绑定。本机和云端的服务、身份及数据分开；有授权和可验证来源的语义召回只作为当次请求的参考。
 
-图示覆盖 AgentSession 会话与 Deep Research：恢复展示和明确继续分别处理，查看页面不发起执行。Personal Agent 沿用独立的 Durable 阶段上下文，继续按事项原配置、授权与实际停止事实核验恢复条件。
+记忆可显式保存、搜索和遗忘，结果未知时查询原回执；遗忘阻止后续召回，已保存历史照常保留。AgentSession 的合格聊天可另行启用自动采集，识别到凭证标记时跳过相应自动外发；发票事项使用显式保存。
 
 ### 原生能力、适配与自定义产品实现
 
 | 模块 | 底层基础能力 | Flowmate 的适配与产品实现 |
 |---|---|---|
-| **运行与取消** | AgentSession 的循环、事件与中止接口；Pi Durable 的 Harness 与持久任务执行。 | 两类适配层接合运行与取消；产品 Runtime 管理准入、预算、桌面状态、终态保存和实际停止确认。 |
-| **Personal Agent** | Pi Durable 的持久任务图、原生记录与恢复能力。 | 建模固定票组、逐票 Todo 与最终处置，绑定原配置和资源，核验补料、继续、恢复及结项条件。 |
-| **工具** | Pi 工具协议、原生工具和 Durable 工具执行机制。 | 分别适配会话工具与持久产品工具；执行器增加参数、范围、时限、输出、调用记录和副作用核验。 |
-| **会话与历史** | AgentSession 原生历史与 Pi Durable 原生持久记录。 | 关联产品 Session / Run 及事项、尝试和阶段，接入本地查询与受控恢复；查看历史不触发重新执行。 |
-| **上下文** | Pi 的原生消息、历史与压缩能力，以及 Durable 的阶段上下文。 | 分层管理会话历史、当次工作区投影、显式研究偏好与任务 Checkpoint，保存请求依据；Personal Agent 保留独立的事项上下文与恢复条件。 |
-| **Skill Hub** | Pi 的 Skill 资源与加载机制。 | 管理资源发现、依赖就绪、显式启停、选定版本和运行副本，以短索引与按需读取接入具体 Run。 |
-| **Subagent 驱动** | AgentSession 的子会话执行能力与 Pi Durable 的持久子任务能力。 | 自定义驱动负责真实委派核验、角色与上下文装配、独立历史、只读工具注册、共享预算、并行准入、停止确认与结果回送。 |
-| **研究与业务交付** | 通用模型、工具与扩展能力。 | 将确认的计划步骤关联真实工具回执和来源，管理并行采集、进度投影与手动继续，再组织 Claim 和报告；接合发票候选、人工复核、接受与导出。 |
-
-普通聊天可使用当前平台支持的 Pi 原生文件与命令工具。工作目录用于确定执行位置，**目录选择本身不提供沙箱隔离**。Skill 与 Extension 的依赖、启用状态及工具可用性可在对应资源页面和 Diagnostics 查看。
+| **运行与取消** | AgentSession 循环与事件；Durable 持久任务 | 准入、预算、终态与停止确认 |
+| **Personal Agent** | Durable 任务图、原生记录与恢复 | 固定票组、逐票推进、授权与结项 |
+| **工具** | Pi 工具协议与执行机制 | 范围、时限、输出及副作用核验 |
+| **会话与历史** | 两类原生记录 | 关联运行、事项与执行阶段，按保存事实恢复 |
+| **上下文** | Pi 消息与压缩、Durable 阶段上下文 | 请求投影、偏好、记忆授权和研究 Checkpoint |
+| **Skill Hub** | Pi 资源与加载机制 | 依赖检查、版本保存和按需读取 |
+| **Subagent 驱动** | AgentSession 子会话、Durable 子任务 | 角色、预算、独立历史及回执核验 |
+| **研究与业务交付** | 通用模型和工具 | 持久研究步骤、证据报告、发票复核及导出 |
 
 <a id="quick-start"></a>
 
@@ -375,9 +299,7 @@ flowchart TB
 
 ### 1. 准备环境
 
-- **Windows x64**：当前主要开发与打包目标。
-- **Bun 1.4.4、Node.js 24**：Bun 用于依赖、后端和测试，Node.js 用于开发入口及 Electron 测试；当前 Pi SDK 与 Pi Durable 均为 1.4.0。
-- 可访问的模型服务与 API Key，首次使用时在桌面配置。
+使用 **Windows x64、Bun 1.4.4、Node.js 24**，并准备可访问的模型服务与 API Key。
 
 ### 2. 安装并启动
 
@@ -388,37 +310,31 @@ bun install --frozen-lockfile
 bun run dev
 ```
 
-Renderer 支持热更新；Main / Preload 改动触发停止、关闭与重建。结束开发时按 **Ctrl+C**，等待关闭完成。
+Renderer 支持热更新，Main / Preload 改动后重建。开发结束时按 **Ctrl+C**，等待关闭完成。
 
 ### 3. 配置模型并发起第一次对话
 
-1. 打开 **Models** 或 **Settings → LLM**，选择 Pi 内置供应商与模型。
-2. 填写并保存 API Key；使用 **Custom model** 时同时填写 Base URL、Pi API 类型及实际模型能力。
-3. 点击 **Test connection** 检查连接。
-4. 点击左侧 **New chat**，在对话主区输入问题并点击 **Send**，需要时使用 **Stop**；从 **Chats** 可重新打开已有会话。业务页面保留右侧 Assistant 入口。
+1. 在 **Models** 或 **Settings → LLM** 选择模型并保存 API Key。**Custom model** 还需 Base URL、Pi API 类型及模型能力。
+2. 点击 **Test connection**，再用 **New chat → Send** 对话；需要时用 **Stop**，从 **Chats** 重开历史。
 
-桌面凭据通过系统加密存储保存，评测使用独立配置。会话、事项、候选与报告保存在本地；调用外部模型时，请求内容会发送至所选服务。Test connection、Optimize、Send、Fill with Agent、研究规划或执行，以及 Personal Agent 事项创建、继续或获执行授权的补料，可能请求模型并产生费用。页面和历史查看保持只读；评测调用与轨迹上传按各自配置和显式操作执行。
+桌面凭据由系统加密保存。测试连接、对话、规划及获准的事项执行可能请求模型并产生费用。
 
 ### 4. 体验 Personal Agent
 
-1. 从左侧进入 **Personal Agent**，默认打开云工作区并启动本机 KimiCU；已有云连接配置时会尝试自动重连。首次使用云端时，填写工作区 UUID、SSH 主机、受限用户、私钥和已验证的 known_hosts，连接已部署 Flowmate 云服务的服务器。如需本地执行，选择 **Local workspace**，并在 **Assistant configuration** 选择已保存模型。
-2. 点击 **New invoice work**，选择固定的一组已有解析发票，填写目标并明确提交，创建持久事项。
-3. 查看事项概览、逐票 Todo、候选与来源，为具体票 / Todo 补料；阅读回执，区分已保存、获执行授权、排队和受阻。用户停止或执行失败后，须明确继续。
-4. 沿复核动作回到 **Invoices**，对照原票与解析材料，明确接受结果或对该票作最终拒绝、排除；全部票最终处置且必要执行收口后，事项完成。
+1. 在 **Personal Agent** 选择 **Local workspace** 并配置已保存模型，或连接已部署的云工作区：填写工作区 UUID、SSH 主机、受限用户、私钥与已验证的 known_hosts。进入云工作区时尝试重连并启动或复用已配置的本机桥。
+2. 在 **New invoice work** 固定票组与目标并提交；在逐票 Todo 补料或明确继续，沿复核入口处理候选，用 **Attach confirmed acceptance** 关联接受回执。
 
-Personal Agent 使用独立的 Pi Durable 入口；已有 Chats、Invoices、Deep Research 继续使用 AgentSession。新增票据另建事项，查看页面或重连不会自动发起执行。
+**可选：由本地 Personal Agent 填写发票表单。** 为新事项启用 `personal_observe_invoice_form` 与 `personal_fill_invoice_form`，在原票 **Results → Prepare form for Personal Agent** 准备表单，回事项补充要求并继续。核对草稿后由用户接受；连接或目标变化后重新准备，此入口不依赖 KimiCU。
 
-**可选：由本地 Personal Agent 填写 Flowmate 发票表单。** 在新事项的配置中启用 `personal_observe_invoice_form` 和 `personal_fill_invoice_form`。候选生成后，从事项打开该票复核，在 **Results** 中点击 **Prepare form for Personal Agent**；返回原事项，针对相关 Todo 明确补充填写要求并继续。再次打开原票可检查已填草稿；接受候选仍需用户明确操作，并将接受回执关联到原事项。准备的表单只属于当前桌面会话，连接或目标变化后需要重新准备；此路径不依赖 KimiCU。
+**可选：读取网页。** 安装本机 WebBridge 与 Chrome 扩展，为新事项启用 **Browser page reading**。在对应发票用 **Open dedicated tab** 绑定页面，再按提示批准单次读取。
 
-**可选：本机 Windows 桌面操作。** Personal Agent 可以通过独立安装的 KimiCU 观察用户选定的外部窗口，并对每次点击或输入先展示目标和内容，等待用户单独确认。云端 Work 由云端 Pi Durable 执行，桌面操作通过 SSH 中继到当前 Windows 交互桌面；本地 Work 也可使用此能力。工具默认关闭，需为新 Work 显式启用；自动启动 KimiCU 不会自动执行桌面动作或提交 Work。Flowmate 自身的发票结果继续通过产品复核与接受接口处理。
-
-使用前确保 PATH 中的 Node.js 版本至少为 24.15.0，并在 `%APPDATA%\Flowmate\data\kimi-cu.json` 写入本机插件和运行时的绝对路径，例如：
+**可选：操作外部 Windows 窗口。** 独立安装 KimiCU，确保 PATH 中 Node.js ≥ 24.15.0。通过 `%APPDATA%\Flowmate\data\kimi-cu.json` 指定本机绝对路径：
 
 ```json
 {"version":1,"pluginRoot":"D:\\KimiCU\\plugin","runtimeExecutable":"D:\\KimiCU\\runtime\\kimi-cu.exe"}
 ```
 
-也可以在启动 Flowmate 的 PowerShell 中同时设置以下两个环境变量，它们优先于上述配置文件：
+也可同时设置下列变量，优先于配置文件：
 
 ```powershell
 $env:FLOWMATE_KIMICU_PLUGIN_ROOT = 'D:\KimiCU\plugin'
@@ -426,33 +342,21 @@ $env:KIMI_CU_WINDOWS_EXE = 'D:\KimiCU\runtime\kimi-cu.exe'
 bun run dev
 ```
 
-在 **Assistant configuration** 为新事项启用 `desktop_list_windows`、`desktop_observe_window`、`desktop_propose_action` 和 `desktop_execute_approved`。进入事项的具体发票后，点击 **Find desktop windows**，选择并授权目标窗口；提议出现后逐次查看并批准或拒绝。窗口、控件或发票变化时应重新观察并确认；动作结果不确定时先检查原应用，系统不会自动重放。已批准但尚未领取的动作可以撤销。
+桌面工具默认关闭。为新事项启用 `desktop_list_windows`、`desktop_observe_window`、`desktop_propose_action`、`desktop_execute_approved`；在对应发票点击 **Find desktop windows**，选窗后逐次批准动作。云端桌面操作要求 Authority、Runtime 和 SSH Bridge 配套版本。
 
-云端桌面操作要求桌面端与云端 Authority、Runtime 和 SSH 桥使用本版本的配套代码。旧版云服务仍可连接普通云工作区，但需更新后才能使用 KimiCU；部署方法见 [云端服务文件](deploy/cloud/README.zh-CN.md)。
-
-首次支持文本可读的 Windows 辅助控件，不包含截图或坐标操作；Windows 输入可能激活目标窗口并使用真实鼠标和键盘，文本输入会覆盖系统剪贴板。人与其他自动化仍可能改变界面；辅助信息可能包含敏感内容，并可能保存在工作历史中或发送给所选模型服务。[Kimi 官方建议](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/plugins.html)不要将涉及金钱、账户或发布的任务交给 KimiCU；逐次确认不能消除该风险。Flowmate 作为自定义宿主尚未获得厂商支持确认，插件和运行时需要独立安装，不随 Flowmate 分发；不同外部软件的兼容性须分别验证。
+当前支持文本可读控件；真实输入可能激活窗口、覆盖剪贴板，观察内容可能进入历史或模型请求。涉及资金、账户和发布的操作应由用户完成。插件与运行时单独安装，厂商支持及各外部应用兼容性需分别核验。
 
 ### 5. 体验 Deep Research
 
-1. 按需在 **Settings → General → Research preferences** 填写并保存研究偏好，后续研究 Run 使用新版本。
-2. 进入 **Deep Research**，导入或选择本地 `.txt` / `.md` 资料，也可选择已登记解析资料；填写问题和范围并创建研究。
-3. 在 Assistant 点击 **Send** 生成含采集步骤的计划，查看子问题、材料、证据需求和预算，按需修改并确认该版本。
-4. 在 **Research steps** 查看逐步状态、来源身份和失败原因；在 **Evidence / Report** 查看结论、覆盖与缺口，使用 **Save report** 另存 Markdown。
-5. 中断后重新打开任务查看已保存进度，点击 **Continue research** 明确继续，复用成功来源并处理剩余步骤。旧计划需重新生成并确认含步骤的计划，才能使用新步骤工作流。
-
-要使用调查子任务，先在 Extensions 启用已登记的 **subagents** 扩展。研究无需先创建发票任务。
+在 **Deep Research** 选本地资料并创建任务，使用 Assistant 生成并确认计划。在 **Research steps** 看进度，**Continue research** 手动继续，在 **Evidence / Report** 复核并另存 Markdown。可在 **Settings → General → Research preferences** 保存偏好；调查子代理需启用 subagents 扩展。
 
 ### 6. 体验单票复核
 
-准备同一张发票的原件与外部已生成的解析材料，开发环境正式导入来源为 `data/invoices/agent-input/`。在 **Invoices** 导入并查看 **Original / Parsed / Results**，点击 **Process this invoice**，再在 Assistant 点击 **Send**。
+将原件与外部解析材料登记到 **Invoices**（开发导入目录：`data/invoices/agent-input/`）。查看 **Original / Parsed / Results**，用 **Process this invoice → Send** 生成候选。
 
 ![发票处理入口：导入发票、选择处理任务与 Assistant](docs/screenshots/Invoices.png)
 
-*发票处理入口：在 Invoices 导入并发起处理，通过右侧 Assistant 继续交互。*
-
-选择候选后，可用 **Fill with Agent** 实际填表，或用 **Edit** 人工编辑；核对并保存后，通过 **Accept result** 明确接受，再导出 JSON、CSV 或 Markdown。业务取证读取已登记解析材料，原票用于人工对照，Host 不运行发票解析器。
-
-默认桌面数据根为 `%APPDATA%\Flowmate`，数据库位于 `data\app.sqlite`。候选生成、编辑保存和接受分别记录；未保存编辑只存在于当前窗口，离开时按提示保存或放弃。撤回材料使用权限后，受影响会话不能继续请求模型。
+选择 **Fill with Agent** 或 **Edit**，保存后明确 **Accept result**，再导出 JSON、CSV 或 Markdown。撤回资料权限后，受影响会话不能继续请求模型；未保存的编辑仅在当前窗口保留。
 
 <a id="development"></a>
 
@@ -460,9 +364,7 @@ bun run dev
 
 ### 常用命令
 
-以下命令均在仓库根目录执行：
-
-| 用途 | 命令 |
+| 用途 | 在仓库根目录执行 |
 |---|---|
 | 桌面开发 | `bun run dev` |
 | 类型检查 | `bun --no-env-file run typecheck` |
@@ -474,84 +376,36 @@ bun run dev
 | Windows x64 目录包 | `bun --no-env-file run package:dir` |
 | Windows x64 NSIS 安装包 | `bun --no-env-file run package:win` |
 
-打包脚本要求 Windows x64 与 Bun 1.4.4。产物生成、实际安装、升级和恢复分别验证。
+工程测试使用受控 Provider；打包需要 Windows x64 与 Bun 1.4.4，实际安装、升级与恢复单独验证。
 
 ### 项目结构
 
 ```text
-apps/
-  desktop/           Electron Main、Preload 与 React Renderer
-  host/              Bun Host 入口
-  composition.ts     公共应用组装
-packages/
-  contracts/         输入、状态、事件与跨层接口
-  core/              Runtime、Session、Context、工具与研究服务
-  runtime-pi/        Pi 会话、Provider、原生与自定义工具适配
-  runtime-durable/   Pi Durable、持久任务与产品工具适配
-  data/              解析材料登记与读取
-  employee-invoice/  发票规则、业务工具与表单能力
-  logging/           运行日志与 Prompt Trace
-  shared/            路径、凭据与共享能力
-resources/           Skills、Prompts、模板、子任务角色与扩展声明
-agent-eval/          隔离执行、评分、校准、回归与本地报告
-tests/               工程测试与合成夹具
-scripts/             开发、测试与打包入口
+apps/       桌面、Host 与云端入口
+packages/   契约、业务、存储及两套 Runtime
+resources/  Skills、Prompts、模板、角色与扩展
+agent-eval/ 隔离执行、评分、回归与报告
+tests/      工程测试与合成夹具
+scripts/    开发、测试与打包
 ```
 
-### 工程测试验证机制，Agent 评测验证任务表现
-
-标准 `test` 入口依次运行类型检查、Unit、Integration、桌面构建与 Electron E2E。临时数据目录和受控 Provider 用于检查配置、消息、工具、取消、恢复与桌面接合，不请求付费模型。
-
-Agent 评测使用专用 Agent 与 Judge 配置，通过独立本地 Host 调用同一产品核心，采集真实产品状态与工具记录。本地按 Run 保存 Trial、Trace、交付产物、评分与比较，桌面 **Evaluation** 提供轨迹、候选、实验和评测模型入口；Langfuse 展示上传后的模型、工具、子 Agent 观察与评分。
+### 独立 Agent 评测闭环
 
 ![Evaluation 评测闭环：轨迹采集、上传与挖掘开关，以及 Traces、Candidates、Experiments 入口](docs/screenshots/Evaluation.png)
 
-*评测工作台：独立控制轨迹采集、上传与自动挖掘，在 Traces、Candidates、Experiments 间查看证据、审核候选和组织实验。*
-
-### 从真实轨迹到回归改进
-
 **Trace → Dataset → Evaluator → Experiment → Regression → Improvement。**
 
-产品轨迹连接实际请求、工具调用和业务回执，候选挖掘从中整理 Gold、Bad 与 Regression 样例。候选经过校验、必要重放及当前版本的人工批准后，才发布为明确版本的数据集；独立参考答案仅供评分，不进入被测 Agent 上下文。
+试验隔离保存执行、业务交付与评分。从轨迹和回执整理候选，经校验、必要重放及人工批准进入版本化数据集。确定性检查与语义 Judge 使用独立 Gold 评分，覆盖 Skill 正反例和 Deep Research 证据链；Gold 仅供评分。补评分只调用适用的 Judge，保留原执行与原分数。Baseline / Gate 衡量可比实验的相对回归，绝对质量结合任务结果与证据判断。
 
-实验比较明确声明的模型、Prompt、Skill、策略或代码配置，保留每次执行的实际条件与结果，再以指定 Baseline 和回归 Gate 判断变化。人工反馈与后续修订保留原始来源和关联，不覆盖原执行或原评分。
-
-### 独立评测的执行与评分
-
-| 能力 | Flowmate 的实现与判断依据 |
-|---|---|
-| **隔离试验** | 分离 Task / Trial / Trace / Outcome；隔离每次试验，分别核验执行终态、业务交付与质量。多次有效重复可统计 pass@k、pass^k 和波动，单次观察不证明稳定性。 |
-| **轨迹与候选** | 采集实际模型、工具和业务事实；候选经过编辑、校验、必要重放与人工批准，发布为可追溯的数据集版本。 |
-| **Skill 行为检查** | 设置 Skill 正例、反例和正确不使用 Skill 的场景，从实际工具与资源读取记录检验行为。 |
-| **质量评分** | 明确成功与失败标准，拆分确定性检查和语义评分，使用独立 Gold、各评判项的 Rubric 与校准；区分不适用、未运行和评分故障。 |
-| **比较与回归** | Baseline 绑定明确 Run、配置、选集和可比条件，Gate 判断相对退化；缺失结果、评分错误或条件不符时保留 blocked。 |
-| **评分故障恢复** | 显式补评分只调用适用的 Judge，不重跑 Agent；新增评分修订并保留原分数，比较与 Gate 明确选择所用修订。 |
-| **反馈与改进** | 将离线评测、人工反馈与回归流程衔接；保留失败来源、目标指标和后续运行关联，反馈经核验后才能成为正式样例。 |
-
-执行器与评分器在本地实现。适用的语义判据在单次 Trial 中合并为一次 Judge 生成，确定性判据由本地检查执行，并保留独立参考答案、校准与人工核验流程。
-
-流程完成、绝对质量、相对回归及平台回读分别呈现。质量 FAIL 是有效测量结果；Gate 通过表示相对所选 Baseline 未退化，不能单独推导任务质量达标。Langfuse 提供观察与分数，本地保存的证据承载比较、Baseline 和 Gate。
-
-**Deep Research 质量评测**从实际保存的计划、Claim、报告、来源正文与 Run / ToolCall 取得证据，检查事实准确性与遗漏、来源支撑、有效证据覆盖和多跳证据链。产品中的覆盖记录属于被测结果，独立参考答案仅用于评分；控制器读到材料，也不能直接证明模型实际接收或使用了该材料。
-
-### 执行独立评测
-
-创建 `agent-eval/configs/.env`，填写专用 Agent、Judge 及 Smoke / Full 所需的 Langfuse 配置，先检查就绪条件：
+**Smoke / Full 主基准。** 在 `agent-eval/configs/.env` 配置 Agent、Judge 与 Langfuse 后先预检。基准调用真实模型并上传、回读评测材料，可能产生费用。桌面产品轨迹采集、上传与自动挖掘默认关闭，分别启用。
 
 ```powershell
 bun --no-env-file run eval -- doctor --backend local
-```
-
-doctor 必要时只读模型元数据，就绪失败返回非零状态。产品轨迹采集、上传和自动挖掘三个开关独立且默认关闭，填写凭据不会自动开启。以下 Smoke / Full 命令则明确包含被测模型与适用 Judge 调用、Langfuse 上传和回读，可能产生模型费用并发送该次评测材料：
-
-```powershell
 bun --no-env-file run eval:smoke
 bun --no-env-file run eval:full
 ```
 
-两个入口完成预检、执行、确定性检查与适用语义评分、本地采证、平台上传回读、诊断、配置比较及对应选集的 Baseline / Gate。读取保存记录不请求模型；显式候选挖掘、模型重放或补评分按操作调用相应模型。
-
-工程测试、受控评测与真实模型质量分别表述。质量结论以对应 Execution 的模型、资料、执行完整性、评分及人工核验为准；模拟模型、未完成试验或评分故障不计作真实质量通过。
+**Personal Agent 场景评测。** `bun --no-env-file run eval:personal` 使用隔离数据与模拟 Provider，报告保存在本地；加 `--suite full` 覆盖审批、恢复、子任务及业务回执。真实模型质量单独评估。
 
 <a id="capabilities"></a>
 
@@ -565,4 +419,4 @@ bun --no-env-file run eval:full
 | **发票** | 支持已有解析材料上的候选、字段核算、人工复核、接受与导出；不在 Host 中执行原票解析。 |
 | **验证** | 已有工程测试，以及轨迹、候选、数据集、评分、实验和回归入口。机制覆盖、真实模型质量、相对 Gate 与平台回读分别判断，不由功能存在推导质量达标。 |
 | **发行** | 当前主要目标为 Windows x64；完整安装、升级、恢复验收及其他操作系统兼容性仍需实际验证。 |
-| **数据** | 产品数据在本地保存；外部模型调用会发送相应请求内容，凭据、模型选择与费用由使用者配置。 |
+| **数据** | 本地模式默认数据根为 `%APPDATA%\Flowmate`，SQLite 位于 `data\app.sqlite`；云端事项使用明确提交的资料与资源。外部模型和可选 OpenViking 按各自授权接收内容。 |
