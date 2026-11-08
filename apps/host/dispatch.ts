@@ -92,7 +92,7 @@ const closingReads: readonly HostCommand['type'][] = [
   'personal_agent_get', 'personal_agent_open_conversation', 'invoice_work_list', 'invoice_work_get',
   'invoice_work_query_operation', 'invoice_work_desktop_list', 'invoice_work_desktop_query_decision', 'invoice_work_browser_list',
   'invoice_work_browser_query_decision', 'personal_task_list', 'personal_task_get',
-  'personal_task_history', 'personal_task_history_entry', 'invoice_work_timeline',
+  'personal_task_history', 'personal_task_history_entry', 'invoice_work_timeline', 'invoice_work_feedback_get',
   'memory_get_settings', 'memory_list_entries', 'memory_read_entry', 'memory_list_operations',
   'memory_inspect_configuration',
 ];
@@ -558,6 +558,8 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
         case 'personal_task_history': value = await application.personalTasks.history(captured.input); break;
         case 'personal_task_history_entry': value = await application.personalTasks.historyEntry(captured.input); break;
         case 'invoice_work_timeline': value = await application.invoiceWorks.timeline(captured.input); break;
+        case 'invoice_work_feedback_get': value = await application.invoiceWorkFeedback.get(captured.input); break;
+        case 'invoice_work_feedback_submit': value = await application.invoiceWorkFeedback.submit(captured.input); break;
       }
       const result = parsePersonalAgentHostResult(captured.type, value);
       await send({ version: 1, type: 'response', requestId: command.requestId,

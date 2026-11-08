@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { CLOUD_WORK_TIMEOUT_MS_MAX, CloudChildReportSchema, CloudDesktopConnectionSchema, CloudProgressEventSchema, CloudReviewAcceptReceiptSchema, compareInvoiceWorkTimelineCursor, ok, type CloudDesktopConnection, type DesktopBridge, type DocumentSnapshot, type InvoiceWorkView, type InvoiceWorkItemView,
   type BrowserReadView, type BrowserTarget, type DesktopActionView, type InvoicePeerReviewView, type InvoiceWorkTodoView, type InvoiceWorkTimelinePage, type ModelProfile, type PersonalAgentConfiguration,
   type PersonalAgentSnapshot, type PersonalHistoryPage, type PersonalHistoryEntry, type PersonalHistoryTarget,
-  type PersonalTaskView, type PersonalTaskGetResult, type Result } from '@flowmate/contracts';
+  type PersonalTaskView, type PersonalTaskGetResult, type Result, type RuntimeToolView } from '@flowmate/contracts';
 import { capturePersonalWrite, emptyPersonalDraft, executePersonalWrite, readPersonalDraft, recoverPersonalWrite,
   savePersonalDraft, personalReceiptText, type PersonalDraft, type PersonalReviewTarget, type PersonalWriteCommand,
   type PersonalWriteReceipt } from './personal-state.ts';
@@ -14,6 +14,8 @@ import { CLOUD_CONNECTION_KEY, readCloudConnection, saveCloudConnection } from '
 import { CloudInvoiceReview } from './cloud-invoice-review.tsx';
 import { CloudQueuePanel } from './cloud-queue.tsx';
 import { CloudDeliveryPanel } from './cloud-delivery.tsx';
+import { PersonalModelDiagnostics } from './model-timing.tsx';
+import { PersonalCandidateFeedback, type AssociatedExecution } from './personal-candidate-feedback.tsx';
 
 type Props = { ready: boolean; hostEpoch: number; models: readonly ModelProfile[];
   onModels(): void; onOpenInvoice(target: PersonalReviewTarget): Promise<void> };
@@ -149,6 +151,8 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   const [documents, setDocuments] = useState<DocumentSnapshot[]>([]), [documentCursor, setDocumentCursor] = useState<number | null>(null);
   const [tasks, setTasks] = useState<readonly PersonalTaskView[]>([]), [taskCursor, setTaskCursor] = useState<number | null>(null);
   const [task, setTask] = useState<PersonalTaskGetResult | null>(null);
+  const selectedAttempt = useRef<{ workId: number; attemptId: number } | null>(null);
+  const [feedbackOrigin, setFeedbackOrigin] = useState<{ workId: number; execution: AssociatedExecution; tool: RuntimeToolView } | null>(null);
   const taskRef = useRef(task);
   useEffect(() => { taskRef.current = task; }, [task]);
   const [timeline, setTimeline] = useState<InvoiceWorkTimelinePage | null>(null);
@@ -214,7 +218,40 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
       setTask(previous => append && previous?.task.attempt.attemptId === attemptId
         ? { ...result, children: [...previous.children, ...result.children] } : result);
       if (!cloud || taskRef.current?.task.workId !== workId || taskRef.current.task.attempt.attemptId !== attemptId) setReport(null);
+      return result;
     } catch (cause) { if (token === taskGeneration.current) setError(cause instanceof Error ? cause.message : 'The original task could not be read.'); }
+  }
+  async function openFeedbackOrigin(work: InvoiceWorkView, execution: AssociatedExecution) {
+    const taskRequest = readTask(execution.attemptId), token = taskGeneration.current;
+    try {
+      const [toolResult, originalTask] = await Promise.all([window.flowmate.queryRunToolCall({
+        runId: execution.runId, sessionId: work.sessionId, toolCallId: execution.toolCallId,
+      }), taskRequest]);
+      if (token !== taskGeneration.current || draftRef.current.selectedWorkId !== work.workId) return;
+      if (originalTask?.task.attempt.runId !== execution.runId || originalTask.task.sessionId !== work.sessionId)
+        throw Error('Original execution unavailable.');
+      const tool = need(toolResult);
+      selectedAttempt.current = { workId: work.workId, attemptId: execution.attemptId };
+      setFeedbackOrigin({ workId: work.workId, execution, tool });
+      setView('Tasks');
+    } catch (cause) { if (token === taskGeneration.current) setError(cause instanceof Error ? cause.message : 'Original execution unavailable.'); }
+  }
+
+  async function refreshTimeline(workId: number) {
+    const token = generation.current;
+    try {
+      const page = need(await personal.invoiceWorks.timeline({ workId, limit: 50 }));
+      if (!current(token) || draftRef.current.selectedWorkId !== workId) return;
+      setTimeline(previous => {
+        if (previous?.workId !== workId) return page;
+        const merged = new Map(previous.entries.map(entry => [entry.key, entry]));
+        // Without an overlap the pages may have a gap. Start paging from the latest facts.
+        if (!page.entries.some(entry => merged.has(entry.key))) return page;
+        for (const entry of page.entries) merged.set(entry.key, entry);
+        return { ...page, nextBefore: previous.nextBefore,
+          entries: [...merged.values()].sort((a, b) => compareInvoiceWorkTimelineCursor(b, a)) };
+      });
+    } catch (cause) { if (current(token)) setError(cause instanceof Error ? cause.message : 'Saved timeline unavailable.'); }
   }
   async function refresh(workId = draftRef.current.selectedWorkId) {
     const token = ++generation.current; setLoading(true); setError(null);
@@ -233,8 +270,9 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
       if (!current(token) || workId !== draftRef.current.selectedWorkId || value.view !== 'work') return;
       setWork(value.work); setItems(value.items); setItemCursor(value.nextAfterItemId); setTasks(executions.items); setTaskCursor(executions.nextBeforeAttemptId); setTimeline(events);
       if (selectedItem?.workId === workId) void readItem(selectedItem.itemId);
-      const attemptId = cloud && taskRef.current?.task.workId === workId ? taskRef.current.task.attempt.attemptId
-        : value.work.execution.attempt?.attemptId ?? executions.items[0]?.attempt.attemptId;
+      let attemptId = value.work.execution.attempt?.attemptId ?? executions.items[0]?.attempt.attemptId;
+      if (cloud && taskRef.current?.task.workId === workId) attemptId = taskRef.current.task.attempt.attemptId;
+      else if (selectedAttempt.current?.workId === workId) attemptId = selectedAttempt.current.attemptId;
       if (attemptId !== undefined) void readTask(attemptId); else setTask(null);
     } catch (cause) { if (current(token)) setError(cause instanceof Error ? cause.message : 'Personal Agent could not be read.'); }
     finally { if (current(token)) setLoading(false); }
@@ -242,11 +280,59 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
   useEffect(() => { if (props.ready) void refresh(); return () => { generation.current++; itemGeneration.current++; taskGeneration.current++; historyGeneration.current++; }; }, [props.ready, props.hostEpoch]);
   const refreshRef = useRef(refresh);
   useEffect(() => { refreshRef.current = refresh; });
+  const workId = work?.workId;
+  const currentAttemptId = work?.execution.attempt?.attemptId;
+  const polledAttemptId = view === 'Tasks' && task?.task.workId === workId && task?.task.attempt.attemptId === currentAttemptId
+    ? currentAttemptId : undefined;
+  const pendingReviewItemId = peerReview?.view.kind === 'pending' && peerReview.workId === workId && peerReview.itemId === selectedItem?.itemId
+    ? peerReview.itemId : undefined;
+  const localWorkActive = !!work && (work.execution.queued || work.execution.stopUnconfirmed
+    || work.execution.runStatus === 'created' || work.execution.runStatus === 'running');
   useEffect(() => {
-    if (cloud || !props.ready || peerReview?.view.kind !== 'pending' || peerReview.itemId !== selectedItem?.itemId) return;
-    const timer = window.setInterval(() => void refreshRef.current(peerReview.workId), 2000);
-    return () => window.clearInterval(timer);
-  }, [cloud, props.ready, peerReview?.workId, peerReview?.itemId, peerReview?.view.kind, selectedItem?.itemId]);
+    if (cloud || !props.ready || loading || workId === undefined || !localWorkActive && pendingReviewItemId === undefined) return;
+    let active = true;
+    const token = generation.current;
+    const owner = workId;
+    let timer: number;
+    async function poll() {
+      try {
+        const taskToken = taskGeneration.current, itemToken = itemGeneration.current;
+        const [workResult, taskResult, itemResult] = await Promise.all([
+          personal.invoiceWorks.get({ view: 'work', workId: owner, limit: 50 }),
+          polledAttemptId === undefined ? null : personal.personalTasks.get({ workId: owner, attemptId: polledAttemptId, limit: 1 }),
+          pendingReviewItemId === undefined ? null : personal.invoiceWorks.get({ view: 'item', workId: owner,
+            itemId: pendingReviewItemId, includePeerReview: true, limit: 1 }),
+        ]);
+        const page = need(workResult);
+        if (!active || !current(token) || draftRef.current.selectedWorkId !== owner || page.view !== 'work') return;
+        setWork(previous => previous?.workId === owner && previous.revision <= page.work.revision ? page.work : previous);
+        const updated = new Map(page.items.map(item => [item.itemId, item]));
+        setItems(previous => previous.map(item => {
+          const next = updated.get(item.itemId);
+          return next && next.revision >= item.revision ? next : item;
+        }));
+        if (taskResult?.ok && taskToken === taskGeneration.current) {
+          const next = taskResult.data.task;
+          setTask(previous => previous?.task.workId === owner && previous.task.attempt.attemptId === next.attempt.attemptId
+            ? { ...previous, task: next } : previous);
+          setTasks(previous => previous.map(item => item.attempt.attemptId === next.attempt.attemptId ? next : item));
+        }
+        if (itemResult?.ok && itemResult.data.view === 'item' && itemResult.data.peerReview && itemToken === itemGeneration.current) {
+          const { item, peerReview: latestReview } = itemResult.data;
+          setSelectedItem(previous => previous?.workId === owner && previous.itemId === item.itemId && previous.revision <= item.revision ? item : previous);
+          setPeerReview({ workId: owner, itemId: item.itemId, itemRevision: item.revision, view: latestReview });
+        }
+        setProgressError(taskResult?.ok === false || itemResult?.ok === false ? 'Saved Work progress could not be fully refreshed.' : null);
+      } catch {
+        if (active && current(token) && draftRef.current.selectedWorkId === owner) setProgressError('Saved Work progress could not be refreshed.');
+      } finally {
+        if (active && current(token) && draftRef.current.selectedWorkId === owner) timer = window.setTimeout(() => void poll(), 2000);
+      }
+    }
+    setProgressError(null);
+    timer = window.setTimeout(() => void poll(), 2000);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [personal, cloud, props.ready, props.hostEpoch, loading, localWorkActive, workId, polledAttemptId, pendingReviewItemId]);
   useEffect(() => {
     if (!cloud || !props.ready || !work) return;
     let active = true, cursor: { generation: string; sequence: number } | null = null, idle = 0;
@@ -431,6 +517,7 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
         {receiptMissing && <button type="button" disabled={!props.ready || saving} onClick={() => void operate(() => recover(true))}>Retry original request</button>}</div></section>}
     {cloud && <p className="notice">Selected invoice materials and visible tool feedback may be sent to DeepSeek.</p>}
     {cloud && progressError && <div className="notice" role="alert">{progressError} <button type="button" onClick={() => setProgressRetry(value => value + 1)}>Retry progress updates</button></div>}
+    {!cloud && progressError && <p role="alert" className="notice">{progressError}</p>}
     {cloud && liveOutput && work?.execution.runStatus === 'running' && liveOutput.attemptId === work.execution.attempt?.attemptId
       && <section className="panel" aria-label="Live cloud response"><h2>Live cloud response</h2><p>Temporary output may be incomplete; the saved result may differ.</p>
         <pre>{liveOutput.truncated ? '…' : ''}{liveOutput.text}</pre></section>}
@@ -497,7 +584,12 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
               source: { workId: work.workId, items: items.map(item => ({ itemId: item.itemId, documentRef: item.documentRef, candidateRef: item.candidateRef })) } })) setCreating(true); }}>Create related work</button>}
           </div>
           <div className="tabs" role="tablist" aria-label="Personal Agent views">{(['Invoices', 'Tasks', 'History', 'Timeline'] as const).map(tab => <button type="button" key={tab} role="tab" aria-selected={view === tab}
-            onClick={() => { setView(tab); if (tab === 'History') void readHistory({ workId: work.workId }); }}>{tab}</button>)}</div>
+            onClick={() => { setView(tab); if (tab === 'History') void readHistory({ workId: work.workId });
+              if (!cloud && tab === 'Timeline') void refreshTimeline(work.workId);
+              if (!cloud && tab === 'Tasks') {
+                const attemptId = task?.task.workId === work.workId ? task.task.attempt.attemptId : work.execution.attempt?.attemptId;
+                if (attemptId !== undefined && (!task?.children.length || task.task.attempt.runId === null)) void readTask(attemptId);
+              } }}>{tab}</button>)}</div>
           {view === 'Invoices' && <>
             <ul className="personal-items">{items.map(item => <li key={item.itemId}><button type="button" aria-pressed={selectedItemId === item.itemId} onClick={() => void readItem(item.itemId)}>
               {displayDocument(item.documentRef.id)} · {item.disposition} · {item.todoCount} Todo</button><span>Candidate {item.candidateRef ? `${item.candidateRef.id}/${item.candidateRef.sequence}` : 'not saved'}
@@ -595,9 +687,20 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
               <button type="button" disabled={writeDisabled} onClick={() => void operate(checkAcceptance)}>Check original acceptance</button>
               {work.status === 'open' && <button type="button" disabled={writeDisabled} onClick={() => void operate(attachAcceptance)}>Attach confirmed acceptance</button>}</section>}
           </>}
-          {view === 'Tasks' && <section aria-label="Work execution attempts"><h3>Execution attempts</h3>{tasks.map(value => <button type="button" key={value.attempt.attemptId} onClick={() => void readTask(value.attempt.attemptId)}>Attempt {value.attempt.attemptId} · {value.runStatus ?? 'not started'}{value.queued ? ' · queued' : ''}</button>)}
+          {view === 'Tasks' && <section aria-label="Work execution attempts"><h3>Execution attempts</h3>{tasks.map(value => <button type="button" key={value.attempt.attemptId} onClick={() => {
+            selectedAttempt.current = { workId: work.workId, attemptId: value.attempt.attemptId };
+            void readTask(value.attempt.attemptId);
+          }}>Attempt {value.attempt.attemptId} · {value.runStatus ?? 'not started'}{value.queued ? ' · queued' : ''}</button>)}
             {taskCursor && <button type="button" onClick={() => void operate(async () => { const token = generation.current; const page = need(await personal.personalTasks.list({ workId: work.workId, beforeAttemptId: taskCursor, limit: 30 })); if (!current(token) || draftRef.current.selectedWorkId !== work.workId) return; setTasks(previous => [...previous, ...page.items]); setTaskCursor(page.nextBeforeAttemptId); })}>Earlier attempts</button>}
-            {task && <><p>Attempt {task.task.attempt.attemptId}: {task.task.runStatus ?? 'no Run'} · stop {task.task.stoppedAt ? 'confirmed' : 'not confirmed'}</p>{task.children.length === 0 && <p>No saved child execution for this attempt.</p>}
+            {task?.task.workId === work.workId && <><p>Attempt {task.task.attempt.attemptId}: {task.task.runStatus ?? 'no Run'} · stop {task.task.stoppedAt ? 'confirmed' : 'not confirmed'}</p>
+              {feedbackOrigin?.workId === work.workId && feedbackOrigin.execution.attemptId === task.task.attempt.attemptId && <div>
+                <p>Original execution: Attempt {feedbackOrigin.execution.attemptId} · Phase {feedbackOrigin.execution.phaseId} · ToolCall {feedbackOrigin.execution.toolCallId}</p>
+                <p>{feedbackOrigin.tool.toolName} · {feedbackOrigin.tool.status} · {feedbackOrigin.tool.startedAt ?? 'start unavailable'} → {feedbackOrigin.tool.endedAt ?? 'end unavailable'}</p>
+              </div>}
+              {cloud ? <p>Model request diagnostics are available for local execution.</p> : task.task.attempt.runId !== null &&
+                <PersonalModelDiagnostics key={`${props.hostEpoch}:${task.task.attempt.runId}`} runId={task.task.attempt.runId}
+                  origin={feedbackOrigin?.execution.runId === task.task.attempt.runId ? feedbackOrigin.execution.source : undefined} />}
+              {task.children.length === 0 && <p>No saved child execution for this attempt.</p>}
               {task.children.map(child => <article className="personal-child" key={child.childRunId}><h4>Evidence checker {child.childRunId}</h4><p>{child.runStatus} · report {child.resultRecorded ? 'saved' : 'not confirmed'} · returned to Master {child.delivery.messageObservedAt ? 'observed' : 'not confirmed'} · Master received {child.parentModelReceivedAt ?? 'not confirmed'} · stop {child.stopConfirmed ? 'confirmed' : 'not confirmed'}</p>
                 <p>Report delivery and source references do not prove that its conclusions are correct.</p><div className="button-row"><button type="button" onClick={() => void readHistory({ workId: work.workId, childRunId: child.childRunId })}>View child history {child.childRunId}</button>
                   <button type="button" onClick={() => void operate(async () => { const token = taskGeneration.current;
@@ -622,10 +725,20 @@ export function PersonalAgentWorkspace(props: WorkspaceProps) {
                 ...(history.owner.itemId === undefined ? {} : { itemId: history.owner.itemId }) }, true)}>Earlier history entries</button>}
               {historyDetail && <section className="personal-history-detail"><h4>Original Entry {historyDetail.entryId}</h4><p>{historyDetail.format} · bytes {historyDetail.offset}–{historyDetail.offset + new TextEncoder().encode(historyDetail.text).byteLength} of {historyDetail.totalBytes}</p><pre>{historyDetail.text}</pre>{historyDetail.nextOffset !== null && <button type="button" onClick={() => void operate(() => readEntry(historyDetail.entryId, historyDetail.nextOffset!))}>Next Entry chunk</button>}</section>}</>}
           </section>}
-          {view === 'Timeline' && <section aria-label="Work evidence timeline"><h3>Saved business timeline</h3><p>Activity comes from saved records. Refresh to see late evidence; a finished evidence checker does not accept an invoice.</p>
-            {timeline?.entries.map(entry => <article key={entry.key}><h4>{title(entry.kind)}</h4><p>{entry.summary}</p><small>{entry.occurredAt} · {entry.itemId === null ? 'Work' : `Invoice item ${entry.itemId}`}</small>
+          {view === 'Timeline' && <section aria-label="Work evidence timeline"><h3>Work evidence timeline</h3><p>Business receipts and model observations retain their original scope. Refresh to see late evidence.</p>
+            {timeline?.workId === work.workId && timeline.entries.map(entry => <article key={entry.key}><h4>{title(entry.kind)}</h4><p>{entry.summary}</p>
+              <small>{entry.occurredAt} · {entry.evidenceSource === 'observation' ? 'Observation' : 'Saved receipt'} · {entry.itemId === null ? 'Work' : `Invoice item ${entry.itemId}`}
+                {entry.refs.attemptId && ` · Attempt ${entry.refs.attemptId}`}{entry.refs.phaseId && ` · Phase ${entry.refs.phaseId}`}</small>
+              {entry.kind === 'model_observed' && entry.refs.attemptId && <button type="button" onClick={() => {
+                selectedAttempt.current = { workId: work.workId, attemptId: entry.refs.attemptId! };
+                setView('Tasks'); void readTask(entry.refs.attemptId!);
+              }}>Inspect model attempt {entry.refs.attemptId}</button>}
               {entry.itemId !== null && <button type="button" onClick={() => void readHistory({ workId: work.workId, itemId: entry.itemId! })}>Read invoice history</button>}
               {entry.refs.candidateRef && <p>Result {entry.refs.candidateRef.id} · version {entry.refs.candidateRef.sequence}</p>}
+              {!cloud && entry.kind === 'candidate_generated' && entry.itemId !== null && entry.refs.candidateRef &&
+                <PersonalCandidateFeedback key={props.hostEpoch} target={{ workId: work.workId, itemId: entry.itemId,
+                  candidateId: entry.refs.candidateRef.id, candidateSequence: entry.refs.candidateRef.sequence }}
+                  onOpen={execution => void openFeedbackOrigin(work, execution)} />}
               {entry.refs.documentRef && <p>Invoice {entry.refs.documentRef.id} · source version {entry.refs.documentRef.version}</p>}
               <details><summary>Original references</summary><pre>{JSON.stringify(entry.refs, null, 2)}</pre></details>
               {entry.evidence.resultRecorded && <p>Result saved{entry.refs.childRunId !== undefined ? ` · returned to Master ${entry.evidence.returnedToParent ? 'observed' : 'not confirmed'} · Master received ${entry.evidence.parentConsumed ? 'observed' : 'not confirmed'}` : ''}</p>}

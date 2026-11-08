@@ -176,6 +176,7 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   cloudDesktop: import('./cloud-desktop.ts').CloudDesktopApi;
   backgroundService: import('./background-service.ts').BackgroundServiceApi;
   invoiceWorks: import('./personal-agent.ts').InvoiceWorksApi;
+  invoiceWorkFeedback: import('./personal-agent.ts').InvoiceWorkFeedbackApi;
   personalTasks: Omit<import('./personal-agent.ts').PersonalTasksApi, 'resume'>;
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   saveResearchExport(input: import('zod').z.infer<typeof import('./research.ts').ResearchReportRequestSchema>): Promise<import('./runtime.ts').Result<{ cancelled: boolean; destinationPath?: string }>>;

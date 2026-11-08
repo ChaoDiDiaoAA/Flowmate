@@ -247,6 +247,8 @@ const bridge: DesktopBridge = {
     rebindBrowserRead: input => invokeAssembly('invoice_work_browser_rebind', input),
     revokeBrowserRead: input => invokeAssembly('invoice_work_browser_revoke', input), queryBrowserDecision: input => invokeAssembly('invoice_work_browser_query_decision', input),
     timeline: input => invokeAssembly('invoice_work_timeline', input) },
+  invoiceWorkFeedback: { get: input => invokeAssembly('invoice_work_feedback_get', input),
+    submit: input => invokeAssembly('invoice_work_feedback_submit', input) },
   personalTasks: { list: input => invokeAssembly('personal_task_list', input), get: input => invokeAssembly('personal_task_get', input),
     stop: input => invokeAssembly('personal_task_stop', input), history: input => invokeAssembly('personal_task_history', input),
     historyEntry: input => invokeAssembly('personal_task_history_entry', input) },

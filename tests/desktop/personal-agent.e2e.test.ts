@@ -11,56 +11,10 @@ import { CandidateDraftSchema, InvoiceFormTargetSchema, InvoiceWorkWorkingContex
 import { ServiceClient } from '../../apps/desktop/main/service-client.ts';
 import { ServiceInstallationSchema } from '../../packages/shared/src/service-layout.ts';
 import type { ChildStopSnapshot, ChildStopTarget } from '../support/owner-child-stop-fixture.ts';
-import { cleanupResources, closeDesktopFixture, createHttpProvider, installReadGate, mkdtemp } from '../support/resources.ts';
+import { cleanupResources, closeDesktopFixture, createHttpProvider, installReadGate } from '../support/resources.ts';
+import { configure, environment, mixedInvoiceBlocks, root, seed, stream } from '../../agent-eval/personal-agent/support/personal-agent-desktop.ts';
 
 test.afterEach(cleanupResources);
-const root = resolve(import.meta.dirname, '../..');
-function environment(userData: string) {
-  const env: Record<string, string> = { FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData };
-  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
-    if (process.env[key]) env[key] = process.env[key]!;
-  return env;
-}
-function mixedInvoiceBlocks(index: number) {
-  const buyer = index <= 7 ? 'Buyer Example ' + index : index <= 10 ? 'Buyer name unreadable in the controlled source' : 'Buyer Alpha';
-  return ['Invoice MIX-' + index, 'Issued 2026-10-29', 'Seller Example Seller ' + index, buyer, 'Currency CNY', 'Net 100.00', 'Tax 13.00', 'Total 113.00',
-    ...(index > 10 ? ['Buyer Beta'] : [])].map((text, offset) => ({ id: 'b' + (offset + 1), kind: 'text', text, sourceIndex: offset, sourceType: 'controlled', bbox: null }));
-}
-async function seed(mixed = false) {
-  const userData = await mkdtemp(join(tmpdir(), 'flowmate-personal-ui-'));
-  const processResult = spawnSync(process.env.FLOWMATE_BUN_EXECUTABLE || 'bun', ['--no-env-file', '-e', `
-    import { createFileStore,openDatabase } from '@flowmate/core'; import { resolveProductPaths } from '@flowmate/shared';
-    const input=JSON.parse(await Bun.stdin.text()), paths=resolveProductPaths(input.root); if(!paths.ok) throw Error(paths.error.code);
-    const opened=openDatabase(paths.data); if(!opened.ok) throw Error(opened.error.code);
-    try { const files=createFileStore(paths.data,opened.data), at='2026-10-29T00:00:00.000Z';
-      for(let index=1;index<=input.count;index++) { const blocks=input.mixedBlocks?.[index-1]??[{id:'b1',kind:'text',text:'Total 113.00',sourceIndex:0,sourceType:'controlled',bbox:null}];
-        const parsed={formatVersion:2,pages:[{page:1,blocks}],completeness:{status:'complete',checks:[],warnings:[]}};
-        const published=await files.publish({sourceKey:'voxel51-hq-invoice-ocr',sourceRecordId:'p18-ui-'+index,sourceVersion:'p18-ui-v'+index,at,
-          original:{kind:'original',primaryName:'original.png',files:[{name:'original.png',bytes:Buffer.from(input.png,'base64'),mimeType:'image/png'}]},
-          parsed:{kind:'parsed',primaryName:'parsed.json',files:[{name:'parsed.json',bytes:Buffer.from(JSON.stringify(parsed)),mimeType:'application/json'}]}});
-        if(!published.ok) throw Error(published.error.code);
-        const registered=await opened.data.transaction(scope=>scope.documents.register({documentId:published.data.documentId,sourceKey:'voxel51-hq-invoice-ocr',sourceRecordId:'p18-ui-'+index,version:'p18-ui-v'+index,
-          originalArtifact:published.data.original,parsedArtifact:published.data.parsed,status:'available',metadata:{version:2,sampleId:String(index).padStart(6,'0'),pageCount:1,warnings:[],allowedUsesClaim:['local review'],licenseVerification:'not_verified',unavailableReason:null},createdAt:at,updatedAt:at}));
-        if(!registered.ok) throw Error(registered.error.code);
-      }
-    } finally { await opened.data.close(); }
-  `], { cwd: root, input: JSON.stringify({ root: userData, count: mixed ? 12 : 2,
-    mixedBlocks: mixed ? Array.from({ length: 12 }, (_, index) => mixedInvoiceBlocks(index + 1)) : null,
-    png: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a54AAAAASUVORK5CYII=' }),
-    encoding: 'utf8', windowsHide: true });
-  if (processResult.status !== 0) throw Error('Isolated invoice seed failed: ' + processResult.stderr);
-  return userData;
-}
-function stream(value: string | { document: DocumentSnapshot; id: number; candidate?: ReturnType<typeof CandidateDraftSchema.parse> }) {
-  const missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
-  const draft = typeof value === 'string' ? null : value.candidate ?? CandidateDraftSchema.parse({ fields: { ...Object.fromEntries(invoiceHeaderFields.map(key => [key, missing])),
-    totalAmount: { raw: '113.00', normalized: '113.00', state: 'present', alternatives: [], sources: [{ documentId: value.document.documentRef.id,
-      version: value.document.documentRef.version, artifactId: value.document.parsedArtifactId, page: 1, blockId: 'b1', quote: 'Total 113.00' }] } }, lines: [], notes: [] });
-  const delta = typeof value === 'string' ? { role: 'assistant', content: value } : { role: 'assistant', tool_calls: [{ index: 0, id: 'p18-ui-call-' + value.id,
-    type: 'function', function: { name: 'save_invoice_candidate', arguments: JSON.stringify({ documentId: value.document.documentRef.id, candidate: draft }) } }] };
-  return new Response('data: ' + JSON.stringify({ id: 'p18-ui-response', object: 'chat.completion.chunk', created: 1, model: 'personal-ui-model',
-    choices: [{ index: 0, delta, finish_reason: typeof value === 'string' ? 'stop' : 'tool_calls' }] }) + '\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
-}
 function mixedCandidate(document: DocumentSnapshot, index: number) {
   const blocks = mixedInvoiceBlocks(index), missing = { raw: null, normalized: null, state: 'missing', alternatives: [], sources: [] };
   const source = (offset: number) => ({ documentId: document.documentRef.id, version: document.documentRef.version,
@@ -371,27 +325,6 @@ test('a twelve-invoice Work shows seven reviews, three material requests and two
   finally { try { if (app) await closeDesktopFixture(app, userData, failure); } finally { await provider.stop(); } }
   if (failure) throw failure;
 });
-async function configure(page: Page, baseUrl: string) {
-  expect(await page.evaluate(async baseUrl => {
-    const current = await window.flowmate.getState(); if (!current.ok) return current;
-    return window.flowmate.saveSettings({ ...current.data.settings, models: [{ id: 'personal-ui', credentialRef: '00000000000000000000000000000091',
-      name: 'Personal fixture', kind: 'custom', providerId: null, baseUrl: baseUrl + '/v1', model: 'personal-ui-model',
-      api: 'openai-completions', contextWindow: 64000, maxTokens: 8192, reasoning: false }], defaultModelId: 'personal-ui' },
-    { modelId: 'personal-ui', apiKey: 'synthetic-personal-ui-key' });
-  }, baseUrl)).toMatchObject({ ok: true });
-  await page.getByRole('button', { name: 'Personal Agent', exact: true }).click(); await page.getByRole('button', { name: 'Local workspace', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'Personal Agent', exact: true })).toBeVisible();
-  const personal = await page.evaluate(() => window.flowmate.personalAgent.get());
-  expect(personal, JSON.stringify(personal)).toMatchObject({ ok: true });
-  await page.locator('.personal-configuration > summary').click();
-  await expect(page.getByLabel('Personal Agent model', { exact: true })).toBeVisible({ timeout: 5000 }).catch(async cause => {
-    throw Error(String(cause) + '\nPersonal page: ' + await page.locator('.personal-agent-page').innerText());
-  });
-  await page.getByLabel('Personal Agent model', { exact: true }).selectOption('personal-ui');
-  await page.getByRole('button', { name: 'Save assistant configuration', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Assistant configuration saved');
-  await page.locator('.personal-configuration > summary').click();
-}
 
 test('Windows Chrome reads a synthetic page once through the approved Personal Agent UI', async () => {
   test.skip(process.platform !== 'win32' || !process.env.FLOWMATE_LIVE_WEBBRIDGE_EXE, 'An installed, connected Windows WebBridge is required.');

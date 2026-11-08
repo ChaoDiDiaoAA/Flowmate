@@ -52,7 +52,7 @@ test.each(['success', 'registration failure'] as const)('schema24 migration pres
     } finally { after.close(); }
   } else {
     const current = need(opened);
-    expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 28 });
+    expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 30 });
     expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_works').all())).toEqual(before.works);
     expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_work_items').all())).toEqual(before.items);
     expect(await current.read(scope => scope.sessions.get(session.sessionId))).toMatchObject({ ok: true,

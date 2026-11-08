@@ -18,6 +18,7 @@ import type { DurableProductToolExecution, DurableSubagentCallbacks, DurableWork
 import { createDurableHistoryReader } from './history.ts';
 import { createDurableQueueController, queueSubmissionKey } from './queue.ts';
 import type { CloudQueuePort } from '../../contracts/src/cloud-queue.ts';
+import { observePromptTrace, type PromptTraceBuffer, type PromptTraceCall } from '@flowmate/contracts';
 import { createDurableCompactionRuntime } from './compaction.ts';
 import { formatInvoiceWorkContext, formatInvoiceWorkInstructions } from './context.ts';
 import { DurableCompactionIdentitySchema, DurableCompactionRequestSchema, type DurableCompactionCallbacks } from '../../contracts/src/durable-compaction.ts';
@@ -30,6 +31,9 @@ export type DurableRuntimeOptions = {
   verifySchedulingUse?(identity: DurableAttemptIdentity, pendingFeedback: readonly DurableProductToolCall[]): Result<void> | Promise<Result<void>>;
   reserveModelRequest(identity: DurableAttemptIdentity): Result<void> | Promise<Result<void>>;
   readWorkingContext?(identity: DurableWorkingContextQuery): Result<InvoiceWorkWorkingContext> | Promise<Result<InvoiceWorkWorkingContext>>;
+  modelDiagnostics?: { buffer: PromptTraceBuffer; readRunId(query: DurableSubmissionQuery): Promise<number | null>;
+    capture?(call: PromptTraceCall): void;
+    source?(input: DurableSubmissionQuery & { nativeTaskId: number; generationTaskId: number; assistantEntryId: number; phaseId: number; observationId?: string }): void };
   readMemory?(identity: DurableWorkingContextQuery): Result<import('@flowmate/contracts').MemoryRecallResult> | Promise<Result<import('@flowmate/contracts').MemoryRecallResult>>;
   verifyQueueInputs?(input: CloudQueueVerifyInputs): Result<CloudQueueInstruction[]> | Promise<Result<CloudQueueInstruction[]>>;
   verifyWorkingContext?(identity: DurableWorkingContextQuery): Result<void> | Promise<Result<void>>;
@@ -82,7 +86,7 @@ const Binding = defineDoc({ kind: 'flowmate.runtime.binding', version: 3, scope:
 type ConsumptionReceipt = DurableSubmissionQuery & { nativeSubmissionId: number; nativeEntryId: number;
   nativeTaskId: number; cutoff: number; phaseId: number; consumedAt: string };
 const GenerationPhase = defineDoc({ kind: 'flowmate.runtime.generation-phase', version: 1, scope: 'task',
-  initial: (): { receipt: ConsumptionReceipt | null; calls: Array<{ nativeTaskId: number; argumentsJson: string }> } =>
+  initial: (): { receipt: ConsumptionReceipt | null; observationId?: string; calls: Array<{ nativeTaskId: number; argumentsJson: string }> } =>
     ({ receipt: null, calls: [] }), checkpointWhen: () => true });
 const Consumption = defineDocFamily({ kind: 'flowmate.runtime.consumption', version: 1, family: true,
   scope: 'conversation', history: 'latest', fork: 'initial', initial: (receipt: ConsumptionReceipt): ConsumptionReceipt => receipt,
@@ -153,6 +157,8 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
   };
   const attempts = new Map<number, { identity: DurableAttemptIdentity; config: ProviderConfig; binding: DurableModelBinding }>();
   const phases = new Map<string, { provider: string; modelId: string }>();
+  let diagnosticCallSequence = 0;
+  const observedOutputs = new WeakMap<object, string>();
   const requested = new Map<TaskId, { query: DurableSubmissionQuery; conversationId: ConversationId;
     nativeSubmissionId: number; nativeEntryId: number; cutoff: number; phaseId: number; children: ParentChildConsumption[] }>();
   const cloudAttempts = new Map<TaskId, { modelAttemptIds: string[]; cutoff: number }>();
@@ -356,7 +362,26 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
         requested.set(task.id, { query, conversationId, nativeSubmissionId: current.record.id, nativeEntryId: current.record.entry,
           cutoff: checkpoint.cutoff, phaseId: workingContext.phase.phaseId,
           children: reviewing ? [] : await children.captureParent(query, view.entries, messages) });
-        if (reviewing) return { workingContext, messages };
+        const diagnostics = options.modelDiagnostics;
+        let runId: number | null = null;
+        if (diagnostics?.buffer.beginTiming && !cloud?.success) {
+          try { runId = await diagnostics.readRunId(query); } catch { /* Diagnostics cannot block model use. */ }
+        }
+        const observedRunId = runId;
+        let observationId: string | undefined;
+        const trace = diagnostics && observedRunId !== null ? {
+          beginTiming: (startedAt: number, observesHttp: boolean) => {
+            observationId = randomUUID();
+            return diagnostics.buffer.beginTiming?.({
+            runId: observedRunId, sessionId: query.sessionId, nativeSessionId: String(conversationId), callSequence: ++diagnosticCallSequence,
+            observationId, startedAt: new Date().toISOString(),
+            durable: { workId: query.workId, itemId: workingContext.item.itemId, attemptId: query.attemptId,
+              phaseId: workingContext.phase.phaseId, nativeTaskId: task.id },
+            }, startedAt, observesHttp, diagnostics.capture);
+          },
+          observeOutput: (message: object) => { if (observationId) observedOutputs.set(message, observationId); },
+        } : {};
+        if (reviewing) return { workingContext, messages, ...trace };
         let memory: import('@flowmate/contracts').MemoryRecallResult | undefined;
         if (options.readMemory) {
           try {
@@ -367,7 +392,7 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
             }
           } catch { /* Memory is optional; the original phase remains authoritative. */ }
         }
-        return { workingContext, ...projected, ...(memory ? { memory } : {}) };
+        return { workingContext, ...projected, ...trace, ...(memory ? { memory } : {}) };
       }) } : {}) }, binding);
     if (!prepared.ok) throw new ProductFailure(prepared.error);
     const racedPhase = phases.get(modelKey(query)); if (racedPhase) return racedPhase;
@@ -643,7 +668,7 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
       await compactions.verifyInput(query, nativeConversationId, view, receipt.entry);
       return call;
     }
-    return read(() => harness.commit(async tx => {
+    const resolved = await read(() => harness.commit(async tx => {
       const task = await tx.task(nativeTaskId);
       if (!task || task.kind !== ToolTask.definition.name || task.conversationId !== nativeConversationId || task.owner === undefined)
         throw Error('state_conflict');
@@ -678,8 +703,14 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
         if (existing && !isDeepStrictEqual(JSON.parse(existing.argumentsJson), args)) throw Error('storage_corrupt');
         if (!existing) phase.calls.push({ nativeTaskId, argumentsJson: JSON.stringify(args) });
       }
-      return { ...query, nativeConversationId, nativeTaskId, nativeToolCallId: input.callId, name: call.name, arguments: args };
+      return { call: { ...query, nativeConversationId, nativeTaskId, nativeToolCallId: input.callId, name: call.name, arguments: args },
+        generationTaskId: task.owner, assistantEntryId: input.assistant, phaseId: selected.phaseId, observationId: phase.observationId };
     }, context));
+    if (!cloud?.success && resolved.call.name === 'save_invoice_candidate')
+      observePromptTrace(() => options.modelDiagnostics?.source?.({ ...phaseIdentity(resolved.call),
+        nativeTaskId, generationTaskId: resolved.generationTaskId, assistantEntryId: resolved.assistantEntryId,
+        phaseId: resolved.phaseId, observationId: resolved.observationId }));
+    return resolved.call;
   };
   const feedbackWrites = new Map<TaskId, { workId: number; sessionId: number; entryId: EntryId; confirmed: boolean; settled: Promise<boolean> }>();
   const recordToolFeedback = (call: DurableProductToolCall, entry: EntryRecord): Promise<boolean> => {
@@ -898,7 +929,12 @@ export async function createDurableRuntime(options: DurableRuntimeOptions): Prom
         nativeEntryId: selected.nativeEntryId, nativeTaskId: api.taskId, cutoff: selected.cutoff, phaseId: selected.phaseId,
         consumedAt: new Date().toISOString() };
       await tx.doc(Consumption, api.conversationId, key(selected.query), receipt);
-      (await tx.doc(GenerationPhase, api.taskId)).receipt = receipt;
+      const phase = await tx.doc(GenerationPhase, api.taskId);
+      phase.receipt = receipt;
+      // Only the actual SDK result returned to Durable can identify a model invocation.
+      const observationId = observedOutputs.get(message);
+      if (observationId) phase.observationId = observationId;
+      else delete phase.observationId;
     }, context);
     await children.parentConsumed(selected.children, api.taskId, new Date().toISOString());
   }, afterTools: async (_assistant, results, api, nativeContext) => {

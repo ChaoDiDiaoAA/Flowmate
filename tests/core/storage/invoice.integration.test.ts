@@ -221,7 +221,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual(Array.from({ length: 28 }, (_, index) => ({ version: index + 1 })));
+      .toEqual(Array.from({ length: 30 }, (_, index) => ({ version: index + 1 })));
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
@@ -301,7 +301,7 @@ describe('P3 invoice storage migration', () => {
     deferCleanup(() => opened.data.close());
     const db = opened.data.db;
     expect(db.query('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual(Array.from({ length: 28 }, (_, index) => ({ version: index + 1 })));
+      .toEqual(Array.from({ length: 30 }, (_, index) => ({ version: index + 1 })));
     expect((db.query('PRAGMA table_info(documents)').all() as Array<{ name: string }>).map((row) => row.name))
       .not.toContain('parser_name');
     expect(db.query(`SELECT ${legacyRunColumns} FROM runs ORDER BY id`).all()).toEqual(oldRows);

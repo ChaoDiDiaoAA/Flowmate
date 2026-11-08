@@ -1,7 +1,7 @@
 import type { InputDefinitions } from './prompt-templates.ts';
 import { parsePersonalAgentCommand, parsePersonalAgentHostResult, matchesPersonalAgentResponse,
   personalAgentHostFailure, type PersonalAgentCommandType } from '../../contracts/src/personal-agent-commands.ts';
-import { PersonalTaskIdentitySchema, type PersonalAgentApi, type InvoiceWorksApi, type PersonalTasksApi } from '../../contracts/src/personal-agent.ts';
+import { PersonalTaskIdentitySchema, type PersonalAgentApi, type InvoiceWorksApi, type PersonalTasksApi, type InvoiceWorkFeedbackApi } from '../../contracts/src/personal-agent.ts';
 import { ResearchSessionRequestSchema, ResearchSessionResultSchema, ResearchPageRequestSchema, ResearchEvidenceRequestSchema,
   PreparedInvoiceMaterialSchema, InvoiceSaveReplayRequestSchema } from '@flowmate/contracts';
 import { MemoryEntriesRequestSchema, MemoryEntryRequestSchema, MemoryForgetRequestSchema, MemoryOperationsRequestSchema, MemoryPolicyUpdateSchema, MemorySearchRequestSchema,
@@ -117,7 +117,9 @@ type ResourceQueryPort = { [K in 'catalog' | 'readFile' | 'verifyFrozen' | 'read
   (...input: Parameters<ResourceService[K]>) => ReturnType<ResourceService[K]> | Promise<ReturnType<ResourceService[K]>> };
 export type ProductApplicationOptions = {
   memory?: import('@flowmate/contracts').MemoryApi;
-  personal?: { agent: PersonalAgentApi; works: InvoiceWorksApi; tasks: PersonalTasksApi; close?: () => Promise<Result<void>> };
+  personal?: { agent: PersonalAgentApi; works: InvoiceWorksApi; tasks: PersonalTasksApi; feedback?: InvoiceWorkFeedbackApi;
+    readObservations?: (runId: number, callSequence?: number) => Promise<import('@flowmate/contracts').PromptTraceCall[]>;
+    close?: () => Promise<Result<void>> };
   research?: {
     listMaterials(...input: Parameters<ResearchRepository['listMaterials']>): ReturnType<ResearchRepository['listMaterials']> | Promise<ReturnType<ResearchRepository['listMaterials']>>;
     create(...input: Parameters<ResearchRepository['create']>): ReturnType<ResearchRepository['create']> | Promise<ReturnType<ResearchRepository['create']>>;
@@ -204,7 +206,7 @@ export function makeApplication(
     if (!products?.personal) return personalUnavailable();
     if (closing && ['personal_agent_update', 'invoice_work_create', 'invoice_work_supplement', 'invoice_work_dispose_item',
       'invoice_work_continue', 'invoice_work_cancel', 'invoice_work_desktop_decide', 'invoice_work_desktop_rebind', 'invoice_work_desktop_discard',
-      'invoice_work_browser_decide', 'invoice_work_browser_rebind', 'invoice_work_browser_revoke', 'personal_task_stop'].includes(type))
+      'invoice_work_browser_decide', 'invoice_work_browser_rebind', 'invoice_work_browser_revoke', 'personal_task_stop', 'invoice_work_feedback_submit'].includes(type))
       return fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.'));
     try {
       const result = parsePersonalAgentHostResult(type, await invoke(command.input as I));
@@ -309,6 +311,10 @@ export function makeApplication(
       revokeBrowserRead: raw => personalCommand('invoice_work_browser_revoke', raw, input => products?.personal?.works.revokeBrowserRead(input)),
       queryBrowserDecision: raw => personalCommand('invoice_work_browser_query_decision', raw, input => products?.personal?.works.queryBrowserDecision(input)),
       timeline: raw => personalCommand('invoice_work_timeline', raw, input => products?.personal?.works.timeline(input)),
+    },
+    invoiceWorkFeedback: {
+      get: raw => personalCommand('invoice_work_feedback_get', raw, input => products?.personal?.feedback?.get(input)),
+      submit: raw => personalCommand('invoice_work_feedback_submit', raw, input => products?.personal?.feedback?.submit(input)),
     },
     personalTasks: {
       list: raw => personalCommand('personal_task_list', raw, input => products?.personal?.tasks.list(input)),
@@ -675,6 +681,16 @@ export function makeApplication(
       let result;
       try { result = promptTrace.query(runId, callSequence); }
       catch { return ok({ availability: 'source-unavailable', calls: [], droppedCalls: null }); }
+      if ('runtimeKind' in run.data && run.data.runtimeKind === 'durable' && products?.personal?.readObservations) {
+        try {
+          const saved = await products.personal.readObservations(runId, callSequence);
+          const liveIds = new Set(result.calls.map(call => call.observationId));
+          const calls = [...saved.filter(call => call.sessionId === run.data.sessionId && !liveIds.has(call.observationId)), ...result.calls];
+          if (calls.length) return ok({ ...result, availability: 'available', calls });
+        } catch {
+          if (!result.calls.length) return ok({ availability: 'source-unavailable', calls: [], droppedCalls: null });
+        }
+      }
       if (result.availability === 'not-started') {
         const agent = run.data.output?.agent;
         const calls = agent && typeof agent === 'object' && 'modelCallCount' in agent ? agent.modelCallCount : undefined;

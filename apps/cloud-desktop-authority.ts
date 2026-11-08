@@ -77,6 +77,7 @@ export function createCloudDesktopAuthorizer(database: Pick<DbHandle, 'read'>, r
           });
         const command = parsed.data;
         switch (command.type) {
+          case 'invoice_work_feedback_get': case 'invoice_work_feedback_submit': return denied();
           case 'invoice_work_desktop_list': case 'invoice_work_desktop_decide': case 'invoice_work_desktop_rebind': case 'invoice_work_desktop_discard': case 'invoice_work_desktop_query_decision':
           case 'invoice_work_browser_list': case 'invoice_work_browser_decide': case 'invoice_work_browser_rebind': case 'invoice_work_browser_revoke': case 'invoice_work_browser_query_decision':
             return work(command.input.workId) ? ok(undefined) : denied();

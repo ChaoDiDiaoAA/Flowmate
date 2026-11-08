@@ -25,7 +25,7 @@ import {
   type AgentSession,
   type AgentToolResult, type LoadExtensionsResult,
 } from '@earendil-works/pi-coding-agent';
-import { RUNTIME_CONFIG, appError, fail, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema, ContextToolDefinitionsEvidenceSchema } from '@flowmate/contracts';
+import { RUNTIME_CONFIG, appError, fail, observePromptTrace, ok, NativeInputContextBindingSchema, NativeToolResultContextBindingSchema, RequestContextBindingSchema, ContextSafeErrorCodeSchema, CompactionPolicySchema, ContextToolDefinitionsEvidenceSchema } from '@flowmate/contracts';
 import { loadControlledExtensions, extensionAssembly, type LoadedExtensionSet } from './extensions/loader.ts';
 import type { DelegateExecution } from './extensions/subagents.ts';
 import type { ManagedChildControl } from '@tintinweb/pi-subagents/dist/agent-runner.js';
@@ -60,6 +60,7 @@ import type {
   PromptTraceBuffer,
   PromptTraceEntry,
   PromptTraceEvent,
+  PromptTraceOutcome,
   PromptTraceReference,
   PreparedAgent,
   Result,
@@ -2656,6 +2657,8 @@ export class PiAgentAdapter implements AgentPort {
     let sdkSuccessSlot: { attempt: number; status: number; responseAt: string } | undefined;
     let consumedResponse: { status: number; nativeRequestId: string | null; api: string; provider: string; model: string } | undefined;
     const observable = observedFetch(model.api, this.dependencies.fetch ?? globalThis.fetch) !== undefined;
+    const traceReference = { runId: active.runId, sessionId: active.sessionId, nativeSessionId: active.nativeSessionId, callSequence };
+    const timing = observePromptTrace(() => this.dependencies.promptTrace?.beginTiming?.(traceReference, callStartedAt, observable));
     const baseFetch: FetchLike = (options?.fetch as FetchLike | undefined)
       ?? this.dependencies.fetch
       ?? ((request, init) => globalThis.fetch(request, init));
@@ -2687,10 +2690,17 @@ export class PiAgentAdapter implements AgentPort {
       active.attempts += 1;
       const requestUrl = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url;
       this.observe(active, 'request_dispatched', { callSequence: active.callSequence, attempt: active.attempts, url: safeUrl(requestUrl) });
+      const observeHttp = timing && observePromptTrace(() => timing.dispatch(performance.now()));
       let launched: Promise<Response>;
       try { launched = baseFetch(request, init); } catch (error) { launched = Promise.reject(error); }
       // Attach immediately: an entered-write rejection must not abandon a rejected launched request.
-      const settled = launched.then(response => ({ response }), error => ({ error }));
+      const settled = launched.then(response => {
+        if (observeHttp) observePromptTrace(() => observeHttp(performance.now(), response.status));
+        return { response };
+      }, error => {
+        if (observeHttp) observePromptTrace(() => observeHttp(performance.now(), null, signal.aborted ? 'aborted' : 'error'));
+        return { error };
+      });
       const entered = requestBinding ? await recordEvidence({ kind: 'attempt-entered', attempt, at: now().at }) : ok(undefined);
       const outcome = await settled;
       if ('response' in outcome) {
@@ -2795,6 +2805,7 @@ export class PiAgentAdapter implements AgentPort {
           this.observe(active, 'text_delta', { length, textBytes: active.textBytes });
           const displayText = appended.text.slice(previousText.length);
           if (displayText) {
+            if (timing && displayText.trim()) observePromptTrace(() => timing.text(performance.now()));
             try { active.observe({ type: 'display_text_delta', text: displayText, ...now() }); }
             catch { /* display observers cannot interrupt the native run */ }
           }
@@ -2891,10 +2902,15 @@ export class PiAgentAdapter implements AgentPort {
     active.modelCalls.push({ callSequence, durationMs: Math.max(0, performance.now() - callStartedAt),
       complete: active.complete && !streamFailed && !active.signal.aborted });
     try {
-      const reference = { runId: active.runId, sessionId: active.sessionId, nativeSessionId: active.nativeSessionId, callSequence };
-      this.dependencies.promptTrace?.append(reference, { at: now().at, event: 'native_terminal',
+      this.dependencies.promptTrace?.append(traceReference, { at: now().at, event: 'native_terminal',
         summary: `Native model stream settled · stop=${safeTraceStopReason(finalMessage?.stopReason) ?? 'other'}`, truncated: false });
-      this.dependencies.promptTrace?.end(reference);
+      const status = finalMessage?.stopReason;
+      let outcome: PromptTraceOutcome = 'done';
+      if (status === 'aborted' || signal.aborted && !streamFailed) outcome = 'aborted';
+      else if (streamFailed || status === 'error') outcome = 'error';
+      else if (!status || status === 'length') outcome = 'incomplete';
+      try { timing?.finish(performance.now(), outcome); }
+      finally { this.dependencies.promptTrace?.end(traceReference); }
     } catch { /* Diagnostics are optional. */ }
   }
 

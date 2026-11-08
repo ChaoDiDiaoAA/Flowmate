@@ -136,6 +136,7 @@ export async function startCloudAuthorityEndpoints(options: Options): Promise<Re
       case 'personal_task_history': return tasks.history(command.input);
       case 'personal_task_history_entry': return tasks.historyEntry(command.input);
       case 'invoice_work_timeline': return works.timeline(command.input);
+      case 'invoice_work_feedback_get': case 'invoice_work_feedback_submit': return forbidden();
     }
   };
   const authority = await listenCloudUnixRpc({ socketPath: options.authoritySocket, allowStaleSocket: true,

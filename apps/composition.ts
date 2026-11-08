@@ -361,7 +361,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const workspaceService = createWorkspaceService(database.data, now, workspaceVerifier);
   const jobService = createJobService(database.data, now);
   if (options.personalAgent) {
-    const personal = await createPersonalAgentRuntime({ ...options.personalAgent, database: database.data, definitions,
+    const personal = await createPersonalAgentRuntime({ ...options.personalAgent, database: database.data, definitions, promptTrace,
       ...(memory ? { memory } : {}),
       ...(cloudDesktop ? { desktop: cloudDesktop } : {}),
       ...(cloudDesktopRelay ? { browser: createBrowserBridge((request, signal) => cloudDesktopRelay.request(request, signal)) } : {}),
@@ -650,7 +650,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     try {
       if (!existsSync(join(options.paths.root, 'data/settings.json'))) write('settings.json', installedSettings.data);
       write('installed-release.json', { version: 1, releaseId: options.installedRelease.releaseId,
-        productVersion: options.installedRelease.productVersion, schemaVersion: 28, settingsVersion: 7 });
+        productVersion: options.installedRelease.productVersion, schemaVersion: 30, settingsVersion: 7 });
     } catch {
       await application.close();
       return fail(appError('maintenance_release_record_failed', 'storage', 'The installed release could not be recorded; original data and backups were retained.', true));

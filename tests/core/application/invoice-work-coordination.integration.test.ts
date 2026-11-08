@@ -1675,12 +1675,12 @@ test.each(['local', 'cloud'] as const)('approved %s peer review consumes only it
     expect(history.entries.length).toBeGreaterThan(0);
     await f.restart(async () => {
       const old = new Database(f.paths.databaseFile);
-      try { old.exec('DROP TABLE invoice_work_peer_reviews; DELETE FROM schema_migrations WHERE version=28;'); }
+      try { old.exec('DROP TABLE IF EXISTS personal_tool_model_sources; DROP TABLE IF EXISTS personal_model_observations; DELETE FROM schema_migrations WHERE version=30; DROP TABLE IF EXISTS invoice_work_feedback; DELETE FROM schema_migrations WHERE version=29; DROP TABLE invoice_work_peer_reviews; DELETE FROM schema_migrations WHERE version=28;'); }
       finally { old.close(); }
     });
     expect(await f.work(created.workId)).toEqual(initial);
     expect(need(await f.runtime.queryHistory(owner))).toEqual(history);
-    expect(await f.database.read(owner => owner.db.query('SELECT MAX(version) version FROM schema_migrations').get())).toEqual({ version: 28 });
+    expect(await f.database.read(owner => owner.db.query('SELECT MAX(version) version FROM schema_migrations').get())).toEqual({ version: 30 });
   }
   const preview = need(await f.service.get({ view: 'item', workId: created.workId, itemId: item.itemId, includePeerReview: true }));
   if (preview.view !== 'item') throw Error('Expected invoice item');

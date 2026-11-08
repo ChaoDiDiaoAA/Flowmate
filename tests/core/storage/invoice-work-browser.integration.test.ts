@@ -34,7 +34,7 @@ test.each([24, 27])('upgrading a schema %i database preserves Work and desktop a
   }));
   await f.database.close();
   const legacy = new Database(f.paths.databaseFile);
-  if (version === 27) legacy.exec('DROP TABLE invoice_work_peer_reviews; DELETE FROM schema_migrations WHERE version=28;');
+  if (version === 27) legacy.exec('DROP TABLE IF EXISTS personal_tool_model_sources; DROP TABLE IF EXISTS personal_model_observations; DELETE FROM schema_migrations WHERE version=30; DROP TABLE IF EXISTS invoice_work_feedback; DELETE FROM schema_migrations WHERE version=29; DROP TABLE invoice_work_peer_reviews; DELETE FROM schema_migrations WHERE version=28;');
   else {
     removeMemorySchemaFromFixture(legacy);
     legacy.exec('DROP INDEX invoice_work_phase_one_active; DROP INDEX invoice_work_phase_one_item; ALTER TABLE invoice_work_phases DROP COLUMN scheduler_state; DELETE FROM schema_migrations WHERE version=26; DROP TABLE IF EXISTS invoice_work_browser_reads; DELETE FROM schema_migrations WHERE version=25;');
@@ -42,7 +42,7 @@ test.each([24, 27])('upgrading a schema %i database preserves Work and desktop a
   legacy.close();
   const migrated = need(openTestDatabase(f.paths));
   try {
-    expect(migrated.db.query('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: 28 });
+    expect(migrated.db.query('SELECT max(version) version FROM schema_migrations').get()).toEqual({ version: 30 });
     expect(migrated.db.query('SELECT * FROM invoice_works').all()).toEqual(before.works);
     expect(migrated.db.query('SELECT * FROM invoice_work_items').all()).toEqual(before.items);
     expect(migrated.db.query('SELECT * FROM invoice_work_desktop_actions').all()).toEqual(before.actions);
@@ -93,7 +93,7 @@ test.each(['success', 'registration failure'] as const)('item-lane migration pre
   } else {
     const current = need(opened);
     try {
-      expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 28 });
+      expect(await current.read(scope => scope.db.query('SELECT max(version) version FROM schema_migrations').get())).toEqual({ version: 30 });
       expect(await current.read(scope => scope.db.query(`SELECT ${phaseColumns} FROM invoice_work_phases`).all())).toEqual(before.phases);
       expect(await current.read(scope => scope.db.query('SELECT scheduler_state FROM invoice_work_phases').all())).toEqual([{ scheduler_state: 'legacy' }]);
       expect(await current.read(scope => scope.db.query('SELECT * FROM invoice_works').all())).toEqual(before.works);

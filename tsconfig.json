@@ -21,6 +21,7 @@
     "apps/**/*.d.ts",
     "electron.vite.config.ts",
     "agent-eval/src/**/*.ts",
+    "agent-eval/personal-agent/**/*.ts",
     "packages/**/*.ts",
     "tests/**/*.ts",
     "agent-eval/tests/**/*.ts",

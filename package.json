@@ -23,6 +23,7 @@
     "eval": "node --import tsx agent-eval/src/cli.ts",
     "eval:smoke": "node --import tsx agent-eval/src/cli.ts benchmark run --selection smoke",
     "eval:full": "node --import tsx agent-eval/src/cli.ts benchmark run --selection full",
+    "eval:personal": "bun --no-env-file run agent-eval/personal-agent/run.ts",
     "eval:upload": "node --import tsx agent-eval/src/cli.ts resend"
   },
   "dependencies": {

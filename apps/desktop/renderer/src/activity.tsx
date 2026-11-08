@@ -3,6 +3,7 @@ import type { AgentRunSnapshot, BusinessEventSnapshot, DocumentSnapshot, JobSnap
   RunSnapshot, RuntimeEvent, RuntimeState, RuntimeToolView, SessionSnapshot, ContextReference } from '@flowmate/contracts';
 import type { EventViewState } from './event-state.ts';
 import { Subagents } from './subagents.tsx';
+import { ModelTiming } from './model-timing.tsx';
 
 const eventLabels: Record<RuntimeEvent['type'], string> = {
   run_created: 'Request accepted', run_started: 'Processing started', run_completed: 'Processing completed',
@@ -207,7 +208,9 @@ export function ActivityPage(props: Props) {
       <details className="activity-diagnostics"><summary onClick={() => void loadTrace()}>Model request diagnostics</summary>
         <p>This diagnostic buffer belongs to the current process and is separate from saved activity.</p>
         {traceError ? <p role="alert">Model request diagnostics are unavailable.</p> : trace && <><p>{trace.availability === 'evicted' ? 'These diagnostics were evicted from the process buffer.' : trace.availability === 'process-exited' ? 'The process that collected these diagnostics has exited.' : trace.availability.replaceAll('-', ' ')} · {trace.calls.length} request(s) · {trace.droppedCalls ?? 'Unknown'} evicted request(s)</p>
-          {trace.calls.map(call => <div key={call.callSequence}><strong>Request {call.callSequence} · {call.state}</strong><p>{call.entries.map(entry => entry.event).join(' → ')} · {call.droppedEntries} evicted detail(s)</p></div>)}</>}
+          {trace.calls.map(call => <div key={call.callSequence}><strong>Request {call.callSequence} · {call.state}</strong>
+            {call.timing && <ModelTiming timing={call.timing} />}
+            <p>{call.entries.map(entry => entry.event).join(' → ')} · {call.droppedEntries} evicted detail(s)</p></div>)}</>}
       </details>
     </section>}
     <section className="panel"><div className="panel-head"><h2>Invoice actions</h2></div><div className="activity-controls"><label>Invoice or processing record

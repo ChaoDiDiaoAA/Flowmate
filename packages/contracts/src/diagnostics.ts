@@ -62,6 +62,10 @@ export type PromptTraceReference = {
   sessionId: number;
   nativeSessionId: string;
   callSequence: number;
+  observationId?: string;
+  startedAt?: string;
+  endedAt?: string;
+  durable?: { workId: number; itemId: number; attemptId: number; phaseId: number; nativeTaskId: number };
 };
 
 export type PromptTraceEntry = {
@@ -75,7 +79,31 @@ export type PromptTraceCall = PromptTraceReference & {
   state: 'active' | 'ended';
   entries: PromptTraceEntry[];
   droppedEntries: number;
+  timing?: PromptTraceTiming;
 };
+
+export type PromptTraceOutcome = 'done' | 'error' | 'aborted' | 'incomplete';
+export type PromptTraceTiming = {
+  elapsedMs: number | null;
+  budgetMs: number | null;
+  beforeHttpMs: number | null;
+  firstTextMs: number | null;
+  transport: 'unobservable' | 'not-entered' | 'entered';
+  outcome: PromptTraceOutcome | 'pending';
+  attempts: { headersMs: number | null; status: number | null; outcome: 'pending' | 'headers' | 'error' | 'aborted' }[];
+  droppedAttempts: number;
+};
+
+export interface PromptTraceTimingObserver {
+  budget(ms: number): void;
+  dispatch(at: number): (at: number, status: number | null, failure?: 'error' | 'aborted') => void;
+  text(at: number): void;
+  finish(at: number, outcome: PromptTraceOutcome): void;
+}
+
+export function observePromptTrace<T>(observe: () => T): T | undefined {
+  try { return observe(); } catch { return undefined; }
+}
 
 export type PromptTraceAvailability =
   | 'available'
@@ -93,6 +121,8 @@ export type PromptTraceResult = {
 
 export interface PromptTraceBuffer {
   begin(reference: PromptTraceReference): void;
+  beginTiming?(reference: PromptTraceReference, startedAt: number, observesHttp: boolean,
+    observe?: (call: PromptTraceCall) => void): PromptTraceTimingObserver;
   append(reference: PromptTraceReference, entry: PromptTraceEntry): void;
   end(reference: PromptTraceReference): void;
   clearSession(sessionId: number): void;

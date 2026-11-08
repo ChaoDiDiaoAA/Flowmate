@@ -5,6 +5,30 @@ const reference = (runId: number, callSequence = 1) => ({ runId, sessionId: 8, n
 const entry = (event: 'model_request' | 'text_delta', summary: string, at = '2026-09-24T00:00:00.000Z') => ({ at, event, summary, truncated: false });
 
 describe('PromptTraceBuffer', () => {
+  it('keeps first visible text, HTTP attempts and budget timing separate', () => {
+    const buffer = createPromptTraceBuffer(), ref = reference(1);
+    const timing = buffer.beginTiming!(ref, 100, true);
+    timing.budget(12);
+    timing.dispatch(125)(150, 429);
+    timing.dispatch(155)(175, 200);
+    timing.text(180);
+    timing.text(190);
+    timing.finish(200, 'done');
+    expect(buffer.query(1).calls[0]?.timing).toEqual({
+      elapsedMs: 100, budgetMs: 12, beforeHttpMs: 25, firstTextMs: 80,
+      transport: 'entered', outcome: 'done', droppedAttempts: 0,
+      attempts: [{ headersMs: 25, status: 429, outcome: 'headers' }, { headersMs: 20, status: 200, outcome: 'headers' }],
+    });
+  });
+
+  it('distinguishes an invisible transport from a failure before an observable dispatch', () => {
+    const buffer = createPromptTraceBuffer();
+    buffer.beginTiming!(reference(1), 100, false).finish(120, 'error');
+    buffer.beginTiming!(reference(2), 100, true).finish(120, 'error');
+    expect(buffer.query(1).calls[0]?.timing).toMatchObject({ transport: 'unobservable', beforeHttpMs: null });
+    expect(buffer.query(2).calls[0]?.timing).toMatchObject({ transport: 'not-entered', beforeHttpMs: null });
+  });
+
   it('bounds summaries and entries while retaining an active call', () => {
     const buffer = createPromptTraceBuffer();
     const ref = reference(1);

@@ -24,6 +24,8 @@ const factsSql = `WITH RECURSIVE owned(id,attempt_id,item_id) AS (
   SELECT i.id item_id,i.job_id FROM invoice_work_items i JOIN jobs j ON j.id=i.job_id WHERE i.work_id=?1
     AND json_extract(j.input_json,'$.version')=2 AND json_extract(j.input_json,'$.workId')=?1
     AND json_extract(j.input_json,'$.itemId')=i.id
+), local_work AS (
+  SELECT w.id FROM invoice_works w JOIN sessions s ON s.id=w.session_id WHERE w.id=?1 AND s.durable_runtime_id='local'
 ), facts(sourceKind,sourceId,kind,occurredAt,itemId) AS (
   SELECT 'operation',id,CASE kind WHEN 'create' THEN 'work_created' WHEN 'continueWork' THEN 'work_continued'
     WHEN 'supplement' THEN 'supplement_received' ELSE 'work_cancelled' END,received_at,
@@ -36,6 +38,24 @@ const factsSql = `WITH RECURSIVE owned(id,attempt_id,item_id) AS (
   UNION ALL SELECT 'attempt',id,'attempt_created',created_at,NULL FROM invoice_work_attempts WHERE work_id=?1
   UNION ALL SELECT 'attempt',id,'attempt_stop_requested',stop_requested_at,NULL FROM invoice_work_attempts WHERE work_id=?1 AND stop_requested_at IS NOT NULL
   UNION ALL SELECT 'attempt',id,'attempt_stopped',stopped_at,NULL FROM invoice_work_attempts WHERE work_id=?1 AND stopped_at IS NOT NULL
+  UNION ALL SELECT 'phase',id,'phase_created',created_at,item_id FROM invoice_work_phases WHERE work_id IN local_work
+  UNION ALL SELECT 'phase',id,'phase_input_consumed',consumed_at,item_id FROM invoice_work_phases WHERE work_id IN local_work AND consumed_at IS NOT NULL
+  UNION ALL SELECT 'phase',id,'phase_closed',closed_at,item_id FROM invoice_work_phases WHERE work_id IN local_work AND closed_at IS NOT NULL
+  UNION ALL SELECT 'model_observation',m.rowid,'model_observed',m.started_at,p.item_id
+    FROM personal_model_observations m JOIN owned o ON o.id=m.run_id
+    JOIN invoice_work_phases p ON p.id=json_extract(m.summary_json,'$.durable.phaseId') AND p.attempt_id=o.attempt_id
+    WHERE p.work_id IN local_work AND julianday(m.started_at)>=julianday('now','-7 days')
+  UNION ALL SELECT 'tool_call',t.id,'tool_execution',t.requested_at,p.item_id FROM tool_calls t
+    JOIN owned o ON o.id=t.run_id JOIN invoice_work_tool_calls b ON b.tool_call_id=t.id
+    JOIN invoice_work_phases p ON p.id=b.phase_id AND p.work_id IN local_work
+  UNION ALL SELECT 'browser_approval',id,'approval_requested',created_at,item_id FROM invoice_work_browser_reads WHERE work_id IN local_work
+  UNION ALL SELECT 'desktop_approval',id,'approval_requested',created_at,item_id FROM invoice_work_desktop_actions WHERE work_id IN local_work
+  UNION ALL SELECT 'browser_approval',id,'approval_decided',json_extract(decision_receipt_json,'$.receivedAt'),item_id
+    FROM invoice_work_browser_reads WHERE work_id IN local_work AND decision_receipt_json IS NOT NULL
+  UNION ALL SELECT 'desktop_approval',id,'approval_decided',json_extract(decision_receipt_json,'$.receivedAt'),item_id
+    FROM invoice_work_desktop_actions WHERE work_id IN local_work AND decision_receipt_json IS NOT NULL
+  UNION ALL SELECT 'memory_recall',m.id,'memory_recalled',m.created_at,p.item_id FROM memory_recalls m
+    JOIN invoice_work_phases p ON p.id=m.phase_id AND p.work_id IN local_work
   UNION ALL SELECT 'business_event',e.id,e.type,e.occurred_at,j.item_id FROM business_events e JOIN own_jobs j ON j.job_id=e.job_id
     WHERE e.type IN ('candidate_generated','candidate_edited','candidate_accepted','candidate_rejected','candidate_exported')
       AND (e.run_id IS NULL OR EXISTS(SELECT 1 FROM owned WHERE id=e.run_id))
@@ -133,6 +153,50 @@ function project(store: SqlDatabaseStore, workId: number, fact: Fact): InvoiceWo
       }
     }
     evidence.stopConfirmed = fact.kind === 'attempt_stopped';
+  } else if (fact.sourceKind === 'phase') {
+    const row = store.db.query<{ attempt_id: number; run_id: number | null; native_submission_id: number | null }, [number, number]>(`
+      SELECT p.attempt_id,a.run_id,p.native_submission_id FROM invoice_work_phases p
+      JOIN invoice_work_attempts a ON a.id=p.attempt_id AND a.work_id=p.work_id WHERE p.id=? AND p.work_id=?`).get(fact.sourceId, workId);
+    requireFact(row);
+    refs = { ...refs, phaseId: fact.sourceId, attemptId: row.attempt_id,
+      runId: row.run_id ?? undefined, nativeSubmissionId: row.native_submission_id ?? undefined };
+  } else if (fact.sourceKind === 'model_observation') {
+    const row = store.db.query<{ observation_id: string; run_id: number; phase_id: number; attempt_id: number; task_id: number; outcome: string }, [number]>(`
+      SELECT observation_id,run_id,json_extract(summary_json,'$.durable.phaseId') phase_id,
+      json_extract(summary_json,'$.durable.attemptId') attempt_id,json_extract(summary_json,'$.durable.nativeTaskId') task_id,
+      json_extract(summary_json,'$.timing.outcome') outcome FROM personal_model_observations WHERE rowid=?`).get(fact.sourceId);
+    requireFact(row);
+    const state = z.enum(['done', 'error', 'aborted', 'pending', 'incomplete']).catch('incomplete').parse(row.outcome);
+    summary = `Model observation · ${state === 'pending' || state === 'incomplete' ? 'settlement unconfirmed' : state}`;
+    refs = { ...refs, phaseId: row.phase_id, attemptId: row.attempt_id, runId: row.run_id,
+      observationId: row.observation_id, nativeModelTaskId: row.task_id };
+  } else if (fact.sourceKind === 'memory_recall') {
+    const row = store.db.query<{ phase_id: number; attempt_id: number; status: string }, [number, number]>(`
+      SELECT m.phase_id,p.attempt_id,m.status FROM memory_recalls m JOIN invoice_work_phases p ON p.id=m.phase_id
+      WHERE m.id=? AND p.work_id=?`).get(fact.sourceId, workId);
+    requireFact(row);
+    summary = `Memory recall · ${row.status} · context use unconfirmed`;
+    refs = { ...refs, phaseId: row.phase_id, attemptId: row.attempt_id };
+  } else if (fact.sourceKind === 'browser_approval' || fact.sourceKind === 'desktop_approval') {
+    const table = fact.sourceKind === 'browser_approval' ? 'invoice_work_browser_reads' : 'invoice_work_desktop_actions';
+    const row = store.db.query<{ proposal_tool_call_id: number; decision: string | null; phase_id: number | null; attempt_id: number | null }, [number, number]>(`
+      SELECT a.proposal_tool_call_id,json_extract(a.decision_receipt_json,'$.decision') decision,b.phase_id,p.attempt_id
+      FROM ${table} a LEFT JOIN invoice_work_tool_calls b ON b.tool_call_id=a.proposal_tool_call_id
+      LEFT JOIN invoice_work_phases p ON p.id=b.phase_id AND p.work_id=a.work_id WHERE a.id=? AND a.work_id=?`).get(fact.sourceId, workId);
+    requireFact(row);
+    summary = fact.kind === 'approval_decided' ? `Approval decision saved · ${row.decision}` : 'Approval requested';
+    refs = { ...refs, proposalId: fact.sourceId, toolCallId: row.proposal_tool_call_id,
+      phaseId: row.phase_id ?? undefined, attemptId: row.attempt_id ?? undefined };
+  } else if (fact.kind === 'tool_execution') {
+    const call = need(store.toolCalls.getById(fact.sourceId));
+    const row = store.db.query<{ phase_id: number; attempt_id: number }, [number, number]>(`
+      SELECT b.phase_id,p.attempt_id FROM invoice_work_tool_calls b JOIN invoice_work_phases p ON p.id=b.phase_id
+      WHERE b.tool_call_id=? AND p.work_id=?`).get(fact.sourceId, workId);
+    requireFact(row);
+    const commit = call.runtimeObservation?.commit;
+    summary = `${call.toolName} · ${call.status} · effect ${commit ?? 'unconfirmed'} · delivery ${call.delivery.state}`;
+    refs = { ...refs, phaseId: row.phase_id, attemptId: row.attempt_id, runId: call.runId, toolCallId: call.toolCallId };
+    evidence.resultRecorded = commit === 'committed';
   } else if (fact.sourceKind === 'business_event') {
     const row = store.db.query<{ job_id: number; candidate_id: number | null; artifact_id: number | null; operation_ref: string; run_id: number | null }, [number]>(
       'SELECT job_id,candidate_id,artifact_id,operation_ref,run_id FROM business_events WHERE id=?').get(fact.sourceId);
@@ -160,6 +224,12 @@ function project(store: SqlDatabaseStore, workId: number, fact: Fact): InvoiceWo
       const actual = childEvidence(store, run.runId); evidence = actual.evidence;
       refs.childRunId = run.runId; refs.parentRunId = run.parentRunId; refs.originToolCallId = run.originToolCallId;
     }
+    if (run.kind === 'agent' && fact.kind === 'run_started' && run.startedAt) {
+      const attempt = store.db.query<{ created_at: string }, [number, number]>(
+        'SELECT created_at FROM invoice_work_attempts WHERE id=? AND work_id=?').get(run.scope.attemptId, workId);
+      const elapsed = attempt ? Date.parse(run.startedAt) - Date.parse(attempt.created_at) : NaN;
+      if (Number.isFinite(elapsed) && elapsed >= 0) summary += ` · Attempt to Run start ${elapsed} ms`;
+    }
     if (fact.kind === 'run_failed' && run.error) summary += `: ${run.error.code}`;
   } else if (fact.sourceKind === 'tool_call') {
     const child = need(store.runs.getByOriginToolCall(fact.sourceId)); requireFact(child && child.kind === 'subagent');
@@ -173,6 +243,7 @@ function project(store: SqlDatabaseStore, workId: number, fact: Fact): InvoiceWo
     if (fact.kind === 'delegation_stop_confirmed') evidence.stopConfirmed &&= actual.call.cleanup.stopped && actual.call.stoppedAt !== null;
   }
   return InvoiceWorkTimelineEntrySchema.parse({ ...fact, workId, summary, refs, evidence,
+    ...(fact.sourceKind === 'model_observation' ? { evidenceSource: 'observation' } : {}),
     key: JSON.stringify([fact.sourceKind, fact.sourceId, fact.kind]) });
 }
 

@@ -3,7 +3,7 @@ import { WorkspaceInputSchema } from './workspace.ts';
 import { RUNTIME_CONFIG } from './runtime-config.ts';
 import type { ResearchQueryApi } from './research.ts';
 import type { DurableRunScope, DurableSubagentRunScope } from './durable-run.ts';
-import type { PersonalAgentApi, InvoiceWorksApi, PersonalTasksApi } from './personal-agent.ts';
+import type { PersonalAgentApi, InvoiceWorksApi, PersonalTasksApi, InvoiceWorkFeedbackApi } from './personal-agent.ts';
 
 export type DbId = number;
 
@@ -555,6 +555,7 @@ export interface Application extends ResearchQueryApi {
   personalAgent: PersonalAgentApi;
   invoiceWorks: InvoiceWorksApi;
   personalTasks: PersonalTasksApi;
+  invoiceWorkFeedback: InvoiceWorkFeedbackApi;
   querySessionExtensions(input: import('./extensions.ts').SessionExtensionQuery): Promise<Result<import('./extensions.ts').SessionExtensionView>>;
   queryRunExtensions(input: import('./extensions.ts').RunExtensionQuery): Promise<Result<import('./extensions.ts').RunExtensionView>>;
   executeExtensionCommand(input: import('./extensions.ts').ExtensionCommandRequest): Promise<Result<import('./extensions.ts').ExtensionCommandReceipt>>;

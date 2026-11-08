@@ -57,6 +57,23 @@ const wireBytes = 262_144;
 const text = z.string().max(22_000).refine(value => new TextEncoder().encode(value).byteLength <= 22_000);
 const requiredText = text.refine(value => value.trim().length > 0, 'Text is empty.');
 const time = z.string().datetime({ offset: true });
+export const InvoiceWorkFeedbackTargetSchema = z.object({ workId: id, itemId: id, candidateId: id, candidateSequence: id }).strict();
+export const InvoiceWorkFeedbackSubmitSchema = InvoiceWorkFeedbackTargetSchema.extend({ helpful: z.boolean() });
+export const InvoiceWorkFeedbackSourceSchema = z.object({ generationTaskId: id, assistantEntryId: id,
+  observationId: z.string().uuid().optional(), callSequence: id.optional() }).strict();
+export const InvoiceWorkFeedbackSchema = InvoiceWorkFeedbackSubmitSchema.extend({ savedAt: time,
+  association: z.discriminatedUnion('status', [
+    z.object({ status: z.literal('unavailable') }).strict(),
+    z.object({ status: z.literal('associated'), attemptId: id, phaseId: id, runId: id, toolCallId: id,
+      source: InvoiceWorkFeedbackSourceSchema.optional(),
+    }).strict(),
+  ]),
+});
+export type InvoiceWorkFeedback = z.infer<typeof InvoiceWorkFeedbackSchema>;
+export interface InvoiceWorkFeedbackApi {
+  get(input: z.infer<typeof InvoiceWorkFeedbackTargetSchema>): Promise<Result<InvoiceWorkFeedback | null>>;
+  submit(input: z.infer<typeof InvoiceWorkFeedbackSubmitSchema>): Promise<Result<InvoiceWorkFeedback>>;
+}
 const candidateRef = WorkspaceExpectationSchema.shape.candidateRef;
 const sourceItem = z.object({ itemId: id, documentRef: DocumentRefSchema, candidateRef }).strict();
 const uniqueIds = (values: readonly number[]) => new Set(values).size === values.length;

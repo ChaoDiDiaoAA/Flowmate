@@ -14,9 +14,11 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { formatInvoiceWorkContext, formatInvoiceWorkInstructions } from './context.ts';
 import { assessDurableContextCapacity } from './context-capacity.ts';
+import { observePromptTrace, type PromptTraceOutcome, type PromptTraceTimingObserver } from '@flowmate/contracts';
 
 export type DurableWorkingContext = { workingContext: InvoiceWorkWorkingContext; messages: Message[]; systemPrompt?: string; summary?: UserMessage;
-  memory?: import('@flowmate/contracts').MemoryRecallResult };
+  memory?: import('@flowmate/contracts').MemoryRecallResult; beginTiming?: (startedAt: number, observesHttp: boolean) => PromptTraceTimingObserver | undefined;
+  observeOutput?: (message: object) => void };
 export type DurableCompactionModelUse = { verify(): Promise<Result<void>>; reserve(): Promise<Result<void>>; entered(): Promise<void> };
 
 export type DurableModelAccess = {
@@ -150,8 +152,11 @@ export async function createDurableModels(raw: ProviderConfig, access: DurableMo
     return key;
   };
   const customFetch = !['google-generative-ai', 'google-vertex', 'bedrock-converse-stream'].includes(selected.api);
-  const stream = (model: Model<Api>, context: Parameters<ProviderStreams['stream']>[1], options: StreamOptions | SimpleStreamOptions | undefined, simple: boolean) =>
-    lazyStream(model, async () => {
+  const stream = (model: Model<Api>, context: Parameters<ProviderStreams['stream']>[1], options: StreamOptions | SimpleStreamOptions | undefined, simple: boolean) => {
+    const startedAt = performance.now();
+    let timing: PromptTraceTimingObserver | undefined;
+    let observeOutput: DurableWorkingContext['observeOutput'];
+    return lazyStream(model, async () => {
       const verify = () => checkUse(options?.signal);
       const summary = await summaryUse(options?.signal);
       if (model.id !== selected.id || model.provider !== selected.provider || model.api !== selected.api || model.baseUrl !== selected.baseUrl)
@@ -163,6 +168,8 @@ export async function createDurableModels(raw: ProviderConfig, access: DurableMo
       if (!summary && access.readWorkingContext) {
         const saved = await access.readWorkingContext(context, options?.signal);
         if (!saved.ok) throw Error(saved.error.code);
+        timing = observePromptTrace(() => saved.data.beginTiming?.(startedAt, customFetch));
+        if (timing) observeOutput = saved.data.observeOutput;
         const peerReview = saved.data.workingContext.peerReview;
         if (peerReview) {
           reviewer = true;
@@ -202,14 +209,29 @@ export async function createDurableModels(raw: ProviderConfig, access: DurableMo
           reviewerTransportEntered = true;
         }
         await verify();
-        if (!reserved) { const result = summary ? await summary.reserve() : await access.reserveModelRequest(options?.signal); if (!result.ok) throw Error(result.error.code); reserved = true; }
+        if (!reserved) {
+          const budgetStarted = performance.now();
+          try {
+            const result = summary ? await summary.reserve() : await access.reserveModelRequest(options?.signal);
+            if (!result.ok) throw Error(result.error.code);
+            reserved = true;
+          } finally { if (timing) observePromptTrace(() => timing?.budget(performance.now() - budgetStarted)); }
+        }
         await verify();
       };
       const fetch: FetchFunction = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
         const currentKey = await readKey(); await verify();
         if (currentKey !== key) throw Error('provider_auth_failed');
         await reserve(); if (summary) { await summary.entered(); await verify(); }
-        return access.fetch ? access.fetch(input, init, options?.signal) : globalThis.fetch(input, init);
+        const observeHttp = timing && observePromptTrace(() => timing?.dispatch(performance.now()));
+        try {
+          const response = await (access.fetch ? access.fetch(input, init, options?.signal) : globalThis.fetch(input, init));
+          if (observeHttp) observePromptTrace(() => observeHttp(performance.now(), response.status));
+          return response;
+        } catch (error) {
+          if (observeHttp) observePromptTrace(() => observeHttp(performance.now(), null, options?.signal?.aborted || init?.signal?.aborted ? 'aborted' : 'error'));
+          throw error;
+        }
       // Bun's fetch contract includes preconnect; product calls do not warm connections.
       }, { preconnect: () => {} });
       const request = { ...options, apiKey: key, maxRetries: 0, transport: 'sse' as const,
@@ -228,7 +250,21 @@ export async function createDurableModels(raw: ProviderConfig, access: DurableMo
       // These SDK clients hide their fetch: reserve conservatively while keeping observed HTTP attempts unknown.
       if (summary && !customFetch) await reserve();
       return simple ? driver.streamSimple(selected, requestContext, request) : driver.stream(selected, requestContext, request);
+    }, {
+      onEvent(event) {
+        if (timing && event.type === 'text_delta' && event.delta.trim()) observePromptTrace(() => timing?.text(performance.now()));
+      },
+      onResult(result) {
+        if (!timing) return;
+        let outcome: PromptTraceOutcome = 'done';
+        if (result?.stopReason === 'aborted' || options?.signal?.aborted) outcome = 'aborted';
+        else if (result?.stopReason === 'error') outcome = 'error';
+        else if (!result || result.stopReason === 'length') outcome = 'incomplete';
+        if (result && outcome === 'done') observePromptTrace(() => observeOutput?.(result));
+        observePromptTrace(() => timing?.finish(performance.now(), outcome));
+      },
     });
+  };
   const registered = createProvider({ id: selected.provider, models: [structuredClone(selected)],
     auth: { apiKey: { name: 'Product credential', resolve: async ({ signal }) => {
       await checkUse(signal);

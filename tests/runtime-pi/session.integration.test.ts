@@ -1174,11 +1174,15 @@ describe('PiAgentAdapter', () => {
     await rm(app.root, { recursive: true, force: true });
   });
 
-  it('keeps a successful Run successful when Prompt Trace cleanup throws', async () => {
+  it.each(['cleanup', 'timing'] as const)('keeps a successful Run successful when Prompt Trace %s throws', mode => verifyTraceFailure(mode));
+
+  async function verifyTraceFailure(mode: 'cleanup' | 'timing') {
+    const broken = () => { throw Error('diagnostic-only trace failure'); };
     const promptTrace: PromptTraceBuffer = {
       begin() {},
       append() {},
-      end() { throw new Error('diagnostic-only trace failure'); },
+      end: broken,
+      ...(mode === 'timing' ? { beginTiming: () => ({ budget: broken, dispatch: broken, text: broken, finish: broken }) } : {}),
       clearSession() {},
       query() { throw new Error('diagnostic-only query failure'); },
     };
@@ -1194,7 +1198,7 @@ describe('PiAgentAdapter', () => {
 
     expect(app.requests).toHaveLength(1);
     expect(outcome).toMatchObject({ text: 'fixture answer', error: null, stopped: true });
-  });
+  }
 
   it('switches the model within the same native session and retains its history', async () => {
     const app = await fixture();

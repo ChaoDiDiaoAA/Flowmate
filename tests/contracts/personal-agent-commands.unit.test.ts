@@ -100,6 +100,8 @@ describe('P18 command protocol', () => {
       { type: 'personal_task_history', input: { target: { workId: 7 } } },
       { type: 'personal_task_history_entry', input: { target: { workId: 7 }, throughEntryId: 9, entryId: 8 } },
       { type: 'invoice_work_timeline', input: { workId: 7 } },
+      { type: 'invoice_work_feedback_get', input: { workId: 7, itemId: 2, candidateId: 4, candidateSequence: 1 } },
+      { type: 'invoice_work_feedback_submit', input: { workId: 7, itemId: 2, candidateId: 4, candidateSequence: 1, helpful: true } },
     ];
     expect(personalAgentHostCommandSchemas({ version: z.literal(1), requestId: z.string().min(1) })).toHaveLength(commands.length);
     for (const command of commands) {

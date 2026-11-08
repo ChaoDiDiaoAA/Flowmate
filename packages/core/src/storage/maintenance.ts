@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, type ProductPaths, type Result } from '@flowmate/contracts';
-import { PackagedReleaseSchema, ServiceInstallationSchema, resolveProductPaths, validateProductPaths, type PackagedRelease, type ServiceInstallation } from '@flowmate/shared';
+import { PACKAGED_MIGRATIONS, PackagedReleaseSchema, ServiceInstallationSchema, resolveProductPaths, validateProductPaths, type PackagedRelease, type ServiceInstallation } from '@flowmate/shared';
 import { validateProductSettings } from '../configuration/settings.ts';
 import { writeSynced } from '../skill-hub/resources.ts';
 import { readManagedArtifact, readManagedInvoiceExport, readManagedResearchSource } from './file-store.ts';
@@ -22,11 +22,11 @@ export type BackupManifest = { version: 1; backupId: string; createdAt: string; 
 export type BackupReceipt = { directory: string; manifest: BackupManifest };
 
 export const InstalledReleaseSchema = z.object({ version: z.literal(1), releaseId: z.string().uuid(),
-  productVersion: z.string().min(1).max(128), schemaVersion: z.number().int().min(1).max(28),
+  productVersion: z.string().min(1).max(128), schemaVersion: z.number().int().min(1).max(PACKAGED_MIGRATIONS.length),
   settingsVersion: z.number().int().min(1).max(7) }).strict();
 const backupSchema = z.object({ version: z.literal(1), backupId: z.string().uuid(), createdAt: z.string().datetime(),
   productVersion: z.string().max(128).nullable(), releaseId: z.string().uuid().nullable(),
-  schemaVersion: z.number().int().min(1).max(28).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
+  schemaVersion: z.number().int().min(1).max(PACKAGED_MIGRATIONS.length).nullable(), settingsVersion: z.number().int().min(1).max(7).nullable(),
   files: z.array(z.object({ path: z.string().min(1).max(1024), byteLength: z.number().int().nonnegative().safe() }).strict()).min(1),
   gaps: z.array(z.string().max(256)) }).strict();
 
@@ -69,7 +69,7 @@ function inspectDatabase(db: Database): { schemaVersion: number | null; journalM
   let schemaVersion: number | null = null;
   if (migrationTable) {
     const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
-    if (!rows.length || rows.length > 28 || rows.some((row, index) => row.version !== index + 1)) throw Error('maintenance_store_incompatible');
+    if (!rows.length || rows.length > PACKAGED_MIGRATIONS.length || rows.some((row, index) => row.version !== index + 1)) throw Error('maintenance_store_incompatible');
     schemaVersion = rows.length;
   } else if (db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get())
     throw Error('maintenance_store_incompatible');
@@ -130,7 +130,8 @@ function persistentFiles(paths: ProductPaths): string[] {
 
 async function checkReferences(paths: ProductPaths, version: number | null): Promise<string[]> {
   const gaps: string[] = [];
-  if (version !== 20 && version !== 21 && version !== 22 && version !== 23 && version !== 24 && version !== 25 && version !== 26 && version !== 27 && version !== 28) { if (version !== null) gaps.push('matching_old_program_or_explicit_upgrade_required'); return gaps; }
+  if (version === null) return gaps;
+  if (version < 20 || version > PACKAGED_MIGRATIONS.length) { gaps.push('matching_old_program_or_explicit_upgrade_required'); return gaps; }
   const db = new Database(paths.databaseFile, { readonly: true });
   try {
     const documents = createDocumentRepository(db), contentsReader = createManagedFileContents(db);

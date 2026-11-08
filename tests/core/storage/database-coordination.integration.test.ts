@@ -15,7 +15,7 @@ test('formal DbHandle exposes the owner while keeping raw SQLite and root reposi
       'recoveryError', 'maxRunIdAtBoot', 'close'].sort());
     expect(Object.keys(store.coordinator).sort()).toEqual(['read', 'transaction']);
     expect(await store.read(scope => scope.db.query('SELECT version FROM schema_migrations ORDER BY version').all()))
-      .toEqual(Array.from({ length: 28 }, (_, index) => ({ version: index + 1 })));
+      .toEqual(Array.from({ length: 30 }, (_, index) => ({ version: index + 1 })));
     expect(await store.transaction(scope => scope.sessions.create({ nativeSessionId: 'owner-only', title: 'Owner only', at: stamp })))
       .toMatchObject({ ok: true, data: { sessionId: 1 } });
     expect(await store.read(scope => scope.sessions.get(1))).toMatchObject({ ok: true, data: { nativeSessionId: 'owner-only' } });

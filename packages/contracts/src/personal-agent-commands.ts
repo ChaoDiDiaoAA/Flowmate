@@ -40,6 +40,8 @@ const commandSchemas = [
   z.object({ type: z.literal('personal_task_history'), input: H.PersonalHistoryRequestSchema }).strict(),
   z.object({ type: z.literal('personal_task_history_entry'), input: H.PersonalHistoryEntryRequestSchema }).strict(),
   z.object({ type: z.literal('invoice_work_timeline'), input: T.InvoiceWorkTimelineRequestSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_feedback_get'), input: P.InvoiceWorkFeedbackTargetSchema }).strict(),
+  z.object({ type: z.literal('invoice_work_feedback_submit'), input: P.InvoiceWorkFeedbackSubmitSchema }).strict(),
 ] as const;
 
 export const PersonalAgentCommandSchema = z.discriminatedUnion('type', commandSchemas)
@@ -81,6 +83,8 @@ const resultSchemas = {
   personal_task_history: result(H.PersonalHistoryPageSchema),
   personal_task_history_entry: result(H.PersonalHistoryEntrySchema),
   invoice_work_timeline: result(T.InvoiceWorkTimelinePageSchema),
+  invoice_work_feedback_get: result(P.InvoiceWorkFeedbackSchema.nullable()),
+  invoice_work_feedback_submit: result(P.InvoiceWorkFeedbackSchema),
 };
 
 export function isPersonalAgentHostCommand(type: string): type is PersonalAgentCommandType {
@@ -118,13 +122,18 @@ export function matchesPersonalAgentResponse(command: { type: string; input?: un
     && result.error.sessionId === undefined && result.error.toolCallId === undefined;
   const data = result.data;
   if (data === null) return captured.type === 'invoice_work_query_operation' || captured.type === 'invoice_work_desktop_query_decision'
-    || captured.type === 'invoice_work_browser_query_decision';
+    || captured.type === 'invoice_work_browser_query_decision' || captured.type === 'invoice_work_feedback_get';
   if ('execution' in data && 'kind' in data.execution && data.execution.kind === 'blocked') {
     const { reason, attempt } = data.execution;
     if (reason.runId !== undefined && reason.runId !== attempt?.runId || reason.toolCallId !== undefined
       || reason.sessionId !== undefined && (!('sessionId' in data) || reason.sessionId !== data.sessionId)) return false;
   }
   switch (captured.type) {
+    case 'invoice_work_feedback_get':
+    case 'invoice_work_feedback_submit': return 'association' in data
+      && data.workId === captured.input.workId && data.itemId === captured.input.itemId
+      && data.candidateId === captured.input.candidateId && data.candidateSequence === captured.input.candidateSequence
+      && (captured.type === 'invoice_work_feedback_get' || data.helpful === captured.input.helpful);
     case 'personal_task_history': return 'owner' in data && 'entries' in data
       && data.owner.workId === captured.input.target.workId && data.owner.childRunId === (captured.input.target.childRunId ?? null)
       && data.owner.itemId === captured.input.target.itemId

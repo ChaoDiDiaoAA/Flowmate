@@ -5,12 +5,15 @@ import type { Result } from './runtime.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const MAX_INVOICE_WORK_TIMELINE_PAGE_BYTES = 262_144;
-export const InvoiceWorkTimelineSourceKindSchema = z.enum(['work', 'operation', 'item', 'todo', 'attempt', 'business_event', 'run', 'tool_call']);
+export const InvoiceWorkTimelineSourceKindSchema = z.enum(['work', 'operation', 'item', 'todo', 'attempt', 'business_event', 'run', 'tool_call',
+  'phase', 'model_observation', 'browser_approval', 'desktop_approval', 'memory_recall']);
 export const InvoiceWorkTimelineKindSchema = z.enum(['work_created', 'work_continued', 'supplement_received', 'work_cancelled',
   'work_completed', 'item_disposed', 'todo_created', 'todo_superseded', 'attempt_created', 'attempt_stop_requested', 'attempt_stopped',
   'candidate_generated', 'candidate_edited', 'candidate_accepted', 'candidate_rejected', 'candidate_exported', 'run_created',
   'run_started', 'run_completed', 'run_failed', 'run_cancelled', 'run_stop_requested', 'run_stop_confirmed',
-  'child_result_recorded', 'child_result_returned', 'child_result_consumed', 'delegation_stop_confirmed']);
+  'child_result_recorded', 'child_result_returned', 'child_result_consumed', 'delegation_stop_confirmed',
+  'phase_created', 'phase_input_consumed', 'phase_closed', 'model_observed', 'tool_execution',
+  'approval_requested', 'approval_decided', 'memory_recalled']);
 export const InvoiceWorkTimelineCursorSchema = z.object({ occurredAt: z.string().datetime({ offset: true }),
   sourceKind: InvoiceWorkTimelineSourceKindSchema, sourceId: id, kind: InvoiceWorkTimelineKindSchema }).strict();
 export type InvoiceWorkTimelineCursor = z.infer<typeof InvoiceWorkTimelineCursorSchema>;
@@ -30,11 +33,14 @@ export const InvoiceWorkTimelineRefsSchema = z.object({ operationId: id.optional
   runId: id.optional(), parentRunId: id.optional(), childRunId: id.optional(), originToolCallId: id.optional(), toolCallId: id.optional(),
   jobId: id.optional(), candidateRef: WorkspaceExpectationSchema.shape.candidateRef.unwrap().optional(), documentRef: DocumentRefSchema.optional(),
   artifactId: id.optional(), nativeEntryId: id.optional(), nativeModelTaskId: id.optional(),
+  phaseId: id.optional(), nativeSubmissionId: id.optional(), observationId: z.string().uuid().optional(),
+  proposalId: id.optional(),
   childReportRefs: z.array(InvoiceCandidateChildReportReferenceSchema).max(50).optional() }).strict();
 export const InvoiceWorkTimelineEntrySchema = InvoiceWorkTimelineCursorSchema.extend({ key: z.string().min(1).max(256),
   workId: id, itemId: id.nullable(), summary: z.string().refine(text => new TextEncoder().encode(text).byteLength <= 1024),
   refs: InvoiceWorkTimelineRefsSchema, evidence: z.object({ resultRecorded: z.boolean(), returnedToParent: z.boolean(),
     parentConsumed: z.boolean(), stopConfirmed: z.boolean() }).strict(),
+  evidenceSource: z.enum(['receipt', 'observation']).optional(),
 }).strict().refine(value => value.key === JSON.stringify([value.sourceKind, value.sourceId, value.kind])
   && (!value.evidence.parentConsumed || value.evidence.returnedToParent)
   && (!value.evidence.returnedToParent || value.evidence.resultRecorded), 'Evidence needs its original fact and key.');

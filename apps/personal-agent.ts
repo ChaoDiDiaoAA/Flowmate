@@ -8,12 +8,15 @@ import { createResourceService, createToolExecutor, createInvoiceWorkToolBridge,
   createPersonalHistoryService, createInvoiceWorkApprovalWait, createInvoiceWorkCompactionCallbacks, createDesktopProposalTool, createDesktopExecutionTool, createDesktopReadTools,
   createPersonalInvoiceFormTool, createPersonalInvoiceFormObserveTool, createBrowserRequestTool, createBrowserExecutionTool, resolveInvoiceWorkToolScope, type InvoiceFormService } from '@flowmate/core';
 import type { DbHandle } from '../packages/core/src/storage/database.ts';
+import { createInvoiceWorkFeedback } from '../packages/core/src/personal-agent/feedback.ts';
+import { createPersonalObservations } from '../packages/core/src/personal-agent/observations.ts';
 import { buildInvoiceWorkContext, createDurableRuntime, createDurableSqliteStorage, prepareDurableModelBinding, DURABLE_SDK_VERSIONS,
   type DurableRuntimeOptions } from '@flowmate/runtime-durable';
 import { inspectNativeResources, toPiParameters } from '@flowmate/runtime-pi';
 import { createLocalDurableRuntime } from './local-durable-runtime.ts';
 import type { CloudAuthorityCallbacks } from './cloud-authority-rpc.ts';
 import type { CloudQueueAuthority } from './cloud-queue-authority.ts';
+import type { PromptTraceBuffer } from '@flowmate/contracts';
 
 export type PersonalAgentRuntimeOptions = {
   memory?: { owner: { environment: 'local' | 'cloud'; ownerId: string }; runtime: ReturnType<typeof import('@flowmate/core').createMemoryRuntime> };
@@ -29,6 +32,7 @@ export type PersonalAgentRuntimeOptions = {
   defaultConfiguration?: PersonalAgentConfiguration;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
   cloud?: { workspaceId: string; runtime: DurableRuntimePort };
+  promptTrace?: PromptTraceBuffer;
   onError?: (error: AppError) => void;
   desktop?: Pick<Parameters<typeof createDesktopExecutionTool>[0], 'resolveTarget' | 'dispatch'> & Parameters<typeof createDesktopReadTools>[0];
   browser?: Pick<Parameters<typeof createBrowserExecutionTool>[0], 'resolveTarget' | 'read'>;
@@ -44,6 +48,8 @@ const callIdentity = ({ workId, sessionId, itemId, attemptId, requestId }: Durab
 /** One product owner assembles both runtime boundaries; only committed commands wake business execution. */
 export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOptions) {
   const { database, now } = options;
+  const observations = !options.cloud && options.promptTrace ? createPersonalObservations(database, now, () =>
+    options.onError?.(appError('personal_observation_unavailable', 'storage', 'Personal Agent observation is unavailable.'))) : undefined;
   const governor = new DurableInvoiceGovernor(database, now, options.foregroundBusy, options.cloud ? 'cloud' : 'local');
   const browserRebindings = new Map<string, { original: BrowserTarget; current: BrowserTarget; enabled: boolean }>();
   const desktopRebindings = new Map<string, { originalAction: DesktopActionProposal; originalTarget: DesktopActionTarget; action: DesktopActionProposal; target: DesktopActionTarget; enabled: boolean }>();
@@ -300,6 +306,15 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
   };
   if (options.cloud) CloudWorkspaceIdSchema.parse(options.cloud.workspaceId);
   const runtimeOptions: Omit<DurableRuntimeOptions, 'storage'> = {
+    ...(!options.cloud && options.promptTrace ? { modelDiagnostics: {
+      buffer: options.promptTrace,
+      capture: observations?.capture,
+      source: observations?.source,
+      readRunId: query => database.read(scope => {
+        const attempt = scope.invoiceWorkAttempts.get({ workId: query.workId, attemptId: query.attemptId, limit: 1 });
+        return attempt.ok && attempt.data.task.sessionId === query.sessionId ? attempt.data.task.attempt.runId : null;
+      }),
+    } } : {}),
     approvalWait: checkedApproval,
     readApiKey: (_identity, config) => options.readApiKey(config), verifyModelUse: identity => governor.verifyModelUse(identity),
     verifySchedulingUse: (identity, pendingFeedback) => governor.verifySchedulingUse(identity, pendingFeedback),
@@ -434,7 +449,8 @@ export async function createPersonalAgentRuntime(options: PersonalAgentRuntimeOp
     approvalWait: checkedApproval,
     subagents: runtimeOptions.subagents, compactions: runtimeOptions.compactions,
   };
-  return ok({ personal: { agent, works, tasks }, coordinator,
+  return ok({ personal: { agent, works, tasks, readObservations: observations?.read,
+    ...(!options.cloud ? { feedback: createInvoiceWorkFeedback(database, now) } : {}) }, coordinator,
     cloudAuthority: options.cloud ? { workspaceId: options.cloud.workspaceId, callbacks, governor, tools: runtimeOptions.tools ?? [],
       attachQueue: (queue: Pick<CloudQueueAuthority, 'currentEdit' | 'wasCancelled' | 'verifyInputs'>) => { if (cloudQueue && cloudQueue !== queue) throw Error('cloud_queue_owner_conflict'); cloudQueue = queue; },
       reconcilePhase: (identity: Parameters<InvoiceWorkPhaseObserver['reconcile']>[0]) => observer!.reconcile(identity) } : null,

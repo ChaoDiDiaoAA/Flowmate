@@ -9,7 +9,7 @@ import type { DbHandle, SqlDatabaseStore } from './database.ts';
 import { createMemoryStore } from '../memory/persistence.ts';
 import { createMemoryIntegrationRepository } from '../openviking/repository.ts';
 import { appError, fail, ok, type ProductPaths, type Result } from '@flowmate/contracts';
-import { validateProductPaths } from '@flowmate/shared';
+import { PACKAGED_MIGRATIONS, validateProductPaths } from '@flowmate/shared';
 import { createSessionInputLedger } from '../sessions/input-ledger.ts';
 import { createRuntimeEventStore, type RuntimeEventStore } from '../events/store.ts';
 import { createEventService } from '../events/service.ts';
@@ -46,9 +46,9 @@ function createSqlStore(db: SynchronousDatabaseExecutor, listeners: Set<EventLis
   };
 }
 
-type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28;
+type SchemaVersion = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30;
 function migrationSql(version: SchemaVersion): string {
-  const file = ['001_provider.sql', '002_agent_sessions.sql', '003_invoice_tools.sql', '004_parsed_documents.sql', '005_native_session_history.sql', '006_hidden_processing.sql', '007_hidden_chats_invoices.sql', '008_native_entry_runs.sql', '009_session_inputs.sql', '010_human_candidates.sql', '011_session_management.sql', '012_tool_runtime_observations.sql', '013_runtime_events.sql', '014_workspace_selection.sql', '015_context_snapshots.sql', '016_native_history_commits.sql', '017_subagent_runs.sql', '018_subagent_parallel.sql', '019_research.sql', '020_direct_content.sql', '021_personal_agent.sql', '022_research_steps.sql', '023_runtime_scopes.sql', '024_desktop_actions.sql', '025_browser_reads.sql', '026_personal_item_lanes.sql', '027_openviking_memory.sql', '028_invoice_peer_reviews.sql'][version - 1];
+  const file = PACKAGED_MIGRATIONS[version - 1];
   if (!file) throw new Error('unsupported_schema_version');
   return readFileSync(new URL(`./migrations/${file}`, import.meta.url), 'utf8');
 }
@@ -161,7 +161,7 @@ function runMigration(db: Database, version: SchemaVersion, paths?: ProductPaths
         || db.query('SELECT id FROM runs WHERE parent_run_id IS NOT NULL OR origin_tool_call_id IS NOT NULL OR plugin_agent_id IS NOT NULL').get())
         throw new Error('migration_preservation_failed');
       db.exec('COMMIT');
-    } else if (version === 15 || version === 16 || version === 18 || version === 19 || version === 20 || version === 24 || version === 25 || version === 26 || version === 27 || version === 28) {
+    } else if (version === 15 || version === 16 || version === 18 || version === 19 || version === 20 || version >= 24) {
       // Trigger bodies contain semicolons: execute each explicit whole-statement boundary.
       for (const statement of migrationSql(version).split(/^\s*-- statement\s*$/m).map(sql => sql.trim()).filter(Boolean)) db.exec(statement);
       if (version === 20 && paths) migrateLegacyMetadata(db, paths, backup);
@@ -230,16 +230,16 @@ function migrateToLatest(db: Database, paths: ProductPaths): void {
 
   const rows = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>;
   const versions = rows.map((row) => row.version);
-  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > 28) {
+  if (versions.some((version, index) => version !== index + 1) || versions.length < 1 || versions.length > PACKAGED_MIGRATIONS.length) {
     throw new Error('unsupported_schema_version');
   }
   const backup = migrationTable && versions.length < 20 ? backupLegacyStore(db, paths) : null;
-  for (let version = versions.length + 1; version <= 28; version += 1) {
+  for (let version = versions.length + 1; version <= PACKAGED_MIGRATIONS.length; version += 1) {
     if (version === 23 && migrationTable) backupBeforeRuntimeScopes(db, paths);
     runMigration(db, version as SchemaVersion, paths, backup);
   }
   const completed = db.query('SELECT version FROM schema_migrations ORDER BY version').all() as { version: number }[];
-  if (completed.length !== 28 || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
+  if (completed.length !== PACKAGED_MIGRATIONS.length || completed.some((row, index) => row.version !== index + 1)) throw new Error('unsupported_schema_version');
 }
 
 export function bootstrapDatabase(paths: ProductPaths): Result<DatabaseBootstrap> {

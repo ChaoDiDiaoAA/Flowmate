@@ -1,9 +1,10 @@
-import type { PromptTraceBuffer, PromptTraceCall, PromptTraceEntry, PromptTraceReference, PromptTraceResult } from '@flowmate/contracts';
+import type { PromptTraceBuffer, PromptTraceCall, PromptTraceEntry, PromptTraceReference, PromptTraceResult, PromptTraceTiming } from '@flowmate/contracts';
 
 const maxEntries = 200;
 const maxSummaryLength = 2_000;
 const maxEndedCalls = 20;
 const maxEvictedKeys = 4_096;
+const maxHttpAttempts = 16;
 
 function keyOf(reference: Pick<PromptTraceReference, 'runId' | 'callSequence'>): string {
   return `${reference.runId}:${reference.callSequence}`;
@@ -28,7 +29,7 @@ export function createPromptTraceBuffer(): PromptTraceBuffer {
     if (evictedOrder.length > maxEvictedKeys) evicted.delete(evictedOrder.shift()!);
   }
 
-  return {
+  const buffer: PromptTraceBuffer = {
     begin(reference) {
       if (!Number.isSafeInteger(reference.runId) || reference.runId <= 0
         || !Number.isSafeInteger(reference.sessionId) || reference.sessionId <= 0
@@ -37,6 +38,53 @@ export function createPromptTraceBuffer(): PromptTraceBuffer {
       const key = keyOf(reference);
       if (active.has(key) || ended.some((call) => keyOf(call) === key)) return;
       active.set(key, { ...reference, state: 'active', entries: [], droppedEntries: 0 });
+    },
+    beginTiming(reference, startedAt, observesHttp, observe) {
+      buffer.begin(reference);
+      const timing: PromptTraceTiming = {
+        elapsedMs: null, budgetMs: null, beforeHttpMs: null, firstTextMs: null,
+        transport: observesHttp ? 'not-entered' : 'unobservable', outcome: 'pending', attempts: [], droppedAttempts: 0,
+      };
+      const call = active.get(keyOf(reference));
+      if (call) {
+        call.timing = timing;
+        if (observe) {
+          try { observe(structuredClone(call)); } catch { /* Diagnostics are optional. */ }
+        }
+      }
+      return {
+        budget(ms) { if (timing.outcome === 'pending') timing.budgetMs = (timing.budgetMs ?? 0) + ms; },
+        dispatch(at) {
+          if (timing.outcome !== 'pending') return () => {};
+          timing.transport = 'entered';
+          timing.beforeHttpMs ??= at - startedAt;
+          if (timing.attempts.length >= maxHttpAttempts) {
+            timing.droppedAttempts += 1;
+            return () => {};
+          }
+          const attempt: PromptTraceTiming['attempts'][number] = { headersMs: null, status: null, outcome: 'pending' };
+          timing.attempts.push(attempt);
+          return (settledAt, status, failure) => {
+            if (timing.outcome !== 'pending' || attempt.outcome !== 'pending') return;
+            attempt.outcome = status === null ? failure ?? 'error' : 'headers';
+            attempt.status = status;
+            if (status !== null) attempt.headersMs = settledAt - at;
+          };
+        },
+        text(at) { if (timing.outcome === 'pending') timing.firstTextMs ??= at - startedAt; },
+        finish(at, outcome) {
+          if (timing.outcome !== 'pending') return;
+          timing.elapsedMs = at - startedAt;
+          timing.outcome = outcome;
+          if (call && active.get(keyOf(reference))?.timing === timing) {
+            buffer.end(reference);
+            if (observe) {
+              call.endedAt = new Date().toISOString();
+              try { observe(structuredClone(call)); } catch { /* Diagnostics are optional. */ }
+            }
+          }
+        },
+      };
     },
     append(reference, entry) {
       const call = active.get(keyOf(reference));
@@ -71,7 +119,7 @@ export function createPromptTraceBuffer(): PromptTraceBuffer {
     query(runId, callSequence) {
       const calls = [...ended, ...active.values()]
         .filter((call) => call.runId === runId && (callSequence === undefined || call.callSequence === callSequence))
-        .map((call) => ({ ...call, entries: call.entries.map((entry) => ({ ...entry })) }));
+        .map((call) => structuredClone(call));
       if (calls.length) return { availability: 'available', calls, droppedCalls };
       const wasEvicted = callSequence === undefined
         ? [...evicted].some((key) => key.startsWith(`${runId}:`))
@@ -79,4 +127,5 @@ export function createPromptTraceBuffer(): PromptTraceBuffer {
       return { availability: wasEvicted ? 'evicted' : 'not-started', calls: [], droppedCalls };
     },
   };
+  return buffer;
 }
