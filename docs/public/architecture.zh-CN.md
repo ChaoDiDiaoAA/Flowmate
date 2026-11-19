@@ -36,6 +36,8 @@ flowchart TB
 
 Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取，持久查询提供权威状态；回复丢失或迟到不授权重执行写入。生命周期详见 [Agent Runtime](agent-runtime.zh-CN.md)。
 
+联网 Deep Research 由执行研究的 Host 从启动环境读取 `FLOWMATE_TAVILY_API_KEY`，Renderer 只接收配置状态。计划确认后，父 Agent 的研究工具通过 Tavily 执行已确认的搜索或指定网址读取。搜索可提取计划排名选中的公开结果。网页正文作为不可信来源保存，引用复用已有研究步骤与来源快照。
+
 对于[云端 Personal Agent Work](personal-agent.zh-CN.md#cloud-workspace)，桌面连接受限 SSH Bridge。Authority 负责工作区授权、业务持久化和模型代理，Runtime 负责原生 Durable 执行与检查点。窗口及浏览器交互仍由桌面负责。业务效果通过保存的业务回执核对，模型观测提供执行线索。
 
 ## 职责划分

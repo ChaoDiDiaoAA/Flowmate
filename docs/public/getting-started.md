@@ -68,7 +68,7 @@ This command still requires the model to make a real `Agent` tool call. A comman
 
 ## Next workflows and common issues
 
-Use [Workflows](workflows.md) for research, single-invoice review and ongoing Personal Agent work. For [Deep Research](workflows.md#deep-research), optionally save **Settings → General → Research preferences**, then select local text/Markdown or registered parsed material, review and confirm the plan, and inspect **Research steps**. After interruption, **Continue research** is an explicit action when available. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
+Use [Workflows](workflows.md) for research, single-invoice review and ongoing Personal Agent work. For [Deep Research](workflows.md#deep-research), optionally save **Settings → General → Research preferences**, then select local text, Markdown or registered parsed material as needed. For public webpages, set `FLOWMATE_TAVILY_API_KEY` in the executing Host's startup environment, restart it, and enable **Web search** in **New research**. After reviewing and confirming the plan, inspect **Research steps** and use **Evidence / Report** to verify citations and export Markdown. After interruption, **Continue research** is an explicit action when available. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
 
 | Symptom | First check |
 |---|---|
@@ -76,6 +76,7 @@ Use [Workflows](workflows.md) for research, single-invoice review and ongoing Pe
 | Send is unavailable | Selected model, Host/Runtime readiness, active or unconfirmed stopping work |
 | Skill is Partial | Its listed tool, Skill and extension dependencies |
 | No child appears | Extension enabled, role available, actual `Agent` call and remaining budget |
+| Web search is disabled | Check `FLOWMATE_TAVILY_API_KEY` in the executing Host's startup environment and restart it after configuring the value |
 | Research cannot continue | Confirmed plan, unfinished step status, runtime readiness and original stopping facts |
 | Old conversation cannot continue | Saved history/material access may be unusable; read diagnostics before a new Run |
 

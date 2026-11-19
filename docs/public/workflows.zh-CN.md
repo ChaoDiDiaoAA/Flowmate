@@ -34,10 +34,10 @@ flowchart LR
 ```
 
 1. 可先在 **Settings → General → Research preferences** 填写证据或报告偏好，点击 **Save research preferences**。默认文字为空，最多 8,192 UTF-8 字节；每次研究 Run 捕获当时保存的文字和 revision，保存本身不请求模型。
-2. 打开 **Deep Research → New research**，输入问题与可选范围，导入或选择授权本地资料、解析文档。点击 **Create research**，再在关联 Assistant 中 **Send** 以生成计划。确认前可检查发送给 Tavily 的查询、时间范围和公开 URL。当前发票不会被自动加入研究。
-3. 检查已保存 Plan 的问题、证据需求、来源范围、预算和停止条件。带步骤的计划将每次采集关联到问题及一个选定材料、搜索查询或公开网址。需要时使用 **Revise plan**，再明确点击 **Confirm plan version** 启动调查。改变授权材料选择需要新建研究任务。
-4. 对带步骤的计划，查看 **Research steps** 和已保存来源入口。同一研究任务的父任务与 `research-investigator` 子任务合计最多同时进行 **2 路**来源采集，包括本地读取和 Tavily 搜索或正文提取。两路采集并发与四个子任务的上限分别计算。网页来源保存正文、链接、取证时间和已知的来源日期。Tavily 优先实时抓取。指定排名缺少候选时，沿用已确认的查询和日期条件补查一次，再提取选中网址的正文。Agent 可以委派适合的独立问题，但父任务仍负责综合与保存。
-5. 查看 **Evidence / Report**。Claim 将确认的问题与实际来源执行、匹配原文和依赖关联。完整报告还要求计划步骤全部成功，并满足既有覆盖与支持检查。活动采集停止后，部分报告可将失败和未完成步骤保留为明确缺口。**Save report** 将已保存报告导出为 Markdown。
+2. 打开 **Deep Research → New research**，输入问题与可选范围，按需导入或选择授权本地资料与解析文档。如果需要公开网页，打开 **Web search**。点击 **Create research**，再在关联 Assistant 中 **Send** 生成计划。当前发票不会被自动加入研究。
+3. 检查已保存 Plan 的问题、证据需求、来源范围、预算和停止条件。开启联网时，**Web requests to Tavily** 会列出搜索词、时间范围、排名和指定的公开网址。带步骤的计划将每次采集关联到问题及一个选定材料、搜索查询或公开网址。需要时使用 **Revise plan**，再明确点击 **Confirm plan version** 启动调查。改变授权材料选择需要新建研究任务。
+4. 对带步骤的计划，查看 **Research steps** 和已保存来源入口。同一研究任务的父任务与 `research-investigator` 子任务合计最多同时进行 **2 路**来源采集，包括本地读取和 Tavily 搜索或正文提取。两路采集并发与四个子任务的上限分别计算。网页来源保存正文、链接、取证时间和已知的来源日期。父 Agent 执行已确认的 Tavily 步骤。搜索优先实时抓取。指定排名缺少候选时，保留查询、日期条件和排名补查一次，再提取选中网页的正文。当已选搜索结果缺少正文时，直接提取该网址。可将适合的独立问题委派给只读调查子代理，综合与保存由父 Agent 负责。
+5. 查看 **Evidence / Report**。Claim 将确认的问题与实际来源执行、匹配原文和依赖关联。对网页来源，可查看已保存的原文或用 **Open webpage** 打开原网页。完整报告还要求计划步骤全部成功，并满足既有覆盖与支持检查。活动采集停止后，部分报告可将失败和未完成步骤保留为明确缺口。**Save report** 将已保存报告导出为 Markdown。
 
 带步骤计划的 Checkpoint 展示 `pending`、`running`、`succeeded`、`failed` 或 `interrupted`。成功要求工具回执成功、清理已确认且来源已保存；模型自述不等于回执。仍有 pending、running 或 interrupted 步骤时不能保存 Claim。失败步骤保留供排查，在其成功前不能保存完整报告。
 

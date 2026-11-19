@@ -39,6 +39,8 @@ Light、dark、system 主题复用背景、表面、正文、边框、强调、�
 - 草稿归属具体 Session，在当前窗口内切换对话主区与侧栏、收起并重新展开 Assistant，均保留当前草稿。
 - 输入属于具体 Session/Context，迟到回复不能把旧工作区或结果附到新选择。
 - Host 就绪后可恢复有效保存的研究页面与任务。任务不可用时显示提示；迟到的恢复不会覆盖用户后来的选择或草稿，也不会启动研究。
+- **New research** 中的 **Web search** 按任务授权联网，默认关闭。Host 缺少 Tavily 配置时，开关禁用并显示配置提示。**Plan → Web requests to Tavily** 展示待确认的搜索词、时间范围、结果排名和指定网址。
+- **Evidence** 提供网页快照原文和 **Open webpage** 入口。**Report** 可按 Claim 检查引文并用 **Save report** 导出 Markdown。
 - **Research steps** 展示已保存步骤状态、错误和来源入口。已确认计划存在 pending、failed 或 interrupted 步骤时显示 **Continue research**；选定研究 Session、模型与运行时就绪，没有活跃 Run 且页面未在加载或保存时才能启用。详见 [Deep Research](workflows.zh-CN.md#deep-research)。
 - Send、Stop、Fill with Agent、Save、Accept、Export 含义不同，字段可见值不证明候选提交。
 - 加载、错误、缺证据、历史不可用、停止未确认分别保留；回复丢失不等于成功，也不授权新执行。

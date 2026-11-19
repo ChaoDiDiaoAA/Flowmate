@@ -13,7 +13,7 @@ The primary development and packaging target is Windows x64. Local-first describ
 | Need | User path | Reviewable result |
 |---|---|---|
 | Ask about supplied information | Main conversation via New chat or saved chat, selected materials or working directory, Send | Conversation history, actual tool records and context basis |
-| Investigate a question across local sources | Deep Research, plan, user confirmation, step acquisition and explicit continuation | Saved step/source facts, Claims, full or partial report with gaps |
+| Investigate a question across local and optional public web sources | Deep Research, plan, user confirmation, step acquisition and explicit continuation | Saved step/source facts, Claims, full or partial report with gaps |
 | Extract and check an invoice | Invoices, existing parsed material, processing, review | Candidate versions, field evidence, explicit acceptance and export |
 | Continue work on an invoice group | Personal Agent, fixed parsed invoices, Todo and explicit review | Work/attempt history and a final disposition for every invoice |
 | Delegate an independent check | AgentSession subagents extension or Personal Agent's bounded Durable `Agent` tool | Owned child execution, actual output and stopping facts |
@@ -27,7 +27,7 @@ The default view is the main conversation; a valid saved page focus can restore 
 
 The workbench provides persistent Sessions; input and Context records; bounded Runs; platform-available Pi file and command tools; opt-in Skills and controlled extensions; research planning and evidence; and invoice review and export. The product distinguishes model output, tool execution, committed writes, delivery to the model, and user acceptance.
 
-Deep Research currently reads authorized local text, Markdown and registered parsed documents. Online search and webpage extraction are unavailable. A plan is confirmed before investigation; when it contains steps, progress follows actual tool receipts and saved sources, and unfinished work can be continued explicitly. A partial report may retain unresolved questions. Evidence location checks do not establish that an inference is semantically correct.
+Deep Research reads authorized local text, Markdown and registered parsed documents. With Tavily configured, users can enable public web search and page extraction for each new task. Web access defaults to off. Investigation starts after the user confirms the saved plan version. Actual tool receipts and saved sources track progress, and users can explicitly continue eligible unfinished steps. Web citations include excerpts, links, acquisition time and the source date when available, including in Markdown exports. A partial report may retain unresolved questions. Evidence location checks do not establish that an inference is semantically correct.
 
 AgentSession captures applicable page focus and authorized Workspace references with the input; temporary page state is projected into the model request separately from conversation history. Research preferences are saved explicitly and captured per Run. These layers do not automatically learn permanent user preferences or grant access to a different task's material. See [Agent runtime](agent-runtime.md#context-memory-layers).
 
@@ -51,7 +51,7 @@ Subagents are foreground, read-only workers with at most four owned child execut
 
 SQLite and managed files live beneath the product user-data root. Model credentials use the desktop's system-encrypted store; evaluation uses dedicated configuration. Explicit model operations can cost money. Some evaluation paths can run locally without export; the standard Smoke/Full benchmark commands require Langfuse preflight and include upload/readback. See [Evaluation](EVALUATION.md).
 
-This repository does not promise autonomous accounting submission, online research, universal provider compatibility, an OS sandbox, or successful recovery on another Windows account. See [Architecture](architecture.md), [Evaluation](EVALUATION.md), and [Packaging and recovery](packaging-and-recovery.md) for the implementation boundaries.
+This repository does not promise autonomous accounting submission, universal provider compatibility, an OS sandbox, or successful recovery on another Windows account. See [Architecture](architecture.md), [Evaluation](EVALUATION.md), and [Packaging and recovery](packaging-and-recovery.md) for the implementation boundaries.
 
 ## Implementation references
 

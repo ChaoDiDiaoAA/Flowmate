@@ -36,6 +36,8 @@ flowchart TB
 
 Host messages carry validated request and ownership identities. Notifications wake readers; saved queries supply authoritative state. A missing or late reply is not permission to re-execute a write. See [Agent runtime](agent-runtime.md) for lifecycle details.
 
+For web-enabled Deep Research, the executing Host reads `FLOWMATE_TAVILY_API_KEY` from its startup environment. The Renderer receives configuration status only. After plan confirmation, the parent Agent's research tools use Tavily for approved searches or reads of specified public URLs. A search can extract the public result at the planned rank. The returned page text is saved as untrusted source material, and citations use the existing research steps and source snapshots.
+
 For [cloud Personal Agent Work](personal-agent.md#cloud-workspace), the desktop connects to the restricted SSH Bridge. Authority owns workspace authorization, business persistence and the provider proxy. Runtime owns the native Durable execution and checkpoints. The desktop keeps ownership of window and browser interactions. Use saved business receipts to confirm effects and model observations to inspect execution evidence.
 
 ## Responsibilities

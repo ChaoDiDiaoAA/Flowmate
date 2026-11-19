@@ -36,7 +36,7 @@ Built-in author definitions live in [resources/subagents](../../resources/subage
 |---|---|---|
 | `general-analyst` | No tools | Independent analysis of information supplied in the task |
 | `invoice-evidence-checker` | Declared read-only file, invoice evidence and resource readers | Check source locations, uncertainties and missing invoice evidence |
-| `research-investigator` | `read_research_local`, `query_research_evidence` | Investigate assigned questions inside a confirmed local research plan |
+| `research-investigator` | `read_research_local`, `query_research_evidence` | Investigate assigned questions with selected local material and saved evidence from the confirmed plan |
 
 A minimal tool-free role has this format:
 
@@ -130,7 +130,7 @@ After restart, inspect the saved child/parent facts. Recovery does not automatic
 
 **Ordinary analysis:** use `general-analyst` to compare explanations, constraints or risks contained in the supplied text. It cannot look up facts because its tool list is empty. Ask the parent to distinguish independent reasoning from verified evidence.
 
-**Local research:** after confirming a research plan and enabling the extension, ask the parent to assign independent subquestions to `research-investigator`. For a plan with steps, the child uses the assigned step IDs and exact planned materials; parent and children share the two acquisition slots. It returns findings, source identities, excerpts, conflicts and gaps. The parent verifies evidence and saves Claims/reports. A user can explicitly continue eligible unfinished research; this does not automatically replay an interrupted child. For web-enabled research, the parent runs the confirmed Tavily search and page extraction steps. See [Deep Research](workflows.md#deep-research).
+**Research evidence.** After confirming a research plan and enabling the extension, ask the parent to assign independent subquestions to `research-investigator`. For a plan with steps, the child uses the assigned step IDs and exact planned materials; parent and children share the two acquisition slots. It returns findings, source identities, excerpts, conflicts and gaps. The parent verifies evidence and saves Claims/reports. A user can explicitly continue eligible unfinished research; this does not automatically replay an interrupted child. For web-enabled research, the parent runs the confirmed Tavily search and page extraction steps. See [Deep Research](workflows.md#deep-research).
 
 **Invoice review:** once the invoice and parsed material are selected, `/parallel-invoice-review …` can request an evidence child and a tool-free reasoning child. Evidence readers stay within the fixed material scope. The parent reconciles returned results; only the authorized parent/user path can save, fill or accept the candidate. A template request is not proof that both children ran.
 

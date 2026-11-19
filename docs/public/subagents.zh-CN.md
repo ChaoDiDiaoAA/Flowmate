@@ -36,7 +36,7 @@ Master 指各自运行线的父任务。Personal Agent 的 **Tasks** 可沿原�
 |---|---|---|
 | `general-analyst` | 无工具 | 独立分析任务中提供的信息 |
 | `invoice-evidence-checker` | 声明的只读文件、发票证据与资源读取工具 | 核对来源定位、不确定性与缺失发票证据 |
-| `research-investigator` | `read_research_local`、`query_research_evidence` | 在已确认的本地研究计划内调查指定问题 |
+| `research-investigator` | `read_research_local`、`query_research_evidence` | 在确认计划内调查指定问题，读取选定本地资料与已保存证据 |
 
 最小无工具角色格式如下：
 
@@ -130,7 +130,7 @@ sequenceDiagram
 
 **普通分析：** 使用 `general-analyst` 比较所附文字中的解释、约束或风险。该角色没有工具，无法查外部事实；要求父任务区分独立推理与已核实证据。
 
-**本地研究：** 确认研究计划并启用扩展后，可让父任务将独立子问题交给 `research-investigator`。计划含步骤时，子任务使用指定步骤 ID 和准确的计划材料，父子共享两路采集名额。它返回发现、来源身份、原文、冲突与缺口，父任务核对证据并保存 Claim/报告。用户可以明确继续符合条件的未完成研究，但这不会自动重放已中断子任务。启用联网的研究由父任务执行已确认的 Tavily 搜索和网页提取步骤。见 [Deep Research](workflows.zh-CN.md#deep-research)。
+**研究取证。** 确认研究计划并启用扩展后，可让父任务将独立子问题交给 `research-investigator`。计划含步骤时，子任务使用指定步骤 ID 和准确的计划材料，父子共享两路采集名额。它返回发现、来源身份、原文、冲突与缺口，父任务核对证据并保存 Claim/报告。用户可以明确继续符合条件的未完成研究，但这不会自动重放已中断子任务。启用联网的研究由父任务执行已确认的 Tavily 搜索和网页提取步骤。见 [Deep Research](workflows.zh-CN.md#deep-research)。
 
 **发票复核：** 选定发票与解析资料后，`/parallel-invoice-review …` 可请求一个取证子任务和一个无工具推理子任务。证据读取不越过固定资料范围，父任务综合返回结果；只有授权父任务或用户路径可以保存、填表、接受候选。模板请求不证明两个子任务均执行。
 

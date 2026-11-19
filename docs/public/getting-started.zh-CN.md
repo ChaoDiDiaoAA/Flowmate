@@ -68,7 +68,7 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 
 ## 后续流程与常见问题
 
-研究、单票复核与 Personal Agent 持续事项见[业务流程](workflows.zh-CN.md)。使用 [Deep Research](workflows.zh-CN.md#deep-research) 时，可先保存 **Settings → General → Research preferences**，再选择本地文本、Markdown 或已登记解析资料，复核并确认计划，查看 **Research steps**。中断后可在条件允许时明确点击 **Continue research**。发票流程需要原件与外部准备的解析材料，应用不生成解析。
+研究、单票复核与 Personal Agent 持续事项见[业务流程](workflows.zh-CN.md)。使用 [Deep Research](workflows.zh-CN.md#deep-research) 时，可先保存 **Settings → General → Research preferences**，再选择本地文本、Markdown 或已登记解析资料。需要公开网页时，将 `FLOWMATE_TAVILY_API_KEY` 配到执行 Host 的启动环境并重启，在 **New research** 打开 **Web search**。复核并确认计划后，在 **Research steps** 查看进度，在 **Evidence / Report** 检查引用并另存 Markdown。中断后可在条件允许时明确点击 **Continue research**。发票流程需要原件与外部准备的解析材料，应用不生成解析。
 
 | 现象 | 优先检查 |
 |---|---|
@@ -76,6 +76,7 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 | Send 不可用 | 模型选择、Host/Runtime 就绪、在途或停止未确认的任务 |
 | Skill 显示 Partial | 列出的工具、Skill 和扩展依赖 |
 | 没有子任务 | 扩展启用、角色可用、实际 Agent 调用及剩余预算 |
+| Web search 无法打开 | 执行 Host 的启动环境中是否配置 `FLOWMATE_TAVILY_API_KEY`，以及配置后是否重启 |
 | 研究无法继续 | 已确认计划、未完成步骤状态、运行时就绪与原停止事实 |
 | 历史会话不能继续 | 保存历史或资料权限可能不可用；新 Run 前查看诊断 |
 

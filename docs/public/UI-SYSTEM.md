@@ -39,6 +39,8 @@ Light, dark and system themes use shared background, surface, text, border, acce
 - Drafts belong to their Session. Switching between the main conversation and sidebar, or collapsing and reopening Assistant, preserves the current draft in the window.
 - Input belongs to a specific Session/context. Late replies must not attach an old workspace or result to a new selection.
 - A valid saved research page and task may be restored after the Host is ready. An unavailable task is reported, and a delayed restore does not replace a newer user selection or draft; restoration does not start research.
+- **Web search** in **New research** authorizes web access for the task and defaults to off. The switch is disabled with a configuration hint when the Host lacks Tavily credentials. **Plan → Web requests to Tavily** lists the search terms, time ranges, result ranks and specified URLs for confirmation.
+- **Evidence** shows saved webpage text and offers **Open webpage**. Use **Report** to inspect citations by Claim and **Save report** to export Markdown.
 - **Research steps** displays saved step status, errors and source links. **Continue research** is shown for a confirmed plan with pending, failed or interrupted steps and can be enabled only when the selected research Session, model and runtime are ready, no Run is active, and the page is not loading or saving. See [Deep Research](workflows.md#deep-research).
 - Send, Stop, Fill with Agent, Save, Accept and Export are distinct operations. Visible field values do not prove a committed candidate.
 - Loading, errors, missing evidence, unavailable history and unconfirmed stopping retain their meanings; a missing reply is not success or permission for a new execution.

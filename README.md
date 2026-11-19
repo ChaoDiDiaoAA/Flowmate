@@ -30,7 +30,7 @@
 | 能力 | Flowmate 的自定义实现与作用 |
 |---|---|
 | **Personal Agent 持续事项助手** | 基于 Pi Durable 保存固定票组、逐票 Todo、候选与处置，按原配置、授权和预算继续执行。 |
-| **结构化 Deep Research** | 将确认计划拆为可追踪步骤，用工具回执与来源快照记录进度，继续时复用成功证据。 |
+| **结构化 Deep Research** | 从本地资料与可选 Tavily 网页取证生成报告。确认计划后按步骤采集，对照来源快照和工具回执复核引用。 |
 | **Skill Hub 技能管理** | 检查技能依赖，显式启用并固定运行版本；模型先读索引，再按需读取正文。 |
 | **Master + Subagent 协作** | 两套 Runtime 分别接入受限委派，管理并行准入、共享预算、独立历史与停止确认，分别记录结果保存、回送和是否进入父模型请求。 |
 | **预算感知的工具 Runtime** | 让模型看到剩余调用数、时间和可用工具时限，并由执行器落实约束。 |
@@ -81,21 +81,21 @@ flowchart TB
 
 ## 🔬 Deep Research：从研究问题到可追溯的证据链
 
-用授权的本地文本、Markdown 或已登记解析资料回答研究问题，保留来源、结论与缺口。
+用授权的本地文本、Markdown、已登记解析资料和可选公开网页回答研究问题，保留来源、结论与缺口。**Web search** 按任务开启，新建任务时默认关闭。
 
-![Deep Research 创建表单：研究问题、范围约束与本地资料选择](docs/screenshots/Deep%20Research.png)
+![Deep Research 创建表单中的研究问题、Web search 开关和本地资料选择](docs/screenshots/Deep%20Research.png)
 
 ### 研究流程
 
 ```mermaid
 flowchart TB
-  Question["研究问题与范围<br/>选择授权本地资料"] --> Plan["生成并保存含步骤的计划<br/>子问题 / 材料参数 / 预算"]
+  Question["研究问题与来源范围<br/>选择本地资料 / 可选联网"] --> Plan["生成并保存含步骤的计划<br/>子问题 / 本地来源 / 网页请求 / 预算"]
   Plan --> Confirm{"用户确认当前计划版本？"}
   Confirm -->|"修改计划"| Plan
   Confirm -->|"确认执行"| Steps["读取计划步骤与 Checkpoint"]
-  Steps -->|"剩余步骤"| Collect["按步骤采集授权本地资料<br/>同研究主 / 子共享 2 个名额"]
+  Steps -->|"剩余步骤"| Collect["按计划读取本地资料并按需调用 Tavily<br/>同研究主 / 子共享 2 个名额"]
   Collect --> Receipts["保存来源正文与执行回执<br/>Run / ToolCall / 停止事实"]
-  Collect -.->|"按需委派"| Investigator["只读调查子代理<br/>沿用计划范围与预算"]
+  Collect -.->|"按需委派"| Investigator["只读调查子代理<br/>本地资料与已保存证据"]
   Investigator --> Receipts
   Receipts --> Checkpoint["更新研究 Checkpoint<br/>依据工具终态与来源<br/>成功 / 失败 / 中断"]
   Steps -->|"复用成功证据"| Claims["综合证据并保存原子 Claim<br/>证据关系 / 结论依赖"]
@@ -111,11 +111,11 @@ flowchart TB
   Continue --> Steps
 ```
 
-1. **确认计划。** 保存子问题、带材料参数的步骤和预算，确认具体版本后执行。原范围内修改需重新确认；更换授权资料需新建研究任务。
-2. **受控采集。** 复用现有读取工具，主 Agent 与可选只读调查子代理共享 **2** 路采集及根预算，排队可取消。成功由工具成功终态、停止确认和来源快照共同支撑。中断后查看进度，再用 **Continue research** 复用成功来源、处理剩余步骤；停止未确认时继续受阻。
-3. **证据交付。** Claim 关联子问题、依赖结论及支持或反驳它的原文。问题均有覆盖、结论获证据支持且无未解决项时保存完整报告，否则以部分报告保留冲突和缺口。导出 Markdown 时复核来源与原文片段；语义质量由独立评测判断。
+1. **确认计划。** 核对研究问题、来源、步骤和预算。开启联网时，确认页列出将发送给 Tavily 的搜索词、时间范围、结果排名和指定的公开网址。确认该版本后才开始调查。修改计划需重新确认，变更任务授权范围需新建研究任务。
+2. **按步骤采集。** 主 Agent 通过 Tavily 搜索公开网页或提取指定网址。搜索优先实时抓取，指定排名缺少候选时，沿用已确认的查询和日期条件补查一次，再提取选中网页的正文。主 Agent 与可选只读调查子代理共享 **2** 路采集及根预算，排队可取消。**Continue research** 复用已成功保存的来源并尝试符合条件的剩余步骤。
+3. **复核和导出。** Claim 关联子问题、依赖结论及支持或反驳它的原文。网页来源保存正文、链接、取证时间及可用的来源日期。可在 **Evidence / Report** 查看引用或打开原网页，并用 **Save report** 导出含引用的 Markdown。部分报告保留未解决问题与证据缺口。
 
-旧计划仍可读取，重新确认含步骤的计划后使用新工作流。当前研究不联网搜索或抓取网页。
+旧计划仍可读取。要使用步骤跟踪，可重新生成并确认含步骤的计划。具体操作见 [Deep Research 业务流程](docs/public/workflows.zh-CN.md#deep-research)。
 
 <a id="runtime"></a>
 
@@ -348,7 +348,9 @@ bun run dev
 
 ### 5. 体验 Deep Research
 
-在 **Deep Research** 选本地资料并创建任务。Host 配置 `FLOWMATE_TAVILY_API_KEY` 后可按任务开启 **Web search**。使用 Assistant 生成计划，确认本地来源和将发送给 Tavily 的网页请求。在 **Research steps** 看进度，**Continue research** 手动继续，在 **Evidence / Report** 复核并另存 Markdown。可在 **Settings → General → Research preferences** 保存偏好；调查子代理需启用 subagents 扩展。
+在 **Deep Research → New research** 输入问题，按需选择本地资料。需要公开网页时，在实际执行的 Host 启动环境配置 `FLOWMATE_TAVILY_API_KEY`，重启后打开 **Web search**。桌面本地 Host 从启动桌面的环境继承该变量，WinSW 从服务启动环境读取。
+
+点击 **Create research**，在 Assistant 点击 **Send** 生成计划，核对来源后点击 **Confirm plan version**。在 **Research steps** 查看进度，在 **Evidence / Report** 核对引用和导出 Markdown。可在 **Settings → General → Research preferences** 保存偏好。
 
 ### 6. 体验单票复核
 
@@ -414,7 +416,7 @@ bun --no-env-file run eval:full
 | 方面 | 当前能力与边界 |
 |---|---|
 | **Personal Agent** | 基于 Pi Durable 持续整理固定票组，保留逐票 Todo、补料、候选、原配置与人工最终处置；按已保存授权恢复合格原尝试。关闭桌面后持续执行、服务重启和开机恢复的真实系统验收仍待完成。 |
-| **研究** | 支持本地资料规划与确认、受控并行采集、持久步骤及手动继续，复用成功证据并保存 Claim 与完整或部分报告；可选只读子任务。尚未接入联网搜索和网页抓取。 |
+| **研究** | 使用选定本地资料与按任务开启的 Tavily 网页搜索和提取。按已确认的计划采集，继续时复用成功来源，并支持带引用的完整或部分报告与 Markdown 导出。 |
 | **日常任务** | Chats、Invoices、Deep Research 使用 AgentSession，支持资料问答、持久会话和当前平台可用的 Pi 原生工具；工作目录选择不构成沙箱。 |
 | **发票** | 支持已有解析材料上的候选、字段核算、人工复核、接受与导出；不在 Host 中执行原票解析。 |
 | **验证** | 已有工程测试，以及轨迹、候选、数据集、评分、实验和回归入口。机制覆盖、真实模型质量、相对 Gate 与平台回读分别判断，不由功能存在推导质量达标。 |
