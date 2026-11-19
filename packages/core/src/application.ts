@@ -136,6 +136,7 @@ export type ProductApplicationOptions = {
     listReports(...input: Parameters<ResearchRepository['listReports']>): ReturnType<ResearchRepository['listReports']> | Promise<ReturnType<ResearchRepository['listReports']>>;
   };
   queryResearchEvidence?: (input: import('zod').z.input<typeof import('@flowmate/contracts').ResearchEvidenceRequestSchema>) => Result<import('zod').z.infer<typeof import('@flowmate/contracts').ResearchEvidenceSchema>> | Promise<Result<import('zod').z.infer<typeof import('@flowmate/contracts').ResearchEvidenceSchema>>>;
+  queryResearchReportDocument?: (input: import('zod').z.infer<typeof import('@flowmate/contracts').ResearchReportRequestSchema>) => Promise<Result<import('@flowmate/contracts').ResearchReportDocument>>;
   exportResearchReport?: (input: import('zod').z.infer<typeof import('@flowmate/contracts').ResearchReportRequestSchema>) => Result<import('@flowmate/contracts').ResearchExport> | Promise<Result<import('@flowmate/contracts').ResearchExport>>;
   importResearchMaterial?: (input: import('@flowmate/contracts').ImportResearchMaterialRequest) => Result<import('@flowmate/contracts').ResearchMaterial> | Promise<Result<import('@flowmate/contracts').ResearchMaterial>>;
   inputDefinitions?: InputDefinitions;
@@ -424,6 +425,11 @@ export function makeApplication(
       const parsed = ResearchEvidenceRequestSchema.safeParse(input);
       return parsed.success ? await products?.queryResearchEvidence?.(parsed.data) ?? fail(appError('research_unavailable', 'storage', 'Research evidence is unavailable.'))
         : fail(appError('input_invalid', 'input', 'Evidence request is invalid.'));
+    },
+    queryResearchReportDocument: async input => {
+      const parsed = ResearchReportRequestSchema.safeParse(input);
+      return parsed.success ? await products?.queryResearchReportDocument?.(parsed.data) ?? fail(appError('research_unavailable', 'storage', 'Research document is unavailable.'))
+        : fail(appError('input_invalid', 'input', 'Report request is invalid.'));
     },
     exportResearchReport: async input => {
       const parsed = ResearchReportRequestSchema.safeParse(input);

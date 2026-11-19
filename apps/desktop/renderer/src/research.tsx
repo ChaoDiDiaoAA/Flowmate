@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { researchCitationKey } from '@flowmate/contracts';
+import type { ResearchReference, ResearchReportDocument, ResearchSentence } from '@flowmate/contracts';
 import type { DocumentSnapshot, ResearchTask, ResearchPlan, ResearchReport, ResearchMaterial, SourceSnapshot,
   Claim, ResearchIntent, ResearchPlanBody, Result } from '@flowmate/contracts';
 
@@ -13,6 +15,11 @@ export function ResearchPage(props: Props) {
   const [task, setTask] = useState<ResearchTask | null>(null), [plan, setPlan] = useState<ResearchPlan | null>(null);
   const [report, setReport] = useState<ResearchReport | null>(null), [reports, setReports] = useState<ResearchReport[]>([]), [reportCursor, setReportCursor] = useState<number | null>(null);
   const [planChanges, setPlanChanges] = useState('');
+  const [format, setFormat] = useState<'markdown' | 'pdf'>('markdown');
+  const [document, setDocument] = useState<ResearchReportDocument | null>(null);
+  const [referenceNumber, setReferenceNumber] = useState<number | null>(null);
+  const referencePanel = useRef<HTMLElement>(null);
+  const [documentError, setDocumentError] = useState<string | null>(null);
   const [sources, setSources] = useState<SourceSnapshot[]>([]), [sourceCursor, setSourceCursor] = useState<number | null>(null);
   const [claims, setClaims] = useState<Claim[]>([]), [claimCursor, setClaimCursor] = useState<number | null>(null);
   const [materials, setMaterials] = useState<ResearchMaterial[]>([]), [materialCursor, setMaterialCursor] = useState<number | null>(null);
@@ -82,12 +89,53 @@ export function ResearchPage(props: Props) {
       setMessage('Research created. Press Send in Assistant to generate a plan. Investigation starts only after you confirm it.');
     });
   }
+  const citedReportId = report?.cited ? report.reportId : undefined;
+  const citedResearchId = report?.cited ? report.researchId : undefined;
+  useEffect(() => {
+    setDocument(null); setReferenceNumber(null); setDocumentError(null); setFormat('markdown');
+    if (view !== 'Report' || !props.ready || citedReportId === undefined || citedResearchId === undefined) return;
+    let current = true;
+    void window.flowmate.queryResearchReportDocument({ researchId: citedResearchId, reportId: citedReportId })
+      .then(result => {
+        if (!current) return;
+        if (result.ok) setDocument(result.data);
+        else setDocumentError(result.error.message);
+      }).catch(() => { if (current) setDocumentError('Saved references could not be loaded.'); });
+    return () => { current = false; };
+  }, [view, props.ready, props.refreshToken, citedReportId, citedResearchId]);
+
+  const activeDocument = document?.reportId === citedReportId && document?.researchId === citedResearchId ? document : null;
+  const reference = activeDocument?.references.find(item => item.number === referenceNumber);
+  useEffect(() => { if (reference) referencePanel.current?.focus(); }, [reference]);
+  const referenceByCitation = new Map(activeDocument?.references.map(item => [researchCitationKey(item), item]));
+  function renderSentences(sentences: ResearchSentence[]) {
+    return sentences.map((sentence, index) => <span key={index}>{sentence.text.trim()}{sentence.citations.map(citation => {
+      const item = referenceByCitation.get(researchCitationKey(citation));
+      return item && <button key={item.number} type="button" className="text-button"
+        aria-label={`Reference ${item.number}`} aria-expanded={referenceNumber === item.number}
+        onClick={() => setReferenceNumber(item.number)}>[{item.number}]</button>;
+    })}{' '}</span>);
+  }
+  function renderReference(item: ResearchReference) {
+    const { source, locator } = item;
+    return <section ref={referencePanel} tabIndex={-1} className="research-source" aria-label="Selected reference">
+      <h3>Reference [{item.number}]</h3>
+      <p><strong>{source.title}</strong> · {source.address}</p>
+      <p className="research-help">Source snapshot {source.sourceSnapshotId} · Run {source.runId} / ToolCall {source.toolCallId} · UTF-16 offsets [{locator.start}, {locator.end})</p>
+      <p className="research-help">Fetched {new Date(source.fetchedAt).toLocaleString()} · {item.relation}</p>
+      <pre className="research-prose">{locator.quote}</pre>
+      <button type="button" className="text-button" onClick={() => void readEvidence(source.sourceSnapshotId, locator.start, Math.min(4000, locator.end - locator.start))}>View saved passage</button>
+      <button type="button" className="text-button" onClick={() => void readClaim(item.claimId)}>Open Claim {item.claimId}</button>
+      {source.kind === 'web' && <button type="button" className="text-button" onClick={() => void openWebSource(source)}>Open webpage</button>}
+    </section>;
+  }
+
   async function openWebSource(source: SourceSnapshot) {
     await operate(async () => { need(await window.flowmate.openResearchSource({ researchId: source.researchId, sourceSnapshotId: source.sourceSnapshotId })); });
   }
-  async function readEvidence(sourceSnapshotId: number, offset = 0) {
+  async function readEvidence(sourceSnapshotId: number, offset = 0, limit = 4000) {
     if (!task) return; const token = ++evidenceGeneration.current;
-    try { const result = need(await window.flowmate.queryResearchEvidence({ researchId: task.researchId, sourceSnapshotId, offset, limit: 4000 }));
+    try { const result = need(await window.flowmate.queryResearchEvidence({ researchId: task.researchId, sourceSnapshotId, offset, limit }));
       if (token === evidenceGeneration.current) { setEvidence(result); setView('Evidence'); } }
     catch (cause) { if (token === evidenceGeneration.current) setError(cause instanceof Error ? cause.message : 'Evidence could not be read.'); }
   }
@@ -207,21 +255,31 @@ export function ResearchPage(props: Props) {
           {view === 'Report' && (report ? <div className="research-report">
             <div className="research-report-toolbar" aria-label="Report actions">
               <label className="field"><span>Saved report</span><select aria-label="Saved report" disabled={saving} value={report.reportId} onChange={event => { const next = reports.find(item => item.reportId === Number(event.target.value)); if (next) { setReport(next); setMessage(null); setError(null); } }}>{reports.map(item => <option key={item.reportId} value={item.reportId}>Report {item.reportId} · plan {item.revision} · {item.completeness}</option>)}</select></label>
-              <div className="research-export-action"><span className="research-badge">{report.completeness === 'full' ? 'Complete report' : 'Partial report'}</span><button type="button" className="primary-button" disabled={saving || !props.ready} onClick={() => void operate(async () => {
-                const result = need(await window.flowmate.saveResearchExport({ researchId: task.researchId, reportId: report.reportId }));
+              <div className="research-export-action"><label className="field"><span>Export format</span><select value={format}
+                onChange={event => setFormat(event.target.value === 'pdf' ? 'pdf' : 'markdown')}>
+                <option value="markdown">Markdown</option><option value="pdf" disabled={!report.cited}>PDF</option>
+              </select></label><span className="research-badge">{report.completeness === 'full' ? 'Complete report' : 'Partial report'}</span><button type="button" className="primary-button" disabled={saving || !props.ready} onClick={() => void operate(async () => {
+                const result = need(await window.flowmate.saveResearchExport({ researchId: task.researchId, reportId: report.reportId, format }));
                 setMessage(result.cancelled ? 'Save cancelled. Your report is still available here.' : 'Report saved' + (result.destinationPath ? ' to ' + result.destinationPath : '.'));
-              })}>Save report</button><small>Markdown .md · choose a location</small></div>
+              })}>Save report</button><small>{format === 'pdf' ? 'PDF .pdf' : 'Markdown .md'} · choose a location</small></div>
               {error && <p role="alert" className="notice bad research-error">{error}</p>}
               {message && <p role="status" className="notice research-feedback">{message}</p>}
             </div>
             {reportCursor && <button type="button" className="text-button" disabled={saving} onClick={() => void operate(async () => { const page = need(await window.flowmate.listResearchReports({ researchId: task.researchId, beforeId: reportCursor, limit: 100 })); setReports(items => [...items, ...page.items.filter(next => !items.some(item => item.reportId === next.reportId))]); setReportCursor(page.nextBeforeId); })}>More reports</button>}
             <article className="research-report-body">
               <p className="research-help">Report {report.reportId} · Plan version {report.revision} · Saved {new Date(report.createdAt).toLocaleString()}</p>
-              <h3>Research answer</h3><p className="research-prose research-answer">{report.answer}</p>
-              {report.sections.map((section, index) => <section key={index}><h3>{section.title}</h3><p className="research-prose">{section.text}</p><div className="research-citations">{section.claimIds.map(id => <button type="button" className="secondary-button" key={id} onClick={() => void readClaim(id)}>Inspect claim {id}</button>)}</div></section>)}
+              {report.cited && !activeDocument ? <p role={documentError ? 'alert' : 'status'}>{documentError ?? 'Loading saved references…'}</p> : <>
+                {report.answer && <><h3>Research answer</h3><p className="research-prose research-answer">
+                  {report.cited ? renderSentences(report.cited.answer) : report.answer}</p></>}
+                {report.sections.map((section, index) => <section key={index}><h3>{section.title}</h3><p className="research-prose">
+                  {report.cited ? renderSentences(report.cited.sections[index]!.sentences) : section.text}</p><div className="research-citations">
+                  {section.claimIds.map(id => <button type="button" className="secondary-button" key={id} onClick={() => void readClaim(id)}>Inspect claim {id}</button>)}</div></section>)}
+                {report.cited && !report.answer && !report.sections.length && <p className="research-help">No citable findings</p>}
+                {reference && renderReference(reference)}
+              </>}
               <section><h3>Coverage</h3><ul className="research-coverage">{report.coverage.map(row => <li key={row.questionId}><strong>{row.questionId}</strong><span className="research-badge">{row.status}</span><p>{row.reason}</p><small>Claims: {row.claimIds.join(', ') || 'none'}</small></li>)}</ul></section>
               {([['Conflicts', report.conflicts], ['Limitations', report.limitations], ['Unresolved questions', report.unresolvedQuestions]] as const).map(([title, items]) => <section key={title}><h3>{title}</h3>{items.length ? <ul>{items.map((text, index) => <li key={index}>{text}</li>)}</ul> : <p className="research-help">None recorded.</p>}</section>)}
-              <p className="research-help">Verification is recorded per claim and does not guarantee every conclusion is true.</p>
+              {!report.cited && <p className="research-help">Historical report with section-level citations. Generate a new report to export PDF.</p>}
               <footer className="research-report-footer"><p>Continue with this research in Assistant.</p><button type="button" className="secondary-button" onClick={() => props.onAssistant(false)}>Ask follow-up</button></footer>
             </article>
           </div> : <div className="research-empty"><h3>No saved report yet</h3><p>Reports appear here after the investigation saves its findings. Partial evidence and failed source calls remain available in Evidence and Assistant.</p><button type="button" className="primary-button" disabled>Save report</button></div>)}

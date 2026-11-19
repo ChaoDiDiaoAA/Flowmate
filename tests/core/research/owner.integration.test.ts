@@ -7,10 +7,11 @@ import { createFileStore } from '../../../packages/core/src/storage/file-store.t
 import { createResearchPlanTool } from '../../../packages/core/src/research/tools.ts';
 import { createResearchReadTools } from '../../../packages/core/src/research/read-tools.ts';
 import { createResearchSynthesisTools, readResearchEvidence } from '../../../packages/core/src/research/synthesis-tools.ts';
+import { exportResearchReport, queryResearchReportDocument } from '../../../packages/core/src/research/export.ts';
 import { researchEvidenceRef } from '../../../packages/core/src/research/source-text.ts';
 import { createToolExecutor } from '../../../packages/core/src/tools/executor.ts';
 import { openTestDatabase } from '../../support/database.ts';
-import { researchPlan } from '../../support/research.ts';
+import { citedSentence, researchPlan } from '../../support/research.ts';
 import { mkdtempSync } from '../../support/resources.ts';
 
 const at = '2026-10-28T00:00:00.000Z', text = '\ufeffOriginal research evidence 😀\nMetered usage.';
@@ -74,17 +75,53 @@ async function hold(f: Awaited<ReturnType<typeof fixture>>) {
   return { release: release.resolve, completion };
 }
 
-async function source(f: Awaited<ReturnType<typeof fixture>>) {
+async function source(f: Awaited<ReturnType<typeof fixture>>, finish = true) {
   const call = await f.call('read_research_local');
   const published = need(await f.files.publishResearchSource({ researchId: f.task.researchId, toolCallId: call.toolCallId, text }));
   const saved = need(await f.database.transaction(store => store.research.saveSource({ researchId: f.task.researchId,
     runId: f.context.runId, toolCallId: call.toolCallId, source: { kind: 'local', address: 'artifact:1', title: 'Controlled evidence',
       artifactId: 1, documentId: null, ...published, fetchedAt: at, publishedAt: null, truncated: false }, at })));
-  need(await f.database.transaction(store => store.toolCalls.finish({ toolCallId: call.toolCallId,
+  if (finish) need(await f.database.transaction(store => store.toolCalls.finish({ toolCallId: call.toolCallId,
     result: { version: 1, committedCandidateId: null, status: 'succeeded', data: { source: saved } }, cleanup: { version: 1, stopped: true, stopReason: 'tool-completed', errors: [] },
     endedAt: at, stoppedAt: at })));
   return saved;
 }
+
+test('keeps a legacy report readable and exportable in Markdown only', async () => {
+  const f = await fixture(true), call = await f.call('save_research_report');
+  const body = { answer: 'Historical answer.', sections: [{ title: 'Cost', text: 'No pricing was found.', claimIds: [] }],
+    completeness: 'partial', conflicts: [], limitations: [], unresolvedQuestions: [],
+    coverage: [{ questionId: 'cost-1', claimIds: [], status: 'gap', reason: 'Pricing unavailable.' }] };
+  const reportId = await f.database.transaction(store => Number(store.db.query(
+    'INSERT INTO research_reports(research_id,plan_id,revision,run_id,tool_call_id,body_json,created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(f.task.researchId, f.binding.plan!.planId, f.binding.plan!.revision, f.context.runId, call.toolCallId, JSON.stringify(body), at).lastInsertRowid));
+  const request = { researchId: f.task.researchId, reportId };
+  const report = need(await f.database.read(store => store.research.getReport(request)));
+  expect(report).toMatchObject(body);
+  expect(report.cited).toBeUndefined();
+  const exported = need(await exportResearchReport(f, request));
+  expect(exported.markdown).toContain('Historical answer.');
+  expect(await queryResearchReportDocument(f, request)).toMatchObject({ ok: false, error: { code: 'research_pdf_legacy' } });
+});
+
+test('a stored Claim cannot establish report evidence if acquisition never successfully stopped', async () => {
+  const f = await fixture(true), saved = await source(f, false);
+  const claimCall = await f.call('save_research_claim');
+  const ref = researchEvidenceRef(f.binding, saved, { start: 0, end: text.length, quote: text })!;
+  const claim = need(await f.database.transaction(store => store.research.saveClaim({
+    researchId: f.task.researchId, runId: f.context.runId, toolCallId: claimCall.toolCallId, at,
+    claim: { questionId: 'cost-1', text: 'Usage is metered.', dependencies: [], evidence: [{ relation: 'supports', ref }],
+      verification: { status: 'supported', reasons: ['Seed a stored Claim for the acquisition receipt check.'] } },
+  })));
+  const call = await f.call('save_research_report');
+  const tool = createResearchSynthesisTools({ ...f, now: () => at }).find(item => item.name === 'save_research_report')!;
+  const input = { formatVersion: 2, answer: [citedSentence(claim.text, [claim.claimId])], sections: [], completeness: 'partial',
+    conflicts: [], limitations: [], unresolvedQuestions: [],
+    coverage: [{ questionId: 'cost-1', claimIds: [claim.claimId], status: 'covered', reason: 'A stored Claim is available.' }] };
+  const attempt = await tool.execute(input, call, f.context).then(() => null, failure);
+  expect(attempt).toMatchObject({ code: 'research_evidence_incomplete', message: 'The source has no successful acquisition receipt.' });
+  expect(need(await f.database.read(store => store.research.get(f.task.researchId))).currentReportId).toBeNull();
+});
 
 test.each([
   ['save_research_plan', 'research_plans'], ['read_research_local', 'research_sources'],
@@ -121,7 +158,7 @@ test.each([
     if (name === 'save_research_report') {
       expect((await executor.execute('save_research_claim', claim, { ...context, nativeToolCallId: 'seed-claim' })).result.status).toBe('succeeded');
       const claimId = need(await f.database.read(store => store.research.listClaims({ researchId: f.task.researchId, planId: f.binding.plan!.planId, limit: 10 }))).items[0]!.claimId;
-      body = { answer: 'The selected evidence supports a metered condition.', sections: [{ title: 'Costs', text: 'Usage is metered.', claimIds: [claimId] }],
+      body = { formatVersion: 2, answer: [citedSentence('The selected evidence supports a metered condition.', [claimId])], sections: [{ title: 'Costs', sentences: [citedSentence('Usage is metered.', [claimId])] }],
         conflicts: [], limitations: [], unresolvedQuestions: [], completeness: 'full',
         coverage: [{ questionId: 'cost-1', claimIds: [claimId], status: 'covered', reason: 'The saved claim has supporting evidence.' }] };
     }
@@ -257,8 +294,8 @@ test.each([
     need(store.toolCalls.start({ toolCallId: input.toolCallId, startedAt: at }));
     return store.research.saveClaim({ researchId: f.task.researchId, runId: f.context.runId, toolCallId: input.toolCallId, claim, at });
   })).claimId : 0;
-  const body = name === 'save_research_claim' ? claim : { answer: 'The selected evidence supports a metered condition.',
-    sections: [{ title: 'Costs', text: 'Usage is metered.', claimIds: [claimId] }], conflicts: [], limitations: [], unresolvedQuestions: [],
+  const body = name === 'save_research_claim' ? claim : { formatVersion: 2, answer: [citedSentence('The selected evidence supports a metered condition.', [claimId])],
+    sections: [{ title: 'Costs', sentences: [citedSentence('Usage is metered.', [claimId])] }], conflicts: [], limitations: [], unresolvedQuestions: [],
     completeness: 'full', coverage: [{ questionId: 'cost-1', claimIds: [claimId], status: 'covered', reason: 'The saved claim has supporting evidence.' }] };
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), read = f.files.readResearchSource.bind(f.files);
   let held: Promise<void> | undefined, reads = 0;

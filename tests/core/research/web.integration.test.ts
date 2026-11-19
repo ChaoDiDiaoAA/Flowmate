@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { acquireTavilyPage } from '../../../packages/core/src/research/tavily.ts';
-import { researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
+import { citedSentence, researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
 
 const webUrl = 'https://example.org/policy';
 const pricingUrl = 'https://example.org/pricing';
@@ -42,8 +42,10 @@ it('executes only confirmed web steps, publishes evidence and retries a failed e
     }
     if (index === 5) {
       const claim = need(await f.app.listResearchClaims({ researchId: f.task.researchId, planId })).items[0]!;
-      return { tool: 'save_research_report', id: 'report', args: { answer: 'Deployment costs are public.',
-        sections: [{ title: 'Cost', text: claim.text, claimIds: [claim.claimId] }], completeness: 'partial', conflicts: [],
+      return { tool: 'save_research_report', id: 'report', args: { formatVersion: 2, answer: [{
+        text: 'Deployment costs are public.', citations: [{ claimId: claim.claimId, evidenceIndex: 0 }, { claimId: claim.claimId, evidenceIndex: 1 }],
+      }],
+        sections: [{ title: 'Cost', sentences: [citedSentence(claim.text, [claim.claimId], 1)] }], completeness: 'partial', conflicts: [],
         limitations: ['The specified page was unavailable.'], unresolvedQuestions: ['Confirm the page independently.'],
         coverage: [{ questionId: 'cost-1', status: 'covered', claimIds: [claim.claimId], reason: 'Two sources agree.' }] } };
     }
@@ -89,7 +91,12 @@ it('executes only confirmed web steps, publishes evidence and retries a failed e
   const partial = need(await f.app.queryResearchTask(f.task.researchId));
   expect(partial.status).toBe('partial');
   expect(partial.workflow?.steps.map(step => step.status)).toEqual(['succeeded', 'succeeded', 'failed']);
-  const exported = need(await f.app.exportResearchReport({ researchId: partial.researchId, reportId: partial.currentReportId! }));
+  const reportRequest = { researchId: partial.researchId, reportId: partial.currentReportId! };
+  const document = need(await f.app.queryResearchReportDocument(reportRequest));
+  expect(document.references[0]).toMatchObject({ source: { address: pricingUrl } });
+  expect(document.references[1]).toMatchObject({ source: { artifactId: localArgs.artifactId } });
+  expect(document.references[0]!.source.toolCallId).not.toBe(document.references[1]!.source.toolCallId);
+  const exported = need(await f.app.exportResearchReport(reportRequest));
   for (const value of ['https://example.org/pricing', 'Official web pricing.', 'Team policy lists the costs.', '2026-11-17'])
     expect(exported.markdown).toContain(value);
   await f.reopen();

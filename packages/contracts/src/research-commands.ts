@@ -17,6 +17,7 @@ export const researchOperations = {
   list_research_sources: ['listResearchSources', R.ResearchSourcesRequestSchema, R.ResearchSourcesResultSchema],
   list_research_claims: ['listResearchClaims', R.ResearchClaimsRequestSchema, R.ResearchClaimsResultSchema],
   list_research_reports: ['listResearchReports', R.ResearchSourcesRequestSchema, R.ResearchReportsResultSchema],
+  query_research_report_document: ['queryResearchReportDocument', R.ResearchReportRequestSchema, R.ResearchReportDocumentResultSchema],
   export_research_report: ['exportResearchReport', R.ResearchReportRequestSchema, R.ResearchExportResultSchema],
 } as const;
 export type ResearchCommandType = keyof typeof researchOperations;

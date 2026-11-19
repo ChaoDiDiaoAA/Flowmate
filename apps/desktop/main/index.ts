@@ -132,7 +132,8 @@ import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import { readManagedInvoiceExport } from '../../../packages/core/src/storage/file-store.ts';
 import { publishInvoiceExportCopy } from './invoice-export.ts';
 import { publishExportCopy } from './invoice-export.ts';
-import { ResearchReportRequestSchema, ResearchExportResultSchema, ResearchSourceRequestSchema, ResearchSourceResultSchema, isResearchWebUrl } from '@flowmate/contracts';
+import { printResearchPdf } from './research-pdf.ts';
+import { SaveResearchExportRequestSchema, ResearchReportDocumentResultSchema, ResearchExportResultSchema, ResearchSourceRequestSchema, ResearchSourceResultSchema, isResearchWebUrl } from '@flowmate/contracts';
 import { CloudDesktopController } from './cloud-desktop-controller.ts';
 import { connectCloudSsh } from './cloud-ssh-session.ts';
 import { createHostCloudMaterialExport, uploadCloudMaterial } from './cloud-material-transfer.ts';
@@ -1229,13 +1230,30 @@ function registerIpc(): void {
     catch { return fail(appError('research_source_unavailable', 'input', 'The webpage could not be opened in the default browser.')); }
   });
   handle('flowmate:save-research-export', async (event, raw) => {
-    const parsed = ResearchReportRequestSchema.safeParse(raw);
+    const parsed = SaveResearchExportRequestSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'Report export request is invalid.'));
     const owner = mainWindow, frame = event.senderFrame, epoch = transportEpoch;
     const current = () => owner !== null && owner === mainWindow && !owner.isDestroyed()
       && event.sender === owner.webContents && frame === owner.webContents.mainFrame && epoch === transportEpoch;
     if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed.'));
-    const exported = ResearchExportResultSchema.safeParse(await assemblyIpcQuery('export_research_report', parsed.data));
+    const { format, ...identity } = parsed.data;
+    if (format === 'pdf') {
+      const document = ResearchReportDocumentResultSchema.safeParse(await assemblyIpcQuery('query_research_report_document', identity));
+      if (!document.success) return fail(appError('host_protocol_invalid', 'runtime', 'Report document could not be verified.'));
+      if (!document.data.ok) return document.data;
+      if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed.'));
+      const destination = await dialog.showSaveDialog(owner!, { title: 'Save research PDF',
+        defaultPath: `research-${identity.researchId}-report-${identity.reportId}.pdf`, filters: [{ name: 'PDF', extensions: ['pdf'] }] });
+      if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed before saving.'));
+      if (destination.canceled || !destination.filePath) return ok({ cancelled: true });
+      let pdf: Buffer;
+      try { pdf = await printResearchPdf(document.data.data); }
+      catch { return fail(appError('research_pdf_failed', 'runtime', 'The research PDF could not be rendered.')); }
+      if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed before saving.'));
+      const saved = publishExportCopy(destination.filePath, pdf);
+      return saved.ok ? ok({ cancelled: false, destinationPath: saved.data.destinationPath }) : saved;
+    }
+    const exported = ResearchExportResultSchema.safeParse(await assemblyIpcQuery('export_research_report', identity));
     if (!exported.success) return fail(appError('host_protocol_invalid', 'runtime', 'Report export could not be verified.'));
     if (!exported.data.ok) return exported.data;
     if (!current()) return fail(appError('state_conflict', 'input', 'The research window changed.'));

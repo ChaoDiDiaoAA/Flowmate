@@ -50,9 +50,13 @@ for (const isolation of [undefined] as const) test
                 evidence: [{ relation: 'supports', ref: { researchId: source.researchId, planId: plan.planId, revision: plan.revision, runId: source.runId,
                     toolCallId: source.toolCallId, sourceSnapshotId: source.sourceSnapshotId, locator: { start: 0, end: prefix.length, quote: prefix } } }],
                 verification: { status: 'supported', reasons: ['The synthetic source explicitly states this condition.'] } } };
-            if (index === 8) reply = { tool: 'save_research_report', args: { answer: 'Usage is metered.', completeness: 'full',
-                sections: [{ title: 'Cost', text: 'Usage is metered.', claimIds: evidence.claims.map(c => c.claimId) }], conflicts: [], limitations: ['Synthetic engineering fixture.'], unresolvedQuestions: [],
-                coverage: [{ questionId: 'cost-1', claimIds: evidence.claims.map(c => c.claimId), status: 'covered', reason: 'Explicit source evidence.' }] } };
+            if (index === 8) {
+                const claimIds = evidence.claims.map(c => c.claimId);
+                const sentence = { text: 'Usage is metered.', citations: claimIds.map(claimId => ({ claimId, evidenceIndex: 0 })) };
+                reply = { tool: 'save_research_report', args: { formatVersion: 2, answer: [sentence], completeness: 'full',
+                    sections: [{ title: 'Cost', sentences: [sentence] }], conflicts: [], limitations: ['Synthetic engineering fixture.'], unresolvedQuestions: [],
+                    coverage: [{ questionId: 'cost-1', claimIds, status: 'covered', reason: 'Explicit source evidence.' }] } };
+            }
         }
         const chunk = (delta: object, finish: string | null = null) => `data: ${JSON.stringify({ id: 'eval-host-fixture', model: 'eval-host-fixture', choices: [{ index: 0, delta, finish_reason: finish }],
             ...(finish ? { usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } } : {}) })}\n\n`;
@@ -115,8 +119,11 @@ for (const isolation of [undefined] as const) test
         expect(scoredResearch.scores.filter(s=>s.metricId.startsWith('DR')&&s.metricId!=='DR06').map(s=>s.value)).toEqual([1,1,1,1,1]);
         expect(frame.blocks.map(b=>b.kind)).toEqual(['claim','report-answer','report-section']);
         const changed={...result,evidence:{...result.evidence,research:structuredClone(result.evidence.research!)}};
-        const changedResearch=changed.evidence.research!.actual as{reports:Array<{sections:Array<{text:string}>}>};
-        changedResearch.reports[0]!.sections[0]!.text+=' An additional unchecked fact.';
+        const changedResearch=changed.evidence.research!.actual as{reports:Array<import('@flowmate/contracts').ResearchReport>};
+        const amended=changedResearch.reports[0]!, section=amended.cited!.sections[0]!;
+        const textAdded='An additional unchecked fact.';
+        section.sentences.push({text:textAdded,citations:section.sentences[0]!.citations});
+        amended.sections[0]!.text+=' '+textAdded;
         const additional=buildResearchFrame({task:researchTask,result:changed,projected:trial.input,judge:null})!;
         expect(additional.blocks.some(b=>b.text.includes('additional unchecked fact'))).toBe(true);
         expect(additional.integrity.valid).toBe(false);

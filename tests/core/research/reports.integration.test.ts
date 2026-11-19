@@ -1,11 +1,11 @@
 import { expect, it } from 'bun:test';
-import { researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
+import { citedSentence, researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
 import type { ResearchClaimBody } from '@flowmate/contracts';
 import { join } from 'node:path';
 import { writeFileSync } from 'node:fs';
 
 async function fixture(alter?: (claim: ResearchClaimBody, bodyPath: string) => ResearchClaimBody,
-  options: { partial?: boolean; failReport?: boolean } = {}) {
+  options: { partial?: boolean; failReport?: boolean; invalidCitation?: boolean; changeSourceBeforeReport?: boolean } = {}) {
   const text = ('Official usage cost is metered. ' + 'More public documentation. '.repeat(190)).slice(0, 4000)
     + 'Metered usage is billed by published usage units.';
   let f!: Awaited<ReturnType<typeof researchFixture>>;
@@ -29,8 +29,10 @@ async function fixture(alter?: (claim: ResearchClaimBody, bodyPath: string) => R
       const task = need(await f.app.queryResearchTask(f.task.researchId));
       const claims = need(await f.app.listResearchClaims({ researchId: task.researchId, planId: task.currentPlanId! })).items;
       const claimIds = claims.map(claim => claim.claimId);
-      return { tool: 'save_research_report', args: { answer: 'Usage cost is metered.',
-        sections: [{ title: 'Cost', text: 'The saved official source states that usage is metered.', claimIds }], completeness: options.partial ? 'partial' : 'full',
+      if (options.changeSourceBeforeReport) writeFileSync(join(f.paths.root, source!.relativePath), text.replace('Official', 'Modified'));
+      return { tool: 'save_research_report', args: { formatVersion: 2, answer: [citedSentence('Usage cost is metered.', claimIds.length ? claimIds : [1], options.invalidCitation ? 2 : 0),
+        citedSentence('Costs depend on published usage units.', claimIds.length ? claimIds : [1], 1)],
+        sections: [{ title: 'Cost', sentences: [citedSentence('The saved official source states that usage is metered.', claimIds.length ? claimIds : [1], 1)] }], completeness: options.partial ? 'partial' : 'full',
         conflicts: [], limitations: ['This engineering fixture does not establish a real deployment recommendation.'], unresolvedQuestions: options.partial ? ['Version-specific pricing is missing.'] : [],
         coverage: [{ questionId: 'cost-1', claimIds, status: options.partial ? 'gap' : 'covered', reason: options.partial
           ? 'Version-specific pricing is missing.' : 'The planned cost condition has supporting evidence.' }] }, id: 'report' };
@@ -43,7 +45,7 @@ async function fixture(alter?: (claim: ResearchClaimBody, bodyPath: string) => R
   const task = need(await f.app.queryResearchTask(f.task.researchId));
   const plan = need(await f.app.queryResearchPlan({ researchId: task.researchId, planId: task.currentPlanId! }));
   const investigation = await f.run(f.request(2, { researchId: task.researchId, phase: 'researching', plan: { planId: plan.planId, revision: plan.revision } }));
-  return { ...f, investigation, text, task: need(await f.app.queryResearchTask(task.researchId)), plan };
+  return { ...f, get app() { return f.app; }, investigation, text, task: need(await f.app.queryResearchTask(task.researchId)), plan };
 }
 
 it('records a coverage gap, reads one bounded supplementary passage and saves its evidence-backed report through the actual SDK', async () => {
@@ -62,15 +64,26 @@ it('records a coverage gap, reads one bounded supplementary passage and saves it
   expect(need(await f.app.listRunToolCalls({ runId: report.runId, sessionId: f.session.sessionId })).items.map(call => call.toolName))
     .toContain('save_research_report');
   expect(f.task.status).toBe('completed');
+  expect(report.cited?.answer).toHaveLength(2);
+  expect(f.requests).toHaveLength(7);
+  const document = need(await f.app.queryResearchReportDocument({ researchId: f.task.researchId, reportId: report.reportId }));
+  expect(document.references.map(reference => [reference.number, reference.evidenceIndex])).toEqual([[1, 0], [2, 1]]);
+  expect(document.references[1]).toMatchObject({ claimId: claim.claimId, source: {
+    sourceSnapshotId: claim.evidence[1]!.ref.sourceSnapshotId, runId: claim.evidence[1]!.ref.runId, toolCallId: claim.evidence[1]!.ref.toolCallId },
+    locator: claim.evidence[1]!.ref.locator });
   const source = claim.evidence[0]!.ref.sourceSnapshotId;
   const evidence = need(await f.app.queryResearchEvidence({ researchId: f.task.researchId, sourceSnapshotId: source, offset: 4000, limit: 600 }));
   expect(evidence.excerpt.quote).toBe(f.text.slice(4000, 4600));
   const requestsBefore = f.requests.length, query = { researchId: f.task.researchId, reportId: report.reportId };
   const exported = need(await f.app.exportResearchReport(query));
+  expect(exported.markdown).toContain('[[1]](#reference-1)'); expect(exported.markdown).toContain('[[2]](#reference-2)');
+  expect(exported.markdown.match(/\[\[2\]\]\(#reference-2\)/g)).toHaveLength(2);
   expect(exported.markdown).toContain('Claim verification'); expect(exported.markdown).toContain(claim.evidence[0]!.ref.locator.quote);
   expect(exported.markdown).toContain(`Run ${claim.evidence[0]!.ref.runId} / ToolCall ${claim.evidence[0]!.ref.toolCallId}`);
   expect(need(await f.app.exportResearchReport(query))).toEqual(exported);
   expect(f.requests.length).toBe(requestsBefore);
+  await f.reopen();
+  expect(need(await f.app.queryResearchReportDocument(query))).toEqual(document);
   await f.run(f.request(3));
   expect(need(await f.app.queryResearchTask(f.task.researchId)).currentReportId).toBe(report.reportId);
   expect(need(await f.app.exportResearchReport(query))).toEqual(exported);
@@ -97,6 +110,17 @@ it('preserves an insufficient claim and a partial report independently of a comp
   const report = need(await f.app.queryResearchReport({ researchId: f.task.researchId, reportId: f.task.currentReportId! }));
   expect(report.completeness).toBe('partial'); expect(report.coverage[0]!.status).toBe('gap');
   expect(report.unresolvedQuestions).toEqual(['Version-specific pricing is missing.']);
+});
+
+it.each([
+  [{ invalidCitation: true }, 'research_evidence_incomplete'],
+  [{ changeSourceBeforeReport: true }, 'research_source_unavailable'],
+] as const)('refuses to save a report with unverifiable references (%o)', async (options, errorCode) => {
+  const f = await fixture(undefined, options);
+  expect(f.task.currentReportId).toBeNull();
+  expect(need(await f.app.listResearchReports({ researchId: f.task.researchId })).items).toEqual([]);
+  expect(need(await f.app.listRunToolCalls({ runId: f.investigation.accepted.runId, sessionId: f.session.sessionId })).items
+    .find(call => call.toolName === 'save_research_report')).toMatchObject({ status: 'failed', errorCode });
 });
 
 it('rejects evidence whose saved body changed before the claim is committed', async () => {

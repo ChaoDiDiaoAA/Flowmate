@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, deferCleanup } from '../../support/resources.ts';
 import { openTestDatabase } from '../../support/database.ts';
 import { openTestDatabase as openDatabase } from '../../support/database.ts';
+import { citedSentence } from '../../support/research.ts';
 import type { Result } from '@flowmate/contracts';
 
 const at = '2026-10-10T00:00:00.000Z';
@@ -53,16 +54,17 @@ function stop(f: ReturnType<typeof fixture>, runId: number) {
 
 it.each([['unknown', 'gap', 'partial', 'research_coverage_invalid', 'coverage'],
   ['cost-1', 'gap', 'full', 'research_evidence_incomplete', 'covered'],
-  ['cost-1', 'covered', 'partial', 'research_coverage_invalid', 'supported']] as const)
+  ['cost-1', 'covered', 'partial', 'input_invalid', 'input']] as const)
   ('reports bounded domain constraints for %s %s %s without changing report completeness', (questionId, status, completeness, code, constraint) => {
     const f=fixture(),planning=run(f,'planning'),plan=need(savePlan(f,planning,call(f,planning,'save_research_plan'))); stop(f,planning);
     const runId=run(f,'researching',plan),toolCallId=call(f,runId,'save_research_report');
-    const result=f.store.research.saveReport({researchId:f.task.researchId,runId,toolCallId,at,report:{answer:'Evidence is incomplete.',
-      sections:[{title:'Cost',text:'No supported claims yet.',claimIds:[]}],completeness,conflicts:[],limitations:[],unresolvedQuestions:[],
+    const body = completeness === 'full' ? [citedSentence('Potential finding.', [1])] : [];
+    const result=f.store.research.saveReport({researchId:f.task.researchId,runId,toolCallId,at,
+      report:{formatVersion:2,answer:body,sections:body.length ? [{title:'Cost',sentences:body}] : [],completeness,conflicts:[],limitations:[],unresolvedQuestions:[],
       coverage:[{questionId,claimIds:[],status,reason:'No supported claims yet.'}]}});
     expect(result).toMatchObject({ok:false,error:{code}});
     if(result.ok)throw new Error('Invalid report unexpectedly committed.');
-    expect(result.error.message).toContain(constraint);expect(result.error.message.length).toBeLessThanOrEqual(4000);
+    if (code !== 'input_invalid') expect(result.error.message).toContain(constraint);expect(result.error.message.length).toBeLessThanOrEqual(4000);
     expect(need(f.store.research.get(f.task.researchId)).currentReportId).toBeNull();
   });
 
@@ -180,12 +182,13 @@ describe('P15 research storage, isolated engineering fixtures', () => {
       .toMatchObject({ ok: false, error: { code: 'research_evidence_incomplete' } });
     const reportCall = call(f, runId, 'save_research_report');
     expect(f.store.research.saveReport({ researchId: f.task.researchId, runId, toolCallId: reportCall,
-      report: { answer: 'No verified coverage.', sections: [{ title: 'Cost', text: 'Unverified.', claimIds: [claim.claimId] }],
+      report: { formatVersion: 2, answer: [citedSentence('Usage is metered.', [claim.claimId])],
+        sections: [{ title: 'Cost', sentences: [citedSentence('Usage is metered.', [claim.claimId])] }],
         completeness: 'partial', conflicts: [], limitations: ['Not verified.'], unresolvedQuestions: ['Cost conditions'],
         coverage: [{ questionId: 'cost-1', claimIds: [claim.claimId], status: 'covered', reason: 'Pretend the question is covered.' }] }, at }))
       .toMatchObject({ ok: false, error: { code: 'research_coverage_invalid' } });
     const report = need(f.store.research.saveReport({ researchId: f.task.researchId, runId, toolCallId: reportCall,
-      report: { answer: 'Evidence is incomplete.', sections: [{ title: 'Cost', text: 'Unverified.', claimIds: [claim.claimId] }],
+      report: { formatVersion: 2, answer: [], sections: [],
         completeness: 'partial', conflicts: [], limitations: ['Not verified.'], unresolvedQuestions: ['Cost conditions'],
         coverage: [{ questionId: 'cost-1', claimIds: [claim.claimId], status: 'gap', reason: 'Pending verification.' }] }, at }));
     expect(need(f.store.research.get(f.task.researchId)).status).toBe('researching');

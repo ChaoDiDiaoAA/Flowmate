@@ -28,16 +28,22 @@ flowchart LR
   Evidence -->|unfinished or failed| Continue[User explicitly continues]
   Continue --> Read
   Evidence -->|acquisition settled| Claims[Claims with evidence and dependencies]
-  Claims --> Report[Full or explicit partial report]
-  Evidence -->|gaps, no active reads| Report
-  Report --> Review[Review and save Markdown]
+  Claims --> Check[Check each sentence citation against saved evidence]
+  Evidence -->|acquisition stopped, no citable findings| Check
+  Check --> Report[Save full or explicit partial report]
+  Report --> Review[Review references and export Markdown or PDF]
 ```
 
 1. Optionally open **Settings → General → Research preferences**, enter the desired evidence or report preferences, and select **Save research preferences**. The default is empty and the text is limited to 8,192 UTF-8 bytes; each research Run captures the saved text and revision. Saving does not start a model call.
 2. Open **Deep Research → New research**, enter the question and optional scope, and import or select authorized local material or parsed documents as needed. Enable **Web search** if the task needs public webpages. Select **Create research**, then **Send** in the linked Assistant to generate a plan. The currently selected invoice is not added automatically.
 3. Inspect the saved Plan's questions, evidence needs, source scope, budget and stop conditions. A plan with steps binds each acquisition to its questions and one selected material, query or public URL. With web search enabled, **Web requests to Tavily** lists the saved plan's search terms, time ranges, result ranks and specified public URLs for review. Use **Revise plan** if necessary, then explicitly select **Confirm plan version** to start investigation. Changing the authorized material selection requires a new research task.
 4. For a plan with steps, inspect **Research steps** and the saved-source links. Local reads, web searches and page extraction share **two** active acquisition slots per task, including reads delegated to `research-investigator` children. This is separate from the limit of four owned children. The parent runs the confirmed Tavily steps and saves Claims and reports. Search tries live fetching first. If the selected rank has no candidate, Flowmate repeats discovery once with the confirmed query, date constraints and rank, then extracts the selected webpage. If a selected search result has no body, Flowmate extracts that URL directly.
-5. Review **Evidence** and **Report**. Claims connect confirmed questions to actual source executions, matching excerpts and dependencies. Web sources retain the body, URL, acquisition time and source date when available. Inspect the saved excerpt or select **Open webpage** to visit the source. A full report also requires every planned step to succeed and the existing coverage/support checks to pass. A partial report can preserve failures and unfinished steps as explicit gaps after active acquisitions stop. Use **Save report** to export the saved report as Markdown.
+5. Open **Report** and choose a version in **Saved report**. Click a marker such as `[1]` to see its source snapshot, exact quotation, UTF-16 character range, acquisition time and Run / ToolCall. Use **View saved passage** to open the text in **Evidence**, **Open Claim** to inspect its supporting or refuting evidence and dependencies, or **Open webpage** for a web source. Web snapshots retain the page text, URL, acquisition time and source date when available.
+6. Choose Markdown or PDF under **Export format**, then select **Save report**. Both formats retain the sentence markers and References appendix. In a PDF, clicking a marker jumps to its entry. Historical reports with section-level citations remain readable and exportable as Markdown. Generate a new report to export PDF.
+
+Every sentence in a new report's answer, conclusions and section body requires a citation to a specific evidence entry on a saved Claim. Before saving, Flowmate checks the Claim and plan, compares the quote with the saved snapshot at the recorded UTF-16 offsets (start inclusive, end exclusive), and checks the acquisition Run / ToolCall IDs against the successfully completed tool call. If a citation is missing or fails these checks, the report is not saved. This check requires no additional model call.
+
+A full report requires successful planned acquisitions and support for the planned questions. Once active acquisitions stop, a partial report can record failed or unfinished steps, limitations, conflicts and unresolved questions separately from the body. If there are no citable findings, the partial report can leave its body empty and record the gaps.
 
 For a plan with steps, the checkpoint displays `pending`, `running`, `succeeded`, `failed` or `interrupted`. Success requires a successful tool receipt, confirmed cleanup and a saved source; a model's statement is not a receipt. Claim saving is blocked while a step remains pending, running or interrupted. A failed step remains visible for diagnosis and prevents a full report until it succeeds.
 

@@ -85,7 +85,7 @@ const closingReads: readonly HostCommand['type'][] = [
   'list_resources', 'read_resource_file', 'query_run_resources', 'read_run_resource_file',
   'query_research_web_status', 'list_research_materials', 'list_research_tasks', 'query_research_task', 'query_research_for_session',
   'query_research_plan', 'query_research_source', 'query_research_evidence', 'query_research_claim',
-  'query_research_report', 'list_research_sources', 'list_research_claims', 'list_research_reports',
+  'query_research_report', 'query_research_report_document', 'list_research_sources', 'list_research_claims', 'list_research_reports',
   'query_run', 'read_workspace', 'query_task_operation', 'list_documents', 'query_document',
   'list_jobs', 'query_job', 'list_job_candidates', 'query_job_candidate', 'list_activity',
   'read_document_page', 'list_document_pages', 'read_document_original', 'query_native_tools',

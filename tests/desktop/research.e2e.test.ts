@@ -52,8 +52,8 @@ test('research restores unfinished steps after relaunch and acquires them only a
       sourcePolicy: policy(), stopConditions: ['Policy is cited or an explicit gap is saved.'], execution,
       steps: [{ id: 'policy-source', questionIds: ['local'], tool: 'read_research_local', input: { artifactId, documentId: null } }] } }
       : index === 3 || index === 6 ? { name: 'read_research_local', args: { artifactId, documentId: null, stepId: index === 3 ? 'wrong-step' : 'policy-source' } }
-      : index === 4 ? { name: 'save_research_report', args: { answer: 'The source still needs acquisition.', completeness: 'partial',
-        sections: [{ title: 'Evidence gap', text: 'The planned source has not been acquired.', claimIds: [] }], conflicts: [],
+      : index === 4 ? { name: 'save_research_report', args: { formatVersion: 2, answer: [], completeness: 'partial',
+        sections: [], conflicts: [],
         limitations: ['Acquisition was rejected because it used the wrong step.'], unresolvedQuestions: ['What does the policy require?'],
         coverage: [{ questionId: 'local', claimIds: [], status: 'gap', reason: 'Acquire the confirmed source step.' }] } } : null;
     const chunk = (delta: object, finish_reason: string | null) => `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
@@ -127,7 +127,10 @@ test('research restores unfinished steps after relaunch and acquires them only a
 
 test('research desktop creates and confirms a plan, reads local evidence, exports and reopens without replay', async ({}, testInfo) => {
   test.setTimeout(90000);
-  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p15-ui-')), text = 'Team policy: deployments must run locally.';
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-p15-ui-'));
+  const finding = '部署必须在本地运行。';
+  const text = 'Team policy: deployments must run locally.\n' + finding + '\n'
+    + '适用于测试环境的部署规范和执行条件。\n'.repeat(185) + '引用末尾保留。';
   let page!: Page, requests = 0, holdNext = false, releaseHeld: () => void = () => {};
   const provider = await createHttpProvider(async request => {
     const body = await request.json() as { tools?: Array<{ function: { name: string } }> };
@@ -157,7 +160,10 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     } else if (index === 7 || index === 9) {
       const claimIds = await page.evaluate(async () => { const tasks = await window.flowmate.listResearchTasks(); if (!tasks.ok) throw new Error(tasks.error.code); const task = tasks.data.items[0]!;
         const claims = await window.flowmate.listResearchClaims({ researchId: task.researchId, planId: task.currentPlanId! }); if (!claims.ok) throw new Error(claims.error.code); return claims.data.items.map(item => item.claimId); });
-      tool = { name: 'save_research_report', arguments: { answer: index === 9 ? 'Updated report: deployment must run locally.' : 'Deployment must run locally.', sections: [{ title: 'Deployment constraint', text, claimIds }],
+      const citations = claimIds.map(claimId => ({ claimId, evidenceIndex: 0 }));
+      tool = { name: 'save_research_report', arguments: { formatVersion: 2,
+        answer: [{ text: index === 9 ? 'Updated report: deployment must run locally.' : 'Deployment must run locally.', citations }],
+        sections: [{ title: 'Deployment constraint', sentences: [{ text: finding, citations }] }],
         completeness: index === 9 ? 'partial' : 'full', conflicts: [], limitations: ['Engineering fixture; no product recommendation is validated.'], unresolvedQuestions: [],
         coverage: [{ questionId: 'local', claimIds, status: 'covered', reason: 'The selected policy supports the deployment constraint.' }] } };
     }
@@ -227,6 +233,16 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await expect(page.locator('.chat-transcript')).toContainText('The research report is saved.', { timeout: 20000 });
     await page.getByRole('button', { name: 'Report', exact: true }).click(); await expect(page.locator('.research-detail')).toContainText('Deployment must run locally.');
     await expect(page.getByRole('button', { name: 'Open Assistant', exact: true })).toBeVisible();
+    const markers = page.getByRole('button', { name: 'Reference 1', exact: true });
+    await expect(markers).toHaveCount(2);
+    await markers.first().click();
+    const reference = page.getByRole('region', { name: 'Selected reference', exact: true });
+    await expect(reference).toBeVisible();
+    await expect(reference).toContainText('Source snapshot 1 · Run');
+    await expect(reference).toContainText(finding);
+    await reference.getByRole('button', { name: 'View saved passage', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Saved source text', exact: true })).toContainText(finding);
+    await page.getByRole('button', { name: 'Report', exact: true }).click();
     await page.getByRole('button', { name: 'Inspect claim 1', exact: true }).click();
     await expect(page.locator('.research-detail')).toContainText('Claim 1 · supported');
     await page.getByRole('button', { name: 'Inspect evidence for claim 1 / source 1', exact: true }).click();
@@ -237,19 +253,32 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.locator('.research-report-footer').scrollIntoViewIfNeeded();
     await page.getByRole('button', { name: 'Save report', exact: true }).click(); await expect(page.getByRole('status')).toContainText(output);
     await expect(page.getByRole('status')).toBeInViewport();
-    expect(readFileSync(output, 'utf8')).toContain(text); expect(readFileSync(output, 'utf8')).toContain('ToolCall');
+    const markdown = readFileSync(output, 'utf8');
+    expect(markdown).toContain(finding); expect(markdown).toContain('引用末尾保留。');
+    expect(markdown).toContain('ToolCall');
+    expect(markdown.match(/\[\[1\]\]\(#reference-1\)/g)).toHaveLength(2);
     await page.screenshot({ path: testInfo.outputPath('research-report.png') });
+    await page.getByLabel('Export format').selectOption('pdf');
+    const pdfOutput = testInfo.outputPath('research-report.pdf');
+    await app.evaluate(({ dialog }, destination) => { dialog.showSaveDialog = (async () => ({ canceled: false, filePath: destination })) as typeof dialog.showSaveDialog; }, pdfOutput);
+    await page.getByRole('button', { name: 'Save report', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText(pdfOutput);
+    const pdf = readFileSync(pdfOutput).toString('latin1');
+    expect(pdf.startsWith('%PDF-')).toBe(true);
+    expect(pdf).toContain('/Subtype /Link');
+    expect(pdf).toContain('/Dest /reference-1');
     // The existing no-overwrite publication failure must preserve both reports and external content.
-    const conflictPath = join(userData, 'different-content.md'); writeFileSync(conflictPath, 'Keep my existing file.');
+    const conflictPath = join(userData, 'different-content.pdf'); writeFileSync(conflictPath, 'Keep my existing file.');
     await app.evaluate(({ dialog }, destination) => { dialog.showSaveDialog = (async () => ({ canceled: false, filePath: destination })) as typeof dialog.showSaveDialog; }, conflictPath);
     await page.getByRole('button', { name: 'Save report', exact: true }).click();
     await expect(page.getByRole('alert')).toBeVisible();
     expect(readFileSync(conflictPath, 'utf8')).toBe('Keep my existing file.');
-    await expect(page.locator('.research-report-body')).toContainText(text);
+    await expect(page.locator('.research-report-body')).toContainText(finding);
     await app.evaluate(({ dialog }) => { dialog.showSaveDialog = (async () => ({ canceled: true, filePath: '' })) as typeof dialog.showSaveDialog; });
     await page.getByRole('button', { name: 'Save report', exact: true }).click();
     await expect(page.getByRole('status')).toContainText('Save cancelled.');
     await expect(page.getByRole('alert')).toHaveCount(0);
+    await page.getByLabel('Export format').selectOption('markdown');
     await page.getByRole('button', { name: 'Ask follow-up', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Close Assistant', exact: true })).toBeVisible();
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('Save an updated partial report using the existing evidence.');
@@ -328,7 +357,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await expect(page.getByRole('button', { name: 'Report', exact: true })).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByRole('button', { name: 'Close Assistant', exact: true })).toBeVisible();
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
-    await expect(page.locator('.research-detail')).toContainText(text);
+    await expect(page.locator('.research-detail')).toContainText(finding);
     expect(requests).toBe(count);
     await page.getByRole('button', { name: 'Chats', exact: true }).click();
     const expandAgain = page.getByRole('button', { name: 'Open Assistant', exact: true }); if (await expandAgain.isVisible()) await expandAgain.click();

@@ -292,6 +292,7 @@ const bridge: DesktopBridge = {
   listResearchSources: input => invokeAssembly('list_research_sources', input),
   listResearchClaims: input => invokeAssembly('list_research_claims', input),
   listResearchReports: input => invokeAssembly('list_research_reports', input),
+  queryResearchReportDocument: input => invokeAssembly('query_research_report_document', input),
   exportResearchReport: input => invokeAssembly('export_research_report', input),
   openResearchSource: input => ipcRenderer.invoke('flowmate:open-research-source', input),
   saveResearchExport: input => ipcRenderer.invoke('flowmate:save-research-export', input),

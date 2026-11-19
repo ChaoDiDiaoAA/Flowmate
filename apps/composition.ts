@@ -18,7 +18,7 @@ import { readProductSettings } from '../packages/core/src/configuration/settings
 import { writeSynced } from '../packages/core/src/skill-hub/resources.ts';
 import { prepareStoreUpgrade } from '../packages/core/src/storage/maintenance.ts';
 import type { PackagedRelease } from '@flowmate/shared';
-import { readResearchEvidence, exportResearchReport } from '@flowmate/core';
+import { readResearchEvidence, exportResearchReport, queryResearchReportDocument } from '@flowmate/core';
 import { ResearchEvidenceRequestSchema } from '@flowmate/contracts';
 import { createFileStore, createInvoiceEditService, createInvoiceFormService, createJobService, createToolExecutor, createWorkspaceService, createWorkspaceVerifier, makeApplication,
   ContextService, RuntimeService, SessionService, openDatabase, createResourceService, createExtensionService, createSubagentTool, createResearchPlanTool, createResearchReadTools, createResearchSynthesisTools, createMemoryRuntime, createMemoryManager } from '@flowmate/core';
@@ -555,6 +555,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       listReports: input => database.data.read(scope => scope.research.listReports(input))
         .catch(() => fail(appError('research_read_failed', 'storage', 'Research reports could not be read.', true))),
     },
+    queryResearchReportDocument: input => queryResearchReportDocument({ database: database.data, files }, input),
     exportResearchReport: async input => await exportResearchReport({ database: database.data, files }, input),
     queryResearchEvidence: async input => {
       const parsed = ResearchEvidenceRequestSchema.safeParse(input);

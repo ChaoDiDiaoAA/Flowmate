@@ -38,6 +38,8 @@ Host messages carry validated request and ownership identities. Notifications wa
 
 For web-enabled Deep Research, the executing Host reads `FLOWMATE_TAVILY_API_KEY` from its startup environment. The Renderer receives configuration status only. After plan confirmation, the parent Agent's research tools use Tavily for approved searches or reads of specified public URLs. A search can extract the public result at the planned rank. The returned page text is saved as untrusted source material, and citations use the existing research steps and source snapshots.
 
+New reports store structured sentences with references to specific saved Claim evidence entries. The Host validates references against the confirmed plan, source snapshots, exact UTF-16 slices and acquisition receipts before committing the report. The Renderer and export paths use the same reference numbering. For PDF, Electron renders the verified report document locally as printable pages with internal links to the References appendix. See [Deep Research](workflows.md#deep-research).
+
 For [cloud Personal Agent Work](personal-agent.md#cloud-workspace), the desktop connects to the restricted SSH Bridge. Authority owns workspace authorization, business persistence and the provider proxy. Runtime owns the native Durable execution and checkpoints. The desktop keeps ownership of window and browser interactions. Use saved business receipts to confirm effects and model observations to inspect execution evidence.
 
 ## Responsibilities

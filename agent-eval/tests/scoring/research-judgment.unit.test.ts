@@ -49,6 +49,13 @@ test('a structurally invalid or unlinked citation cannot be rescued by a Judge s
   const counts=deriveResearchCounts(frame,proof);expect(counts.DR04!.row).toEqual([1,2,0]);expect(counts.DR05!.row).toEqual([1,2,0]);expect(counts.DR06!.row).toEqual([0,1,0]);
  }
 });
+test('a sentence cannot get credit for a reference attached only elsewhere',()=>{
+ const{frame,proof}=fixture();
+ frame.blocks[0]={kind:'report-answer',key:'answer',claimId:null,text:frame.blocks[0]!.text,citationKeys:[frame.links[1]!.key]};
+ const counts=deriveResearchCounts(frame,proof);
+ expect(counts.DR04!.row).toEqual([1,2,0]);
+ expect(counts.DR05!.row).toEqual([1,2,0]);
+});
 test('partial collections preserve known wrong assertions while refusing an invented precision denominator',()=>{
  const{frame,proof}=fixture();frame.complete=false;proof.atoms[0]!.correct=0;proof.atoms[0]!.covered=0;
  const counts=deriveResearchCounts(frame,proof);expect(counts.DR01).toMatchObject({row:null,knownFailure:true,statistics:{numerator:1,denominator:null,missing:null}});

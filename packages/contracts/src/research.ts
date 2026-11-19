@@ -7,7 +7,8 @@ const boundedText = (bytes: number) => z.string().refine(value => value.trim().l
 const label = boundedText(480);
 const key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/);
 const unique = <T>(items: T[]) => new Set(items).size === items.length;
-const ids = z.array(id).max(128).refine(unique, 'Duplicate identities.');
+const maxIdentityListSize = 128;
+const ids = z.array(id).max(maxIdentityListSize).refine(unique, 'Duplicate identities.');
 export const ResearchIntentSchema = z.object({ researchId: id, phase: z.enum(['planning', 'researching']),
   plan: z.object({ planId: id, revision: id }).strict().nullable(), continuation: z.literal(true).optional() }).strict()
   .refine(value => (value.phase === 'planning') === (value.plan === null) && (!value.continuation || value.phase === 'researching'));
@@ -140,9 +141,76 @@ const reportBody = z.object({ answer: boundedText(32000),
   limitations: z.array(boundedText(4000)).max(64), unresolvedQuestions: z.array(boundedText(4000)).max(128),
   coverage: z.array(z.object({ questionId: key, claimIds: ids, status: z.enum(['covered', 'gap', 'conflict']), reason: boundedText(4000) }).strict()).min(1).max(256),
 }).strict();
+const citation = z.object({ claimId: id, evidenceIndex: z.number().int().min(0).max(63) }).strict();
+const sentenceSegmenter = new Intl.Segmenter('und', { granularity: 'sentence' });
+function isResearchSentence(text: string): boolean {
+  // ICU splits common titles before names and can join sentences that start lowercase.
+  const prose = text.trim()
+    .replace(/\b(Mr|Mrs|Ms|Dr|Prof)\.(?=\s+\p{Lu})/gu, '$1')
+    .replace(/\b(Fig|Eq|No|Sec)\.(?=\s+\p{N})/gu, '$1')
+    .replace(/\b(U\.S|U\.K|e\.g|i\.e)\.(?=\s+\p{Ll})/gu, '$1');
+  return !/[\r\n\u0085\u2028\u2029]/.test(text)
+    && [...sentenceSegmenter.segment(prose)].length === 1
+    && !/[.!?。！？][”’"')\]]*\s+[\p{Ll}\p{N}]/u.test(prose);
+}
+const sentence = z.object({ text: boundedText(4000).refine(isResearchSentence, 'Submit one sentence per item.'),
+  citations: z.array(citation).min(1).max(64).refine(rows => unique(rows.map(row => `${row.claimId}:${row.evidenceIndex}`)),
+    'A sentence must cite distinct Claim evidence entries.') }).strict();
+const citedBody = reportBody.extend({
+  formatVersion: z.literal(2),
+  answer: z.array(sentence).max(128),
+  sections: z.array(z.object({ title: label, sentences: z.array(sentence).min(1).max(128) }).strict()).max(32),
+});
+function citedClaimIds(sentences: ReadonlyArray<z.infer<typeof sentence>>): number[] {
+  return [...new Set(sentences.flatMap(item => item.citations.map(ref => ref.claimId)))];
+}
+function checkCitedBody(body: z.infer<typeof citedBody>, ctx: z.RefinementCtx) {
+  if (!unique(body.coverage.map(row => row.questionId)))
+    ctx.addIssue({ code: 'custom', path: ['coverage'], message: 'Each question has one coverage record.' });
+  if (body.completeness === 'full' && (!body.answer.length || !body.sections.length))
+    ctx.addIssue({ code: 'custom', path: ['answer'], message: 'A full report requires a cited answer and at least one cited section.' });
+  if (!body.answer.length && !body.sections.length && body.coverage.every(row => row.status === 'covered'))
+    ctx.addIssue({ code: 'custom', path: ['coverage'], message: 'A report without findings requires an explicit gap or conflict.' });
+  for (const [index, section] of body.sections.entries()) {
+    if (citedClaimIds(section.sentences).length > maxIdentityListSize)
+      ctx.addIssue({ code: 'custom', path: ['sections', index, 'sentences'], message: 'Too many distinct Claim IDs in one section.' });
+  }
+  if ([body.answer, ...body.sections.map(section => section.sentences)].some(rows =>
+    new TextEncoder().encode(rows.map(row => row.text.trim()).join(' ')).length > 32000))
+    ctx.addIssue({ code: 'custom', path: ['sections'], message: 'An answer or section exceeds its text size limit.' });
+  if (new TextEncoder().encode(JSON.stringify(body)).length > 2_000_000)
+    ctx.addIssue({ code: 'custom', path: ['sections'], message: 'The report exceeds its size limit.' });
+}
+export const CitedResearchReportBodySchema = citedBody.superRefine(checkCitedBody);
+export type CitedResearchReportBody = z.infer<typeof CitedResearchReportBodySchema>;
+export type ResearchSentence = z.infer<typeof sentence>;
+export function researchSentences(body: Pick<CitedResearchReportBody, 'answer' | 'sections'>): ResearchSentence[] {
+  return [...body.answer, ...body.sections.flatMap(section => section.sentences)];
+}
+export function researchCitations(body: Pick<CitedResearchReportBody, 'answer' | 'sections'>) {
+  const result = new Map<string, z.infer<typeof citation> & { number: number }>();
+  for (const item of researchSentences(body).flatMap(row => row.citations)) {
+    const key = researchCitationKey(item);
+    if (!result.has(key)) result.set(key, { ...item, number: result.size + 1 });
+  }
+  return result;
+}
+export function researchCitationKey({ claimId, evidenceIndex }: z.infer<typeof citation>): string {
+  return `${claimId}:${evidenceIndex}`;
+}
 export const ResearchReportBodySchema = reportBody.refine(value => unique(value.coverage.map(c => c.questionId)), 'Each question has one coverage record.');
-export const ResearchReportSchema = reportBody.extend({ reportId: id, researchId: id, planId: id, revision: id,
-  runId: id, toolCallId: id, createdAt: z.string().datetime() }).refine(value => unique(value.coverage.map(c => c.questionId)));
+export const ResearchReportSchema = reportBody.extend({ answer: z.union([boundedText(32000), z.literal('')]), sections: reportBody.shape.sections.min(0), reportId: id, researchId: id, planId: id, revision: id,
+  runId: id, toolCallId: id, createdAt: z.string().datetime(),
+  cited: citedBody.pick({ answer: true, sections: true, formatVersion: true }).optional()
+}).refine(value => unique(value.coverage.map(c => c.questionId)) &&
+  (value.cited !== undefined || Boolean(value.answer.trim()) && value.sections.length > 0));
+export function projectCitedResearchReport(record: CitedResearchReportBody) {
+  const { formatVersion, answer, sections, ...facts } = record;
+  return { ...facts, answer: answer.map(item => item.text.trim()).join(' '),
+    sections: sections.map(section => ({ title: section.title, text: section.sentences.map(item => item.text.trim()).join(' '),
+      claimIds: citedClaimIds(section.sentences) })),
+    cited: { formatVersion, answer, sections } };
+}
 export const ResearchPageRequestSchema = z.object({ beforeId: id.optional(), limit: z.number().int().min(1).max(100).default(30) }).strict();
 export const ResearchTaskPageSchema = z.object({ items: z.array(ResearchTaskSchema).max(100), nextBeforeId: id.nullable() }).strict();
 export const ResearchRecordRequestSchema = z.object({ researchId: id, planId: id.optional() }).strict();
@@ -157,6 +225,13 @@ export type ResearchClaimBody = z.infer<typeof ResearchClaimBodySchema>;
 export type Claim = z.infer<typeof ClaimSchema>;
 export type ResearchReportBody = z.infer<typeof ResearchReportBodySchema>;
 export type ResearchReport = z.infer<typeof ResearchReportSchema>;
+export function researchReportClaimIds(report: ResearchReport): number[] {
+  return [...new Set([
+    ...(report.cited ? researchSentences(report.cited).flatMap(item => item.citations.map(citation => citation.claimId))
+      : report.sections.flatMap(section => section.claimIds)),
+    ...report.coverage.flatMap(row => row.claimIds),
+  ])];
+}
 export type ResearchPageRequest = z.input<typeof ResearchPageRequestSchema>;
 export type ResearchTaskPage = z.infer<typeof ResearchTaskPageSchema>;
 
@@ -168,6 +243,7 @@ export const ResearchEvidenceSchema = z.object({ source: SourceSnapshotSchema, e
   nextOffset: z.number().int().min(1).max(2_000_000).nullable() }).strict();
 export const ResearchClaimRequestSchema = z.object({ researchId: id, claimId: id }).strict();
 export const ResearchReportRequestSchema = z.object({ researchId: id, reportId: id }).strict();
+export const SaveResearchExportRequestSchema = ResearchReportRequestSchema.extend({ format: z.enum(['markdown', 'pdf']).optional() });
 export const ResearchSourcesRequestSchema = ResearchPageRequestSchema.extend({ researchId: id });
 export const ResearchClaimsRequestSchema = ResearchSourcesRequestSchema.extend({ planId: id });
 export const ResearchSourcesPageSchema = z.object({ items: z.array(SourceSnapshotSchema).max(100), nextBeforeId: id.nullable() }).strict();
@@ -197,10 +273,25 @@ export const ResearchExportSchema = z.object({ researchId: id, reportId: id,
   markdown: boundedText(2_000_000), bytes: z.number().int().positive() }).strict();
 export type ResearchExport = z.infer<typeof ResearchExportSchema>;
 export const ResearchExportResultSchema = result(ResearchExportSchema);
+export const ResearchReferenceSchema = citation.extend({ number: id, source: SourceSnapshotSchema,
+  relation: z.enum(['supports', 'refutes']), locator: ResearchLocatorSchema });
+export type ResearchReference = z.infer<typeof ResearchReferenceSchema>;
+export const ResearchReportDocumentSchema = z.object({ researchId: id, reportId: id, title: label,
+  report: ResearchReportSchema, references: z.array(ResearchReferenceSchema) }).strict()
+  .refine(({ report, researchId, reportId, references }) => {
+    if (!report.cited || researchId !== report.researchId || reportId !== report.reportId) return false;
+    const expected = [...researchCitations(report.cited).values()];
+    return expected.length === references.length && references.every((item, i) =>
+      item.number === expected[i]!.number && researchCitationKey(item) === researchCitationKey(expected[i]!)
+      && item.source.researchId === researchId && item.locator.end <= item.source.characters);
+  }, 'Report references must match every numbered citation in order.');
+export type ResearchReportDocument = z.infer<typeof ResearchReportDocumentSchema>;
+export const ResearchReportDocumentResultSchema = result(ResearchReportDocumentSchema);
 export interface ResearchQueryApi {
   queryResearchWebStatus(): Promise<Result<{ configured: boolean }>>;
   queryResearchForSession(input: z.infer<typeof ResearchSessionRequestSchema>): Promise<Result<ResearchTask | null>>;
   queryResearchEvidence(input: z.input<typeof ResearchEvidenceRequestSchema>): Promise<Result<z.infer<typeof ResearchEvidenceSchema>>>;
+  queryResearchReportDocument(input: z.infer<typeof ResearchReportRequestSchema>): Promise<Result<ResearchReportDocument>>;
   exportResearchReport(input: z.infer<typeof ResearchReportRequestSchema>): Promise<Result<ResearchExport>>;
   importResearchMaterial(input: ImportResearchMaterialRequest): Promise<Result<ResearchMaterial>>;
   listResearchMaterials(input?: ResearchPageRequest): Promise<Result<z.infer<typeof ResearchMaterialsPageSchema>>>;

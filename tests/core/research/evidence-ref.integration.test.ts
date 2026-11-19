@@ -1,5 +1,5 @@
 import { expect, it } from 'bun:test';
-import { researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
+import { citedSentence, researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
 import type { EvidenceRef } from '@flowmate/contracts';
 
 it('explains rejected full report unresolvedQuestions and saves explicit partial within the same budget', async () => {
@@ -19,8 +19,8 @@ it('explains rejected full report unresolvedQuestions and saves explicit partial
                 feedback=String(request.messages.filter(m=>m.role==='tool').at(-1)!.content);
                 reportBeforeCorrection=task.currentReportId;
             }
-            return {tool:'save_research_report',id:index===5?'invalid-full':'explicit-partial',args:{answer:'Usage is metered.',
-                sections:[{title:'Cost',text:'Usage is metered.',claimIds}],completeness:index===5?'full':'partial',conflicts:[],limitations:['Version-specific limits are unknown.'],
+            return {tool:'save_research_report',id:index===5?'invalid-full':'explicit-partial',args:{formatVersion:2,answer:[citedSentence('Usage is metered.',claimIds)],
+                sections:[{title:'Cost',sentences:[citedSentence('Usage is metered.',claimIds)]}],completeness:index===5?'full':'partial',conflicts:[],limitations:['Version-specific limits are unknown.'],
                 unresolvedQuestions:['What version-specific limits apply?'],coverage:[{questionId:'cost-1',claimIds,status:index===5?'covered':'gap',reason:'Version-specific limits are unknown.'}]}};
         }
         return {text:'Inspect saved report facts.'};
@@ -58,7 +58,7 @@ it('reuses exact emoji evidence from a planning Run, corrects one invalid Claim 
         if(index===7){
             const task=need(await f.app.queryResearchTask(f.task.researchId));
             const ids=need(await f.app.listResearchClaims({researchId:task.researchId,planId:task.currentPlanId!})).items.map(c=>c.claimId);
-            return{tool:'save_research_report',id:'partial',args:{answer:'Usage is metered; limits need further evidence.',sections:[{title:'Cost',text:'Usage is metered.',claimIds:ids}],
+            return{tool:'save_research_report',id:'partial',args:{formatVersion:2,answer:[citedSentence('Usage is metered.',ids)],sections:[{title:'Cost',sentences:[citedSentence('Usage is metered.',ids)]}],
                 completeness:'partial',conflicts:[],limitations:['Version-specific limits are unavailable.'],unresolvedQuestions:['What version-specific limits apply?'],
                 coverage:[{questionId:'cost-1',claimIds:ids,status:'gap',reason:'Version-specific conditions remain unknown.'}]}};
         }

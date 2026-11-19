@@ -1,12 +1,12 @@
 import {collectedResearchSchema} from '../adapters/research-evidence.ts';
 import {inspectResearchEvidence} from '../adapters/research-integrity.ts';
 import type {EvaluationContext} from './types.ts';
-import {ResearchTaskSchema,ResearchReportSchema,type EvidenceRef} from '../../../packages/contracts/src/research.ts';
+import {ResearchTaskSchema,ResearchReportSchema,researchReportClaimIds,type ResearchSentence,type EvidenceRef} from '../../../packages/contracts/src/research.ts';
 import type {EvidenceFact} from '../types.ts';
 import {z} from 'zod';
 
 const unavailable:EvidenceFact={present:false,actual:null,source:'Original evidence unavailable'};
-export type ResearchBlock={kind:'claim'|'report-answer'|'report-section';key:string;claimId:number|null;text:string};
+export type ResearchBlock={kind:'claim'|'report-answer'|'report-section';key:string;claimId:number|null;text:string;citationKeys?:string[]};
 export type ResearchLink={key:string;claimId:number|null;evidenceIndex:number|null;ref:EvidenceRef|null;relation:'supports'|'refutes'|'unbound';valid:boolean|null;display:string};
 
 /** Quality-side numbering includes final Report prose; a controller query never proves a model read. */
@@ -20,14 +20,22 @@ export function buildResearchFrame(context:EvaluationContext){
  const inspected=inspectResearchEvidence(evidence,proof),integrity=inspected.actual as{valid:boolean|null;issues:Array<{kind:string;id:number|null;code:string;severity:string}>;
   links:Array<{claimId:number;evidenceIndex:number;valid:boolean|null}>;sourceBindings:Array<{sourceSnapshotId:number;sample:string;file:string}>};
  const data=parsed.data,report=data.reports.find(r=>r.reportId===data.task?.currentReportId);
- const requested=[...new Set(report?[...report.sections.flatMap(s=>s.claimIds),...report.coverage.flatMap(c=>c.claimIds)]:[])].sort((a,b)=>a-b);
+ const requested=(report?researchReportClaimIds(report):[]).sort((a,b)=>a-b);
  const claims=requested.flatMap(id=>data.claims.filter(c=>c.claimId===id));
  const blocks:ResearchBlock[]=claims.map(c=>({kind:'claim',key:'claim:'+c.claimId,claimId:c.claimId,text:c.text}));
  const links:ResearchLink[]=claims.flatMap(c=>c.evidence.map((e,i)=>({key:`claim:${c.claimId}:citation:${i}`,claimId:c.claimId,evidenceIndex:i,ref:e.ref,relation:e.relation,
   valid:integrity.links.find(l=>l.claimId===c.claimId&&l.evidenceIndex===i)?.valid??null,display:e.ref.locator.quote})));
  if(report){
-  blocks.push({kind:'report-answer',key:'report:'+report.reportId+':answer',claimId:null,text:report.answer});
-  blocks.push(...report.sections.map((section,i)=>({kind:'report-section' as const,key:`report:${report.reportId}:section:${i}`,claimId:null,text:section.text})));
+  if (report.cited) {
+   const block=(kind:ResearchBlock['kind'],key:string,sentence:ResearchSentence):ResearchBlock=>({kind,key,claimId:null,text:sentence.text,
+    citationKeys:sentence.citations.map(c=>`claim:${c.claimId}:citation:${c.evidenceIndex}`)});
+   blocks.push(...report.cited.answer.map((sentence,i)=>block('report-answer',`report:${report.reportId}:answer:${i}`,sentence)));
+   blocks.push(...report.cited.sections.flatMap((section,i)=>section.sentences.map((sentence,j)=>
+    block('report-section',`report:${report.reportId}:section:${i}:${j}`,sentence))));
+  } else {
+   blocks.push({kind:'report-answer',key:'report:'+report.reportId+':answer',claimId:null,text:report.answer});
+   blocks.push(...report.sections.map((section,i)=>({kind:'report-section' as const,key:`report:${report.reportId}:section:${i}`,claimId:null,text:section.text})));
+  }
   const inline=new Set<string>();
   for(const block of blocks.filter(b=>b.kind!=='claim'))for(const match of block.text.matchAll(/\[[^\]\n]*\]\(([^)\s]+)\)/g)){
    const address=match[1]!;if(inline.has(address))continue;inline.add(address);
@@ -41,7 +49,7 @@ export function buildResearchFrame(context:EvaluationContext){
   sources:data.sourceTexts.map(s=>({sourceSnapshotId:s.sourceSnapshotId,text:s.text,modelRead:false as const,
    binding:integrity.sourceBindings.find(b=>b.sourceSnapshotId===s.sourceSnapshotId)??null})),
 
-  rule:'Number atomic asserted facts from the ordered original blocks, including new Report facts. Deduplicate semantically equivalent facts across blocks. Split compound assertions; preserve conditions, dates and intermediate entities. Do not treat product verification/full flags or controller source acquisition as independent semantic truth. Report omissions remain missing Gold facts. Unlinked or report-external evidence cannot cover a reported fact.'};
+  rule:'Number atomic asserted facts from the ordered original blocks, including new Report facts. Deduplicate semantically equivalent facts across blocks. Split compound assertions; preserve conditions, dates and intermediate entities. Do not treat product verification/full flags or controller source acquisition as independent semantic truth. Report omissions remain missing Gold facts. When a report block supplies citationKeys, use only those links for its direct factual support. Unlinked or report-external evidence cannot cover a reported fact.'};
 }
 export type ResearchFrame=NonNullable<ReturnType<typeof buildResearchFrame>>;
 

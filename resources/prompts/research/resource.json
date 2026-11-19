@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "kind": "prompt",
   "id": "research",
-  "version": "v3",
+  "version": "v4",
   "bodyFile": "prompt.md",
   "keywords": [
     "research",
@@ -19,7 +19,7 @@
   "files": [
     {
       "path": "prompt.md",
-      "bytes": 2025
+      "bytes": 2620
     }
   ]
 }

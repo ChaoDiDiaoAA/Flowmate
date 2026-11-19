@@ -180,7 +180,7 @@ export type DesktopBridge = import('./diagnostics.ts').DiagnosticsDesktopApi & i
   personalTasks: Omit<import('./personal-agent.ts').PersonalTasksApi, 'resume'>;
   listResources(): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceCatalog>>;
   openResearchSource(input: import('zod').z.infer<typeof import('./research.ts').ResearchSourceRequestSchema>): Promise<import('./runtime.ts').Result<void>>;
-  saveResearchExport(input: import('zod').z.infer<typeof import('./research.ts').ResearchReportRequestSchema>): Promise<import('./runtime.ts').Result<{ cancelled: boolean; destinationPath?: string }>>;
+  saveResearchExport(input: import('zod').z.infer<typeof import('./research.ts').SaveResearchExportRequestSchema>): Promise<import('./runtime.ts').Result<{ cancelled: boolean; destinationPath?: string }>>;
   readResourceFile(input: import('./resources.ts').ResourceFileRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceFilePage>>;
   updateResourceSelection(input: import('./resources.ts').ResourceSelectionRequest): Promise<import('./runtime.ts').Result<import('./resources.ts').ResourceSelectionResult>>;
   queryRunResources(input: import('./resources.ts').RunResourceQuery): Promise<import('./runtime.ts').Result<import('./resources.ts').RunResourceView>>;

@@ -28,16 +28,22 @@ flowchart LR
   Evidence -->|未完成或失败| Continue[用户明确继续]
   Continue --> Read
   Evidence -->|采集已收口| Claims[含证据与依赖的 Claim]
-  Claims --> Report[完整或明确的部分报告]
-  Evidence -->|有缺口且无活动读取| Report
-  Report --> Review[复核并另存 Markdown]
+  Claims --> Check[按保存的证据逐句核对引用]
+  Evidence -->|采集已停止且无可引用结论| Check
+  Check --> Report[保存完整或明确的部分报告]
+  Report --> Review[复核引用并导出 Markdown 或 PDF]
 ```
 
 1. 可先在 **Settings → General → Research preferences** 填写证据或报告偏好，点击 **Save research preferences**。默认文字为空，最多 8,192 UTF-8 字节；每次研究 Run 捕获当时保存的文字和 revision，保存本身不请求模型。
 2. 打开 **Deep Research → New research**，输入问题与可选范围，按需导入或选择授权本地资料与解析文档。如果需要公开网页，打开 **Web search**。点击 **Create research**，再在关联 Assistant 中 **Send** 生成计划。当前发票不会被自动加入研究。
 3. 检查已保存 Plan 的问题、证据需求、来源范围、预算和停止条件。开启联网时，**Web requests to Tavily** 会列出搜索词、时间范围、排名和指定的公开网址。带步骤的计划将每次采集关联到问题及一个选定材料、搜索查询或公开网址。需要时使用 **Revise plan**，再明确点击 **Confirm plan version** 启动调查。改变授权材料选择需要新建研究任务。
 4. 对带步骤的计划，查看 **Research steps** 和已保存来源入口。同一研究任务的父任务与 `research-investigator` 子任务合计最多同时进行 **2 路**来源采集，包括本地读取和 Tavily 搜索或正文提取。两路采集并发与四个子任务的上限分别计算。网页来源保存正文、链接、取证时间和已知的来源日期。父 Agent 执行已确认的 Tavily 步骤。搜索优先实时抓取。指定排名缺少候选时，保留查询、日期条件和排名补查一次，再提取选中网页的正文。当已选搜索结果缺少正文时，直接提取该网址。可将适合的独立问题委派给只读调查子代理，综合与保存由父 Agent 负责。
-5. 查看 **Evidence / Report**。Claim 将确认的问题与实际来源执行、匹配原文和依赖关联。对网页来源，可查看已保存的原文或用 **Open webpage** 打开原网页。完整报告还要求计划步骤全部成功，并满足既有覆盖与支持检查。活动采集停止后，部分报告可将失败和未完成步骤保留为明确缺口。**Save report** 将已保存报告导出为 Markdown。
+5. 打开 **Report**，在 **Saved report** 选择要查看的版本。点击正文中的 `[1]` 等标记，查看来源快照、引用原文、UTF-16 字符区间、采集时间和 Run／ToolCall。点击 **View saved passage** 可在 **Evidence** 中查看对应原文，点击 **Open Claim** 可检查支持或反驳该 Claim 的证据和依赖。网页来源还可用 **Open webpage** 打开原网页。
+6. 在 **Export format** 选择 Markdown 或 PDF，再点击 **Save report**。两种格式都保留逐句标记和 References 附录，PDF 内的编号可跳到对应条目。只有章节级引用的历史报告仍可查看和导出 Markdown，重新生成后可导出 PDF。
+
+新报告的摘要、结论和章节正文，每句话必须引用已保存 Claim 中的一项或多项具体证据。保存时，Flowmate 核对 Claim 和计划归属，比较引用原文与来源快照中对应的 UTF-16 字符区间（含起点、不含终点），并确认采集 Run／ToolCall 对应的工具调用已成功结束。引用缺失或核对失败时不保存报告。该检查不会额外调用模型。
+
+完整报告要求计划内采集步骤全部成功，且证据支持已规划的问题。活动采集停止后，部分报告可在正文之外记录失败或未完成的步骤、局限、冲突和未解决问题。没有可引用的结论时，部分报告可留空正文并明确记录证据缺口。
 
 带步骤计划的 Checkpoint 展示 `pending`、`running`、`succeeded`、`failed` 或 `interrupted`。成功要求工具回执成功、清理已确认且来源已保存；模型自述不等于回执。仍有 pending、running 或 interrupted 步骤时不能保存 Claim。失败步骤保留供排查，在其成功前不能保存完整报告。
 

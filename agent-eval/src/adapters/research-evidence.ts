@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { HostClient } from '../../../apps/desktop/main/host-client.ts';
 import { ResearchSessionResultSchema, ResearchPlanResultSchema, ResearchSourcesResultSchema, ResearchClaimsResultSchema,
     ResearchReportsResultSchema, ResearchEvidenceResultSchema, ResearchTaskSchema, ResearchPlanSchema, SourceSnapshotSchema,
-    ClaimSchema, ResearchReportSchema } from '../../../packages/contracts/src/research.ts';
+    ClaimSchema, ResearchReportSchema, researchReportClaimIds } from '../../../packages/contracts/src/research.ts';
 import type { EvidenceFact } from '../types.ts';
 
 type HostReader = Pick<HostClient, 'request'>;
@@ -76,7 +76,7 @@ export async function collectResearchEvidence(host: HostReader, input: { session
         for (const report of actual.reports) {
             if (!actual.plans.some(p => p.planId === report.planId && p.revision === report.revision)) throw new Error('Report Plan version missing');
             const claimIds = new Set(actual.claims.filter(c => c.planId === report.planId && c.revision === report.revision).map(c => c.claimId));
-            if ([...report.sections, ...report.coverage].some(section => section.claimIds.some(id => !claimIds.has(id)))) throw new Error('Report references unavailable Claims');
+            if (researchReportClaimIds(report).some(id => !claimIds.has(id))) throw new Error('Report references unavailable Claims');
         }
         for (const snapshot of actual.sources) {
             let offset = 0, text = '';

@@ -15,7 +15,8 @@ export type ResearchProof = z.infer<typeof researchProofSchema>;
 
 const id=z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const researchFrameSchema=z.object({contract:z.literal('flowmate-research-frame/v1'),complete:z.boolean(),reportId:id.nullable(),
- blocks:z.array(z.object({kind:z.enum(['claim','report-answer','report-section']),key:z.string().min(1),claimId:id.nullable(),text:z.string()}).strict()),
+ blocks:z.array(z.object({kind:z.enum(['claim','report-answer','report-section']),key:z.string().min(1),claimId:id.nullable(),
+  text:z.string(),citationKeys:z.array(z.string().min(1)).optional()}).strict()),
  links:z.array(z.object({key:z.string().min(1),claimId:id.nullable(),evidenceIndex:z.number().int().nonnegative().nullable(),ref:EvidenceRefSchema.nullable(),
   relation:z.enum(['supports','refutes','unbound']),valid:z.boolean().nullable(),display:z.string()}).strict()),
  integrity:z.object({valid:z.boolean().nullable(),issues:z.array(z.object({kind:z.string(),id:id.nullable(),code:z.string(),severity:z.enum(['invalid','unknown'])}).passthrough()),
@@ -55,7 +56,10 @@ export function deriveResearchCounts(input:unknown,proof:Pick<ResearchProof,'ato
  }
  const effectiveLinks=proof.links.map((link,i)=>{
   if(![0,1,2].includes(link.state)||link.atom< -1||link.atom>=proof.atoms.length||!Number.isInteger(link.atom)||link.atom===-1&&link.state===1)throw Error('Research citation target is invalid');
-  const original=frame.links[i]!,state=original.valid===false||original.relation==='unbound'?0:original.valid===null?link.state===0?0:2:link.state;
+  const original=frame.links[i]!;
+  const citationKeys=link.atom===-1?undefined:frame.blocks[proof.atoms[link.atom]!.block]!.citationKeys;
+  const invalid=original.valid===false||original.relation==='unbound'||(citationKeys!==undefined&&!citationKeys.includes(original.key));
+  const state=invalid?0:original.valid===null?link.state===0?0:2:link.state;
   return{...link,state,original};
  });
  const uniqueLinks=[...new Map(effectiveLinks.map(link=>[JSON.stringify([link.atom,link.original.ref??link.original.display]),link])).values()];

@@ -1,45 +1,91 @@
 import { setImmediate } from 'node:timers/promises';
-import { appError, fail, ok, ResearchReportRequestSchema, ResearchExportSchema } from '@flowmate/contracts';
-import type { Claim, ResearchExport, Result } from '@flowmate/contracts';
+import { appError, fail, ok, ResearchReportRequestSchema, ResearchExportSchema, ResearchReportDocumentSchema, researchCitationKey, researchCitations } from '@flowmate/contracts';
+import type { Claim, ResearchExport, ResearchReportDocument, ResearchReference, ResearchSentence, Result } from '@flowmate/contracts';
 import { readResearchEvidence, type ResearchEvidenceOptions } from './synthesis-tools.ts';
 
-export async function exportResearchReport(options: ResearchEvidenceOptions, raw: unknown): Promise<Result<ResearchExport>> {
+async function loadReportProof(options: ResearchEvidenceOptions, raw: unknown) {
   const input = ResearchReportRequestSchema.safeParse(raw);
   if (!input.success) return fail(appError('input_invalid', 'input', 'Report export request is invalid.'));
   const loaded = await options.database.read(store => {
     const report = store.research.getReport(input.data); if (!report.ok) return report;
     const task = store.research.get(input.data.researchId); if (!task.ok) return task;
-    return ok({ report: report.data, task: task.data });
+    if (!report.data.cited) return ok({ report: report.data, task: task.data, policy: task.data.sourcePolicy });
+    const plan = store.research.getPlan({ researchId: input.data.researchId, planId: report.data.planId });
+    return plan.ok ? ok({ report: report.data, task: task.data, policy: plan.data.body.sourcePolicy }) : plan;
   }).catch(() => fail(appError('research_read_failed', 'storage', 'Research storage is unavailable.', true)));
   if (!loaded.ok) return loaded;
-  const { report, task } = loaded.data, claims = new Map<number, Claim>(), passages: string[] = [];
-  const pending = report.sections.flatMap(section => section.claimIds).concat(report.coverage.flatMap(row => row.claimIds));
+  const { report, task, policy } = loaded.data, claims = new Map<number, Claim>(), passages: string[] = [];
+  const numbers = report.cited ? researchCitations(report.cited) : new Map<string, { claimId: number; evidenceIndex: number; number: number }>();
+  const references: ResearchReference[] = [];
+  const pending = [...numbers.values()].map(item => item.claimId)
+    .concat(report.sections.flatMap(section => section.claimIds), report.coverage.flatMap(row => row.claimIds));
   while (pending.length) {
     const claimId = pending.pop()!; if (claims.has(claimId)) continue;
     if (claims.size >= 512) return fail(appError('research_evidence_limit', 'tool', 'The report evidence graph exceeds the export limit.'));
     const claim = await options.database.read(store => store.research.getClaim({ researchId: report.researchId, claimId }))
       .catch(() => fail(appError('research_read_failed', 'storage', 'Research storage is unavailable.', true)));
     if (!claim.ok) return claim;
-    if (claim.data.planId !== report.planId) return fail(appError('research_identity_conflict', 'tool', 'Report evidence belongs to another plan.'));
+    if (claim.data.planId !== report.planId || claim.data.revision !== report.revision) return fail(appError('research_identity_conflict', 'tool', 'Report evidence belongs to another plan.'));
     claims.set(claimId, claim.data); pending.push(...claim.data.dependencies);
     if (claims.size % 16 === 0) await setImmediate();
-    for (const { ref, relation } of claim.data.evidence) {
+    for (const [evidenceIndex, { ref, relation }] of claim.data.evidence.entries()) {
+      if (ref.researchId !== report.researchId || ref.planId !== report.planId || ref.revision !== report.revision)
+        return fail(appError('research_identity_conflict', 'tool', 'Report evidence belongs to another plan.'));
       const evidence = await readResearchEvidence(options, { researchId: report.researchId, sourceSnapshotId: ref.sourceSnapshotId,
-        offset: ref.locator.start, limit: Math.min(4000, ref.locator.end - ref.locator.start) }, task.sourcePolicy);
+        offset: ref.locator.start, limit: Math.min(4000, ref.locator.end - ref.locator.start) }, policy, report.cited ? report.planId : undefined);
       if (!evidence.ok) return evidence;
       const source = evidence.data.source;
       const body = await options.files.readResearchSource(source); if (!body.ok) return body;
       if (source.runId !== ref.runId || source.toolCallId !== ref.toolCallId
         || body.data.slice(ref.locator.start, ref.locator.end) !== ref.locator.quote)
         return fail(appError('research_evidence_mismatch', 'tool', 'The report quote cannot be verified against saved evidence.'));
+      if (report.cited) {
+        const selected = numbers.get(researchCitationKey({ claimId, evidenceIndex }));
+        if (selected) references.push({ ...selected, relation, source, locator: ref.locator });
+        continue;
+      }
       const address = source.kind === 'web' ? `<${new URL(source.address).href}>` : source.address;
       const quotation = ref.locator.quote.split(source.kind === 'web' ? /\r\n?|\n/ : '\n').map(line => `${source.kind === 'web' ? '    ' : '> '}${line}`).join('\n');
       const title = source.kind === 'web' ? source.title.replace(/\s+/g, ' ').replace(/[\\`*_{}\[\]()#+\-.!<>|]/g, '\\$&') : source.title;
       passages.push(`### Claim ${claimId} / Source ${source.sourceSnapshotId} (${relation})\n\n${title}\n\n${address}\n\nFetched: ${source.fetchedAt}; ${source.kind === 'web' ? 'source date' : 'published'}: ${source.publishedAt ?? 'unknown'}\n\nRun ${source.runId} / ToolCall ${source.toolCallId}; offsets ${ref.locator.start}–${ref.locator.end}\n\n${quotation}`);
     }
   }
+  if (references.length !== numbers.size)
+    return fail(appError('research_evidence_incomplete', 'tool', 'A selected citation is missing.'));
+  references.sort((left, right) => left.number - right.number);
+  return ok({ task, report, claims, passages, numbers, references });
+}
+
+export async function queryResearchReportDocument(options: ResearchEvidenceOptions, raw: unknown): Promise<Result<ResearchReportDocument>> {
+  const proof = await loadReportProof(options, raw);
+  if (!proof.ok) return proof;
+  const { task, report, references } = proof.data;
+  if (!report.cited)
+    return fail(appError('research_pdf_legacy', 'input', 'Create a report with sentence citations to export PDF.'));
+  const document = ResearchReportDocumentSchema.safeParse({ researchId: report.researchId, reportId: report.reportId,
+    title: task.title, report, references });
+  return document.success && Buffer.byteLength(JSON.stringify(document.data)) <= 2_000_000 ? ok(document.data)
+    : fail(appError('research_export_too_large', 'storage', 'The report document exceeds the export limit.'));
+}
+
+const markdownText = (text: string) => text.replace(/[\\`*_{}\[\]()#+!<>|]/g, '\\$&').replace(/^(\d+)\.(?=\s)/, '$1\\.');
+export async function exportResearchReport(options: ResearchEvidenceOptions, raw: unknown): Promise<Result<ResearchExport>> {
+  const proof = await loadReportProof(options, raw);
+  if (!proof.ok) return proof;
+  const { task, report, claims, passages, numbers, references } = proof.data;
+  const citedText = (sentences: ResearchSentence[]) => sentences.map(sentence =>
+    markdownText(sentence.text.trim()) + sentence.citations.map(citation => {
+      const number = numbers.get(researchCitationKey(citation))!.number;
+      return ` [[${number}]](#reference-${number})`;
+    }).join('')).join(' ');
+  const answer = report.cited ? citedText(report.cited.answer) : report.answer;
+  const sections = report.cited ? report.cited.sections.map(section =>
+    `## ${markdownText(section.title)}\n\n${citedText(section.sentences)}`).join('\n\n')
+    : report.sections.map(section => `## ${section.title}\n\n${section.text}\n\nClaims: ${section.claimIds.join(', ') || 'none'}`).join('\n\n');
+  const referencesText = references.map(({ number, claimId, relation, source, locator }) =>
+    `### Reference ${number}\n\nClaim ${claimId} (${relation}) · Source snapshot ${source.sourceSnapshotId}\n\n${markdownText(source.title)}\n\n${source.kind === 'web' ? '<' + new URL(source.address).href + '>' : markdownText(source.address)}\n\nFetched: ${source.fetchedAt} · Source date: ${source.publishedAt ?? 'unknown'}\n\nRun ${source.runId} / ToolCall ${source.toolCallId} · UTF-16 offsets [${locator.start}, ${locator.end})\n\n${locator.quote.split(/\r\n?|\n/).map(line => '    ' + line).join('\n')}`);
   const list = (items: string[]) => items.length ? items.map(item => `- ${item}`).join('\n') : 'None recorded.';
-  const markdown = `# ${task.title}\n\nResearch ${report.researchId}; report ${report.reportId}; plan ${report.planId} revision ${report.revision}; saved ${report.createdAt}\n\nCompleteness: ${report.completeness}. Verification records show the Agent judgment and its evidence; they do not guarantee every conclusion is true.\n\n${report.answer}\n\n${report.sections.map(section => `## ${section.title}\n\n${section.text}\n\nClaims: ${section.claimIds.join(', ') || 'none'}`).join('\n\n')}\n\n## Coverage\n\n${report.coverage.map(row => `- ${row.questionId}: ${row.status}; claims ${row.claimIds.join(', ') || 'none'}; ${row.reason}`).join('\n')}\n\n## Conflicts\n\n${list(report.conflicts)}\n\n## Limitations\n\n${list(report.limitations)}\n\n## Unresolved questions\n\n${list(report.unresolvedQuestions)}\n\n## Claim verification\n\n${[...claims.values()].map(claim => `### Claim ${claim.claimId}: ${claim.verification.status}\n\n${claim.text}\n\n${list(claim.verification.reasons)}\n\nDependencies: ${claim.dependencies.join(', ') || 'none'}`).join('\n\n')}\n\n## Evidence\n\n${passages.join('\n\n')}\n`;
+  const markdown = `# ${report.cited ? markdownText(task.title) : task.title}\n\nResearch ${report.researchId}; report ${report.reportId}; plan ${report.planId} revision ${report.revision}; saved ${report.createdAt}\n\nCompleteness: ${report.completeness}. Verification records show the Agent judgment and its evidence; they do not guarantee every conclusion is true.\n\n${answer}\n\n${sections}\n\n## Coverage\n\n${report.coverage.map(row => `- ${row.questionId}: ${row.status}; claims ${row.claimIds.join(', ') || 'none'}; ${row.reason}`).join('\n')}\n\n## Conflicts\n\n${list(report.conflicts)}\n\n## Limitations\n\n${list(report.limitations)}\n\n## Unresolved questions\n\n${list(report.unresolvedQuestions)}\n\n## Claim verification\n\n${[...claims.values()].map(claim => `### Claim ${claim.claimId}: ${claim.verification.status}\n\n${claim.text}\n\n${list(claim.verification.reasons)}\n\nDependencies: ${claim.dependencies.join(', ') || 'none'}`).join('\n\n')}\n\n## ${report.cited ? 'References' : 'Evidence'}\n\n${(report.cited ? referencesText : passages).join('\n\n')}\n`;
   const value = ResearchExportSchema.safeParse({ researchId: report.researchId, reportId: report.reportId,
     filename: `research-${report.researchId}-report-${report.reportId}.md`, markdown, bytes: Buffer.byteLength(markdown) });
   return value.success ? ok(value.data) : fail(appError('research_export_too_large', 'storage', 'The report exceeds the Markdown export limit.'));

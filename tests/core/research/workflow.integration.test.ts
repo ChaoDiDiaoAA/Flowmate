@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { ToolExecutionFailure, appError } from '@flowmate/contracts';
-import { researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
+import { citedSentence, researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
 
 it('tracks real step receipts, retains a failed source write and reuses only successful acquisition on continue', async () => {
   let failed = true;
@@ -66,7 +66,7 @@ it('rejects duplicate in-flight and unknown steps without publishing duplicate s
 });
 
 it('gates claims and full reports on acquisition while preserving an explicit partial checkpoint', async () => {
-  const partial = { answer: 'Acquisition is unfinished.', sections: [{ title: 'Gap', text: 'The planned source is pending.', claimIds: [] }],
+  const partial = { formatVersion: 2, answer: [], sections: [],
     completeness: 'partial', conflicts: [], limitations: ['The planned source is pending.'], unresolvedQuestions: ['What costs apply?'],
     coverage: [{ questionId: 'cost-1', claimIds: [], status: 'gap', reason: 'The source is pending.' }] };
   const f = await researchFixture((_request, index) => {
@@ -74,7 +74,7 @@ it('gates claims and full reports on acquisition while preserving an explicit pa
       steps: [{ id: 'local', questionIds: ['cost-1'], tool: 'read_research_local', input: { artifactId: f.task.sourcePolicy.artifactIds[0], documentId: null } }] } };
     if (index === 3) return { tool: 'save_research_claim', id: 'early-claim', args: { questionId: 'cost-1', text: 'Unverified cost.', dependencies: [], evidence: [],
       verification: { status: 'insufficient', reasons: ['Source pending.'] } } };
-    if (index === 4) return { tool: 'save_research_report', id: 'early-full', args: { ...partial, completeness: 'full' } };
+    if (index === 4) return { tool: 'save_research_report', id: 'early-full', args: { ...partial, answer: [citedSentence('The source supports a conclusion.', [1])], sections: [{ title: 'Findings', sentences: [citedSentence('The source supports a conclusion.', [1])] }], completeness: 'full' } };
     if (index === 5) return { tool: 'save_research_report', id: 'partial', args: partial };
     return { text: 'The partial checkpoint preserves the gap.' };
   }, undefined, { material: 'Unacquired evidence.' });

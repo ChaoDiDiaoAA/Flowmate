@@ -13,7 +13,7 @@ The primary development and packaging target is Windows x64. Local-first describ
 | Need | User path | Reviewable result |
 |---|---|---|
 | Ask about supplied information | Main conversation via New chat or saved chat, selected materials or working directory, Send | Conversation history, actual tool records and context basis |
-| Investigate a question across local and optional public web sources | Deep Research, plan, user confirmation, step acquisition and explicit continuation | Saved step/source facts, Claims, full or partial report with gaps |
+| Investigate a question across local and optional public web sources | Deep Research, plan, user confirmation, step acquisition and explicit continuation | Saved sources and Claims, full or partial report with sentence citations, Markdown or PDF export |
 | Extract and check an invoice | Invoices, existing parsed material, processing, review | Candidate versions, field evidence, explicit acceptance and export |
 | Continue work on an invoice group | Personal Agent, fixed parsed invoices, Todo and explicit review | Work/attempt history and a final disposition for every invoice |
 | Delegate an independent check | AgentSession subagents extension or Personal Agent's bounded Durable `Agent` tool | Owned child execution, actual output and stopping facts |
@@ -27,7 +27,9 @@ The default view is the main conversation; a valid saved page focus can restore 
 
 The workbench provides persistent Sessions; input and Context records; bounded Runs; platform-available Pi file and command tools; opt-in Skills and controlled extensions; research planning and evidence; and invoice review and export. The product distinguishes model output, tool execution, committed writes, delivery to the model, and user acceptance.
 
-Deep Research reads authorized local text, Markdown and registered parsed documents. With Tavily configured, users can enable public web search and page extraction for each new task. Web access defaults to off. Investigation starts after the user confirms the saved plan version. Actual tool receipts and saved sources track progress, and users can explicitly continue eligible unfinished steps. Web citations include excerpts, links, acquisition time and the source date when available, including in Markdown exports. A partial report may retain unresolved questions. Evidence location checks do not establish that an inference is semantically correct.
+Deep Research reads authorized local text, Markdown and registered parsed documents. With Tavily configured, users can enable public web search and page extraction for each new task. Web access defaults to off. Investigation starts after the user confirms the saved plan version. Actual tool receipts and saved sources track progress, and users can explicitly continue eligible unfinished steps.
+
+Each sentence in the answer, conclusions and section body of a new report cites saved Claim evidence. Saving requires each citation to resolve to the exact quotation and character range in a source snapshot with a successful acquisition Run / ToolCall receipt. The check requires no separate model judgment. Partial reports can record evidence gaps and unresolved questions. Reports with sentence citations can be exported to Markdown or PDF with the same numbered References. Historical reports retain Markdown export.
 
 AgentSession captures applicable page focus and authorized Workspace references with the input; temporary page state is projected into the model request separately from conversation history. Research preferences are saved explicitly and captured per Run. These layers do not automatically learn permanent user preferences or grant access to a different task's material. See [Agent runtime](agent-runtime.md#context-memory-layers).
 

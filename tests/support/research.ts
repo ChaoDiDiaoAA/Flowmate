@@ -5,7 +5,7 @@ import { createApplication, type ApplicationOptions } from '../../apps/compositi
 import { createFileStore } from '@flowmate/core';
 import { openTestDatabase as openDatabase } from './database.ts';
 import { PiAgentAdapter } from '@flowmate/runtime-pi';
-import type { AgentRunEvent, ProviderConfig, ResearchIntent, Result, SessionInputRequest } from '@flowmate/contracts';
+import type { AgentRunEvent, ProviderConfig, ResearchIntent, ResearchSentence, Result, SessionInputRequest } from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from './resources.ts';
 
 export function researchNeed<T>(result: Result<T>): T { if (!result.ok) throw new Error(JSON.stringify(result.error)); return result.data; }
@@ -14,6 +14,9 @@ export const researchPlan = { question: 'Compare three Agent deployment options.
   sourcePolicy: { web: false, domains: [], artifactIds: [], documentIds: [] },
   stopConditions: ['Each dimension has evidence or an explicit gap.'],
   execution: { budget: { maxModelCalls: 12, maxToolCalls: 24, toolTimeoutMs: 10000 }, timeoutMs: 60000, stopGraceMs: 5000 } };
+export function citedSentence(text: string, claimIds: number[], evidenceIndex = 0): ResearchSentence {
+  return { text, citations: claimIds.map(claimId => ({ claimId, evidenceIndex })) };
+}
 type Request = { tools?: Array<{ function: { name: string } }>; messages: Array<{ role: string; content: unknown }> };
 type ToolReply = { tool: string; args: unknown; id: string; note?: string };
 type Reply = { text: string } | ToolReply | { tools: ToolReply[] };
@@ -44,7 +47,8 @@ export async function researchFixture(respond: (request: Request, index: number)
   }
   const requests: Request[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    const body = await request.json() as Request; requests.push(body);
+    const body = await request.json() as Request;
+    requests.push(body);
     const reply = await respond(body, requests.length);
     const chunk = (delta: object, reason: string | null = null) => `data: ${JSON.stringify({ id: 'research-fixture', model: 'research-fixture',
       choices: [{ index: 0, delta, finish_reason: reason }] })}\n\n`;

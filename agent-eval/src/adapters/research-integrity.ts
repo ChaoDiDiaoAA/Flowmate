@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { isDeepStrictEqual } from 'node:util';
-import { ClaimSchema, ResearchPlanSchema, ResearchReportSchema, SourceSnapshotSchema,
+import { ClaimSchema, ResearchPlanSchema, ResearchReportSchema, researchReportClaimIds, SourceSnapshotSchema,
     ResearchLocatorSchema, EvidenceRefSchema, type ResearchSourcePolicy } from '../../../packages/contracts/src/research.ts';
 import { ToolCallSnapshotSchema } from '../../../packages/contracts/src/tool-evidence.ts';
 import { collectedResearchSchema } from './research-evidence.ts';
@@ -151,9 +151,15 @@ export function inspectResearchEvidence(evidence: EvidenceFact, proof: { runs: E
             const questions = plan?.body.dimensions.flatMap(d => d.questions.map(q => q.id));
             if (questions && (report.coverage.length !== questions.length || report.coverage.some(row => !questions.includes(row.questionId) ||
                 row.claimIds.some(claimId => claims.has(claimId) && claims.get(claimId)!.questionId !== row.questionId)))) add('report', report.reportId, 'report-coverage');
-            const { reportId, researchId, planId, revision, runId, toolCallId, createdAt, ...body } = report;
-            origin('report', report.reportId, report, 'save_research_report', ResearchReportSchema, report, body);
-            const pending = [...report.sections.flatMap(s => s.claimIds), ...report.coverage.flatMap(c => c.claimIds)], seen = new Set<number>();
+            const { reportId, researchId, planId, revision, runId, toolCallId, createdAt, cited, ...body } = report;
+            const input = cited ? { ...body, formatVersion: cited.formatVersion, answer: cited.answer, sections: cited.sections } : body;
+            origin('report', report.reportId, report, 'save_research_report', ResearchReportSchema, report, input);
+            if (cited) for (const sentence of [...cited.answer, ...cited.sections.flatMap(section => section.sentences)])
+                for (const citation of sentence.citations) {
+                    const claim = claims.get(citation.claimId);
+                    if (claim && !claim.evidence[citation.evidenceIndex]) add('report', report.reportId, 'report-citation');
+                }
+            const pending = researchReportClaimIds(report), seen = new Set<number>();
             while (pending.length) {
                 const claimId = pending.pop()!; if (seen.has(claimId)) continue; seen.add(claimId);
                 const claim = claims.get(claimId);

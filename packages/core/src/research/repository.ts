@@ -6,9 +6,9 @@ import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, ResearchTaskSchema, ResearchPlanSchema, ResearchPlanBodySchema, ResearchSourcePolicySchema,
   ResearchRunBindingSchema, ResearchSourceDataSchema, SourceSnapshotSchema, ResearchClaimBodySchema, ClaimSchema,
-  ResearchReportBodySchema, ResearchReportSchema, ResearchPageRequestSchema, ResearchMaterialSchema, RESEARCH_WEB_TOOL_NAMES } from '@flowmate/contracts';
+  CitedResearchReportBodySchema, projectCitedResearchReport, researchSentences, ResearchReportSchema, ResearchPageRequestSchema, ResearchMaterialSchema, RESEARCH_WEB_TOOL_NAMES } from '@flowmate/contracts';
 import type { Result, ResearchSourcePolicy, ResearchTask, ResearchPlanBody, ResearchPlan, ResearchRunBinding, SourceSnapshot,
-  ResearchClaimBody, Claim, ResearchReportBody, ResearchReport, ResearchPageRequest, ResearchTaskPage, ResearchMaterial, ResearchStep } from '@flowmate/contracts';
+  ResearchClaimBody, Claim, CitedResearchReportBody, ResearchReport, ResearchPageRequest, ResearchTaskPage, ResearchMaterial, ResearchStep } from '@flowmate/contracts';
 import type { PublishedArtifact } from '../storage/file-store.ts';
 import { readTransaction } from '../storage/reads.ts';
 import { createSessionRepository } from '../storage/repositories.ts';
@@ -43,7 +43,8 @@ export interface ResearchRepository {
   saveClaim(input: Identity & { claim: ResearchClaimBody }): Result<Claim>;
   getClaim(input: { researchId: number; claimId: number }): Result<Claim>;
   listClaims(input: ResearchPageRequest & { researchId: number; planId: number }): Result<{ items: Claim[]; nextBeforeId: number | null }>;
-  saveReport(input: Identity & { report: ResearchReportBody }): Result<ResearchReport>;
+  validateReport(input: Identity & { report: CitedResearchReportBody }): Result<void>;
+  saveReport(input: Identity & { report: CitedResearchReportBody }): Result<ResearchReport>;
   getReport(input: { researchId: number; reportId: number }): Result<ResearchReport>;
   listReports(input: ResearchPageRequest & { researchId: number }): Result<{ items: ResearchReport[]; nextBeforeId: number | null }>;
 }
@@ -130,10 +131,12 @@ export function createResearchRepository(db: Database): ResearchRepository {
   function decode<K extends Kind>(kind: K, row: RecordRow): Records[K] {
     const common = { researchId: row.research_id, runId: row.run_id, toolCallId: row.tool_call_id, createdAt: row.created_at };
     const body = JSON.parse(row.body_json) as unknown;
+    const cited = kind === 'report' && body && typeof body === 'object' && 'formatVersion' in body
+      ? projectCitedResearchReport(CitedResearchReportBodySchema.parse(body)) : undefined;
     const value = kind === 'plan' ? ResearchPlanSchema.parse({ ...common, planId: row.id, revision: row.revision, body })
       : kind === 'source' ? SourceSnapshotSchema.parse({ ...common, sourceSnapshotId: row.id, ...body as object })
       : kind === 'claim' ? ClaimSchema.parse({ ...common, claimId: row.id, planId: row.plan_id, revision: row.revision, ...body as object })
-      : ResearchReportSchema.parse({ ...common, reportId: row.id, planId: row.plan_id, revision: row.revision, ...body as object });
+      : ResearchReportSchema.parse({ ...common, reportId: row.id, planId: row.plan_id, revision: row.revision, ...(cited ?? body as object) });
     return value as Records[K];
   }
   function record<K extends Kind>(kind: K, researchId: number, id: number): Records[K] {
@@ -144,7 +147,8 @@ export function createResearchRepository(db: Database): ResearchRepository {
   function duplicate<K extends Kind>(kind: K, input: Identity, body: unknown): Records[K] | null {
     const row = db.query(`SELECT * FROM ${tables[kind]} WHERE tool_call_id=?`).get(input.toolCallId) as RecordRow | null;
     if (!row) return null;
-    requireFact(row.research_id === input.researchId && row.run_id === input.runId && isDeepStrictEqual(JSON.parse(row.body_json), body));
+    const stored = JSON.parse(row.body_json);
+    requireFact(row.research_id === input.researchId && row.run_id === input.runId && isDeepStrictEqual(stored, body));
     return decode(kind, row);
   }
   function listRecords<K extends Kind>(kind: K, raw: ResearchPageRequest & { researchId: number; planId?: number }) {
@@ -338,31 +342,13 @@ export function createResearchRepository(db: Database): ResearchRepository {
     }),
     getClaim: input => operation(false, () => record('claim', input.researchId, input.claimId)),
     listClaims: input => operation(false, () => listRecords('claim', input)),
+    validateReport: input => operation(false, () => {
+      checkReport(input, parseInput(CitedResearchReportBodySchema, input.report));
+    }),
     saveReport: input => operation(true, () => {
-      const report = parseInput(ResearchReportBodySchema, input.report), found = duplicate('report', input, report); if (found) return found;
-      const value = execution(input, 'save_research_report', true), plan = currentPlan(value), questions = questionIds(plan);
-      const workflow = readResearchWorkflow(db, input.researchId, plan.planId);
-      requireFact(!workflow?.steps.some(step => step.status === 'running'), 'research_acquisition_running');
-      requireFact(report.completeness !== 'full' || !workflow?.steps.some(step => step.status !== 'succeeded'), 'research_acquisition_incomplete');
-      requireFact(report.coverage.length === questions.length && report.coverage.every(c => questions.includes(c.questionId)), 'research_coverage_invalid',
-        'coverage must contain exactly one record for every confirmed plan questionId, with no missing or unknown questions.');
-      const ids = new Set([...report.sections.flatMap(s => s.claimIds), ...report.coverage.flatMap(c => c.claimIds)]);
-      const claims = new Map([...ids].map(id => [id, record('claim', input.researchId, id)]));
-      requireFact([...claims.values()].every(c => c.planId === plan.planId));
-      requireFact(report.coverage.every(c => c.claimIds.every(id => claims.get(id)!.questionId === c.questionId)), 'research_coverage_invalid',
-        'Each coverage.claimIds entry must reference a saved Claim for that same questionId and confirmed plan.');
-      requireFact(report.coverage.every(c => c.status !== 'covered' || c.claimIds.length > 0
-        && c.claimIds.every(id => claims.get(id)!.verification.status === 'supported')),
-        report.completeness === 'full' ? 'research_evidence_incomplete' : 'research_coverage_invalid',
-        'coverage.status=covered requires non-empty claimIds with every Claim verification.status=supported. Use gap or conflict for unsupported coverage.');
-      if (report.completeness === 'full') {
-        requireFact(report.coverage.every(c => c.status === 'covered' && c.claimIds.length > 0), 'research_evidence_incomplete',
-          'completeness=full requires every planned question coverage.status=covered and non-empty claimIds. Correct the evidence or explicitly submit partial with gaps within the remaining budget.');
-        requireFact([...claims.values()].every(c => c.verification.status === 'supported'), 'research_evidence_incomplete',
-          'completeness=full requires every referenced Claim verification.status=supported. Preserve unsupported findings in an explicit partial report.');
-        requireFact(report.unresolvedQuestions.length === 0, 'research_evidence_incomplete',
-          'completeness=full requires unresolvedQuestions=[]. Resolve the questions with supported evidence or explicitly submit partial with the unresolved questions within the remaining budget.');
-      }
+      const report = parseInput(CitedResearchReportBodySchema, input.report);
+      const found = duplicate('report', input, report); if (found) return found;
+      const plan = checkReport(input, report);
       const row = db.query('INSERT INTO research_reports(research_id,plan_id,revision,run_id,tool_call_id,body_json,created_at) VALUES (?,?,?,?,?,?,?)')
         .run(input.researchId, plan.planId, plan.revision, input.runId, input.toolCallId, JSON.stringify(report), input.at);
       const id = Number(row.lastInsertRowid);
@@ -372,4 +358,35 @@ export function createResearchRepository(db: Database): ResearchRepository {
     getReport: input => operation(false, () => record('report', input.researchId, input.reportId)),
     listReports: input => operation(false, () => listRecords('report', input)),
   };
+
+  function checkReport(input: Identity, report: CitedResearchReportBody) {
+      const value = execution(input, 'save_research_report', true), plan = currentPlan(value), questions = questionIds(plan);
+      const workflow = readResearchWorkflow(db, input.researchId, plan.planId);
+      requireFact(!workflow?.steps.some(step => step.status === 'running'), 'research_acquisition_running');
+      requireFact(report.completeness !== 'full' || !workflow?.steps.some(step => step.status !== 'succeeded'), 'research_acquisition_incomplete');
+      requireFact(report.coverage.length === questions.length && report.coverage.every(c => questions.includes(c.questionId)), 'research_coverage_invalid',
+        'coverage must contain exactly one record for every confirmed plan questionId, with no missing or unknown questions.');
+      if (report.completeness === 'full')
+        requireFact(report.coverage.every(c => c.status === 'covered' && c.claimIds.length > 0), 'research_evidence_incomplete',
+          'completeness=full requires every planned question coverage.status=covered and non-empty claimIds. Correct the evidence or explicitly submit partial with gaps within the remaining budget.');
+      const citations = researchSentences(report).flatMap(sentence => sentence.citations);
+      const ids = new Set([...citations.map(c => c.claimId), ...report.coverage.flatMap(c => c.claimIds)]);
+      const claims = new Map([...ids].map(id => [id, record('claim', input.researchId, id)]));
+      requireFact([...claims.values()].every(c => c.planId === plan.planId && c.revision === plan.revision));
+      requireFact(citations.every(c => claims.get(c.claimId)!.evidence[c.evidenceIndex]), 'research_evidence_incomplete',
+        'Each sentence citation must identify a saved Claim evidence item.');
+      requireFact(report.coverage.every(c => c.claimIds.every(id => claims.get(id)!.questionId === c.questionId)), 'research_coverage_invalid',
+        'Each coverage.claimIds entry must reference a saved Claim for that same questionId and confirmed plan.');
+      requireFact(report.coverage.every(c => c.status !== 'covered' || c.claimIds.length > 0
+        && c.claimIds.every(id => claims.get(id)!.verification.status === 'supported')),
+        report.completeness === 'full' ? 'research_evidence_incomplete' : 'research_coverage_invalid',
+        'coverage.status=covered requires non-empty claimIds with every Claim verification.status=supported. Use gap or conflict for unsupported coverage.');
+      if (report.completeness === 'full') {
+        requireFact([...claims.values()].every(c => c.verification.status === 'supported'), 'research_evidence_incomplete',
+          'completeness=full requires every referenced Claim verification.status=supported. Preserve unsupported findings in an explicit partial report.');
+        requireFact(report.unresolvedQuestions.length === 0, 'research_evidence_incomplete',
+          'completeness=full requires unresolvedQuestions=[]. Resolve the questions with supported evidence or explicitly submit partial with the unresolved questions within the remaining budget.');
+      }
+      return plan;
+  }
 }
