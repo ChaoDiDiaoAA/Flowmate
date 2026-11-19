@@ -132,7 +132,7 @@ import { resolveProductPaths } from '../../../packages/shared/src/paths.ts';
 import { readManagedInvoiceExport } from '../../../packages/core/src/storage/file-store.ts';
 import { publishInvoiceExportCopy } from './invoice-export.ts';
 import { publishExportCopy } from './invoice-export.ts';
-import { ResearchReportRequestSchema, ResearchExportResultSchema } from '@flowmate/contracts';
+import { ResearchReportRequestSchema, ResearchExportResultSchema, ResearchSourceRequestSchema, ResearchSourceResultSchema, isResearchWebUrl } from '@flowmate/contracts';
 import { CloudDesktopController } from './cloud-desktop-controller.ts';
 import { connectCloudSsh } from './cloud-ssh-session.ts';
 import { createHostCloudMaterialExport, uploadCloudMaterial } from './cloud-material-transfer.ts';
@@ -1216,6 +1216,18 @@ function registerIpc(): void {
   handle('flowmate:query-diagnostics', async (_event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Diagnostics takes no arguments.')) : queryDiagnostics());
   handle('flowmate:export-diagnostics', async (event, ...args) => args.length ? fail(appError('input_invalid', 'input', 'Diagnostics export takes no arguments.')) : exportDiagnostics(event));
 
+  handle('flowmate:open-research-source', async (event, raw) => {
+    const input = ResearchSourceRequestSchema.safeParse(raw);
+    if (!input.success) return fail(appError('input_invalid', 'input', 'Research source request is invalid.'));
+    const epoch = transportEpoch;
+    const result = ResearchSourceResultSchema.safeParse(await assemblyIpcQuery('query_research_source', input.data));
+    if (epoch !== transportEpoch || event.sender.isDestroyed() || event.senderFrame !== event.sender.mainFrame)
+      return fail(appError('state_conflict', 'input', 'The research window changed.'));
+    if (!result.success || !result.data.ok || result.data.data.kind !== 'web' || !isResearchWebUrl(result.data.data.address))
+      return fail(appError('research_source_unavailable', 'input', 'The saved webpage address is unavailable.'));
+    try { await shell.openExternal(result.data.data.address); return ok(undefined); }
+    catch { return fail(appError('research_source_unavailable', 'input', 'The webpage could not be opened in the default browser.')); }
+  });
   handle('flowmate:save-research-export', async (event, raw) => {
     const parsed = ResearchReportRequestSchema.safeParse(raw);
     if (!parsed.success) return fail(appError('input_invalid', 'input', 'Report export request is invalid.'));

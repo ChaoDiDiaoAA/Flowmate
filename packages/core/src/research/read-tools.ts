@@ -1,13 +1,17 @@
 import { z } from 'zod';
-import { appError, ToolExecutionFailure, SourceSnapshotSchema, ResearchLocatorSchema, EvidenceRefSchema } from '@flowmate/contracts';
+import { appError, ToolExecutionFailure, SourceSnapshotSchema, ResearchLocatorSchema, EvidenceRefSchema, RESEARCH_WEB_TOOL_NAMES } from '@flowmate/contracts';
 import type { ToolDefinition, ToolCallContext, ProductToolContext, Result, SourceSnapshot } from '@flowmate/contracts';
 import type { DbHandle } from '../storage/database.ts';
 import type { FileStore } from '../storage/file-store.ts';
 import { researchExcerpt, researchEvidenceRef } from './source-text.ts';
 import { checkResearchControl } from './tools.ts';
+import { acquireTavilyPage, type TavilyResearchOptions } from './tavily.ts';
+import type { ResearchStepCall } from './repository.ts';
 
 const usageSchema = z.object({ requestId: z.string().max(256).nullable(), credits: z.number().min(0).nullable() }).strict();
 const bodyReceipt = z.object({ source: SourceSnapshotSchema, excerpt: ResearchLocatorSchema, evidenceRef: EvidenceRefSchema.nullable(), usage: usageSchema }).strict();
+const webInput = z.object({ stepId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/) }).strict();
+const webReceipt = bodyReceipt.extend({ evidenceRef: EvidenceRefSchema });
 const localInput = z.object({ artifactId: z.number().int().positive().nullable(), documentId: z.number().int().positive().nullable(),
   stepId: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/).optional() }).strict();
 
@@ -39,6 +43,7 @@ export function createResearchReadQueue() {
 }
 
 export function createResearchReadTools(options: { database: Pick<DbHandle, 'read' | 'transaction'>; files: FileStore; now: () => string;
+  web?: TavilyResearchOptions;
   readDocument: (documentId: number, context: ProductToolContext) => Promise<Result<{ text: string; artifactId: number; title: string }>> }): ToolDefinition<any, any>[] {
   const run = createResearchReadQueue();
   async function identity(call: ToolCallContext, context: ProductToolContext) {
@@ -53,8 +58,20 @@ export function createResearchReadTools(options: { database: Pick<DbHandle, 'rea
     }).catch(error => { throw error instanceof ToolExecutionFailure ? error
       : new ToolExecutionFailure(appError('research_read_failed', 'storage', 'Research storage is unavailable.', true)); });
   }
-  async function publish(text: string, source: { kind: 'local' | 'document'; address: string; title: string; artifactId: number | null; documentId: number | null },
-    call: ToolCallContext, context: ProductToolContext, usage: z.infer<typeof usageSchema>) {
+  function receipt(binding: Awaited<ReturnType<typeof identity>>['binding'], source: SourceSnapshot, text: string,
+    usage: z.infer<typeof usageSchema> = { requestId: null, credits: null }) {
+    const excerpt = researchExcerpt(text, 0, 4000);
+    if (!excerpt.ok) throw new ToolExecutionFailure(excerpt.error);
+    return { source, excerpt: excerpt.data.excerpt, evidenceRef: researchEvidenceRef(binding, source, excerpt.data.excerpt), usage };
+  }
+  async function reuse(binding: Awaited<ReturnType<typeof identity>>['binding'], source: SourceSnapshot, call: ToolCallContext) {
+    const body = await options.files.readResearchSource(source);
+    if (!body.ok) throw new ToolExecutionFailure(body.error);
+    checkResearchControl(call);
+    return receipt(binding, source, body.data);
+  }
+  async function publish(text: string, source: Pick<SourceSnapshot, 'kind' | 'address' | 'title' | 'artifactId' | 'documentId' | 'publishedAt'>,
+    call: ToolCallContext, context: ProductToolContext, usage?: z.infer<typeof usageSchema>, webTool?: typeof RESEARCH_WEB_TOOL_NAMES[number]) {
     const { binding, toolCallId } = await identity(call, context), at = options.now();
     const published = await options.files.publishResearchSource({ researchId: binding.researchId, toolCallId, text });
     if (!published.ok) throw new ToolExecutionFailure(published.error);
@@ -62,18 +79,49 @@ export function createResearchReadTools(options: { database: Pick<DbHandle, 'rea
     const saved = await options.database.transaction(store => {
       checkResearchControl(call);
       const result = store.research.saveSource({ researchId: binding.researchId, runId: context.runId, toolCallId, at,
-        source: { ...source, ...published.data, fetchedAt: at, publishedAt: null, truncated: false } });
+        webTool, source: { ...source, ...published.data, fetchedAt: at, truncated: false } });
       if (!result.ok) throw new ToolExecutionFailure(result.error);
       store.db.afterCommit?.(() => { confirmed = result.data; });
       return result.data;
     }).catch(error => { if (confirmed !== undefined) return confirmed;
       throw error instanceof ToolExecutionFailure ? error
       : new ToolExecutionFailure(appError('research_write_failed', 'storage', 'Research storage is unavailable.', true)); });
-    const excerpt = researchExcerpt(text, 0, 4000);
-    if (!excerpt.ok) throw new ToolExecutionFailure(excerpt.error);
-    return { source: saved, excerpt: excerpt.data.excerpt, evidenceRef:researchEvidenceRef(binding,saved,excerpt.data.excerpt), usage };
+    return receipt(binding, saved, text, usage);
   }
+  async function bindStep(input: ResearchStepCall, researchId: number, toolCallId: number, call: ToolCallContext, context: ProductToolContext) {
+    return options.database.transaction(store => {
+      checkResearchControl(call);
+      const result = store.research.bindStep({ ...input, researchId, runId: context.runId, toolCallId, at: options.now() });
+      if (!result.ok) throw new ToolExecutionFailure(result.error);
+      return result.data;
+    });
+  }
+  const web = options.web;
+  const webTools: ToolDefinition<z.infer<typeof webInput>, z.infer<typeof webReceipt>>[] = web ? RESEARCH_WEB_TOOL_NAMES.map(name => ({
+    name, version: 'p15-v1', label: name === 'search_research_web' ? 'Search public webpages' : 'Read a public webpage',
+    effect: 'READ', executionMode: 'parallel', inputSchema: webInput, outputSchema: webReceipt,
+    description: name === 'search_research_web'
+      ? 'Run an exact confirmed web search step by stepId and save one live webpage as evidence. Copy its evidenceRef into the claim.'
+      : 'Extract the exact public URL from the confirmed step identified by stepId. Copy its evidenceRef into the claim.',
+    async execute({ stepId }, call, context) {
+      const { binding, toolCallId } = await identity(call, context);
+      const { step, source } = await bindStep({ tool: name, stepId }, binding.researchId, toolCallId, call, context);
+      if (!step || step.tool === 'read_research_local')
+        throw new ToolExecutionFailure(appError('research_step_invalid', 'tool', 'The confirmed web step is unavailable.'));
+      return run(binding.researchId, call, async () => {
+        let data;
+        if (source) data = await reuse(binding, source, call);
+        else {
+          const page = await acquireTavilyPage(web, step, call);
+          data = await publish(page.text, { kind: 'web', title: page.title, address: page.address,
+            artifactId: null, documentId: null, publishedAt: page.publishedAt }, call, context, page.usage, name);
+        }
+        return { ...data, evidenceRef: data.evidenceRef! };
+      });
+    },
+  })) : [];
   return [
+    ...webTools,
     { name: 'read_research_local', version: 'p15-v3', label: 'Read selected research material', effect: 'READ', executionMode: 'parallel',
       description: 'Read one selected local artifact or parsed document; set the other ID to null. For a plan with steps, pass its exact stepId and material parameters. A succeeded step reuses its original source. Saves a body snapshot. In investigation copy the complete returned evidenceRef into claim evidence[].ref; it already has the confirmed plan, original source execution and exact UTF-16 locator. During planning evidenceRef is null; query the saved source after confirmation to get a usable reference.',
       inputSchema: localInput, outputSchema: bodyReceipt,
@@ -85,22 +133,10 @@ export function createResearchReadTools(options: { database: Pick<DbHandle, 'rea
         if (input.documentId !== null
           ? !binding.sourcePolicy.documentIds.includes(input.documentId) || !context.scope.allowedDocumentIds.includes(input.documentId)
           : !binding.sourcePolicy.artifactIds.includes(input.artifactId!) || !context.scope.allowedArtifactIds.includes(input.artifactId!)) return denied();
-        const reusable = await options.database.transaction(store => {
-          checkResearchControl(call);
-          const result = store.research.bindStep({ ...input, researchId: binding.researchId, runId: context.runId, toolCallId, at: options.now() });
-          if (!result.ok) throw new ToolExecutionFailure(result.error);
-          return result.data;
-        });
+        const { source: reusable } = await bindStep({ tool: 'read_research_local', stepId: input.stepId,
+          material: { artifactId: input.artifactId, documentId: input.documentId } }, binding.researchId, toolCallId, call, context);
         return run(binding.researchId, call, async () => {
-          if (reusable) {
-            const body = await options.files.readResearchSource(reusable);
-            if (!body.ok) throw new ToolExecutionFailure(body.error);
-            checkResearchControl(call);
-            const excerpt = researchExcerpt(body.data, 0, 4000);
-            if (!excerpt.ok) throw new ToolExecutionFailure(excerpt.error);
-            return { source: reusable, excerpt: excerpt.data.excerpt, evidenceRef: researchEvidenceRef(binding, reusable, excerpt.data.excerpt),
-              usage: { requestId: null, credits: null } };
-          }
+          if (reusable) return reuse(binding, reusable, call);
           let text: string, title: string, artifactId: number;
           if (input.documentId !== null) {
             const loaded = await options.readDocument(input.documentId, context);
@@ -130,8 +166,7 @@ export function createResearchReadTools(options: { database: Pick<DbHandle, 'rea
             title = artifact.metadata.sourceRecordId;
           }
           return publish(text, { kind: input.documentId === null ? 'local' : 'document', title,
-            address: input.documentId === null ? `artifact:${artifactId}` : `document:${input.documentId}`, artifactId, documentId: input.documentId }, call, context,
-            { requestId: null, credits: null });
+            address: input.documentId === null ? `artifact:${artifactId}` : `document:${input.documentId}`, artifactId, documentId: input.documentId, publishedAt: null }, call, context);
         });
       } },
   ];

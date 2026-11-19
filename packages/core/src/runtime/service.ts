@@ -1,5 +1,5 @@
 import type { ResearchContext, ResearchPlan, ResearchSourcePolicy } from '@flowmate/contracts';
-import { RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES, RESEARCH_PLANNING_SYSTEM_PROMPT, RESEARCH_INVESTIGATION_SYSTEM_PROMPT } from '@flowmate/contracts';
+import { RESEARCH_PLANNING_TOOL_NAMES, RESEARCH_INVESTIGATION_TOOL_NAMES, RESEARCH_WEB_TOOL_NAMES, RESEARCH_PLANNING_SYSTEM_PROMPT, RESEARCH_INVESTIGATION_SYSTEM_PROMPT } from '@flowmate/contracts';
 import { FrozenInputDefinitionsSchema } from '@flowmate/contracts';
 import type { FrozenInputDefinitions } from '@flowmate/contracts';
 import type { InputDefinitions } from '../prompt-templates.ts';
@@ -1181,7 +1181,8 @@ export class RuntimeService {
       if (!required.ok) return required;
       const skillNames = (request.workspace || request.research) && request.goalMode !== 'fill-form'
         ? SKILL_RESOURCE_TOOL_NAMES.filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : [];
-      const activeToolNames = request.research ? [...(request.research.phase === 'planning' ? RESEARCH_PLANNING_TOOL_NAMES : RESEARCH_INVESTIGATION_TOOL_NAMES), ...skillNames]
+      const activeToolNames = request.research ? [...(request.research.phase === 'planning' ? RESEARCH_PLANNING_TOOL_NAMES : RESEARCH_INVESTIGATION_TOOL_NAMES),
+        ...(confirmedPlan?.body.sourcePolicy.web ? RESEARCH_WEB_TOOL_NAMES : []), ...skillNames]
         .filter(name => this.dependencies.tools?.listTools().some(tool => tool.name === name)) : request.workspace ? [...invoiceToolNamesForRun(request.goalMode,
         request.workspace.documentRef !== null, request.workspace.jobId !== null), ...skillNames, ...(request.goalMode === 'fill-form' ? [] : nativeNames)] : [];
       if (delegationConfigured && (!request.research || request.research.phase === 'researching') && request.goalMode !== 'fill-form'

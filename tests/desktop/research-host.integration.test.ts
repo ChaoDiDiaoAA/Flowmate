@@ -34,6 +34,30 @@ it('research imports, task lists and restored reads cross the actual Host withou
   } finally { expect(await client.close()).toMatchObject({ ok: true }); }
 });
 
+it('reports Tavily configuration from the actual Host and gates online task creation', async () => {
+  const key = process.env.FLOWMATE_TAVILY_API_KEY;
+  try {
+    for (const configured of [false, true]) {
+      if (configured) process.env.FLOWMATE_TAVILY_API_KEY = 'synthetic-tavily-host-key';
+      else delete process.env.FLOWMATE_TAVILY_API_KEY;
+      const root = mkdtempSync(join(tmpdir(), 'flowmate-research-web-host-')), client = new HostClient();
+      expect(await client.start(root, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true });
+      try {
+        expect(await client.request({ type: 'query_research_web_status', input: {} })).toEqual({ ok: true, data: { configured } });
+        const session = await client.request({ type: 'create_session', input: { title: 'Web research' } }) as any;
+        expect(session.ok).toBe(true);
+        const task = await client.request({ type: 'create_research_task', input: { sessionId: session.data.sessionId,
+          title: 'Web research', sourcePolicy: { web: true, domains: [], artifactIds: [], documentIds: [] } } });
+        expect(task).toMatchObject(configured ? { ok: true, data: { sourcePolicy: { web: true } } }
+          : { ok: false, error: { code: 'research_web_unconfigured' } });
+      } finally { expect(await client.close()).toMatchObject({ ok: true }); }
+    }
+  } finally {
+    if (key === undefined) delete process.env.FLOWMATE_TAVILY_API_KEY;
+    else process.env.FLOWMATE_TAVILY_API_KEY = key;
+  }
+});
+
 it('recovers an interrupted research Run after an actual Host crash without replaying the model request', async () => {
   const root = mkdtempSync(join(tmpdir(), 'flowmate-research-crash-')), client = new HostClient();
   let requests = 0, release!: () => void;

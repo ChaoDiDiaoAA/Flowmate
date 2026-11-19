@@ -16,7 +16,7 @@ If evidence is missing, ask for the gap rather than a guessed fact. For independ
 
 ## Deep Research
 
-Research currently operates on selected local `.txt`/`.md` material and registered parsed documents. It does not perform online search or webpage extraction and needs no Tavily key.
+Research reads selected local `.txt` and `.md` material and registered parsed documents. **Web search** defaults to off for each new task. Set `FLOWMATE_TAVILY_API_KEY` in the environment of the Host that runs the research and restart it. Desktop local mode inherits the value from the desktop launcher. WinSW reads it from the Windows service startup environment. Review the queries, time ranges and public URLs before confirming the plan. Search and page extraction save source text, URLs and acquisition times for citations. Tavily tries live fetching first. If the selected rank has no result, Flowmate repeats discovery once with the confirmed query and date constraints, then extracts the selected webpage.
 
 ```mermaid
 flowchart LR

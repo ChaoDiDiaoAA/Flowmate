@@ -14,6 +14,31 @@ function environment(userData: string) {
   return env;
 }
 
+test('desktop web search defaults off and can be enabled with the Host key', async () => {
+  const userData = await mkdtemp(join(tmpdir(), 'flowmate-research-web-ui-'));
+  const app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'),
+    args: [join(root, 'out/main/index.js')], env: { ...environment(userData), FLOWMATE_TAVILY_API_KEY: 'synthetic-tavily-desktop-key' }, timeout: 30000 });
+  try {
+    const page = await app.firstWindow();
+    await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
+    await page.getByRole('button', { name: 'New research', exact: true }).click();
+    const web = page.getByRole('switch', { name: 'Web search' });
+    await expect(web).toBeEnabled();
+    await expect(web).not.toBeChecked();
+    await web.check();
+    await web.uncheck();
+    await expect(web).not.toBeChecked();
+    await web.check();
+    await page.getByLabel('Research question', { exact: true }).fill('Find current deployment costs');
+    await page.getByRole('button', { name: 'Create research', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Find current deployment costs', exact: true })).toBeVisible();
+    expect(await page.evaluate(() => window.flowmate.listResearchTasks())).toMatchObject({ ok: true,
+      data: { items: [{ sourcePolicy: { web: true } }] } });
+    await page.getByRole('button', { name: 'New research', exact: true }).click();
+    await expect(web).not.toBeChecked();
+  } finally { await closeDesktopFixture(app, userData); }
+});
+
 test('research restores unfinished steps after relaunch and acquires them only after Continue', async () => {
   test.setTimeout(90000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-research-checkpoint-ui-'));
@@ -168,6 +193,8 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     const newResearch = page.getByRole('button', { name: 'New research', exact: true }); await newResearch.focus(); await newResearch.press('Enter');
     await expect(page.getByRole('button', { name: 'Open Assistant', exact: true })).toBeVisible();
     await expect(page.getByLabel('Research question', { exact: true })).toBeFocused();
+    await expect(page.getByRole('switch', { name: 'Web search' })).toBeDisabled();
+    await expect(page.getByText('Set FLOWMATE_TAVILY_API_KEY', { exact: false })).toBeVisible();
     await expect(page.getByRole('complementary', { name: 'Research list', exact: true })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Create research', exact: true })).toBeDisabled();
     await page.getByLabel('Research question', { exact: true }).fill('Compare Agent deployments using team constraints');

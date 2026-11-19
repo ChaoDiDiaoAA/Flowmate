@@ -38,7 +38,9 @@ export async function createServiceOwner(input: { installationFile: string; runt
   const installation = await readServiceInstallation(input); if (!installation.ok) return installation;
   const saved = installation.data;
   const layout = await resolveServiceRuntime(saved); if (!layout.ok) return layout;
-  // Set SDK paths before importing its module; inherited product/evaluation keys are never a service authority.
+  // Only the research provider receives its service startup credential after the environment is scrubbed.
+  const tavilyApiKey = process.env.FLOWMATE_TAVILY_API_KEY?.trim() || process.env.TAVILY_API_KEY;
+  // Set SDK paths before importing its module; inherited model/evaluation keys are never a service authority.
   const allowed = new Set(['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP',
     'WINDIR', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'PI_OFFLINE']);
   for (const name of Object.keys(process.env)) if (!allowed.has(name)) delete process.env[name];
@@ -287,7 +289,7 @@ export async function createServiceOwner(input: { installationFile: string; runt
       return createCredentialStore(join(saved.dataRoot, 'security/service-memory-credentials', reference + '.json'), storage);
     };
     const created = await createProductCommandDispatcher({ userDataRoot: saved.dataRoot, runtimeRoot: saved.runtimeRoot,
-      invoiceSourceRoot: layout.data.runtime.invoiceSourceRoot, send,
+      invoiceSourceRoot: layout.data.runtime.invoiceSourceRoot, send, tavilyApiKey,
       memoryCredentialRead: async reference => { const result = await memoryStore(reference).read(); return result.ok ? result.data ?? undefined : undefined; },
       credentials: {
         async read(reference) {

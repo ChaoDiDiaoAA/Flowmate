@@ -19,7 +19,7 @@
   <a href="#capabilities">当前能力</a>
 </p>
 
-**Personal Agent** 持续整理一组发票；**Deep Research** 从本地资料建立可复核的证据链。桌面同时提供资料问答与单票复核。
+**Personal Agent** 持续整理一组发票；**Deep Research** 从选定本地资料和按任务授权的公开网页建立可复核的证据链。桌面同时提供资料问答与单票复核。
 
 ![Flowmate 桌面工作台：会话列表、工作目录与 Assistant](docs/screenshots/Chats.png)
 
@@ -348,7 +348,7 @@ bun run dev
 
 ### 5. 体验 Deep Research
 
-在 **Deep Research** 选本地资料并创建任务，使用 Assistant 生成并确认计划。在 **Research steps** 看进度，**Continue research** 手动继续，在 **Evidence / Report** 复核并另存 Markdown。可在 **Settings → General → Research preferences** 保存偏好；调查子代理需启用 subagents 扩展。
+在 **Deep Research** 选本地资料并创建任务。Host 配置 `FLOWMATE_TAVILY_API_KEY` 后可按任务开启 **Web search**。使用 Assistant 生成计划，确认本地来源和将发送给 Tavily 的网页请求。在 **Research steps** 看进度，**Continue research** 手动继续，在 **Evidence / Report** 复核并另存 Markdown。可在 **Settings → General → Research preferences** 保存偏好；调查子代理需启用 subagents 扩展。
 
 ### 6. 体验单票复核
 

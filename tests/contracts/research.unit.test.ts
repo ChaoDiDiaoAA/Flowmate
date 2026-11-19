@@ -17,11 +17,11 @@ describe('Deep Research contracts', () => {
     expect(contracts.ResearchPlanBodySchema.safeParse({ ...plan, sourcePolicy: { ...plan.sourcePolicy, apiKey: 'secret' } }).success).toBe(false);
   });
 
-  it('rejects online acquisition in every public research policy', () => {
-    expect(contracts.ResearchSourcePolicySchema.safeParse({ ...plan.sourcePolicy, web: true }).success).toBe(false);
+  it('allows web authorization while keeping web tools outside the base investigation list', () => {
+    expect(contracts.ResearchSourcePolicySchema.safeParse({ ...plan.sourcePolicy, web: true }).success).toBe(true);
     expect(contracts.ResearchSourcePolicySchema.safeParse({ ...plan.sourcePolicy, domains: ['example.com'] }).success).toBe(false);
-    expect(contracts.ResearchPlanBodySchema.safeParse({ ...plan, sourcePolicy: { ...plan.sourcePolicy, web: true } }).success).toBe(false);
-    expect(contracts.RESEARCH_INVESTIGATION_TOOL_NAMES).not.toContain('search_research_sources');
+    expect(contracts.ResearchPlanBodySchema.safeParse({ ...plan, sourcePolicy: { ...plan.sourcePolicy, web: true } }).success).toBe(true);
+    expect(contracts.RESEARCH_WEB_TOOL_NAMES).toEqual(['search_research_web', 'read_research_web']);
     expect(contracts.RESEARCH_INVESTIGATION_TOOL_NAMES).not.toContain('read_research_web');
   });
 

@@ -71,6 +71,7 @@ export type ApplicationOptions = {
   promptTrace?: PromptTraceBuffer;
   logger?: SafeLogger;
   runtimeDefaults?: () => Result<RuntimeRequestOverrides>;
+  researchWeb?: import('../packages/core/src/research/tavily.ts').TavilyResearchOptions;
   researchPreferences?: () => Result<{ text: string; revision: number }>;
   runtimePolicy?: RuntimeStrategyPolicy;
   sampleSource?: 'production' | 'test' | 'evaluation';
@@ -241,7 +242,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
   const invoiceForms = options.invoiceFormBridge ? createInvoiceFormService({ database: database.data,
     bridge: options.invoiceFormBridge, now }) : undefined;
   let agent: import('@flowmate/contracts').AgentPort;
-  const researchReads = createResearchReadTools({ database: database.data, files, now,
+  const researchWeb = options.researchWeb?.apiKey.trim() ? options.researchWeb : undefined;
+  const researchReads = createResearchReadTools({ database: database.data, files, now, web: researchWeb,
     readDocument: async (id, context) => {
       const loaded = await database.data.transaction(scope => documents.readParsedForRun(id, context, {
         repository: scope.documents, files: { read: (artifact, name) => files.read(artifact, name, scope.contents) },
@@ -521,6 +523,7 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
         .catch(() => fail(appError('storage_read_failed', 'storage', 'Job could not be read.', true))),
     },
     research: {
+      webConfigured: researchWeb !== undefined,
       create: async input => {
         let rejected: Result<never> | undefined;
         try { return await database.data.transaction(scope => {

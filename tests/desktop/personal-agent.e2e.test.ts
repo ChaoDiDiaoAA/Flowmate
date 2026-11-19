@@ -728,7 +728,7 @@ test('Personal Agent configuration keeps explicit resource versions, failed draf
       await page.getByLabel('Assistant preferences', { exact: true }).fill('Use the explicitly selected invoice guidance.');
     };
     await edit();
-    await expect(page.getByLabel('Enable Skill deep-research v2', { exact: true })).toBeDisabled();
+    await expect(page.getByLabel('Enable Skill deep-research v3', { exact: true })).toBeDisabled();
     await expect(page.getByRole('group', { name: 'Personal Agent extensions', exact: true })).toContainText('No Durable phase adapter');
     await expect(page.getByLabel('Enable Personal Agent tool bash', { exact: true })).toHaveCount(0);
     await installReadGate(app, userData);

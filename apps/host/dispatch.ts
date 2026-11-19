@@ -42,6 +42,7 @@ export type ProductCommandDispatcherOptions = {
   memoryCredentialRead?: (reference: string) => Promise<string | undefined>;
   userDataRoot: string;
   invoiceSourceRoot: string;
+  tavilyApiKey?: string;
   runtimeRoot?: string;
   evaluationOverrides?: EvaluationAgentOverrides;
   evaluationWorkspaceRoot?: string;
@@ -82,7 +83,7 @@ const closingReads: readonly HostCommand['type'][] = [
   'list_input_commands', 'list_subagent_definitions', 'get_subagent_definition',
   'list_subagents', 'query_subagent', 'list_extensions', 'query_session_extensions', 'query_run_extensions',
   'list_resources', 'read_resource_file', 'query_run_resources', 'read_run_resource_file',
-  'list_research_materials', 'list_research_tasks', 'query_research_task', 'query_research_for_session',
+  'query_research_web_status', 'list_research_materials', 'list_research_tasks', 'query_research_task', 'query_research_for_session',
   'query_research_plan', 'query_research_source', 'query_research_evidence', 'query_research_claim',
   'query_research_report', 'list_research_sources', 'list_research_claims', 'list_research_reports',
   'query_run', 'read_workspace', 'query_task_operation', 'list_documents', 'query_document',
@@ -196,6 +197,8 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
   const traceSecrets = new Set<string>();
   const collect = (value: unknown): void => { if (typeof value === 'string' && value.length >= 8) traceSecrets.add(value);
     else if (value && typeof value === 'object') for (const item of Object.values(value)) collect(item); };
+  const tavilyApiKey = options.tavilyApiKey?.trim();
+  collect(tavilyApiKey);
   const credentialRequest = (ref: string, operation: 'read' | 'write' | 'delete', credential?: Credential, purpose?: 'memory'): Promise<Credential | undefined> => {
     collect(credential);
     const direct = purpose ? undefined : options.credentials;
@@ -267,6 +270,7 @@ export async function createProductCommandDispatcher(options: ProductCommandDisp
     parameters: { ...RUNTIME_CONFIG.provider },
   });
   const created = await createApplication({
+    researchWeb: tavilyApiKey ? { apiKey: tavilyApiKey } : undefined,
     memory: options.memory ?? { owner: { environment: 'local', ownerId: null }, deferStart: true,
       readCredential: options.memoryCredentialRead ?? (async ref => {
         if (options.credentials || !/^memory_[a-f0-9]{32}$/.test(ref)) return undefined;

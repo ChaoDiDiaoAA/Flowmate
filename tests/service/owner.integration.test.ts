@@ -48,6 +48,30 @@ async function foregroundFixture(mode = '', enabled = true, response?: (count: n
   } };
 }
 
+it('reads the optional Tavily key from the isolated service owner startup environment', async () => {
+  packaged ??= await packageOwnerFixture();
+  const installation = await installOwnerFixture(packaged.runtimeRoot);
+  const previous = process.env.FLOWMATE_TAVILY_API_KEY;
+  process.env.FLOWMATE_TAVILY_API_KEY = 'synthetic-tavily-service-key';
+  let owner: Awaited<ReturnType<typeof spawnOwnerFixture>> | undefined;
+  let client: Awaited<ReturnType<typeof ownerClient>> | undefined;
+  try {
+    owner = await spawnOwnerFixture(installation);
+    client = await ownerClient(installation);
+    expect(await client.call({ type: 'query_research_web_status', input: {} })).toEqual({ ok: true, data: { configured: true } });
+    const session = need(await client.call<{ sessionId: number }>({ type: 'create_session', input: { title: 'Service web research' } }));
+    expect(await client.call({ type: 'create_research_task', input: { sessionId: session.sessionId, title: 'Service web research',
+      sourcePolicy: { web: true, domains: [], artifactIds: [], documentIds: [] } } })).toMatchObject({ ok: true, data: { sourcePolicy: { web: true } } });
+    expect(owner.stderr()).not.toContain(process.env.FLOWMATE_TAVILY_API_KEY);
+  } finally {
+    if (previous === undefined) delete process.env.FLOWMATE_TAVILY_API_KEY;
+    else process.env.FLOWMATE_TAVILY_API_KEY = previous;
+    client?.socket.destroy();
+    if (owner) { need(await owner.close()); await owner.child.exited; }
+    removeOwnerFixture(installation.dataRoot);
+  }
+}, 90000);
+
 it('the Windows service uses its own encrypted memory credential across desktop reconnection', async () => {
   const f = await fixture(), key = 'synthetic-service-memory-key', operationId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
     ref = 'memory_' + operationId.replaceAll('-', '');

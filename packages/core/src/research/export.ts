@@ -32,7 +32,10 @@ export async function exportResearchReport(options: ResearchEvidenceOptions, raw
       if (source.runId !== ref.runId || source.toolCallId !== ref.toolCallId
         || body.data.slice(ref.locator.start, ref.locator.end) !== ref.locator.quote)
         return fail(appError('research_evidence_mismatch', 'tool', 'The report quote cannot be verified against saved evidence.'));
-      passages.push(`### Claim ${claimId} / Source ${source.sourceSnapshotId} (${relation})\n\n${source.title}\n\n${source.address}\n\nFetched: ${source.fetchedAt}; published: ${source.publishedAt ?? 'unknown'}\n\nRun ${source.runId} / ToolCall ${source.toolCallId}; offsets ${ref.locator.start}–${ref.locator.end}\n\n${ref.locator.quote.split('\n').map(line => `> ${line}`).join('\n')}`);
+      const address = source.kind === 'web' ? `<${new URL(source.address).href}>` : source.address;
+      const quotation = ref.locator.quote.split(source.kind === 'web' ? /\r\n?|\n/ : '\n').map(line => `${source.kind === 'web' ? '    ' : '> '}${line}`).join('\n');
+      const title = source.kind === 'web' ? source.title.replace(/\s+/g, ' ').replace(/[\\`*_{}\[\]()#+\-.!<>|]/g, '\\$&') : source.title;
+      passages.push(`### Claim ${claimId} / Source ${source.sourceSnapshotId} (${relation})\n\n${title}\n\n${address}\n\nFetched: ${source.fetchedAt}; ${source.kind === 'web' ? 'source date' : 'published'}: ${source.publishedAt ?? 'unknown'}\n\nRun ${source.runId} / ToolCall ${source.toolCallId}; offsets ${ref.locator.start}–${ref.locator.end}\n\n${quotation}`);
     }
   }
   const list = (items: string[]) => items.length ? items.map(item => `- ${item}`).join('\n') : 'None recorded.';

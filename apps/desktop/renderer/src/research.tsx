@@ -18,6 +18,7 @@ export function ResearchPage(props: Props) {
   const [materials, setMaterials] = useState<ResearchMaterial[]>([]), [materialCursor, setMaterialCursor] = useState<number | null>(null);
   const [view, setView] = useState<'Plan' | 'Evidence' | 'Report'>('Plan'), [creating, setCreating] = useState(false);
   const [question, setQuestion] = useState(''), [scope, setScope] = useState('');
+  const [webEnabled, setWebEnabled] = useState(false), [webConfigured, setWebConfigured] = useState<boolean | null>(null);
   const [artifactIds, setArtifactIds] = useState<number[]>([]), [documentIds, setDocumentIds] = useState<number[]>([]);
   const [loading, setLoading] = useState(false), [saving, setSaving] = useState(false), [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -57,19 +58,32 @@ export function ResearchPage(props: Props) {
   useEffect(() => { if (props.ready) void refresh(); return () => { generation.current++; evidenceGeneration.current++; }; }, [props.ready, props.selectedId, props.refreshToken]);
   useEffect(() => { setEvidence(null); setView('Plan'); setCreating(false); setPlanChanges(''); setMessage(null); }, [props.selectedId]);
   useEffect(() => { if (creating) questionInput.current?.focus(); }, [creating]);
+  useEffect(() => {
+    if (!creating || !props.ready) return;
+    let current = true;
+    void window.flowmate.queryResearchWebStatus().then(result => {
+      if (current) setWebConfigured(result.ok && result.data.configured);
+    }).catch(() => { if (current) setWebConfigured(false); });
+    return () => { current = false; };
+  }, [creating, props.ready]);
+
   async function operate(action: () => Promise<void>) {
     if (operation.current) return; operation.current = true; setSaving(true); setError(null); setMessage(null);
     try { await action(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'The research operation failed. Refresh before retrying.'); }
     finally { operation.current = false; setSaving(false); }
   }
   async function create() {
+    if (!props.ready || webEnabled && webConfigured !== true) return;
     await operate(async () => {
       const session = need(await window.flowmate.createSession({ title: [...question.trim()].slice(0, 80).join('') }));
       const created = need(await window.flowmate.createResearchTask({ sessionId: session.sessionId, title: [...question.trim()].slice(0, 120).join(''),
-        sourcePolicy: { web: false, domains: [], artifactIds, documentIds } }));
+        sourcePolicy: { web: webEnabled, domains: [], artifactIds, documentIds } }));
       setCreating(false); props.onSelect(created, `${question.trim()}${scope.trim() ? `\n\nResearch scope: ${scope.trim()}` : ''}`);
       setMessage('Research created. Press Send in Assistant to generate a plan. Investigation starts only after you confirm it.');
     });
+  }
+  async function openWebSource(source: SourceSnapshot) {
+    await operate(async () => { need(await window.flowmate.openResearchSource({ researchId: source.researchId, sourceSnapshotId: source.sourceSnapshotId })); });
   }
   async function readEvidence(sourceSnapshotId: number, offset = 0) {
     if (!task) return; const token = ++evidenceGeneration.current;
@@ -88,10 +102,10 @@ export function ResearchPage(props: Props) {
   const reportFeedback = !creating && view === 'Report' && report !== null && task?.researchId === props.selectedId;
   return <section className="page-content research-page" aria-label="Deep Research workspace">
     <header className="page-heading research-heading">
-      <div><h1>Deep Research</h1><p>Turn your local materials into a report you can trace and review.</p></div>
+      <div><h1>Deep Research</h1><p>Build a report you can trace to local materials and optional web sources.</p></div>
       <div className="button-row">
         <button type="button" className="text-button" disabled={!props.ready || loading || saving} onClick={() => void refresh()}>Refresh research</button>
-        <button ref={newResearchButton} type="button" className="primary-button" disabled={!props.ready || saving || creating} onClick={() => { setCreating(true); setError(null); setMessage(null); props.onAssistant(true); }}>New research</button>
+        <button ref={newResearchButton} type="button" className="primary-button" disabled={!props.ready || saving || creating} onClick={() => { setWebEnabled(false); setWebConfigured(null); setCreating(true); setError(null); setMessage(null); props.onAssistant(true); }}>New research</button>
       </div>
     </header>
     <ol className="research-steps" aria-label="Research workflow"><li>Question &amp; materials</li><li>Confirm plan</li><li>Research report</li></ol>
@@ -99,10 +113,16 @@ export function ResearchPage(props: Props) {
     {message && !reportFeedback && <p role="status" className="notice research-feedback">{message}</p>}
     {loading && <p role="status" className="research-loading">Loading saved research…</p>}
     {creating ? <form className="research-create panel" onSubmit={event => { event.preventDefault(); void create(); }}>
-      <div className="research-form-head"><div><h2>New research</h2><p>Start with a question and choose the materials to investigate.</p></div><span className="research-badge">Local materials</span></div>
+      <div className="research-form-head"><div><h2>New research</h2><p>Start with a question and choose the materials to investigate.</p></div></div>
       <div className="research-form-body">
         <label className="field"><span>Research question</span><textarea ref={questionInput} required maxLength={16000} placeholder="Compare three Agent deployment options using our team policy. What are the trade-offs?" value={question} onChange={event => setQuestion(event.target.value)} /></label>
         <details className="research-scope"><summary>Scope and constraints <span>Optional</span></summary><label className="field"><span>Research scope and constraints</span><textarea maxLength={16000} placeholder="For example: deployment environment, cost limits, required capabilities…" value={scope} onChange={event => setScope(event.target.value)} /></label></details>
+        <label className="research-material"><input type="checkbox" role="switch" aria-label="Web search" aria-describedby="research-web-status"
+          checked={webEnabled} disabled={webConfigured !== true || !props.ready || saving} onChange={event => setWebEnabled(event.target.checked)} />
+          <span><strong>Web search</strong><small id="research-web-status">{webConfigured === null ? 'Checking Tavily configuration…'
+            : webConfigured ? 'Confirmed search queries and public page URLs are sent to Tavily.'
+              : 'Set FLOWMATE_TAVILY_API_KEY in the research Host environment to enable web search.'}</small></span>
+        </label>
         <section className="research-materials" aria-label="Research materials">
           <div className="research-materials-head"><div><h3>Research materials</h3><p>Text, Markdown and parsed documents</p></div><span className="research-badge">{artifactIds.length + documentIds.length} selected</span></div>
           <label className="secondary-button research-import"><span aria-hidden="true">＋</span> Import text or Markdown
@@ -124,7 +144,7 @@ export function ResearchPage(props: Props) {
           <p className="research-help">Only selected materials are included. Your current invoice is not added automatically.</p>
         </section>
       </div>
-      <footer className="research-form-actions"><span>Create the task, then send your question in Assistant to generate a plan.</span><div className="button-row"><button type="button" className="text-button" disabled={saving} onClick={() => { setCreating(false); requestAnimationFrame(() => newResearchButton.current?.focus()); }}>Cancel</button><button className="primary-button" type="submit" disabled={!question.trim() || saving}>Create research</button></div></footer>
+      <footer className="research-form-actions"><span>Create the task, then send your question in Assistant to generate a plan.</span><div className="button-row"><button type="button" className="text-button" disabled={saving} onClick={() => { setCreating(false); requestAnimationFrame(() => newResearchButton.current?.focus()); }}>Cancel</button><button className="primary-button" type="submit" disabled={!props.ready || !question.trim() || saving || webEnabled && webConfigured !== true}>Create research</button></div></footer>
     </form> : <div className="research-columns">
       <aside className="research-list" aria-label="Research list">
         <details className="research-task-picker"><summary>{task?.title ?? 'Choose research'}<span>{tasks.length} tasks</span></summary><div>
@@ -160,10 +180,16 @@ export function ResearchPage(props: Props) {
             <p className="research-prose">{plan.body.question}</p><p className="research-prose research-help">{plan.body.scope}</p>
             {plan.body.dimensions.map(dimension => <section className="research-dimension" key={dimension.id}><h4>{dimension.title}</h4>{dimension.questions.map(item => <div key={item.id}><p>{item.question}</p><ul>{item.evidenceNeeded.map((text, index) => <li key={index}>{text}</li>)}</ul></div>)}</section>)}
             <details className="research-execution"><summary>Source scope, budget and stop conditions</summary>
-              <h4>Source scope</h4><p>Local materials: {plan.body.sourcePolicy.artifactIds.length}; parsed documents: {plan.body.sourcePolicy.documentIds.length}. Online search is unavailable in this version.</p>
+              <h4>Source scope</h4><p>Local materials: {plan.body.sourcePolicy.artifactIds.length}; parsed documents: {plan.body.sourcePolicy.documentIds.length}. Web search: {plan.body.sourcePolicy.web ? 'on' : 'off'}.</p>
               <h4>Execution budget</h4><p>{plan.body.execution.budget.maxModelCalls} model calls; {plan.body.execution.budget.maxToolCalls} tool calls; {plan.body.execution.timeoutMs / 1000} seconds.</p>
               <h4>Stop conditions</h4><ul>{plan.body.stopConditions.map((text, index) => <li key={index}>{text}</li>)}</ul>
             </details>
+            {plan.body.steps?.some(step => step.tool !== 'read_research_local') && <section className="research-source">
+              <h4>Web requests to Tavily</h4><ul>{plan.body.steps.filter(step => step.tool !== 'read_research_local').map(step =>
+                <li key={step.id} className="research-prose">{step.tool === 'search_research_web'
+                  ? <>Search “{step.input.query}” · {step.input.timeRange ? 'past ' + step.input.timeRange : 'any publication date'} · result {step.input.rank ?? 1}</>
+                  : <>Read {step.input.url}</>}</li>)}</ul>
+            </section>}
             <div className="research-plan-confirm"><p className="research-help">{plan.body.sourcePolicy.artifactIds.length + plan.body.sourcePolicy.documentIds.length} authorized materials · {plan.body.execution.budget.maxModelCalls} model calls · {plan.body.execution.budget.maxToolCalls} tool calls · {plan.body.execution.timeoutMs / 1000} seconds</p><button type="button" className="primary-button" disabled={!props.canRun || task.status !== 'awaiting_confirmation' || loading || saving} onClick={() => props.onRun('I confirm research plan version ' + plan.revision + '. Investigate within its source scope and budget.',
               { researchId: task.researchId, phase: 'researching', plan: { planId: plan.planId, revision: plan.revision } }, plan.body.execution)}>Confirm plan version {plan.revision}</button><p className="research-help">Investigation starts after you confirm this version.</p></div>
             <label className="field"><span>Plan changes</span><textarea maxLength={16000} placeholder="Describe the changes you want before confirming…" value={planChanges} onChange={event => setPlanChanges(event.target.value)} /></label>
@@ -172,7 +198,7 @@ export function ResearchPage(props: Props) {
           </div> : <div className="research-empty"><h3>Start with a research plan</h3><p>Send your question in Assistant. Review the saved plan here before confirming the investigation.</p><button type="button" className="secondary-button" onClick={() => props.onAssistant(false)}>Open research Assistant</button></div>)}
           {view === 'Evidence' && <div className="research-evidence"><div className="research-section-heading"><h3>Saved sources</h3><span className="research-badge">{sources.length} loaded</span></div>
             {!sources.length && <p className="research-help">No source snapshots saved yet.</p>}
-            {sources.map(source => <section key={source.sourceSnapshotId} className="research-source"><div className="research-section-heading"><strong>{source.title}</strong><button type="button" className="text-button" onClick={() => void readEvidence(source.sourceSnapshotId)}>View source {source.sourceSnapshotId}</button></div><p className="research-help">{source.address}{source.verificationGap ? ' · Legacy source bytes cannot be verified. Historical references are retained.' : ''}</p><details className="research-execution"><summary>Execution details</summary><p>Run {source.runId} / ToolCall {source.toolCallId} · {source.fetchedAt}{source.truncated ? ' · truncated' : ''}</p></details></section>)}
+            {sources.map(source => <section key={source.sourceSnapshotId} className="research-source"><div className="research-section-heading"><strong>{source.title}</strong><button type="button" className="text-button" onClick={() => void readEvidence(source.sourceSnapshotId)}>View source {source.sourceSnapshotId}</button></div><p className="research-help">{source.address}{source.kind === 'web' && <> · Source date: {source.publishedAt ?? 'unknown'} · <button type="button" className="text-button" onClick={() => void openWebSource(source)}>Open webpage</button></>}{source.verificationGap ? ' · Legacy source bytes cannot be verified. Historical references are retained.' : ''}</p><details className="research-execution"><summary>Execution details</summary><p>Run {source.runId} / ToolCall {source.toolCallId} · {source.fetchedAt}{source.truncated ? ' · truncated' : ''}</p></details></section>)}
             {sourceCursor && <button type="button" className="text-button" disabled={saving} onClick={() => void operate(async () => { const page = need(await window.flowmate.listResearchSources({ researchId: task.researchId, beforeId: sourceCursor, limit: 30 })); setSources(items => [...items, ...page.items]); setSourceCursor(page.nextBeforeId); })}>More sources</button>}
             {evidence && <section className="research-source-passage" aria-label="Saved source text"><h4>{evidence.source.title}</h4><details className="research-execution"><summary>Passage details</summary><p>Offsets {evidence.excerpt.start}–{evidence.excerpt.end}</p></details><pre className="research-prose">{evidence.excerpt.quote}</pre>{evidence.nextOffset !== null && <button type="button" className="text-button" onClick={() => void readEvidence(evidence.source.sourceSnapshotId, evidence.nextOffset!)}>Next source passage</button>}</section>}
             <h3>Claim verification</h3>{claims.map(claim => <section className="research-source" key={claim.claimId}><h4>Claim {claim.claimId} · {claim.verification.status}</h4><p className="research-prose">{claim.text}</p><ul>{claim.verification.reasons.map((text, index) => <li key={index}>{text}</li>)}</ul><details className="research-execution"><summary>Dependencies</summary>{claim.dependencies.length ? claim.dependencies.map(id => <button type="button" className="text-button" key={id} onClick={() => void readClaim(id)}>Inspect dependency {id}</button>) : <p>None</p>}</details>{claim.evidence.map((item, index) => <div className="research-claim-evidence" key={index}><p>{item.relation}: {item.ref.locator.quote}</p><button type="button" className="text-button" onClick={() => void readEvidence(item.ref.sourceSnapshotId, item.ref.locator.start)}>Inspect evidence for claim {claim.claimId} / source {item.ref.sourceSnapshotId}</button></div>)}</section>)}

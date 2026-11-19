@@ -2,6 +2,7 @@ import { z } from 'zod';
 import * as R from './research.ts';
 
 export const researchOperations = {
+  query_research_web_status: ['queryResearchWebStatus', z.object({}).strict(), R.ResearchWebStatusResultSchema],
   import_research_material: ['importResearchMaterial', R.ImportResearchMaterialSchema, R.ResearchMaterialResultSchema],
   list_research_materials: ['listResearchMaterials', R.ResearchPageRequestSchema, R.ResearchMaterialsResultSchema],
   create_research_task: ['createResearchTask', R.CreateResearchTaskSchema, R.ResearchTaskResultSchema],
@@ -48,7 +49,8 @@ export function matchesResearchResponse(command: { type: string; input?: unknown
   }
   if (Array.isArray(data.items) && input.researchId !== undefined && data.items.some(item => item.researchId !== input.researchId
     || input.planId !== undefined && item.planId !== input.planId)) return false;
-  if (command.type === 'create_research_task' && data.sessionId !== input.sessionId) return false;
+  if (command.type === 'create_research_task' && (data.sessionId !== input.sessionId
+    || (data.sourcePolicy as R.ResearchSourcePolicy).web !== (input.sourcePolicy as R.ResearchSourcePolicy).web)) return false;
   if (command.type === 'query_research_for_session' && data.sessionId !== input.sessionId) return false;
   return true;
 }

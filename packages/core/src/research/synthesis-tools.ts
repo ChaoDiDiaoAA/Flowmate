@@ -1,31 +1,32 @@
 import { setImmediate } from 'node:timers/promises';
 import { appError, fail, ok, ToolExecutionFailure, ResearchEvidenceRequestSchema, ResearchEvidenceSchema,
-  ResearchClaimBodySchema, ClaimSchema, ResearchReportBodySchema, ResearchReportSchema, EvidenceRefSchema } from '@flowmate/contracts';
+  RESEARCH_WEB_TOOL_NAMES, ResearchClaimBodySchema, ClaimSchema, ResearchReportBodySchema, ResearchReportSchema, EvidenceRefSchema } from '@flowmate/contracts';
 import type { EvidenceRef, ResearchSourcePolicy, ResearchRunBinding, ToolDefinition, ToolCallContext, ProductToolContext, SourceSnapshot, ManagedFileContents, Claim, ResearchReport } from '@flowmate/contracts';
 import type { z } from 'zod';
 import type { DbHandle } from '../storage/database.ts';
 import type { FileStore } from '../storage/file-store.ts';
-import { researchExcerpt, researchEvidenceRef } from './source-text.ts';
+import { researchExcerpt, researchEvidenceRef, researchSourceAllowed } from './source-text.ts';
 import { checkResearchControl } from './tools.ts';
 
 export type ResearchEvidenceOptions = { database: Pick<DbHandle, 'read' | 'transaction'>; files: Pick<FileStore, 'readResearchSource'> };
 type VerifiedBody = { source: SourceSnapshot; text: string };
 
-export async function readResearchEvidence(options: ResearchEvidenceOptions, raw: z.input<typeof ResearchEvidenceRequestSchema>, policy: ResearchSourcePolicy) {
+export async function readResearchEvidence(options: ResearchEvidenceOptions, raw: z.input<typeof ResearchEvidenceRequestSchema>, policy: ResearchSourcePolicy, planId?: number) {
   const input = ResearchEvidenceRequestSchema.safeParse(raw);
   if (!input.success) return fail(appError('input_invalid', 'input', 'Evidence offsets are invalid.'));
   policy = structuredClone(policy);
   const source = await options.database.read(store => {
     const loaded = store.research.getSource(input.data); if (!loaded.ok) return loaded;
     const value = loaded.data;
-    const authorized = value.kind === 'local' ? policy.artifactIds.includes(value.artifactId!)
-      : policy.documentIds.includes(value.documentId!);
+    const authorized = researchSourceAllowed(value, policy)
+      && (value.kind !== 'web' || planId === undefined || store.research.webSourceInPlan(value, planId));
     if (!authorized) return fail(appError('research_source_denied', 'tool', 'This evidence is outside the selected source policy.'));
     if (value.verificationGap === 'legacy-original-unavailable') return fail(appError('research_evidence_incomplete', 'tool',
       'The historical source is retained, but its original bytes cannot be verified. Acquire a new source before using it as evidence.'));
     const original = store.toolCalls.getById(value.toolCallId); if (!original.ok) return original;
     if (original.data.runId !== value.runId || original.data.status !== 'succeeded' || !original.data.cleanup.stopped
-      || original.data.toolName !== 'read_research_local')
+      || !(value.kind === 'web' ? RESEARCH_WEB_TOOL_NAMES.some(name => name === original.data.toolName)
+        : original.data.toolName === 'read_research_local'))
       return fail(appError('research_evidence_incomplete', 'tool', 'The source has no successful acquisition receipt.'));
     return loaded;
   }).catch(() => fail(appError('research_read_failed', 'storage', 'Research storage is unavailable.', true)));
@@ -54,7 +55,7 @@ export function createResearchSynthesisTools(options: ResearchEvidenceOptions & 
   async function verify(ref: EvidenceRef, binding: ResearchRunBinding, bodies: Map<number, VerifiedBody>) {
     if (ref.researchId !== binding.researchId || ref.planId !== binding.plan!.planId || ref.revision !== binding.plan!.revision)
       throw new ToolExecutionFailure(appError('research_identity_conflict', 'tool', 'Evidence belongs to a different task or plan.'));
-    const evidence = await readResearchEvidence(options, { researchId: binding.researchId, sourceSnapshotId: ref.sourceSnapshotId }, binding.sourcePolicy);
+    const evidence = await readResearchEvidence(options, { researchId: binding.researchId, sourceSnapshotId: ref.sourceSnapshotId }, binding.sourcePolicy, binding.plan!.planId);
     if (!evidence.ok) throw new ToolExecutionFailure(evidence.error);
     const source = evidence.data.source;
     if (source.runId !== ref.runId || source.toolCallId !== ref.toolCallId)
@@ -81,7 +82,7 @@ export function createResearchSynthesisTools(options: ResearchEvidenceOptions & 
       execute: async (input, call, context) => {
         input = structuredClone(input); call = { ...call }; context = structuredClone(context);
         const { binding } = await identity(call, context, false);
-        const result = await readResearchEvidence(options, { ...input, researchId: binding.researchId }, binding.sourcePolicy);
+        const result = await readResearchEvidence(options, { ...input, researchId: binding.researchId }, binding.sourcePolicy, binding.plan!.planId);
         if (!result.ok) throw new ToolExecutionFailure(result.error);
         checkResearchControl(call);
         return {...result.data,evidenceRef:researchEvidenceRef(binding,result.data.source,result.data.excerpt)!};

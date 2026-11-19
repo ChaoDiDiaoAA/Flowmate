@@ -2,6 +2,15 @@ import { appError, fail, ok } from '@flowmate/contracts';
 import type { EvidenceRef, ResearchRunBinding, ResearchLocatorSchema, SourceSnapshot } from '@flowmate/contracts';
 import type { z } from 'zod';
 
+export function researchSourceAllowed(source: Pick<SourceSnapshot, 'kind' | 'artifactId' | 'documentId'>,
+  policy: import('@flowmate/contracts').ResearchSourcePolicy): boolean {
+  switch (source.kind) {
+    case 'web': return policy.web;
+    case 'local': return source.artifactId !== null && policy.artifactIds.includes(source.artifactId);
+    case 'document': return source.documentId !== null && policy.documentIds.includes(source.documentId);
+  }
+}
+
 export function researchEvidenceRef(binding: ResearchRunBinding, source: SourceSnapshot, locator: z.infer<typeof ResearchLocatorSchema>): EvidenceRef | null {
     return binding.phase==='researching' && binding.plan ? {researchId:binding.researchId,planId:binding.plan.planId,revision:binding.plan.revision,
         runId:source.runId,toolCallId:source.toolCallId,sourceSnapshotId:source.sourceSnapshotId,locator} : null;

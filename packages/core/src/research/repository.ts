@@ -1,18 +1,22 @@
 import type { SynchronousDatabaseExecutor as Database } from '../storage/write-coordinator.ts';
 import { readResearchContext, researchMaterialScope } from './context.ts';
 import { readResearchWorkflow } from './workflow.ts';
+import { researchSourceAllowed } from './source-text.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { appError, fail, ok, ResearchTaskSchema, ResearchPlanSchema, ResearchPlanBodySchema, ResearchSourcePolicySchema,
   ResearchRunBindingSchema, ResearchSourceDataSchema, SourceSnapshotSchema, ResearchClaimBodySchema, ClaimSchema,
-  ResearchReportBodySchema, ResearchReportSchema, ResearchPageRequestSchema, ResearchMaterialSchema } from '@flowmate/contracts';
+  ResearchReportBodySchema, ResearchReportSchema, ResearchPageRequestSchema, ResearchMaterialSchema, RESEARCH_WEB_TOOL_NAMES } from '@flowmate/contracts';
 import type { Result, ResearchSourcePolicy, ResearchTask, ResearchPlanBody, ResearchPlan, ResearchRunBinding, SourceSnapshot,
-  ResearchClaimBody, Claim, ResearchReportBody, ResearchReport, ResearchPageRequest, ResearchTaskPage, ResearchMaterial } from '@flowmate/contracts';
+  ResearchClaimBody, Claim, ResearchReportBody, ResearchReport, ResearchPageRequest, ResearchTaskPage, ResearchMaterial, ResearchStep } from '@flowmate/contracts';
 import type { PublishedArtifact } from '../storage/file-store.ts';
 import { readTransaction } from '../storage/reads.ts';
 import { createSessionRepository } from '../storage/repositories.ts';
 
 type Identity = { researchId: number; runId: number; toolCallId: number; at: string };
+type WebTool = typeof RESEARCH_WEB_TOOL_NAMES[number];
+export type ResearchStepCall = { tool: 'read_research_local'; stepId?: string; material: { artifactId: number | null; documentId: number | null } }
+  | { tool: WebTool; stepId: string };
 type BindingInput = { researchId: number; sessionId: number; runId: number; phase: 'planning' | 'researching'; plan: { planId: number; revision: number } | null; continuation?: true; at: string };
 type RecordRow = { id: number; research_id: number; run_id: number; tool_call_id: number; body_json: string; created_at: string; plan_id?: number; revision?: number };
 type TaskRow = { id: number; session_id: number; title: string; source_policy_json: string; current_plan_id: number | null;
@@ -31,8 +35,9 @@ export interface ResearchRepository {
   materialScope(policy: ResearchSourcePolicy): Result<{ allowedDocumentIds: number[]; allowedArtifactIds: number[] }>;
   savePlan(input: Identity & { body: ResearchPlanBody }): Result<ResearchPlan>;
   getPlan(input: { researchId: number; planId: number }): Result<ResearchPlan>;
-  saveSource(input: Identity & { source: z.infer<typeof ResearchSourceDataSchema> }): Result<SourceSnapshot>;
-  bindStep(input: Identity & { stepId?: string; artifactId: number | null; documentId: number | null }): Result<SourceSnapshot | null>;
+  saveSource(input: Identity & { source: z.infer<typeof ResearchSourceDataSchema>; webTool?: WebTool }): Result<SourceSnapshot>;
+  bindStep(input: Identity & ResearchStepCall): Result<{ step: ResearchStep | null; source: SourceSnapshot | null }>;
+  webSourceInPlan(source: SourceSnapshot, planId: number): boolean;
   getSource(input: { researchId: number; sourceSnapshotId: number }): Result<SourceSnapshot>;
   listSources(input: ResearchPageRequest & { researchId: number }): Result<{ items: SourceSnapshot[]; nextBeforeId: number | null }>;
   saveClaim(input: Identity & { claim: ResearchClaimBody }): Result<Claim>;
@@ -51,7 +56,7 @@ function parseInput<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, raw: unknown
   const value = schema.safeParse(raw); if (!value.success) throw new ResearchFault('input_invalid'); return value.data;
 }
 function sourceSubset(child: ResearchSourcePolicy, parent: ResearchSourcePolicy): boolean {
-  return child.artifactIds.every(id => parent.artifactIds.includes(id))
+  return (!child.web || parent.web) && child.artifactIds.every(id => parent.artifactIds.includes(id))
     && child.documentIds.every(id => parent.documentIds.includes(id));
 }
 
@@ -163,9 +168,12 @@ export function createResearchRepository(db: Database): ResearchRepository {
       bytes: row.bytes, format: row.mime_type === 'text/markdown' ? 'markdown' : 'text',
       ...(metadata.verificationGap === undefined ? {} : { verificationGap: metadata.verificationGap }) });
   }
+  function webSourceInPlan(source: Pick<SourceSnapshot, 'researchId' | 'toolCallId'>, planId: number): boolean {
+    return db.query('SELECT 1 FROM research_step_executions WHERE research_id=? AND plan_id=? AND tool_call_id=?')
+      .get(source.researchId, planId, source.toolCallId) !== null;
+  }
   function checkSource(source: SourceSnapshot | z.infer<typeof ResearchSourceDataSchema>, policy: ResearchSourcePolicy) {
-    if (source.kind === 'local') requireFact(source.artifactId && policy.artifactIds.includes(source.artifactId), 'research_source_denied');
-    else requireFact(source.documentId && policy.documentIds.includes(source.documentId), 'research_source_denied');
+    requireFact(researchSourceAllowed(source, policy), 'research_source_denied');
   }
   return {
     findMaterials: input => operation(false, () => {
@@ -258,17 +266,26 @@ export function createResearchRepository(db: Database): ResearchRepository {
     }),
     getPlan: input => operation(false, () => record('plan', input.researchId, input.planId)),
     bindStep: input => operation(true, () => {
-      const value = execution(input, 'read_research_local', false);
-      if (value.phase === 'planning') { requireFact(input.stepId === undefined, 'research_phase_invalid'); return null; }
+      const web = input.tool !== 'read_research_local';
+      const value = execution(input, input.tool, web);
+      if (web) requireFact(value.phase === 'researching' && value.sourcePolicy.web, 'research_source_denied');
+      if (value.phase === 'planning') {
+        requireFact(input.stepId === undefined, 'research_phase_invalid');
+        return { step: null, source: null };
+      }
       const plan = currentPlan(value);
-      if (!plan.body.steps) { requireFact(input.stepId === undefined, 'research_step_unknown'); return null; }
+      if (!plan.body.steps) {
+        requireFact(!web && input.stepId === undefined, 'research_step_unknown');
+        return { step: null, source: null };
+      }
       const step = plan.body.steps.find(step => step.id === input.stepId);
-      requireFact(step && isDeepStrictEqual(step.input, { artifactId: input.artifactId, documentId: input.documentId }), 'research_step_invalid');
+      requireFact(step && step.tool === input.tool && (input.tool !== 'read_research_local'
+        || isDeepStrictEqual(step.input, input.material)), 'research_step_invalid');
       const existing = db.query('SELECT step_id,plan_id FROM research_step_executions WHERE tool_call_id=?').get(input.toolCallId) as
         { step_id: string; plan_id: number } | null;
-      if (existing) { requireFact(existing.step_id === step.id && existing.plan_id === plan.planId); return null; }
+      if (existing) { requireFact(existing.step_id === step.id && existing.plan_id === plan.planId); return { step, source: null }; }
       const previous = readResearchWorkflow(db, input.researchId, plan.planId)!.steps.find(item => item.id === step.id)!;
-      if (previous.status === 'succeeded') return record('source', input.researchId, previous.sourceSnapshotId!);
+      if (previous.status === 'succeeded') return { step, source: record('source', input.researchId, previous.sourceSnapshotId!) };
       requireFact(previous.status !== 'running', 'research_step_running');
       if (previous.toolCallId !== null) {
         const original = db.query('SELECT stopped_at FROM tool_calls WHERE id=?').get(previous.toolCallId) as { stopped_at: string | null };
@@ -277,11 +294,17 @@ export function createResearchRepository(db: Database): ResearchRepository {
       }
       db.query('INSERT INTO research_step_executions(research_id,plan_id,revision,step_id,run_id,tool_call_id,created_at) VALUES (?,?,?,?,?,?,?)')
         .run(input.researchId, plan.planId, plan.revision, step.id, input.runId, input.toolCallId, input.at);
-      return null;
+      return { step, source: null };
     }),
+    webSourceInPlan,
     saveSource: input => operation(true, () => {
       const source = parseInput(ResearchSourceDataSchema, input.source), found = duplicate('source', input, source); if (found) return found;
-      const value = execution(input, 'read_research_local', false);
+      requireFact((source.kind === 'web') === (input.webTool !== undefined), 'research_source_denied');
+      const value = execution(input, input.webTool ?? 'read_research_local', input.webTool !== undefined);
+      if (input.webTool) {
+        const plan = currentPlan(value);
+        requireFact(webSourceInPlan(input, plan.planId), 'research_step_invalid');
+      }
       checkSource(source, value.sourcePolicy);
       requireFact(source.relativePath === `artifacts/research/${input.researchId}/source-${input.toolCallId}.txt`);
       const row = db.query('INSERT INTO research_sources(research_id,run_id,tool_call_id,artifact_id,document_id,body_json,created_at) VALUES (?,?,?,?,?,?,?)')
@@ -301,6 +324,7 @@ export function createResearchRepository(db: Database): ResearchRepository {
       for (const { ref } of claim.evidence) {
         requireFact(ref.researchId === input.researchId && ref.planId === plan.planId && ref.revision === plan.revision);
         const source = record('source', input.researchId, ref.sourceSnapshotId); checkSource(source, value.sourcePolicy);
+        requireFact(source.kind !== 'web' || webSourceInPlan(source, plan.planId), 'research_source_denied');
         requireFact(source.runId === ref.runId && source.toolCallId === ref.toolCallId && ref.locator.end <= source.characters);
         requireFact(!source.truncated || !['supported', 'refuted'].includes(claim.verification.status), 'research_evidence_incomplete');
       }

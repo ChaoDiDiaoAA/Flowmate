@@ -79,7 +79,10 @@ if (!root || runtimeRoot === null || evaluationWorkspaceRoot === null || evaluat
 async function runHost(userDataRoot: string, invoiceSourceRoot: string, extensionEvaluationProfile?: import('@flowmate/contracts').ExtensionEvaluationProfile,
   caseEvaluationFaultProfile?: import('@flowmate/contracts').CaseEvaluationFaultProfile, runtimeRoot?: string,
   evaluationOverrides?: EvaluationAgentOverrides, evaluationWorkspaceRoot?: string, evaluationTrialRoot?: string): Promise<void> {
-  const created = await createProductCommandDispatcher({ userDataRoot, invoiceSourceRoot, extensionEvaluationProfile,
+  const tavilyApiKey = process.env.FLOWMATE_TAVILY_API_KEY?.trim() || process.env.TAVILY_API_KEY;
+  delete process.env.FLOWMATE_TAVILY_API_KEY;
+  delete process.env.TAVILY_API_KEY;
+  const created = await createProductCommandDispatcher({ userDataRoot, invoiceSourceRoot, extensionEvaluationProfile, tavilyApiKey,
     caseEvaluationFaultProfile, runtimeRoot, evaluationOverrides, evaluationWorkspaceRoot, evaluationTrialRoot, send: async output => {
       await send(output);
       if (output.type === 'event' && output.event.type === 'host_state' && output.event.state.host === 'closing')

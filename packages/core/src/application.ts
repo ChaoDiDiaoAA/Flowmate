@@ -121,6 +121,7 @@ export type ProductApplicationOptions = {
     readObservations?: (runId: number, callSequence?: number) => Promise<import('@flowmate/contracts').PromptTraceCall[]>;
     close?: () => Promise<Result<void>> };
   research?: {
+    webConfigured?: boolean;
     listMaterials(...input: Parameters<ResearchRepository['listMaterials']>): ReturnType<ResearchRepository['listMaterials']> | Promise<ReturnType<ResearchRepository['listMaterials']>>;
     create(...input: Parameters<ResearchRepository['create']>): ReturnType<ResearchRepository['create']> | Promise<ReturnType<ResearchRepository['create']>>;
     get(...input: Parameters<ResearchRepository['get']>): ReturnType<ResearchRepository['get']> | Promise<ReturnType<ResearchRepository['get']>>;
@@ -352,6 +353,7 @@ export function makeApplication(
       return ok({ runId: input.runId, sessionId: input.sessionId, toolCallId: call.toolCallId,
         nativeToolCallId: input.nativeToolCallId, receipt: receipt.data, created: false as const });
     },
+    queryResearchWebStatus: async () => ok({ configured: products?.research?.webConfigured === true }),
     importResearchMaterial: async raw => {
       const parsed = ImportResearchMaterialSchema.safeParse(raw);
       return parsed.success ? contextRead(ResearchMaterialResultSchema, async () => await products?.importResearchMaterial?.(parsed.data))
@@ -365,6 +367,8 @@ export function makeApplication(
     createResearchTask: async raw => {
       const parsed = CreateResearchTaskSchema.safeParse(raw);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Research task parameters are invalid.'));
+      if (parsed.data.sourcePolicy.web && !products?.research?.webConfigured)
+        return fail(appError('research_web_unconfigured', 'input', 'Configure FLOWMATE_TAVILY_API_KEY in the research Host environment.'));
       const request = { ...parsed.data, at: new Date().toISOString() };
       return contextRead(ResearchTaskResultSchema, async () => await products?.research?.create(request));
     },

@@ -100,6 +100,7 @@ export class HostClient {
     if (this.child) this.failAll('host_replaced', 'Bun Host 连接已更换。');
     const executable = process.env.FLOWMATE_BUN_EXECUTABLE?.trim() || 'bun';
     const env = safeChildEnvironment();
+    if (process.env.FLOWMATE_TAVILY_API_KEY) env.FLOWMATE_TAVILY_API_KEY = process.env.FLOWMATE_TAVILY_API_KEY;
     env.FLOWMATE_DESKTOP_VERSION = appVersion;
     const args = launch ? [...launch.args] : ['--no-env-file', 'apps/host/main.ts', '--user-data-root', userDataRoot,
       '--invoice-source-root', invoiceSourceRoot];
