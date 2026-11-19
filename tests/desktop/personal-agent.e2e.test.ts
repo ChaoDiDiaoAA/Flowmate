@@ -703,7 +703,9 @@ test('Personal Agent configuration keeps explicit resource versions, failed draf
   const requests: Array<{ messages: Array<{ role: string; content: string }>; tools: Array<{ function: { name: string } }> }> = [];
   const provider = await createHttpProvider(async request => { requests.push(await request.json()); return stream('The original invoice needs human clarification.'); });
   try {
-    app = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'), args: [resolve(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
+    const env = environment(userData);
+    if (process.env.SystemDrive) env.SystemDrive = process.env.SystemDrive;
+    app = await electron.launch({ executablePath: resolve(root, 'node_modules/electron/dist/electron.exe'), args: [resolve(root, 'out/main/index.js')], env, timeout: 30000 });
     const page = await app.firstWindow();
     await configure(page, 'http://127.0.0.1:' + provider.port);
     const original = await page.evaluate(() => window.flowmate.personalAgent.get()); if (!original.ok) throw Error(original.error.code);
@@ -728,7 +730,11 @@ test('Personal Agent configuration keeps explicit resource versions, failed draf
       await page.getByLabel('Assistant preferences', { exact: true }).fill('Use the explicitly selected invoice guidance.');
     };
     await edit();
-    await expect(page.getByLabel('Enable Skill deep-research v4', { exact: true })).toBeDisabled();
+    const researchSkill = page.getByLabel('Enable Skill deep-research v5', { exact: true });
+    await expect(researchSkill).toBeDisabled();
+    await expect(researchSkill).not.toBeChecked();
+    await expect(page.getByRole('group', { name: 'Personal Agent Skills', exact: true }))
+      .toContainText('No Durable adapter for tool read_research_local.');
     await expect(page.getByRole('group', { name: 'Personal Agent extensions', exact: true })).toContainText('No Durable phase adapter');
     await expect(page.getByLabel('Enable Personal Agent tool bash', { exact: true })).toHaveCount(0);
     await installReadGate(app, userData);

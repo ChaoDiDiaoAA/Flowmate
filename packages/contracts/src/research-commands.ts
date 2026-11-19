@@ -1,11 +1,16 @@
 import { z } from 'zod';
 import * as R from './research.ts';
 
+export const UpdateResearchWebAccessRequestSchema = z.object({ researchId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  web: z.boolean(), expectedWeb: z.boolean() }).strict();
+export type UpdateResearchWebAccessRequest = z.infer<typeof UpdateResearchWebAccessRequestSchema>;
+
 export const researchOperations = {
   query_research_web_status: ['queryResearchWebStatus', z.object({}).strict(), R.ResearchWebStatusResultSchema],
   import_research_material: ['importResearchMaterial', R.ImportResearchMaterialSchema, R.ResearchMaterialResultSchema],
   list_research_materials: ['listResearchMaterials', R.ResearchPageRequestSchema, R.ResearchMaterialsResultSchema],
   create_research_task: ['createResearchTask', R.CreateResearchTaskSchema, R.ResearchTaskResultSchema],
+  update_research_web_access: ['updateResearchWebAccess', UpdateResearchWebAccessRequestSchema, R.ResearchTaskResultSchema],
   list_research_tasks: ['listResearchTasks', R.ResearchPageRequestSchema, R.ResearchTasksResultSchema],
   query_research_task: ['queryResearchTask', z.object({ researchId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict(), R.ResearchTaskResultSchema],
   query_research_for_session: ['queryResearchForSession', R.ResearchSessionRequestSchema, R.ResearchSessionResultSchema],
@@ -52,11 +57,12 @@ export function matchesResearchResponse(command: { type: string; input?: unknown
     || input.planId !== undefined && item.planId !== input.planId)) return false;
   if (command.type === 'create_research_task' && (data.sessionId !== input.sessionId
     || (data.sourcePolicy as R.ResearchSourcePolicy).web !== (input.sourcePolicy as R.ResearchSourcePolicy).web)) return false;
+  if (command.type === 'update_research_web_access' && (data.sourcePolicy as R.ResearchSourcePolicy).web !== input.web) return false;
   if (command.type === 'query_research_for_session' && data.sessionId !== input.sessionId) return false;
   return true;
 }
 export function researchHostFailure(type: string) {
-  const write = type === 'import_research_material' || type === 'create_research_task';
+  const write = type === 'import_research_material' || type === 'create_research_task' || type === 'update_research_web_access';
   return { ok: false as const, error: { code: write ? 'operation_result_unknown' : 'storage_read_failed',
     category: write ? 'runtime' as const : 'storage' as const, retryable: true,
     message: write ? 'The result is unknown. Refresh saved research before retrying.' : 'Research could not be read. Refresh to retry.' } };

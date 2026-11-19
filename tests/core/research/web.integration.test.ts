@@ -42,7 +42,7 @@ it('executes only confirmed web steps, publishes evidence and retries a failed e
     }
     if (index === 5) {
       const claim = need(await f.app.listResearchClaims({ researchId: f.task.researchId, planId })).items[0]!;
-      return { tool: 'save_research_report', id: 'report', args: { formatVersion: 2, answer: [{
+      return { tool: 'save_research_report', id: 'report', args: { formatVersion: 3, answer: [{
         text: 'Deployment costs are public.', citations: [{ claimId: claim.claimId, evidenceIndex: 0 }, { claimId: claim.claimId, evidenceIndex: 1 }],
       }],
         sections: [{ title: 'Cost', sentences: [citedSentence(claim.text, [claim.claimId], 1)] }], completeness: 'partial', conflicts: [],
@@ -105,6 +105,18 @@ it('executes only confirmed web steps, publishes evidence and retries a failed e
   const continued = need(await f.app.queryResearchTask(f.task.researchId));
   expect(continued.workflow?.steps.map(step => step.status)).toEqual(['succeeded', 'succeeded', 'succeeded']);
   expect(continued.workflow?.steps[1]?.sourceSnapshotId).toBe(partial.workflow?.steps[1]?.sourceSnapshotId);
+  const requestCount = f.requests.length, webCount = outgoing.length;
+  const localOnly = need(await f.app.updateResearchWebAccess({ researchId: f.task.researchId, web: false, expectedWeb: true }));
+  expect(localOnly).toMatchObject({ researchId: f.task.researchId, sessionId: f.session.sessionId,
+    sourcePolicy: { ...f.task.sourcePolicy, web: false }, currentPlanId: null, currentRunId: null, currentReportId: partial.currentReportId });
+  expect(f.requests).toHaveLength(requestCount);
+  expect(outgoing).toHaveLength(webCount);
+  expect(need(await f.app.queryResearchReportDocument(reportRequest))).toEqual(document);
+  expect(need(await f.app.exportResearchReport(reportRequest))).toEqual(exported);
+  expect(need(await f.app.queryResearchEvidence({ researchId: f.task.researchId,
+    sourceSnapshotId: document.references[0]!.source.sourceSnapshotId })).excerpt.quote).toBe('Official web pricing.');
+  expect(await f.app.submitInput(f.request(4, { ...intent, continuation: true }))).toMatchObject({ ok: false, error: { code: 'research_plan_stale' } });
+  expect(outgoing).toHaveLength(webCount);
 });
 
 it.each([true, false])('uses the live ranked result and extracts only if its body is missing (%s)', async withBody => {

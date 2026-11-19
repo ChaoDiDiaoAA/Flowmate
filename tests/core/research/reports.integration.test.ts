@@ -1,23 +1,30 @@
 import { expect, it } from 'bun:test';
-import { citedSentence, researchFixture, researchPlan, researchNeed as need } from '../../support/research.ts';
+import { citedSentence, researchFixture, researchPlan, researchNeed as need, supportedResearchReviewResponse } from '../../support/research.ts';
 import type { ResearchClaimBody } from '@flowmate/contracts';
 import { join } from 'node:path';
 import { writeFileSync } from 'node:fs';
+import { PiProviderAdapter } from '@flowmate/runtime-pi';
+import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { ok, type ProviderPort } from '@flowmate/contracts';
 
 async function fixture(alter?: (claim: ResearchClaimBody, bodyPath: string) => ResearchClaimBody,
-  options: { partial?: boolean; failReport?: boolean; invalidCitation?: boolean; changeSourceBeforeReport?: boolean } = {}) {
-  const text = ('Official usage cost is metered. ' + 'More public documentation. '.repeat(190)).slice(0, 4000)
+  options: { partial?: boolean; failReport?: boolean; invalidCitation?: boolean; changeSourceBeforeReport?: boolean;
+    review?: (text: string) => object | Promise<object>; maxModelCalls?: number; metricDrift?: boolean;
+    changeSourceDuringReview?: boolean; toolTimeoutMs?: number; stopGraceMs?: number; provider?: ProviderPort } = {}) {
+  const text = ((options.metricDrift ? '该公司营业收入同比增长 20%。' : 'Official usage cost is metered. ') + 'More public documentation. '.repeat(190)).slice(0, 4000)
     + 'Metered usage is billed by published usage units.';
   let f!: Awaited<ReturnType<typeof researchFixture>>;
   f = await researchFixture(async (_request, index) => {
-    if (index === 1) return { tool: 'save_research_plan', args: { ...researchPlan, sourcePolicy: f.task.sourcePolicy }, id: 'plan' };
+    if (index === 1) return { tool: 'save_research_plan', args: { ...researchPlan, sourcePolicy: f.task.sourcePolicy,
+      execution: { ...researchPlan.execution, stopGraceMs: options.stopGraceMs ?? researchPlan.execution.stopGraceMs, budget: { ...researchPlan.execution.budget,
+        toolTimeoutMs: options.toolTimeoutMs ?? 10000, maxModelCalls: options.maxModelCalls ?? 12 } } }, id: 'plan' };
     if (index === 3) return { tool: 'read_research_local', args: { artifactId: f.task.sourcePolicy.artifactIds[0], documentId: null }, id: 'source' };
     const source = index >= 4 ? need(await f.app.listResearchSources({ researchId: f.task.researchId })).items[0]! : null;
     if (index === 4) return { tool: 'query_research_evidence', args: { sourceSnapshotId: source!.sourceSnapshotId, offset: 4000, limit: 600 }, id: 'read-evidence',
       note: 'Coverage gap for cost-1: the initial excerpt omits the billing units. Read the remaining authorized passage within the confirmed scope and budget.' };
     if (index === 5) {
       const planId = need(await f.app.queryResearchTask(f.task.researchId)).currentPlanId!;
-      const claim: ResearchClaimBody = { questionId: 'cost-1', text: 'Usage cost is metered.', dependencies: [], evidence: [{ relation: 'supports',
+      const claim: ResearchClaimBody = { questionId: 'cost-1', text: options.metricDrift ? '该公司营业收入同比增长 20%。' : 'Usage cost is metered.', dependencies: [], evidence: [{ relation: 'supports',
         ref: { researchId: f.task.researchId, planId, revision: 1, runId: source!.runId, toolCallId: source!.toolCallId,
           sourceSnapshotId: source!.sourceSnapshotId, locator: { start: 0, end: 30, quote: text.slice(0, 30) } } },
         { relation: 'supports', ref: { researchId: f.task.researchId, planId, revision: 1, runId: source!.runId, toolCallId: source!.toolCallId,
@@ -30,7 +37,7 @@ async function fixture(alter?: (claim: ResearchClaimBody, bodyPath: string) => R
       const claims = need(await f.app.listResearchClaims({ researchId: task.researchId, planId: task.currentPlanId! })).items;
       const claimIds = claims.map(claim => claim.claimId);
       if (options.changeSourceBeforeReport) writeFileSync(join(f.paths.root, source!.relativePath), text.replace('Official', 'Modified'));
-      return { tool: 'save_research_report', args: { formatVersion: 2, answer: [citedSentence('Usage cost is metered.', claimIds.length ? claimIds : [1], options.invalidCitation ? 2 : 0),
+      return { tool: 'save_research_report', args: { formatVersion: 3, answer: [citedSentence(options.metricDrift ? '该公司净利润同比增长 20%。' : 'Usage cost is metered.', claimIds.length ? claimIds : [1], options.invalidCitation ? 2 : 0),
         citedSentence('Costs depend on published usage units.', claimIds.length ? claimIds : [1], 1)],
         sections: [{ title: 'Cost', sentences: [citedSentence('The saved official source states that usage is metered.', claimIds.length ? claimIds : [1], 1)] }], completeness: options.partial ? 'partial' : 'full',
         conflicts: [], limitations: ['This engineering fixture does not establish a real deployment recommendation.'], unresolvedQuestions: options.partial ? ['Version-specific pricing is missing.'] : [],
@@ -39,7 +46,13 @@ async function fixture(alter?: (claim: ResearchClaimBody, bodyPath: string) => R
     }
     return { text: 'The fixture is finished. Inspect saved facts for its result.' };
   }, options.failReport ? db => db.run("CREATE TRIGGER fail_report BEFORE UPDATE OF current_report_id ON research_tasks WHEN NEW.current_report_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'fixture_report_save'); END") : undefined,
-  { material: text });
+  { material: text, provider: options.provider, review: async payload => {
+    if (options.changeSourceDuringReview) {
+      const source = need(await f.app.listResearchSources({ researchId: f.task.researchId })).items[0]!;
+      writeFileSync(join(f.paths.root, source.relativePath), text.replace('Official', 'Modified'));
+    }
+    return options.review ? await options.review(payload) : supportedResearchReviewResponse(payload);
+  } });
   const planning = await f.run(f.request(1));
   expect(planning.terminal.result).toMatchObject({ ok: true, data: { status: 'completed', stopped: true } });
   const task = need(await f.app.queryResearchTask(f.task.researchId));
@@ -65,6 +78,8 @@ it('records a coverage gap, reads one bounded supplementary passage and saves it
     .toContain('save_research_report');
   expect(f.task.status).toBe('completed');
   expect(report.cited?.answer).toHaveLength(2);
+  expect(report.semanticReview).toMatchObject({ status: 'verified', sentences: [{ verdict: 'supported' }, { verdict: 'supported' }, { verdict: 'supported' }] });
+  expect(f.reviewRequests).toHaveLength(1);
   expect(f.requests).toHaveLength(7);
   const document = need(await f.app.queryResearchReportDocument({ researchId: f.task.researchId, reportId: report.reportId }));
   expect(document.references.map(reference => [reference.number, reference.evidenceIndex])).toEqual([[1, 0], [2, 1]]);
@@ -91,6 +106,164 @@ it('records a coverage gap, reads one bounded supplementary passage and saves it
   const savedSource = need(await f.app.queryResearchSource({ researchId: f.task.researchId, sourceSnapshotId: source }));
   writeFileSync(join(f.paths.root, savedSource.relativePath), 'changed body');
   expect(await f.app.exportResearchReport(query)).toMatchObject({ ok: false, error: { code: 'research_source_unavailable' } });
+});
+
+it('rejects semantic drift through the actual reviewer request even when the Claim and exact quote are supported', async () => {
+  const f = await fixture(undefined, { metricDrift: true, review: text => {
+    expect(text).toContain('该公司营业收入同比增长 20%。');
+    expect(text).toContain('该公司净利润同比增长 20%。');
+    const response = supportedResearchReviewResponse(text);
+    return { sentences: response.sentences.map((row, index) => index ? row : { ...row,
+      facts: row.facts.map(fact => ({ ...fact, verdict: 'unsupported', reason: 'The quotation concerns revenue, not net profit.' })) }) };
+  } });
+  expect(f.reviewRequests).toHaveLength(1);
+  expect(f.task.currentReportId).toBeNull();
+  const call = need(await f.app.listRunToolCalls({ runId: f.investigation.accepted.runId, sessionId: f.session.sessionId }))
+    .items.find(item => item.toolName === 'save_research_report')!;
+  expect(call).toMatchObject({ status: 'failed', errorCode: 'research_semantic_rejected' });
+  const evidence = need(await f.app.queryRunToolEvidence({ runId: call.runId, sessionId: call.sessionId, toolCallId: call.toolCallId, limit: 32768 }));
+  expect(evidence.nextOffset).toBeNull();
+  const saved = JSON.parse(evidence.chunk);
+  expect(saved.result.data.semanticReview.status).toBe('rejected');
+  expect(saved.result.data.semanticReview.sentences[0]).toMatchObject({ verdict: 'unsupported' });
+  expect(saved.result.error.message).toContain('net profit');
+});
+
+it('reviews corrected wording in a new save call and binds only its successful decision to the saved report', async () => {
+  const sourceText = '该公司营业收入同比增长 20%。', wrongText = '该公司净利润同比增长 20%。';
+  let f!: Awaited<ReturnType<typeof researchFixture>>, feedback = '';
+  f = await researchFixture(async (request, index) => {
+    if (index === 1) return { tool: 'save_research_plan', id: 'plan', args: { ...researchPlan, sourcePolicy: f.task.sourcePolicy } };
+    if (index === 3) return { tool: 'read_research_local', id: 'source', args: { artifactId: f.task.sourcePolicy.artifactIds[0], documentId: null } };
+    const task = need(await f.app.queryResearchTask(f.task.researchId));
+    if (index === 4) {
+      const source = need(await f.app.listResearchSources({ researchId: task.researchId })).items[0]!;
+      return { tool: 'save_research_claim', id: 'claim', args: {
+        questionId: 'cost-1', text: sourceText, dependencies: [], evidence: [{ relation: 'supports', ref: {
+          researchId: task.researchId, planId: task.currentPlanId!, revision: 1, runId: source.runId,
+          toolCallId: source.toolCallId, sourceSnapshotId: source.sourceSnapshotId, locator: { start: 0, end: sourceText.length, quote: sourceText },
+        } }], verification: { status: 'supported', reasons: ['The release states the revenue figure.'] },
+      } };
+    }
+    if (index === 5 || index === 6) {
+      const claim = need(await f.app.listResearchClaims({ researchId: task.researchId, planId: task.currentPlanId! })).items[0]!;
+      if (index === 6) {
+        feedback = String(request.messages.filter(message => message.role === 'tool').at(-1)!.content);
+        expect(task.currentReportId).toBeNull();
+      }
+      return { tool: 'save_research_report', id: index === 5 ? 'wrong-report' : 'corrected-report', args: {
+        formatVersion: 3, answer: [citedSentence(index === 5 ? wrongText : sourceText, [claim.claimId])], sections: [],
+        completeness: 'partial', conflicts: [], limitations: [], unresolvedQuestions: [],
+        coverage: [{ questionId: 'cost-1', claimIds: [claim.claimId], status: 'covered', reason: 'Revenue is documented.' }],
+      } };
+    }
+    return { text: 'The corrected report is saved.' };
+  }, undefined, { material: sourceText, review: text => {
+    const response = supportedResearchReviewResponse(text);
+    return { sentences: response.sentences.map(row => ({ ...row, facts: row.facts.map(fact => ({
+      ...fact, verdict: fact.text === wrongText ? 'unsupported' : 'supported',
+      reason: fact.text === wrongText ? 'The release reports revenue, not profit.' : 'The metric matches the release.',
+    })) })) };
+  } });
+  await f.run(f.request(1));
+  const task = need(await f.app.queryResearchTask(f.task.researchId));
+  const plan = need(await f.app.queryResearchPlan({ researchId: task.researchId, planId: task.currentPlanId! }));
+  const run = await f.run(f.request(2, { researchId: task.researchId, phase: 'researching', plan: { planId: plan.planId, revision: plan.revision } }));
+  expect(feedback).toContain('Sentence 1, fact 1: unsupported');
+  expect(feedback).toContain('revenue, not profit');
+  expect(f.reviewRequests).toHaveLength(2);
+  const reports = need(await f.app.listResearchReports({ researchId: task.researchId })).items;
+  expect(reports).toHaveLength(1);
+  const [saved] = reports, calls = need(await f.app.listRunToolCalls({ runId: run.accepted.runId, sessionId: f.session.sessionId })).items;
+  const refused = calls.find(call => call.toolName === 'save_research_report' && call.status === 'failed')!;
+  const accepted = calls.find(call => call.toolName === 'save_research_report' && call.status === 'succeeded')!;
+  expect(refused.errorCode).toBe('research_semantic_rejected');
+  expect(accepted.toolCallId).not.toBe(refused.toolCallId);
+  expect(saved).toMatchObject({ answer: sourceText, toolCallId: accepted.toolCallId,
+    semanticReview: { status: 'verified', toolCallId: accepted.toolCallId, sentences: [{ text: sourceText }] } });
+  await f.reopen();
+  expect(need(await f.app.queryResearchReport({ researchId: task.researchId, reportId: saved!.reportId }))).toEqual(saved!);
+});
+
+it('keeps a call for the parent response and denies the reviewer before HTTP when the shared budget is exhausted', async () => {
+  const f = await fixture(undefined, { maxModelCalls: 4 });
+  expect(f.reviewRequests).toHaveLength(0);
+  expect(f.task.currentReportId).toBeNull();
+  expect(need(await f.app.listRunToolCalls({ runId: f.investigation.accepted.runId, sessionId: f.session.sessionId })).items
+    .find(item => item.toolName === 'save_research_report')).toMatchObject({ status: 'failed', errorCode: 'agent_model_call_budget' });
+});
+
+it('rechecks the saved body at commit after a successful semantic decision', async () => {
+  const f = await fixture(undefined, { changeSourceDuringReview: true });
+  expect(f.reviewRequests).toHaveLength(1);
+  expect(f.task.currentReportId).toBeNull();
+  expect(need(await f.app.listRunToolCalls({ runId: f.investigation.accepted.runId, sessionId: f.session.sessionId })).items
+    .find(item => item.toolName === 'save_research_report')).toMatchObject({ status: 'failed', errorCode: 'research_source_unavailable' });
+});
+
+it('does not commit when the reviewer exceeds the confirmed tool deadline', async () => {
+  const f = await fixture(undefined, { toolTimeoutMs: 1000, review: async text => {
+    await new Promise(resolve => setTimeout(resolve, 1400));
+    return supportedResearchReviewResponse(text);
+  } });
+  expect(f.reviewRequests).toHaveLength(1);
+  expect(f.task.currentReportId).toBeNull();
+  expect(need(await f.app.listRunToolCalls({ runId: f.investigation.accepted.runId, sessionId: f.session.sessionId })).items
+    .find(item => item.toolName === 'save_research_report')).toMatchObject({ status: 'failed', errorCode: 'tool_timeout' });
+});
+
+it('stops and blocks the root when reviewer termination is unconfirmed', async () => {
+  const actual = new PiProviderAdapter({ credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' });
+  const provider: ProviderPort = { close: () => actual.close(), prepare: async (...args) => {
+    const prepared = await actual.prepare(...args);
+    return prepared.ok ? ok({ ...prepared.data, execute: async (...input) => ({
+      ...await prepared.data.execute(...input), stopped: false,
+    }) }) : prepared;
+  } };
+  const f = await fixture(undefined, { provider });
+  expect(f.task.currentReportId).toBeNull();
+  const run = need(await f.app.queryRun(f.investigation.accepted.runId));
+  expect(run).toMatchObject({ status: 'failed', stoppedAt: null, error: { code: 'stop_not_confirmed' } });
+  expect(need(await f.app.listRunToolCalls({ runId: run.runId, sessionId: f.session.sessionId })).items
+    .find(item => item.toolName === 'save_research_report')).toMatchObject({ stopped: false, errorCode: 'stop_not_confirmed' });
+});
+
+it('keeps the root blocked and usage incomplete when review does not settle within stop grace', async () => {
+  const actual = new PiProviderAdapter({ credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' });
+  const held = Promise.withResolvers<void>(), returned = Promise.withResolvers<void>();
+  let dispatched = false;
+  const provider: ProviderPort = { close: () => actual.close(), prepare: async (...args) => {
+    const prepared = await actual.prepare(...args);
+    return prepared.ok ? ok({ ...prepared.data, execute: async (...input) => {
+      const result = await prepared.data.execute(...input);
+      dispatched = true;
+      await held.promise;
+      returned.resolve();
+      return result;
+    } }) : prepared;
+  } };
+  let f: Awaited<ReturnType<typeof fixture>> | undefined;
+  try {
+    f = await fixture(undefined, { toolTimeoutMs: 1000, stopGraceMs: 100, provider });
+    expect(dispatched).toBe(true);
+    expect(f.task.currentReportId).toBeNull();
+    const run = need(await f.app.queryRun(f.investigation.accepted.runId));
+    expect(run).toMatchObject({ status: 'failed', stoppedAt: null, error: { code: 'stop_not_confirmed' },
+      usage: { source: 'unknown', attemptsComplete: false }, tokens: { usageComplete: false } });
+    expect(run.usage.version === 2 && run.usage.calls.some(call => call.usage.reason === 'research-review-stop-unconfirmed')).toBe(true);
+    const requestCount = f.requests.length;
+    const nextSession = need(await f.app.createSession({ title: 'Unconfirmed reviewer must block fresh execution' }));
+    const nextTask = need(await f.app.createResearchTask({ sessionId: nextSession.sessionId, title: 'Another isolated task',
+      sourcePolicy: { web: false, domains: [], artifactIds: [], documentIds: [] } }));
+    expect(await f.app.submitInput({ ...f.request(1), sessionId: nextSession.sessionId,
+      research: { researchId: nextTask.researchId, phase: 'planning', plan: null } })).toMatchObject({
+        ok: false, error: { code: 'runtime_unusable' },
+      });
+    expect(f.requests).toHaveLength(requestCount);
+  } finally {
+    held.resolve();
+    if (dispatched) await returned.promise;
+  }
 });
 
 it('rejects a fabricated quote and refuses a full report with no supported claim', async () => {

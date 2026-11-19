@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { createHttpProvider, mkdtempSync } from '../../../tests/support/resources.ts';
-import { researchPlan } from '../../../tests/support/research.ts';
+import { researchPlan, supportedResearchReviewResponse, createResearchReviewReceipt } from '../../../tests/support/research.ts';
 import { SourceSnapshotSchema, ResearchPlanSchema, ClaimSchema } from '../../../packages/contracts/src/research.ts';
 import { ExtensionManifestSchema } from '../../../packages/contracts/src/extensions.ts';
 import { ToolCallSnapshotSchema } from '../../../packages/contracts/src/tool-evidence.ts';
@@ -26,13 +26,36 @@ import { fixtureRepo } from '../support/fixtures.ts';
 import { manifest } from '../fixtures/minimal-dataset.ts';
 import {buildResearchFrame} from '../../src/scoring/research-frame.ts';
 
-for (const isolation of [undefined] as const) test
-('the actual ' + (isolation ?? 'local') + ' Host executes planning, exact confirmation, research tools and replay inside one Trial', async () => {
-    const requests: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+test('the actual application Host rejects an unsupported report, then saves and replays its corrected report in one Trial', async () => {
+    const requests: Array<{ messages: Array<{ role: string; content: unknown }>; tools?: unknown[] }> = [];
+    const reviewRequests: typeof requests = [];
+    const unsupportedText = 'Usage is free.';
     const prefix = 'Usage is metered. ', text = prefix + 'a'.repeat(3999 - prefix.length) + '😀' + 'End of synthetic source.';
     let session!: AgentTrialSession;
-    const server = await createHttpProvider(async request => {
-        const body = await request.json() as typeof requests[number]; requests.push(body);
+    let fixtureFailure: unknown;
+    const respond = async (request: Request) => {
+        if (request.headers.get('authorization') !== 'Bearer synthetic-host-key') throw Error('Expected the synthetic trial credential.');
+        const body = await request.json() as typeof requests[number];
+        const chunk = (delta: object, finish: string | null = null) => `data: ${JSON.stringify({ id: 'eval-host-fixture', model: 'eval-host-fixture', choices: [{ index: 0, delta, finish_reason: finish }],
+            ...(finish ? { usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } } : {}) })}\n\n`;
+        if (body.messages.some(message => message.role === 'system' && String(message.content).includes('independent research evidence reviewer'))) {
+            reviewRequests.push(body);
+            const user = body.messages[1]?.content;
+            if (typeof user !== 'string') throw Error('Expected the independent reviewer context.');
+            const reviewed = supportedResearchReviewResponse(user);
+            expect(reviewed.sentences).toHaveLength(2);
+            expect(JSON.parse(user.slice(user.indexOf('\n\n') + 2))).toMatchObject({
+                evidence: [{ evidenceIndex: 0, quote: prefix }], evidenceBySentence: [[expect.any(String)], [expect.any(String)]],
+            });
+            const expectedSection = reviewRequests.length === 1 ? unsupportedText : 'Usage is metered.';
+            const section = reviewed.sentences[1]!.facts[0]!;
+            expect(section.text).toBe(expectedSection);
+            const decision = reviewRequests.length === 1 ? { sentences: [reviewed.sentences[0], { ...reviewed.sentences[1],
+                facts: [{ ...section, verdict: 'unsupported', reason: 'The selected quote says usage is metered and does not establish free usage.' }] }] } : reviewed;
+            return new Response(chunk({ role: 'assistant', content: JSON.stringify(decision) }) + chunk({}, 'stop') + 'data: [DONE]\n\n',
+                { headers: { 'content-type': 'text/event-stream' } });
+        }
+        requests.push(body);
         const index = requests.length;
         let reply: { tool: string; args: unknown } | string = index === 2 ? 'Plan saved; confirm its exact version.' : 'Research report saved.';
         const selected = JSON.stringify(body.messages).match(/artifactIds\\?":\[([\d,]*)\]/);
@@ -41,7 +64,7 @@ for (const isolation of [undefined] as const) test
         if (index === 3) reply = { tool: 'Agent', args: { subagent_type: 'research-investigator', description: 'Synthetic cost evidence', prompt: 'Read the selected local cost source and return its saved source identity.' } };
         if (index === 4) reply = { tool: 'read_research_local', args: { artifactId: JSON.parse('[' + selected?.[1] + ']')[0], documentId: null } };
         if (index === 5) reply = 'CHILD_EVIDENCE: sourceSnapshotId:1; Usage is metered.';
-        if (index >= 6 && index <= 8) {
+        if (index >= 6 && index <= 9) {
             const snapshot = await session.snapshot();
             const evidence = z.object({ sources: z.array(SourceSnapshotSchema), plans: z.array(ResearchPlanSchema), claims: z.array(ClaimSchema) }).passthrough().parse(snapshot.evidence.research!.actual);
             const source = evidence.sources[0]!, plan = evidence.plans[0]!;
@@ -50,24 +73,29 @@ for (const isolation of [undefined] as const) test
                 evidence: [{ relation: 'supports', ref: { researchId: source.researchId, planId: plan.planId, revision: plan.revision, runId: source.runId,
                     toolCallId: source.toolCallId, sourceSnapshotId: source.sourceSnapshotId, locator: { start: 0, end: prefix.length, quote: prefix } } }],
                 verification: { status: 'supported', reasons: ['The synthetic source explicitly states this condition.'] } } };
-            if (index === 8) {
+            if (index === 8 || index === 9) {
+                if (index === 9) {
+                    expect(snapshot.evidence.research).toMatchObject({ present: true, actual: { reportCount: 0, reports: [] } });
+                    expect(body.messages.some(message => message.role === 'tool'
+                        && String(message.content).includes('Sentence 2, fact 1: unsupported.'))).toBe(true);
+                }
                 const claimIds = evidence.claims.map(c => c.claimId);
                 const sentence = { text: 'Usage is metered.', citations: claimIds.map(claimId => ({ claimId, evidenceIndex: 0 })) };
-                reply = { tool: 'save_research_report', args: { formatVersion: 2, answer: [sentence], completeness: 'full',
-                    sections: [{ title: 'Cost', sentences: [sentence] }], conflicts: [], limitations: ['Synthetic engineering fixture.'], unresolvedQuestions: [],
+                reply = { tool: 'save_research_report', args: { formatVersion: 3, answer: [sentence], completeness: 'full',
+                    sections: [{ title: 'Cost', sentences: [index === 8 ? { ...sentence, text: unsupportedText } : sentence] }],
+                    conflicts: [], limitations: ['Synthetic engineering fixture.'], unresolvedQuestions: [],
                     coverage: [{ questionId: 'cost-1', claimIds, status: 'covered', reason: 'Explicit source evidence.' }] } };
             }
         }
-        const chunk = (delta: object, finish: string | null = null) => `data: ${JSON.stringify({ id: 'eval-host-fixture', model: 'eval-host-fixture', choices: [{ index: 0, delta, finish_reason: finish }],
-            ...(finish ? { usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } } : {}) })}\n\n`;
         const output = typeof reply === 'string' ? chunk({ role: 'assistant', content: reply }) + chunk({}, 'stop')
             : chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'fixture-' + index, type: 'function', function: { name: reply.tool, arguments: JSON.stringify(reply.args) } }] }) + chunk({}, 'tool_calls');
         return new Response(output + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
-    }, isolation ? '0.0.0.0' : undefined);
+    };
+    const server = await createHttpProvider(request => respond(request).catch(error => { fixtureFailure ??= error; throw error; }));
     const extension = ExtensionManifestSchema.parse(JSON.parse(readFileSync(join(REPO_ROOT, 'resources/extensions/subagents-v1.json'), 'utf8')));
     const trial: AgentTrial = { identity: { executionId: 'engineering-host', trialId: 'research-1', caseId: 'synthetic-research', caseVersion: 1 },
         directory: mkdtempSync(join(tmpdir(), 'eval-host-trial-')), input: { prompt: researchPlan.question, materials: [{ sample: 'synthetic', file: 'policy.md', text }] },
-        requires: ['agent', 'research', 'subagent'], configuration: { modelCapabilities: syntheticNativeModel, model: 'eval-host-fixture', baseUrl: `http://${isolation ? '127.0.0.1' : '127.0.0.1'}:${server.port}/v1`, api: 'openai-completions',
+        requires: ['agent', 'research', 'subagent'], configuration: { modelCapabilities: syntheticNativeModel, model: 'eval-host-fixture', baseUrl: `http://127.0.0.1:${server.port}/v1`, api: 'openai-completions',
             extensions: { enabledExtensions: [{ id: extension.id, version: extension.version }] } }, steps: [
             { id: 'plan', action: 'research-plan', instruction: researchPlan.question },
             { id: 'stale', action: 'research-confirm', instruction: 'Do not accept a changed revision.', planFromStep: 'plan', revisionOffset: 1, expected: 'research_plan_stale' },
@@ -78,9 +106,13 @@ for (const isolation of [undefined] as const) test
     try {
         session = await prepareHostResearchTrial(trial, new AbortController().signal, { repo: REPO_ROOT, credential: 'synthetic-host-key' });
         const result = await session.execute(new AbortController().signal);
-        expect({ identity: result.identity, status: result.status, endpointReached: result.endpointReached })
+        if (fixtureFailure) throw fixtureFailure;
+        expect({ identity: result.identity, status: result.status, endpointReached: result.endpointReached },
+            JSON.stringify({ error: result.error, requests: requests.length, reviews: reviewRequests.length }))
             .toEqual({ identity: trial.identity, status: 'completed', endpointReached: true });
-        expect(result.evidence.research).toMatchObject({ present: true, actual: { reportCount: 1, sourceTexts: [{ text }] } });
+        expect(result.evidence.research).toMatchObject({ present: true, actual: { reportCount: 1, sourceTexts: [{ text }],
+            reports: [{ answer: 'Usage is metered.', sections: [{ text: 'Usage is metered.' }],
+                semanticReview: { status: 'verified', sentences: [{ verdict: 'supported' }, { verdict: 'supported' }] } }] } });
         expect(result.evidence['research-integrity']).toMatchObject({ present: true, actual: { valid: true, reports: [{ reportId: expect.any(Number) }] } });
         expect(result.evidence.runs!.actual).toHaveLength(3);
         expect(result.evidence.subagents).toMatchObject({ present: true, actual: { children: [{ stopConfirmed: true, role: 'research-investigator',
@@ -89,7 +121,14 @@ for (const isolation of [undefined] as const) test
         expect(result.evidence['tool-evidence']).toMatchObject({ present: true });
         const originalTools = z.object({ calls: z.array(z.object({ tool: ToolCallSnapshotSchema }).passthrough()) }).passthrough()
             .parse(result.evidence['tool-evidence']!.actual).calls.map(call => call.tool);
-        expect(originalTools).toHaveLength(6);
+        expect(originalTools).toHaveLength(7);
+        expect(originalTools.filter(call => call.toolName === 'save_research_report')).toEqual(expect.arrayContaining([
+            expect.objectContaining({ result: expect.objectContaining({ status: 'failed', error: expect.objectContaining({ code: 'research_semantic_rejected' }),
+                data: expect.objectContaining({ semanticReview: expect.objectContaining({ status: 'rejected', sentences: [
+                    expect.objectContaining({ verdict: 'supported' }), expect.objectContaining({ text: unsupportedText, verdict: 'unsupported' }),
+                ] }) }) }) }),
+            expect.objectContaining({ result: expect.objectContaining({ status: 'succeeded' }) }),
+        ]));
         expect(originalTools.find(call => call.toolName === 'Agent')?.args.raw).toMatchObject({ subagent_type: 'research-investigator' });
         expect(originalTools.find(call => call.toolName === 'save_research_plan')?.args.raw).toMatchObject({ question: researchPlan.question });
         const originalSource = z.object({ sources: z.array(SourceSnapshotSchema) }).passthrough().parse(result.evidence.research!.actual).sources[0]!;
@@ -124,6 +163,8 @@ for (const isolation of [undefined] as const) test
         const textAdded='An additional unchecked fact.';
         section.sentences.push({text:textAdded,citations:section.sentences[0]!.citations});
         amended.sections[0]!.text+=' '+textAdded;
+        expect(buildResearchFrame({task:researchTask,result:changed,projected:trial.input,judge:null})).toBeUndefined();
+        amended.semanticReview=createResearchReviewReceipt({...amended,...amended.cited!,formatVersion:3},amended);
         const additional=buildResearchFrame({task:researchTask,result:changed,projected:trial.input,judge:null})!;
         expect(additional.blocks.some(b=>b.text.includes('additional unchecked fact'))).toBe(true);
         expect(additional.integrity.valid).toBe(false);
@@ -156,13 +197,18 @@ for (const isolation of [undefined] as const) test
         expect(result.evidence.environment).toMatchObject({ present: true, actual: { fresh: true,
             isolation: { contract: 'flowmate-local-host/v1', kind: 'local-process', filesystemSandbox: false } } });
         expect(JSON.stringify(requests[0])).not.toContain('FUTURE_CONFIRMATION');
-        expect(JSON.stringify(requests)).not.toContain('synthetic-host-key');
-        expect(requests).toHaveLength(9);
-        expect(result.usage).toMatchObject({ inputTokens: 90, outputTokens: 18, totalTokens: 108, cost: null });
-        const before = requests.length;
+        for (const wire of reviewRequests) {
+            expect(wire.messages.map(message => message.role)).toEqual(['system', 'user']);
+            expect(wire.tools ?? []).toEqual([]);
+        }
+        expect(JSON.stringify([...requests, ...reviewRequests])).not.toContain('synthetic-host-key');
+        expect(requests).toHaveLength(10);
+        expect(reviewRequests).toHaveLength(2);
+        expect(result.usage).toMatchObject({ inputTokens: 120, outputTokens: 24, totalTokens: 144, cost: null });
         const reread = await session.snapshot();
         expect(reread.evidence.research).toEqual(result.evidence.research);
-        expect(requests).toHaveLength(before);
+        expect(requests).toHaveLength(10);
+        expect(reviewRequests).toHaveLength(2);
     } finally {
         if (session) {
             const closed = await session.close();
@@ -186,7 +232,7 @@ test('two independent local Trials rebuild the same material projection without 
         const chunk = (delta: object, finish: string | null) => `data: ${JSON.stringify({ id: 'fresh-trial', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
         return new Response(chunk(delta, null) + chunk({}, planning ? 'tool_calls' : 'stop') + 'data: [DONE]\n\n',
             { headers: { 'content-type': 'text/event-stream' } });
-    }, '0.0.0.0');
+    });
     const root = mkdtempSync(join(tmpdir(), 'eval-fresh-isolated-'));
     const results = [];
     try {

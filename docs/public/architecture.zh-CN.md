@@ -36,9 +36,11 @@ flowchart TB
 
 Host 消息携带经过校验的请求与归属身份。通知负责唤醒读取，持久查询提供权威状态；回复丢失或迟到不授权重执行写入。生命周期详见 [Agent Runtime](agent-runtime.zh-CN.md)。
 
-联网 Deep Research 由执行研究的 Host 从启动环境读取 `FLOWMATE_TAVILY_API_KEY`，Renderer 只接收配置状态。计划确认后，父 Agent 的研究工具通过 Tavily 执行已确认的搜索或指定网址读取。搜索可提取计划排名选中的公开结果。网页正文作为不可信来源保存，引用复用已有研究步骤与来源快照。
+联网 Deep Research 由执行研究的 Host 从启动环境读取 `FLOWMATE_TAVILY_API_KEY`，Renderer 只接收配置状态。计划确认后，父 Agent 的工具向 Tavily 发送获准的公开搜索词或网址，返回的网页正文作为不可信证据保存。任务级开关保留任务、Session 和本地资料 ID 及历史；执行确认停止后才清除当前计划和 Run 指针。继续调查须确认新计划。当前运行中的网页证据查询和保存遵循新 Run 的来源授权及计划；历史查看和导出按原授权解析已保存证据。
 
-新报告按句保存，每条引用指向某个已保存 Claim 的具体证据。Host 在提交报告前核对确认的计划、来源快照、精确的 UTF-16 原文区间和采集回执。Renderer 与导出使用同一套编号。导出 PDF 时，Electron 在本地将已核验的报告排版为可打印页面，并保留跳转到 References 附录的链接。见 [Deep Research](workflows.zh-CN.md#deep-research)。
+新报告按句保存，每条引用指向某个已保存 Claim 的具体证据。Host 核对确认的计划、来源快照、精确的 UTF-16 原文区间和采集回执。有结论的格式 3 报告提交前须向所选模型发出一次隔离请求。请求包含报告、问题和范围、来源元数据及相关引文，包括反驳证据与依赖证据；不带工具或会话历史，也不自动重试。审核与父 Run、子任务共享模型调用预算，仅在还能为 Assistant 回应留出一次调用时才发出请求，时限同时受保存工具和 Run 限制。审核失败会阻止保存；有效的空正文部分报告记录 `no_findings`，不请求模型。Renderer 与导出使用同一套编号。Electron 在本地用已保存的报告和审核结果生成 PDF，保留跳转到 References 附录的链接；格式 2 没有审核记录，仍可导出 PDF。见 [Deep Research](workflows.zh-CN.md#deep-research)。
+
+审核在数据库事务外执行，提交前再次核对活动 Run、确认的计划、材料权限和原文内容。报告、审核回执和当前报告指针一起提交。完全相同的原写入 ToolCall 和已保存载荷重试时，即使 Run 已结束，也会返回已提交回执。原调用的载荷被改动时拒绝重放，修订报告通过新的保存调用提交。大小校验同时覆盖报告投影与完整的 ToolCall 结果封套，回执过大时会在插入报告前拒绝。
 
 对于[云端 Personal Agent Work](personal-agent.zh-CN.md#cloud-workspace)，桌面连接受限 SSH Bridge。Authority 负责工作区授权、业务持久化和模型代理，Runtime 负责原生 Durable 执行与检查点。窗口及浏览器交互仍由桌面负责。业务效果通过保存的业务回执核对，模型观测提供执行线索。
 

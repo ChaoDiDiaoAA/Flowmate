@@ -4,22 +4,26 @@ import { join, resolve } from 'node:path';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { cleanupResources, closeDesktopFixture, createHttpProvider, installReadGate, mkdtemp } from '../support/resources.ts';
+import { supportedResearchReviewResponse } from '../support/research.ts';
 
 test.afterEach(cleanupResources);
 const root = resolve(import.meta.dirname, '../..');
 function environment(userData: string) {
   const env: Record<string, string> = { FLOWMATE_TEST_MODE: '1', FLOWMATE_TEST_USER_DATA_ROOT: userData };
-  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'SystemDrive', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'WINDIR', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA'])
     if (process.env[key]) env[key] = process.env[key]!;
   return env;
 }
 
-test('desktop web search defaults off and can be enabled with the Host key', async () => {
+test('desktop web search defaults off and an enabled task can turn it off after the Host key is removed', async () => {
+  test.setTimeout(60000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-research-web-ui-'));
-  const app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'),
-    args: [join(root, 'out/main/index.js')], env: { ...environment(userData), FLOWMATE_TAVILY_API_KEY: 'synthetic-tavily-desktop-key' }, timeout: 30000 });
+  const launch = (env: Record<string, string>) => electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'),
+    args: [join(root, 'out/main/index.js')], env, timeout: 30000 });
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
   try {
-    const page = await app.firstWindow();
+    app = await launch({ ...environment(userData), FLOWMATE_TAVILY_API_KEY: 'synthetic-tavily-desktop-key' });
+    let page = await app.firstWindow();
     await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
     await page.getByRole('button', { name: 'New research', exact: true }).click();
     const web = page.getByRole('switch', { name: 'Web search' });
@@ -30,13 +34,45 @@ test('desktop web search defaults off and can be enabled with the Host key', asy
     await expect(web).not.toBeChecked();
     await web.check();
     await page.getByLabel('Research question', { exact: true }).fill('Find current deployment costs');
+    await page.getByLabel('Import text or Markdown', { exact: true }).setInputFiles({
+      name: 'local-policy.md', mimeType: 'text/markdown', buffer: Buffer.from('The selected local policy defines the deployment scope.'),
+    });
+    await expect(page.getByLabel('local-policy.md', { exact: false })).toBeChecked();
     await page.getByRole('button', { name: 'Create research', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Find current deployment costs', exact: true })).toBeVisible();
+    const before = await page.evaluate(() => window.flowmate.listResearchTasks());
+    expect(before).toMatchObject({ ok: true, data: { items: [{ sourcePolicy: { web: true, artifactIds: [expect.any(Number)] } }] } });
+    if (!before.ok) throw Error(before.error.code);
+    const original = before.data.items[0]!;
+    const toggle = page.getByRole('switch', { name: 'Web search', exact: true });
+    await expect(toggle).toBeChecked();
+    await toggle.click();
+    await expect(toggle).not.toBeChecked();
     expect(await page.evaluate(() => window.flowmate.listResearchTasks())).toMatchObject({ ok: true,
-      data: { items: [{ sourcePolicy: { web: true } }] } });
+      data: { items: [{ researchId: original.researchId, sessionId: original.sessionId,
+        sourcePolicy: { ...original.sourcePolicy, web: false }, currentRunId: null, currentPlanId: null }] } });
+    await toggle.click();
+    await expect(toggle).toBeChecked();
+    expect(await page.evaluate(() => window.flowmate.listResearchTasks())).toMatchObject({ ok: true,
+      data: { items: [{ researchId: original.researchId, sourcePolicy: original.sourcePolicy }] } });
     await page.getByRole('button', { name: 'New research', exact: true }).click();
     await expect(web).not.toBeChecked();
-  } finally { await closeDesktopFixture(app, userData); }
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await closeDesktopFixture(app, userData); app = null;
+    app = await launch(environment(userData)); page = await app.firstWindow();
+    await page.getByRole('button', { name: 'Deep Research', exact: true }).click();
+    const restoredToggle = page.getByRole('switch', { name: 'Web search', exact: true });
+    await expect(page.getByText('Set FLOWMATE_TAVILY_API_KEY', { exact: false })).toBeVisible();
+    await expect(restoredToggle).toBeChecked();
+    await expect(restoredToggle).toBeEnabled();
+    await restoredToggle.click();
+    await expect(restoredToggle).not.toBeChecked();
+    await expect(restoredToggle).toBeDisabled();
+    expect(await page.evaluate(id => window.flowmate.queryResearchTask(id), original.researchId)).toMatchObject({ ok: true, data: {
+      researchId: original.researchId, sessionId: original.sessionId, sourcePolicy: { ...original.sourcePolicy, web: false },
+      currentRunId: null, currentPlanId: null,
+    } });
+  } finally { if (app) await closeDesktopFixture(app, userData); }
 });
 
 test('research restores unfinished steps after relaunch and acquires them only after Continue', async () => {
@@ -44,7 +80,8 @@ test('research restores unfinished steps after relaunch and acquires them only a
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-research-checkpoint-ui-'));
   let requests = 0, artifactId = 0;
   const policy = () => ({ web: false, domains: [], artifactIds: [artifactId], documentIds: [] });
-  const provider = await createHttpProvider(async () => {
+  const provider = await createHttpProvider(async request => {
+    expect(request.headers.get('authorization')).toBe('Bearer synthetic-checkpoint-key');
     const index = ++requests;
     const execution = { budget: { maxModelCalls: 8, maxToolCalls: 16, toolTimeoutMs: 10000 }, timeoutMs: 60000, stopGraceMs: 5000 };
     const tool = index === 1 ? { name: 'save_research_plan', args: { question: 'Restore the local policy research.', scope: 'Selected local policy only.',
@@ -52,7 +89,7 @@ test('research restores unfinished steps after relaunch and acquires them only a
       sourcePolicy: policy(), stopConditions: ['Policy is cited or an explicit gap is saved.'], execution,
       steps: [{ id: 'policy-source', questionIds: ['local'], tool: 'read_research_local', input: { artifactId, documentId: null } }] } }
       : index === 3 || index === 6 ? { name: 'read_research_local', args: { artifactId, documentId: null, stepId: index === 3 ? 'wrong-step' : 'policy-source' } }
-      : index === 4 ? { name: 'save_research_report', args: { formatVersion: 2, answer: [], completeness: 'partial',
+      : index === 4 ? { name: 'save_research_report', args: { formatVersion: 3, answer: [], completeness: 'partial',
         sections: [], conflicts: [],
         limitations: ['Acquisition was rejected because it used the wrong step.'], unresolvedQuestions: ['What does the policy require?'],
         coverage: [{ questionId: 'local', claimIds: [], status: 'gap', reason: 'Acquire the confirmed source step.' }] } } : null;
@@ -90,6 +127,9 @@ test('research restores unfinished steps after relaunch and acquires them only a
     await page.getByRole('button', { name: 'Confirm plan version 1', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Continue research', exact: true })).toBeEnabled();
     await expect.poll(() => requests).toBe(5);
+    const reports = await page.evaluate(researchId => window.flowmate.listResearchReports({ researchId }), created.task.researchId);
+    expect(reports).toMatchObject({ ok: true, data: { items: [{ completeness: 'partial',
+      semanticReview: { status: 'no_findings', sentences: [] } }] } });
     const count = requests;
     await closeDesktopFixture(app, userData); app = null;
     app = await launch(); page = await app.firstWindow();
@@ -122,7 +162,7 @@ test('research restores unfinished steps after relaunch and acquires them only a
     await expect(page.getByRole('region', { name: 'Research steps', exact: true })).toContainText('1 / 1 sources acquired', { timeout: 20000 });
     expect(requests).toBe(7);
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
-  } finally { if (app) await closeDesktopFixture(app, userData); }
+  } finally { try { if (app) await closeDesktopFixture(app, userData); } finally { await provider.stop(); } }
 });
 
 test('research desktop creates and confirms a plan, reads local evidence, exports and reopens without replay', async ({}, testInfo) => {
@@ -131,9 +171,21 @@ test('research desktop creates and confirms a plan, reads local evidence, export
   const finding = '部署必须在本地运行。';
   const text = 'Team policy: deployments must run locally.\n' + finding + '\n'
     + '适用于测试环境的部署规范和执行条件。\n'.repeat(185) + '引用末尾保留。';
-  let page!: Page, requests = 0, holdNext = false, releaseHeld: () => void = () => {};
+  let page!: Page, requests = 0, reviewRequests = 0, holdNext = false, releaseHeld: () => void = () => {};
+  const desktopEnvironment = { ...environment(userData), FLOWMATE_TAVILY_API_KEY: 'synthetic-tavily-desktop-key' };
   const provider = await createHttpProvider(async request => {
-    const body = await request.json() as { tools?: Array<{ function: { name: string } }> };
+    expect(request.headers.get('authorization')).toBe('Bearer synthetic-research-model-key');
+    const body = await request.json() as { tools?: Array<{ function: { name: string } }>; messages?: Array<{ role: string; content: string }> };
+    if (body.messages?.some(message => message.role === 'system' && message.content.includes('independent research evidence reviewer'))) {
+      reviewRequests++;
+      expect(body.messages.map(message => message.role)).toEqual(['system', 'user']);
+      expect(body.tools ?? []).toEqual([]);
+      const reviewed = supportedResearchReviewResponse(body.messages[1]!.content);
+      return new Response('data: ' + JSON.stringify({ id: 'p15-ui-review', model: 'research-ui',
+        choices: [{ index: 0, delta: { content: JSON.stringify(reviewed) }, finish_reason: null }] })
+        + '\n\ndata: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n',
+        { headers: { 'content-type': 'text/event-stream' } });
+    }
     const index = ++requests;
     if (holdNext) { holdNext = false; await new Promise<void>(resolve => { releaseHeld = resolve; }); }
     let tool: { name: string; arguments: unknown } | null = null;
@@ -161,7 +213,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
       const claimIds = await page.evaluate(async () => { const tasks = await window.flowmate.listResearchTasks(); if (!tasks.ok) throw new Error(tasks.error.code); const task = tasks.data.items[0]!;
         const claims = await window.flowmate.listResearchClaims({ researchId: task.researchId, planId: task.currentPlanId! }); if (!claims.ok) throw new Error(claims.error.code); return claims.data.items.map(item => item.claimId); });
       const citations = claimIds.map(claimId => ({ claimId, evidenceIndex: 0 }));
-      tool = { name: 'save_research_report', arguments: { formatVersion: 2,
+      tool = { name: 'save_research_report', arguments: { formatVersion: 3,
         answer: [{ text: index === 9 ? 'Updated report: deployment must run locally.' : 'Deployment must run locally.', citations }],
         sections: [{ title: 'Deployment constraint', sentences: [{ text: finding, citations }] }],
         completeness: index === 9 ? 'partial' : 'full', conflicts: [], limitations: ['Engineering fixture; no product recommendation is validated.'], unresolvedQuestions: [],
@@ -174,7 +226,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
   });
   let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
   try {
-    app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'), args: [join(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
+    app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'), args: [join(root, 'out/main/index.js')], env: desktopEnvironment, timeout: 30000 });
     page = await app.firstWindow(); await page.getByRole('button', { name: 'Invoices', exact: true }).click(); await page.getByRole('heading', { name: 'Invoices', exact: true }).waitFor({ timeout: 20000 });
     expect(await page.evaluate(async baseUrl => { const state = await window.flowmate.getState(); if (!state.ok) return state;
       return window.flowmate.saveSettings({ ...state.data.settings, models: [{ id: 'research-ui', credentialRef: '00000000000000000000000000000030', name: 'Research fixture', kind: 'custom', providerId: null,
@@ -199,8 +251,8 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     const newResearch = page.getByRole('button', { name: 'New research', exact: true }); await newResearch.focus(); await newResearch.press('Enter');
     await expect(page.getByRole('button', { name: 'Open Assistant', exact: true })).toBeVisible();
     await expect(page.getByLabel('Research question', { exact: true })).toBeFocused();
-    await expect(page.getByRole('switch', { name: 'Web search' })).toBeDisabled();
-    await expect(page.getByText('Set FLOWMATE_TAVILY_API_KEY', { exact: false })).toBeVisible();
+    await expect(page.getByRole('switch', { name: 'Web search' })).toBeEnabled();
+    await expect(page.getByRole('switch', { name: 'Web search' })).not.toBeChecked();
     await expect(page.getByRole('complementary', { name: 'Research list', exact: true })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Create research', exact: true })).toBeDisabled();
     await page.getByLabel('Research question', { exact: true }).fill('Compare Agent deployments using team constraints');
@@ -232,9 +284,15 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await confirm.click();
     await expect(page.locator('.chat-transcript')).toContainText('The research report is saved.', { timeout: 20000 });
     await page.getByRole('button', { name: 'Report', exact: true }).click(); await expect(page.locator('.research-detail')).toContainText('Deployment must run locally.');
+    expect(reviewRequests).toBe(1);
+    const review = page.getByRole('region', { name: 'Semantic review', exact: true });
+    await expect(review).toContainText('verified · Policy research-semantic-v1');
+    const reviewedSection = review.locator('details').filter({ hasText: 'Sentence 2 · supported · complete' });
+    await reviewedSection.locator('summary').click();
+    await expect(reviewedSection.getByText('Controlled structural fixture verdict.', { exact: false })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Open Assistant', exact: true })).toBeVisible();
     const markers = page.getByRole('button', { name: 'Reference 1', exact: true });
-    await expect(markers).toHaveCount(2);
+    await expect(page.locator('.research-answer').getByRole('button', { name: 'Reference 1', exact: true })).toBeVisible();
     await markers.first().click();
     const reference = page.getByRole('region', { name: 'Selected reference', exact: true });
     await expect(reference).toBeVisible();
@@ -256,6 +314,8 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     const markdown = readFileSync(output, 'utf8');
     expect(markdown).toContain(finding); expect(markdown).toContain('引用末尾保留。');
     expect(markdown).toContain('ToolCall');
+    expect(markdown).toContain('## Semantic review');
+    expect(markdown).toContain('All 2 sentences passed independent factual review with research-ui.');
     expect(markdown.match(/\[\[1\]\]\(#reference-1\)/g)).toHaveLength(2);
     await page.screenshot({ path: testInfo.outputPath('research-report.png') });
     await page.getByLabel('Export format').selectOption('pdf');
@@ -265,8 +325,10 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await expect(page.getByRole('status')).toContainText(pdfOutput);
     const pdf = readFileSync(pdfOutput).toString('latin1');
     expect(pdf.startsWith('%PDF-')).toBe(true);
-    expect(pdf).toContain('/Subtype /Link');
-    expect(pdf).toContain('/Dest /reference-1');
+    expect(pdf.trimEnd().endsWith('%%EOF')).toBe(true);
+    expect(pdf.match(/\/Type \/Page\b/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+    // The answer and section plus their two reviewed facts link to the same saved passage.
+    expect(pdf.match(/\/Dest \/reference-1\b/g) ?? []).toHaveLength(4);
     // The existing no-overwrite publication failure must preserve both reports and external content.
     const conflictPath = join(userData, 'different-content.pdf'); writeFileSync(conflictPath, 'Keep my existing file.');
     await app.evaluate(({ dialog }, destination) => { dialog.showSaveDialog = (async () => ({ canceled: false, filePath: destination })) as typeof dialog.showSaveDialog; }, conflictPath);
@@ -284,6 +346,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('Save an updated partial report using the existing evidence.');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect(page.locator('.chat-transcript')).toContainText('Explicit follow-up completed.', { timeout: 20000 });
+    expect(reviewRequests).toBe(2);
     await expect(page.getByLabel('Saved report', { exact: true }).locator('option')).toHaveCount(2).catch(async error => {
       throw new Error(String(error) + '\nResearch UI: ' + (await page.locator('.research-page').innerText()).slice(0, 3500));
     });
@@ -342,7 +405,7 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.screenshot({ path: testInfo.outputPath('research-narrow.png') });
     const task = await page.evaluate(async () => { const result = await window.flowmate.listResearchTasks(); if (!result.ok) throw new Error(result.error.code); return result.data.items[0]!; });
     await closeDesktopFixture(app, userData); app = null;
-    app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'), args: [join(root, 'out/main/index.js')], env: environment(userData), timeout: 30000 });
+    app = await electron.launch({ executablePath: join(root, 'node_modules/electron/dist/electron.exe'), args: [join(root, 'out/main/index.js')], env: desktopEnvironment, timeout: 30000 });
     page = await app.firstWindow();
     await page.getByRole('button', { name: 'Deep Research', exact: true }).waitFor({ timeout: 20000 }).catch(async failure => {
       throw new Error(`${String(failure)}\nReopen URL: ${page.url()}\nVisible text: ${await page.locator('body').innerText()}`);
@@ -359,6 +422,10 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await app.evaluate(() => Reflect.get(globalThis, 'contextReadGate').restore());
     await expect(page.locator('.research-detail')).toContainText(finding);
     expect(requests).toBe(count);
+    expect(reviewRequests).toBe(2);
+    const taskWeb = page.getByRole('switch', { name: 'Web search', exact: true });
+    await expect(taskWeb).toBeEnabled();
+    await expect(taskWeb).not.toBeChecked();
     await page.getByRole('button', { name: 'Chats', exact: true }).click();
     const expandAgain = page.getByRole('button', { name: 'Open Assistant', exact: true }); if (await expandAgain.isVisible()) await expandAgain.click();
     await page.getByRole('textbox', { name: 'Message to model', exact: true }).fill('Summarize saved constraints without changing the plan.');
@@ -389,6 +456,8 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.getByRole('button', { name: 'Close Assistant', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Open Assistant', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Stop research', exact: true })).toBeEnabled();
+    await expect(taskWeb).toBeDisabled();
+    await expect(page.getByText('Wait for the current Run to stop before changing web search.', { exact: false })).toBeVisible();
     await page.getByRole('button', { name: 'New research', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Cancel', exact: true }).click();

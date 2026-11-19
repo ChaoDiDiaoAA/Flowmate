@@ -8,10 +8,13 @@ import { appError, fail, ok, ResearchTaskSchema, ResearchPlanSchema, ResearchPla
   ResearchRunBindingSchema, ResearchSourceDataSchema, SourceSnapshotSchema, ResearchClaimBodySchema, ClaimSchema,
   CitedResearchReportBodySchema, projectCitedResearchReport, researchSentences, ResearchReportSchema, ResearchPageRequestSchema, ResearchMaterialSchema, RESEARCH_WEB_TOOL_NAMES } from '@flowmate/contracts';
 import type { Result, ResearchSourcePolicy, ResearchTask, ResearchPlanBody, ResearchPlan, ResearchRunBinding, SourceSnapshot,
-  ResearchClaimBody, Claim, CitedResearchReportBody, ResearchReport, ResearchPageRequest, ResearchTaskPage, ResearchMaterial, ResearchStep } from '@flowmate/contracts';
+  ResearchClaimBody, Claim, ResearchReport, ResearchPageRequest, ResearchTaskPage, ResearchMaterial, ResearchStep } from '@flowmate/contracts';
 import type { PublishedArtifact } from '../storage/file-store.ts';
+import type { UpdateResearchWebAccessRequest } from '../../../contracts/src/research-commands.ts';
 import { readTransaction } from '../storage/reads.ts';
 import { createSessionRepository } from '../storage/repositories.ts';
+import { ReviewedResearchReportBodySchema, ReviewedResearchReportRecordSchema, researchSemanticReviewMatchesReport, TOOL_CONFIG } from '@flowmate/contracts';
+import type { ReviewedResearchReportBody, ResearchSemanticReview } from '@flowmate/contracts';
 
 type Identity = { researchId: number; runId: number; toolCallId: number; at: string };
 type WebTool = typeof RESEARCH_WEB_TOOL_NAMES[number];
@@ -27,6 +30,7 @@ export interface ResearchRepository {
   registerMaterial(input: PublishedArtifact): Result<ResearchMaterial>;
   listMaterials(input: ResearchPageRequest): Result<{ items: ResearchMaterial[]; nextBeforeId: number | null }>;
   create(input: { sessionId: number; title: string; sourcePolicy: ResearchSourcePolicy; at: string }): Result<ResearchTask>;
+  updateWebAccess(input: UpdateResearchWebAccessRequest & { at: string }): Result<ResearchTask>;
   get(researchId: number): Result<ResearchTask>;
   forSession(sessionId: number): Result<ResearchTask | null>;
   list(input: ResearchPageRequest): Result<ResearchTaskPage>;
@@ -43,8 +47,8 @@ export interface ResearchRepository {
   saveClaim(input: Identity & { claim: ResearchClaimBody }): Result<Claim>;
   getClaim(input: { researchId: number; claimId: number }): Result<Claim>;
   listClaims(input: ResearchPageRequest & { researchId: number; planId: number }): Result<{ items: Claim[]; nextBeforeId: number | null }>;
-  validateReport(input: Identity & { report: CitedResearchReportBody }): Result<void>;
-  saveReport(input: Identity & { report: CitedResearchReportBody }): Result<ResearchReport>;
+  validateReport(input: Identity & { report: ReviewedResearchReportBody }): Result<void>;
+  saveReport(input: Identity & { report: ReviewedResearchReportBody; semanticReview: ResearchSemanticReview }): Result<ResearchReport>;
   getReport(input: { researchId: number; reportId: number }): Result<ResearchReport>;
   listReports(input: ResearchPageRequest & { researchId: number }): Result<{ items: ResearchReport[]; nextBeforeId: number | null }>;
 }
@@ -132,7 +136,7 @@ export function createResearchRepository(db: Database): ResearchRepository {
     const common = { researchId: row.research_id, runId: row.run_id, toolCallId: row.tool_call_id, createdAt: row.created_at };
     const body = JSON.parse(row.body_json) as unknown;
     const cited = kind === 'report' && body && typeof body === 'object' && 'formatVersion' in body
-      ? projectCitedResearchReport(CitedResearchReportBodySchema.parse(body)) : undefined;
+      ? projectCitedResearchReport('semanticReview' in body ? ReviewedResearchReportRecordSchema.parse(body) : CitedResearchReportBodySchema.parse(body)) : undefined;
     const value = kind === 'plan' ? ResearchPlanSchema.parse({ ...common, planId: row.id, revision: row.revision, body })
       : kind === 'source' ? SourceSnapshotSchema.parse({ ...common, sourceSnapshotId: row.id, ...body as object })
       : kind === 'claim' ? ClaimSchema.parse({ ...common, claimId: row.id, planId: row.plan_id, revision: row.revision, ...body as object })
@@ -216,6 +220,30 @@ export function createResearchRepository(db: Database): ResearchRepository {
         .run(input.sessionId, title, JSON.stringify(policy), input.at, input.at);
       return project(taskRow(Number(inserted.lastInsertRowid)));
     }),
+    updateWebAccess: input => operation(true, () => {
+      requireFact(typeof input.web === 'boolean' && typeof input.expectedWeb === 'boolean' && validAt(input.at), 'input_invalid');
+      const task = taskRow(input.researchId);
+      const permission = sessions.isModelUseBlocked(task.session_id), session = sessions.get(task.session_id);
+      requireFact(permission.ok && !permission.data && session.ok && session.data.status === 'active' && !session.data.deletePending, 'research_source_denied');
+      const policy = ResearchSourcePolicySchema.parse(JSON.parse(task.source_policy_json));
+      if (policy.web === input.web) return project(task);
+      requireFact(policy.web === input.expectedWeb, 'state_conflict', 'Research web access changed. Refresh the task before trying again.');
+      // Historical root runs and children in separate Sessions can still have unconfirmed stops.
+      const unsettled = db.query(`WITH RECURSIVE task_runs(id) AS (
+        SELECT id FROM runs WHERE session_id=? AND parent_run_id IS NULL
+        UNION ALL SELECT child.id FROM runs child JOIN task_runs parent ON child.parent_run_id=parent.id
+      ) SELECT 1 FROM task_runs JOIN runs r USING (id)
+        WHERE r.status IN ('created','running') OR r.stopped_at IS NULL
+          OR json_extract(r.cleanup_json,'$.stopped')=0 OR json_extract(r.cleanup_json,'$.lateObservationRequired')=1
+      UNION ALL SELECT 1 FROM task_runs JOIN tool_calls t ON t.run_id=task_runs.id
+        WHERE t.status IN ('requested','running') OR COALESCE(json_extract(t.cleanup_json,'$.stopped'),0)<>1
+          OR (t.started_at IS NOT NULL AND t.stopped_at IS NULL)
+      LIMIT 1`).get(task.session_id);
+      requireFact(!unsettled, 'research_web_access_busy', 'Confirm that research execution and its tools have stopped before changing web access.');
+      db.query(`UPDATE research_tasks SET source_policy_json=json_set(source_policy_json,'$.web',json(?)),
+        current_plan_id=NULL,current_run_id=NULL,updated_at=? WHERE id=?`).run(JSON.stringify(input.web), input.at, task.id);
+      return project(taskRow(task.id));
+    }),
     get: id => operation(false, () => project(taskRow(id))),
     forSession: sessionId => operation(false, () => {
       requireFact(validId(sessionId), 'input_invalid');
@@ -244,6 +272,7 @@ export function createResearchRepository(db: Database): ResearchRepository {
       else {
         requireFact(input.phase === 'researching' && input.plan && input.plan.planId === task.current_plan_id, 'research_plan_stale');
         const plan = record('plan', task.id, input.plan.planId); requireFact(plan.revision === input.plan.revision, 'research_plan_stale');
+        requireFact(binding(plan.runId)?.sourcePolicy.web === policy.web && (!plan.body.sourcePolicy.web || policy.web), 'research_plan_stale');
         const previous = task.current_run_id === null ? null : binding(task.current_run_id);
         const wasConfirmed = confirmed(task);
         requireFact(!input.continuation || wasConfirmed, 'research_plan_not_confirmed');
@@ -260,7 +289,13 @@ export function createResearchRepository(db: Database): ResearchRepository {
     savePlan: input => operation(true, () => {
       const body = parseInput(ResearchPlanBodySchema, input.body), found = duplicate('plan', input, body); if (found) return found;
       const value = execution(input, 'save_research_plan', true); requireFact(value.phase === 'planning', 'research_phase_invalid');
-      requireFact(sourceSubset(body.sourcePolicy, value.sourcePolicy), 'research_source_denied');
+      requireFact(sourceSubset(body.sourcePolicy, value.sourcePolicy) && body.sourcePolicy.web === value.sourcePolicy.web, 'research_source_denied');
+      if (value.sourcePolicy.web && (value.sourcePolicy.artifactIds.length || value.sourcePolicy.documentIds.length))
+        requireFact(body.steps?.some(step => step.tool === 'read_research_local'), 'research_plan_local_step_required',
+          'Include at least one local read step for an authorized material when web access and local materials are enabled.');
+      if (value.sourcePolicy.web)
+        requireFact(body.steps?.some(step => step.tool !== 'read_research_local'), 'research_plan_web_step_required',
+          'Include a planned public-web search or read when Web search is enabled.');
       const revision = (db.query('SELECT COALESCE(MAX(revision),0)+1 AS n FROM research_plans WHERE research_id=?').get(input.researchId) as { n: number }).n;
       const row = db.query('INSERT INTO research_plans(research_id,revision,run_id,tool_call_id,body_json,created_at) VALUES (?,?,?,?,?,?)')
         .run(input.researchId, revision, input.runId, input.toolCallId, JSON.stringify(body), input.at);
@@ -343,14 +378,22 @@ export function createResearchRepository(db: Database): ResearchRepository {
     getClaim: input => operation(false, () => record('claim', input.researchId, input.claimId)),
     listClaims: input => operation(false, () => listRecords('claim', input)),
     validateReport: input => operation(false, () => {
-      checkReport(input, parseInput(CitedResearchReportBodySchema, input.report));
+      checkReport(input, parseInput(ReviewedResearchReportBodySchema, input.report));
     }),
     saveReport: input => operation(true, () => {
-      const report = parseInput(CitedResearchReportBodySchema, input.report);
-      const found = duplicate('report', input, report); if (found) return found;
+      const report = parseInput(ReviewedResearchReportBodySchema, input.report);
+      const saved = parseInput(ReviewedResearchReportRecordSchema, { ...report, semanticReview: input.semanticReview });
+      const found = duplicate('report', input, saved); if (found) return found;
       const plan = checkReport(input, report);
+      requireFact(researchSemanticReviewMatchesReport(report, input.semanticReview, { ...input, planId: plan.planId, revision: plan.revision }), 'research_review_mismatch');
+      const projected = { ...projectCitedResearchReport(saved), researchId: input.researchId, planId: plan.planId, revision: plan.revision,
+        runId: input.runId, toolCallId: input.toolCallId, reportId: Number.MAX_SAFE_INTEGER, createdAt: input.at };
+      const resultEnvelope = { version: 1, committedCandidateId: null, status: 'succeeded', data: projected };
+      requireFact(Buffer.byteLength(JSON.stringify(projected)) <= TOOL_CONFIG.payload.maxOutputBytes
+        && Buffer.byteLength(JSON.stringify(resultEnvelope)) <= TOOL_CONFIG.payload.maxStoredResultEnvelopeBytes, 'research_report_too_large',
+        'Reduce the report and review details to fit the report receipt limit.');
       const row = db.query('INSERT INTO research_reports(research_id,plan_id,revision,run_id,tool_call_id,body_json,created_at) VALUES (?,?,?,?,?,?,?)')
-        .run(input.researchId, plan.planId, plan.revision, input.runId, input.toolCallId, JSON.stringify(report), input.at);
+        .run(input.researchId, plan.planId, plan.revision, input.runId, input.toolCallId, JSON.stringify(saved), input.at);
       const id = Number(row.lastInsertRowid);
       db.query('UPDATE research_tasks SET current_report_id=?,updated_at=? WHERE id=?').run(id, input.at, input.researchId);
       return record('report', input.researchId, id);
@@ -359,7 +402,7 @@ export function createResearchRepository(db: Database): ResearchRepository {
     listReports: input => operation(false, () => listRecords('report', input)),
   };
 
-  function checkReport(input: Identity, report: CitedResearchReportBody) {
+  function checkReport(input: Identity, report: ReviewedResearchReportBody) {
       const value = execution(input, 'save_research_report', true), plan = currentPlan(value), questions = questionIds(plan);
       const workflow = readResearchWorkflow(db, input.researchId, plan.planId);
       requireFact(!workflow?.steps.some(step => step.status === 'running'), 'research_acquisition_running');

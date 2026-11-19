@@ -1,3 +1,4 @@
+import { ResearchMaterialResultSchema, ResearchTaskResultSchema, type Result, type SessionSnapshot } from '@flowmate/contracts';
 import { defaultProductSettings } from '@flowmate/core';
 import { expect, it } from 'bun:test';
 import { join, resolve } from 'node:path';
@@ -34,15 +35,15 @@ it('research imports, task lists and restored reads cross the actual Host withou
   } finally { expect(await client.close()).toMatchObject({ ok: true }); }
 });
 
-it('reports Tavily configuration from the actual Host and gates online task creation', async () => {
+it('reports Tavily configuration and gates web access changes through the actual Host', async () => {
   const key = process.env.FLOWMATE_TAVILY_API_KEY;
   try {
     for (const configured of [false, true]) {
       if (configured) process.env.FLOWMATE_TAVILY_API_KEY = 'synthetic-tavily-host-key';
       else delete process.env.FLOWMATE_TAVILY_API_KEY;
       const root = mkdtempSync(join(tmpdir(), 'flowmate-research-web-host-')), client = new HostClient();
-      expect(await client.start(root, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true });
       try {
+        expect(await client.start(root, '0.1.0', resolve(import.meta.dir, '../..'))).toMatchObject({ ok: true });
         expect(await client.request({ type: 'query_research_web_status', input: {} })).toEqual({ ok: true, data: { configured } });
         const session = await client.request({ type: 'create_session', input: { title: 'Web research' } }) as any;
         expect(session.ok).toBe(true);
@@ -50,6 +51,38 @@ it('reports Tavily configuration from the actual Host and gates online task crea
           title: 'Web research', sourcePolicy: { web: true, domains: [], artifactIds: [], documentIds: [] } } });
         expect(task).toMatchObject(configured ? { ok: true, data: { sourcePolicy: { web: true } } }
           : { ok: false, error: { code: 'research_web_unconfigured' } });
+
+        const localSession = await client.request({ type: 'create_session', input: { title: 'Local research' } }) as Result<SessionSnapshot>;
+        if (!localSession.ok) throw new Error(localSession.error.code);
+        const material = ResearchMaterialResultSchema.parse(await client.request({ type: 'import_research_material', input: {
+          title: 'Toggle fixture', format: 'text', text: 'Keep the selected local deployment policy.',
+        } }));
+        if (!material.ok) throw new Error(material.error.code);
+        const policy = { web: false, domains: [], artifactIds: [material.data.artifactId], documentIds: [] };
+        const localTask = ResearchTaskResultSchema.parse(await client.request({ type: 'create_research_task', input: {
+          sessionId: localSession.data.sessionId, title: 'Local research', sourcePolicy: policy,
+        } }));
+        if (!localTask.ok) throw new Error(localTask.error.code);
+        const { researchId } = localTask.data;
+        const update = (web: boolean, expectedWeb: boolean) => client.request({ type: 'update_research_web_access', input: { researchId, web, expectedWeb } });
+        const read = () => client.request({ type: 'query_research_task', input: { researchId } });
+        const enabled = await update(true, false);
+        if (configured) {
+          expect(enabled).toMatchObject({ ok: true, data: { researchId, sessionId: localSession.data.sessionId,
+            sourcePolicy: { ...policy, web: true }, currentRunId: null, currentPlanId: null } });
+          expect(await read()).toEqual(enabled);
+          expect(await update(true, false)).toEqual(enabled);
+          expect(await update(false, false)).toMatchObject({ ok: false, error: { code: 'state_conflict' } });
+          expect(await read()).toEqual(enabled);
+          const disabled = await update(false, true);
+          expect(disabled).toMatchObject({ ok: true, data: { researchId, sessionId: localSession.data.sessionId,
+            sourcePolicy: policy, currentRunId: null, currentPlanId: null } });
+          expect(await read()).toEqual(disabled);
+        } else {
+          expect(enabled).toMatchObject({ ok: false, error: { code: 'research_web_unconfigured' } });
+          expect(await read()).toEqual(localTask);
+        }
+        expect(await client.request({ type: 'query_runtime_state' })).toMatchObject({ ok: true, data: { active: null, blocked: false } });
       } finally { expect(await client.close()).toMatchObject({ ok: true }); }
     }
   } finally {
@@ -62,7 +95,8 @@ it('recovers an interrupted research Run after an actual Host crash without repl
   const root = mkdtempSync(join(tmpdir(), 'flowmate-research-crash-')), client = new HostClient();
   let requests = 0, release!: () => void;
   const held = new Promise<void>(resolveHeld => { release = resolveHeld; });
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch() {
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    expect(request.headers.get('authorization')).toBe('Bearer synthetic-research-crash-key');
     requests++; await held; return new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
   } });
   deferCleanup(() => { release(); server.stop(true); });

@@ -68,7 +68,11 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 
 ## 后续流程与常见问题
 
-研究、单票复核与 Personal Agent 持续事项见[业务流程](workflows.zh-CN.md)。使用 [Deep Research](workflows.zh-CN.md#deep-research) 时，可先保存 **Settings → General → Research preferences**，再选择本地文本、Markdown 或已登记解析资料。需要公开网页时，将 `FLOWMATE_TAVILY_API_KEY` 配到执行 Host 的启动环境并重启，在 **New research** 打开 **Web search**。确认计划后，在 **Research steps** 查看进度。在 **Report** 点击引用编号可核对已保存原文，再在 **Export format** 选择 Markdown 或 PDF，点击 **Save report**。PDF 仅适用于支持逐句引用的新报告。中断后可在条件允许时点击 **Continue research**。发票流程需要原件与外部准备的解析材料，应用不生成解析。
+研究、单票复核与 Personal Agent 持续事项见[业务流程](workflows.zh-CN.md)。使用 **Deep Research** 时，可先保存 **Settings → General → Research preferences**，再选择本地文本、Markdown 或已登记解析资料。
+
+**Web search** 默认关闭。要在同一任务中结合本地与网页证据，将 `FLOWMATE_TAVILY_API_KEY` 配到执行 Host 的启动环境并重启，再打开开关。已有任务也可在 Run 和工具停止后切换，保留本地材料和历史，在 Assistant 重新生成计划并确认。
+
+确认计划后，在 **Research steps** 查看进度。有结论的新报告须通过引用校验和独立事实审核后才保存。被拒绝时在 Assistant 查看保存错误，成功后在 **Report → Semantic review** 和正文引用编号中查看审核记录及证据。通过 **Export format → Save report** 导出 Markdown 或 PDF，格式 2 和 3 的逐句引用报告都支持 PDF。中断后可在条件允许时点击 **Continue research**。发票流程需要原件与外部准备的解析材料，应用不生成解析。
 
 | 现象 | 优先检查 |
 |---|---|

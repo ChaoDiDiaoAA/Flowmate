@@ -72,6 +72,7 @@ export type SafeConfigSnapshot = {
 };
 
 export type NativeInput = {
+  systemPrompt?: string;
   goal: string;
   text: string;
   messageTimestamp: number;
@@ -248,6 +249,7 @@ export interface PreparedProvider {
     input: NativeInput,
     signal: AbortSignal,
     observe: (event: NativeObservation) => void,
+    control?: { beforeRequest(): Promise<Result<void>> },
   ): Promise<NativeOutcome>;
 }
 

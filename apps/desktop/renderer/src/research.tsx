@@ -13,6 +13,7 @@ function need<T>(result: Result<T>): T { if (!result.ok) throw new Error(result.
 export function ResearchPage(props: Props) {
   const [tasks, setTasks] = useState<ResearchTask[]>([]), [taskCursor, setTaskCursor] = useState<number | null>(null);
   const [task, setTask] = useState<ResearchTask | null>(null), [plan, setPlan] = useState<ResearchPlan | null>(null);
+  const [currentRunStopped, setCurrentRunStopped] = useState(false);
   const [report, setReport] = useState<ResearchReport | null>(null), [reports, setReports] = useState<ResearchReport[]>([]), [reportCursor, setReportCursor] = useState<number | null>(null);
   const [planChanges, setPlanChanges] = useState('');
   const [format, setFormat] = useState<'markdown' | 'pdf'>('markdown');
@@ -42,14 +43,19 @@ export function ResearchPage(props: Props) {
       setTasks(next.items); setTaskCursor(next.nextBeforeId); setMaterials(imported.items); setMaterialCursor(imported.nextBeforeId);
       if (props.selectedId === null) { setTask(null); setPlan(null); setReport(null); return; }
       const selected = need(await window.flowmate.queryResearchTask(props.selectedId));
-      const [savedPlan, savedSources, savedReports] = await Promise.all([
+      const [savedPlan, savedSources, savedReports, savedRun] = await Promise.all([
         selected.currentPlanId ? window.flowmate.queryResearchPlan({ researchId: selected.researchId, planId: selected.currentPlanId }) : null,
         window.flowmate.listResearchSources({ researchId: selected.researchId, limit: 30 }),
-        window.flowmate.listResearchReports({ researchId: selected.researchId, limit: 100 })]);
+        window.flowmate.listResearchReports({ researchId: selected.researchId, limit: 100 }),
+        selected.currentRunId === null ? null : window.flowmate.queryRun(selected.currentRunId).catch(() => null)]);
       const currentPlan = savedPlan ? need(savedPlan) : null, sourcePage = need(savedSources), reportPage = need(savedReports);
       const currentReport = reportPage.items.find(item => item.reportId === selected.currentReportId) ?? null;
       const claimPage = currentPlan ? need(await window.flowmate.listResearchClaims({ researchId: selected.researchId, planId: currentPlan.planId, limit: 30 })) : null;
       if (token !== generation.current) return;
+      const run = savedRun?.ok ? savedRun.data : null;
+      setCurrentRunStopped(run !== null && run.runId === selected.currentRunId && run.sessionId === selected.sessionId
+        && ['completed', 'failed', 'cancelled'].includes(run.status)
+        && run.stoppedAt !== null && run.cleanup.stopped !== false && run.cleanup.lateObservationRequired !== true);
       setTask(selected); props.onUpdated(selected); setPlan(currentPlan); setSources(sourcePage.items); setSourceCursor(sourcePage.nextBeforeId);
       setReports(previous => [...reportPage.items, ...previous.filter(item => item.researchId === selected.researchId && !reportPage.items.some(next => next.reportId === item.reportId))]);
       setReportCursor(reportPage.nextBeforeId);
@@ -66,13 +72,13 @@ export function ResearchPage(props: Props) {
   useEffect(() => { setEvidence(null); setView('Plan'); setCreating(false); setPlanChanges(''); setMessage(null); }, [props.selectedId]);
   useEffect(() => { if (creating) questionInput.current?.focus(); }, [creating]);
   useEffect(() => {
-    if (!creating || !props.ready) return;
+    if ((!creating && props.selectedId === null) || !props.ready) return;
     let current = true;
     void window.flowmate.queryResearchWebStatus().then(result => {
       if (current) setWebConfigured(result.ok && result.data.configured);
     }).catch(() => { if (current) setWebConfigured(false); });
     return () => { current = false; };
-  }, [creating, props.ready]);
+  }, [creating, props.ready, props.selectedId]);
 
   async function operate(action: () => Promise<void>) {
     if (operation.current) return; operation.current = true; setSaving(true); setError(null); setMessage(null);
@@ -87,6 +93,24 @@ export function ResearchPage(props: Props) {
         sourcePolicy: { web: webEnabled, domains: [], artifactIds, documentIds } }));
       setCreating(false); props.onSelect(created, `${question.trim()}${scope.trim() ? `\n\nResearch scope: ${scope.trim()}` : ''}`);
       setMessage('Research created. Press Send in Assistant to generate a plan. Investigation starts only after you confirm it.');
+    });
+  }
+  const webRunBusy = props.running || props.stopping || (task !== null && task.currentRunId !== null && !currentRunStopped);
+  const webChangeBlocked = !props.ready || loading || saving || webRunBusy;
+  const regeneratePlan = props.canRun ? 'Generate a new plan in Assistant and confirm it before continuing.'
+    : 'When Assistant is ready, generate a new plan there and confirm it before continuing.';
+  let webStatus = '';
+  if (webRunBusy) webStatus = 'Wait for the current Run to stop before changing web search.';
+  else if (webConfigured === null) webStatus = 'Checking Tavily configuration…';
+  else if (!webConfigured) webStatus = 'Set FLOWMATE_TAVILY_API_KEY in the research Host environment to enable web search.';
+  async function updateWebAccess(web: boolean) {
+    if (!task || task.researchId !== props.selectedId || webChangeBlocked || web && webConfigured !== true) return;
+    await operate(async () => {
+      const updated = need(await window.flowmate.updateResearchWebAccess({ researchId: task.researchId, web, expectedWeb: task.sourcePolicy.web }));
+      setTask(updated); props.onUpdated(updated);
+      setPlan(current => current?.planId === updated.currentPlanId ? current : null);
+      await refresh();
+      setMessage('Web search updated. ' + regeneratePlan);
     });
   }
   const citedReportId = report?.cited ? report.reportId : undefined;
@@ -108,13 +132,34 @@ export function ResearchPage(props: Props) {
   const reference = activeDocument?.references.find(item => item.number === referenceNumber);
   useEffect(() => { if (reference) referencePanel.current?.focus(); }, [reference]);
   const referenceByCitation = new Map(activeDocument?.references.map(item => [researchCitationKey(item), item]));
+  function renderCitation(citation: ResearchSentence['citations'][number], showClaim = false) {
+    const key = researchCitationKey(citation);
+    const item = referenceByCitation.get(key);
+    if (!item) return showClaim ? <span key={key}> · Claim {citation.claimId}, evidence index {citation.evidenceIndex}</span> : null;
+    return <button key={key} type="button" className="text-button"
+      aria-label={`Reference ${item.number}`} aria-expanded={referenceNumber === item.number}
+      onClick={() => setReferenceNumber(item.number)}>[{item.number}]</button>;
+  }
   function renderSentences(sentences: ResearchSentence[]) {
-    return sentences.map((sentence, index) => <span key={index}>{sentence.text.trim()}{sentence.citations.map(citation => {
-      const item = referenceByCitation.get(researchCitationKey(citation));
-      return item && <button key={item.number} type="button" className="text-button"
-        aria-label={`Reference ${item.number}`} aria-expanded={referenceNumber === item.number}
-        onClick={() => setReferenceNumber(item.number)}>[{item.number}]</button>;
-    })}{' '}</span>);
+    return sentences.map((sentence, index) => <span key={index}>{sentence.text.trim()}{sentence.citations.map(citation => renderCitation(citation))}{' '}</span>);
+  }
+  function renderSemanticReview(report: ResearchReport) {
+    const review = report.semanticReview;
+    if (!review) return <p className="research-help">No independent semantic review for this report.</p>;
+    return <section aria-label="Semantic review">
+      <h3>Semantic review</h3>
+      <p className="research-help">{statusLabel(review.status)} · Policy {review.policyVersion} · Run {review.runId} / ToolCall {review.toolCallId}
+        {review.status !== 'no_findings' && <> · Model {review.model.provider} / {review.model.model}</>}</p>
+      {review.status === 'no_findings' && <p>No findings to review. No review model was called.</p>}
+      {review.sentences.map(row => <details className="research-execution" key={row.sentenceIndex}>
+        <summary>Sentence {row.sentenceIndex + 1} · {statusLabel(row.verdict)} · {row.complete ? 'complete' : 'incomplete'}</summary>
+        <p className="research-prose">{row.text}</p>
+        <ul>{row.facts.map((fact, index) => <li key={index}>
+          <p className="research-prose"><strong>{fact.text}</strong> · {statusLabel(fact.verdict)} · UTF-16 offsets [{fact.start}, {fact.end})</p>
+          <p>{fact.reason}{fact.citations.map(citation => renderCitation(citation, true))}</p>
+        </li>)}</ul>
+      </details>)}
+    </section>;
   }
   function renderReference(item: ResearchReference) {
     const { source, locator } = item;
@@ -209,6 +254,14 @@ export function ResearchPage(props: Props) {
           <header className="research-detail-heading"><div><span className="research-badge">{statusLabel(task.status)}</span><h2>{task.title}</h2><details className="research-execution"><summary>Task details</summary><p>Research {task.researchId} · Assistant session {task.sessionId}</p></details></div>
             <div className="button-row"><button type="button" className="secondary-button" onClick={() => props.onAssistant(false)}>Open research Assistant</button>{props.running && <button type="button" className="secondary-button" disabled={props.stopping} onClick={props.onStop}>{props.stopping ? 'Stopping…' : 'Stop research'}</button>}</div>
           </header>
+          <label className="research-material"><input type="checkbox" role="switch" aria-label="Web search" aria-describedby="research-task-web-status"
+            checked={task.sourcePolicy.web} disabled={webChangeBlocked || !task.sourcePolicy.web && webConfigured !== true}
+            onChange={event => void updateWebAccess(event.target.checked)} />
+            <span><strong>Web search</strong><small id="research-task-web-status">
+              {webStatus}{' '}
+              Changing web search keeps your selected materials and history. {regeneratePlan}
+            </small></span>
+          </label>
           <div className="research-tabs" role="group" aria-label="Research views">{(['Plan', 'Evidence', 'Report'] as const).map(name => <button type="button" key={name} aria-pressed={view === name} onClick={() => { setView(name); if (name === 'Report') props.onAssistant(true); }}>{name}</button>)}</div>
           {task.workflow && <section className="research-source" aria-label="Research steps"><h3>Research steps</h3>
             <p>{task.workflow.steps.filter(step => step.status === 'succeeded').length} / {task.workflow.steps.length} sources acquired</p>
@@ -275,6 +328,7 @@ export function ResearchPage(props: Props) {
                   {report.cited ? renderSentences(report.cited.sections[index]!.sentences) : section.text}</p><div className="research-citations">
                   {section.claimIds.map(id => <button type="button" className="secondary-button" key={id} onClick={() => void readClaim(id)}>Inspect claim {id}</button>)}</div></section>)}
                 {report.cited && !report.answer && !report.sections.length && <p className="research-help">No citable findings</p>}
+                {renderSemanticReview(report)}
                 {reference && renderReference(reference)}
               </>}
               <section><h3>Coverage</h3><ul className="research-coverage">{report.coverage.map(row => <li key={row.questionId}><strong>{row.questionId}</strong><span className="research-badge">{row.status}</span><p>{row.reason}</p><small>Claims: {row.claimIds.join(', ') || 'none'}</small></li>)}</ul></section>

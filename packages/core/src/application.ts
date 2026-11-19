@@ -80,6 +80,7 @@ import type { createResourceService } from './skill-hub/index.ts';
 import type { ResourceSelectionRequest, ResourceSelectionResult, AssemblySelectionSnapshot, ExtensionSelectionRequest, ExtensionSelectionResult } from '@flowmate/contracts';
 import type { ExtensionService } from './extensions/service.ts';
 import type { ResearchRepository } from './research/repository.ts';
+import { UpdateResearchWebAccessRequestSchema, type UpdateResearchWebAccessRequest } from '../../contracts/src/research-commands.ts';
 import { ResearchTasksResultSchema, ResearchTaskResultSchema, ResearchPlanResultSchema, ResearchSourceResultSchema,
   ResearchClaimResultSchema, ResearchReportResultSchema, ResearchSourcesResultSchema, ResearchClaimsResultSchema, ResearchReportsResultSchema,
   ResearchPlanRequestSchema, ResearchSourceRequestSchema, ResearchClaimRequestSchema, ResearchReportRequestSchema,
@@ -122,6 +123,7 @@ export type ProductApplicationOptions = {
     close?: () => Promise<Result<void>> };
   research?: {
     webConfigured?: boolean;
+    updateWebAccess(input: UpdateResearchWebAccessRequest): ReturnType<ResearchRepository['updateWebAccess']> | Promise<ReturnType<ResearchRepository['updateWebAccess']>>;
     listMaterials(...input: Parameters<ResearchRepository['listMaterials']>): ReturnType<ResearchRepository['listMaterials']> | Promise<ReturnType<ResearchRepository['listMaterials']>>;
     create(...input: Parameters<ResearchRepository['create']>): ReturnType<ResearchRepository['create']> | Promise<ReturnType<ResearchRepository['create']>>;
     get(...input: Parameters<ResearchRepository['get']>): ReturnType<ResearchRepository['get']> | Promise<ReturnType<ResearchRepository['get']>>;
@@ -372,6 +374,12 @@ export function makeApplication(
         return fail(appError('research_web_unconfigured', 'input', 'Configure FLOWMATE_TAVILY_API_KEY in the research Host environment.'));
       const request = { ...parsed.data, at: new Date().toISOString() };
       return contextRead(ResearchTaskResultSchema, async () => await products?.research?.create(request));
+    },
+    updateResearchWebAccess: async (raw: UpdateResearchWebAccessRequest) => {
+      const parsed = UpdateResearchWebAccessRequestSchema.safeParse(raw);
+      if (!parsed.success) return fail(appError('input_invalid', 'input', 'Research web access parameters are invalid.'));
+      if (closing) return fail(appError('runtime_closing', 'runtime', 'The product runtime is closing.'));
+      return contextRead(ResearchTaskResultSchema, async () => await products?.research?.updateWebAccess(parsed.data));
     },
     listResearchTasks: async (input = {}) => {
       const parsed = ResearchPageRequestSchema.safeParse(input);

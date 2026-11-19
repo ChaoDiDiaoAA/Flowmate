@@ -251,7 +251,8 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
       return loaded.ok ? ok({ text: loaded.data.parsed.pages.map(page => `[Page ${page.page}]\n${page.blocks.map(block => block.text).join('\n')}`).join('\n\n'),
         artifactId: loaded.data.document.parsedArtifactId, title: `Document ${id}` }) : loaded;
     } });
-  const researchSynthesis = createResearchSynthesisTools({ database: database.data, files, now });
+  const researchSynthesis = createResearchSynthesisTools({ database: database.data, files, now,
+    review: (input, call) => runtime.reviewResearchReport(input, call) });
   const assembled = [createResearchPlanTool(database.data, now), ...researchReads, ...researchSynthesis, ...createInvoiceTools({
     documents: { readParsedForRun: (id, context) => database.data.transaction(scope => documents.readParsedForRun(id, context, {
       repository: scope.documents, files: { read: (artifact, name) => files.read(artifact, name, scope.contents) },
@@ -524,6 +525,10 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     },
     research: {
       webConfigured: researchWeb !== undefined,
+      updateWebAccess: input => database.data.transaction(store => {
+        if (input.web && !researchWeb) return fail(appError('research_web_unconfigured', 'input', 'Configure Tavily before enabling web search.'));
+        return store.research.updateWebAccess({ ...input, at: now() });
+      }).catch(() => fail(appError('research_write_failed', 'storage', 'Research source selection could not be saved.', true))),
       create: async input => {
         let rejected: Result<never> | undefined;
         try { return await database.data.transaction(scope => {
@@ -560,9 +565,16 @@ export async function createApplication(options: ApplicationOptions): Promise<Re
     queryResearchEvidence: async input => {
       const parsed = ResearchEvidenceRequestSchema.safeParse(input);
       if (!parsed.success) return fail(appError('input_invalid', 'input', 'Evidence request is invalid.'));
-      const task = await database.data.read(scope => scope.research.get(parsed.data.researchId))
+      const policy = await database.data.read(scope => {
+        const source = scope.research.getSource(parsed.data);
+        if (!source.ok) return source;
+        const binding = scope.research.bindingForRun(source.data.runId);
+        if (!binding.ok) return binding;
+        return binding.data ? ok(binding.data.sourcePolicy)
+          : fail(appError('research_source_denied', 'tool', 'The original source authorization is unavailable.'));
+      })
         .catch(() => fail(appError('research_read_failed', 'storage', 'Research policy could not be read.', true)));
-      return task.ok ? await readResearchEvidence({ database: database.data, files }, parsed.data, task.data.sourcePolicy) : task;
+      return policy.ok ? await readResearchEvidence({ database: database.data, files }, parsed.data, policy.data) : policy;
     },
     importResearchMaterial: async input => await files.publishResearchMaterial({ ...input, at: now() }, {
       findExisting: async (): Promise<Result<ResearchMaterial | null>> => {

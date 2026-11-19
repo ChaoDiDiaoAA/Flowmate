@@ -38,6 +38,8 @@ Run 准备保留选定资源版本及原文件内容。刷新不会将新作者�
 
 内置发票 Skill 拆分证据发现、字段提取、金额和来源核对、歧义复核、保存与交接；研究 Skill 引导规划、确认、调查、综合、报告，包括计划步骤 ID、已保存 Checkpoint 和明确继续。它使用既有研究工具；选择 Skill 不证明计划步骤已执行。保存类 Skill 不免除实际工具 Schema、权限或持久化检查。“选中 Skill”与“实际读取、使用 Skill”是评测中的不同事实。见 [Deep Research](workflows.zh-CN.md#deep-research)。
 
+研究 Prompt 和 Skill 引导同一个本地资料任务结合可选网页证据。新报告逐句引用，由 Host 生成独立审核回执，写作 Agent 不能自行提交 `semanticReview` 字段。指令要求为审核及后续回应预留模型调用，并为预期产生有引用结论的新计划建议单工具 120 秒、整个 Run 300 秒。执行使用用户确认的限制。切换联网后须确认新计划，被拒绝的报告须修改后重新审核。
+
 Personal Agent 在 **Assistant configuration** 中独立选择模型、工具、Prompt 和 Skill，不沿用普通 Assistant 当前选择。Durable 路径根据可用发票与资源工具检查依赖；目前没有 Durable 扩展适配器，依赖扩展的 Skill 无法用于 Durable 阶段。已受理 Work 保留其选定配置和资源版本。详见 [Personal Agent](personal-agent.zh-CN.md)。
 
 编写资源时，使 SKILL frontmatter 名称与 Manifest、ID 一致，提供准确描述、真实依赖，声明 Manifest 所需文件和 UTF-8 字节数。沿用当前作者指南与相邻资源，不另造加载格式。

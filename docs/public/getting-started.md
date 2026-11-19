@@ -68,7 +68,11 @@ This command still requires the model to make a real `Agent` tool call. A comman
 
 ## Next workflows and common issues
 
-Use [Workflows](workflows.md) for research, single-invoice review and ongoing Personal Agent work. For [Deep Research](workflows.md#deep-research), optionally save **Settings → General → Research preferences**, then select local text, Markdown or registered parsed material as needed. For public webpages, set `FLOWMATE_TAVILY_API_KEY` in the executing Host's startup environment, restart it, and enable **Web search** in **New research**. After confirming the plan, follow progress in **Research steps**. In **Report**, click a numbered reference to inspect the saved passage, then choose Markdown or PDF in **Export format** and click **Save report**. PDF requires a report with sentence citations. After interruption, use **Continue research** when available. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
+Use [Workflows](workflows.md) for research, single-invoice review and ongoing Personal Agent work. For **Deep Research**, optionally save **Settings → General → Research preferences**, then select local text, Markdown or registered parsed material.
+
+**Web search** defaults to off. To combine local evidence with public webpages in one task, set `FLOWMATE_TAVILY_API_KEY` in the executing Host's startup environment, restart it and enable the switch. An existing task can change the switch after its Run and tools stop. Keep its selected local material and history, generate a new plan in Assistant and confirm it.
+
+After confirming a plan, follow **Research steps**. New reports with findings must pass citation checks and a separate factual review before saving. Inspect a rejected save's error in Assistant, or open **Report → Semantic review** and the numbered references for a saved report. Select Markdown or PDF in **Export format** and click **Save report**. Both format 2 and 3 reports with sentence citations support PDF. After interruption, use **Continue research** when available. Invoice processing needs an original plus externally prepared parsing material; the app does not create that parsing itself.
 
 | Symptom | First check |
 |---|---|

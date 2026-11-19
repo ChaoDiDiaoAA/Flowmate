@@ -151,7 +151,7 @@ export function inspectResearchEvidence(evidence: EvidenceFact, proof: { runs: E
             const questions = plan?.body.dimensions.flatMap(d => d.questions.map(q => q.id));
             if (questions && (report.coverage.length !== questions.length || report.coverage.some(row => !questions.includes(row.questionId) ||
                 row.claimIds.some(claimId => claims.has(claimId) && claims.get(claimId)!.questionId !== row.questionId)))) add('report', report.reportId, 'report-coverage');
-            const { reportId, researchId, planId, revision, runId, toolCallId, createdAt, cited, ...body } = report;
+            const { reportId, researchId, planId, revision, runId, toolCallId, createdAt, cited, semanticReview: _semanticReview, ...body } = report;
             const input = cited ? { ...body, formatVersion: cited.formatVersion, answer: cited.answer, sections: cited.sections } : body;
             origin('report', report.reportId, report, 'save_research_report', ResearchReportSchema, report, input);
             if (cited) for (const sentence of [...cited.answer, ...cited.sections.flatMap(section => section.sentences)])

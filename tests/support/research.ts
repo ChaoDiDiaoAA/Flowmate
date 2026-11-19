@@ -1,11 +1,11 @@
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createApplication, type ApplicationOptions } from '../../apps/composition.ts';
-import { createFileStore } from '@flowmate/core';
-import { openTestDatabase as openDatabase } from './database.ts';
-import { PiAgentAdapter } from '@flowmate/runtime-pi';
-import type { AgentRunEvent, ProviderConfig, ResearchIntent, ResearchSentence, Result, SessionInputRequest } from '@flowmate/contracts';
+import type { ApplicationOptions } from '../../apps/composition.ts';
+import {
+  ok, RESEARCH_SEMANTIC_POLICY_VERSION, ResearchSemanticReviewSchema, researchSemanticReportContext, researchSentences,
+  type AgentRunEvent, type ProviderConfig, type ResearchIntent, type ResearchSemanticReviewIdentity,
+  type ResearchSentence, type Result, type ReviewedResearchReportBody, type SessionInputRequest, type UsageRecordV1,
+} from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from './resources.ts';
 
 export function researchNeed<T>(result: Result<T>): T { if (!result.ok) throw new Error(JSON.stringify(result.error)); return result.data; }
@@ -17,17 +17,68 @@ export const researchPlan = { question: 'Compare three Agent deployment options.
 export function citedSentence(text: string, claimIds: number[], evidenceIndex = 0): ResearchSentence {
   return { text, citations: claimIds.map(claimId => ({ claimId, evidenceIndex })) };
 }
+
+function supportedDecision({ text, citations }: ResearchSentence, sentenceIndex: number) {
+  return { sentenceIndex, complete: true, facts: [{ start: 0, end: text.length, text, citations,
+    verdict: 'supported' as const, reason: 'Controlled structural fixture verdict.' }] };
+}
+
+export function supportedResearchReviewResponse(text: string) {
+  const separator = text.indexOf('\n\n');
+  const json = separator >= 0 && !text.trimStart().startsWith('{') ? text.slice(separator + 2) : text;
+  const { report } = JSON.parse(json) as { report: Pick<ReviewedResearchReportBody, 'answer' | 'sections'> };
+  return { sentences: researchSentences(report).map(supportedDecision) };
+}
+
+function controlledReviewMetadata(updatedAt: string) {
+  return {
+    model: { provider: 'research-fixture', model: 'research-fixture' }, responseId: 'research-fixture-review',
+    usage: { version: 1, source: 'unknown', reason: 'fixture-usage-not-measured', sdkValues: null, attempts: 1,
+      attemptsComplete: true, costSource: null, updatedAt } satisfies UsageRecordV1,
+    tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+  };
+}
+
+export async function controlledResearchReviewer({ text }: { text: string }) {
+  return ok({ ...controlledReviewMetadata(new Date().toISOString()), text: JSON.stringify(supportedResearchReviewResponse(text)) });
+}
+
+export function createResearchReviewReceipt(report: ReviewedResearchReportBody,
+  { researchId, planId, revision, runId, toolCallId, reviewedAt = new Date().toISOString() }: ResearchSemanticReviewIdentity & { reviewedAt?: string }) {
+  const binding = { researchId, planId, revision, runId, toolCallId, reviewedAt,
+    policyVersion: RESEARCH_SEMANTIC_POLICY_VERSION, reportContext: researchSemanticReportContext(report) };
+  const sentences = researchSentences(report).map((sentence, index) => ({ ...sentence, ...supportedDecision(sentence, index), verdict: 'supported' }));
+  return ResearchSemanticReviewSchema.parse(sentences.length
+    ? { ...binding, ...controlledReviewMetadata(reviewedAt), status: 'verified', sentences }
+    : { ...binding, status: 'no_findings', sentences: [] });
+}
+
 type Request = { tools?: Array<{ function: { name: string } }>; messages: Array<{ role: string; content: unknown }> };
 type ToolReply = { tool: string; args: unknown; id: string; note?: string };
 type Reply = { text: string } | ToolReply | { tools: ToolReply[] };
+
+function isReviewRequest({ tools, messages }: Request) {
+  return !tools?.length && messages.some(({ role, content }) => {
+    if (role !== 'system' || typeof content !== 'string') return false;
+    const prompt = content.toLowerCase();
+    return prompt.includes(RESEARCH_SEMANTIC_POLICY_VERSION) || (prompt.includes('independent') && prompt.includes('review'));
+  });
+}
+
 export async function researchFixture(respond: (request: Request, index: number) => Reply | Promise<Reply>,
-  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults' | 'toolDefinitions' | 'researchPreferences' | 'memory' | 'researchWeb'> & { web?: boolean; material?: string; parsedDocument?: string } = {}) {
+  setup?: (db: import('bun:sqlite').Database) => void, options: Pick<ApplicationOptions, 'resourceDefaults' | 'toolDefinitions' | 'researchPreferences' | 'memory' | 'researchWeb'> & {
+    web?: boolean; material?: string; parsedDocument?: string; review?: (text: string) => object | Promise<object>; provider?: ApplicationOptions['provider'];
+  } = {}) {
+  // Playwright imports the response helper in Node; only the fixture loads Bun application modules.
+  const [{ InMemoryCredentialStore }, { createApplication }, { createFileStore }, { openTestDatabase }, { PiAgentAdapter, PiProviderAdapter }] = await Promise.all([
+    import('@earendil-works/pi-ai'), import('../../apps/composition.ts'), import('@flowmate/core'), import('./database.ts'), import('@flowmate/runtime-pi'),
+  ]);
   const root = mkdtempSync(join(tmpdir(), 'flowmate-research-fixture-'));
   const paths = { root, databaseFile: join(root, 'data', 'app.sqlite'), artifactsDir: join(root, 'artifacts'),
     runtimeDir: join(root, 'runtime'), logsDir: join(root, 'logs'), outputsDir: join(root, 'outputs') };
   let documentId: number | null = null;
   if (setup || options.parsedDocument) {
-    const store = researchNeed(openDatabase(paths));
+    const store = researchNeed(openTestDatabase(paths));
     try {
       setup?.(store.db);
       if (options.parsedDocument) {
@@ -46,10 +97,19 @@ export async function researchFixture(respond: (request: Request, index: number)
     } finally { await store.close(); }
   }
   const requests: Request[] = [];
+  const reviewRequests: Request[] = [];
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
     const body = await request.json() as Request;
-    requests.push(body);
-    const reply = await respond(body, requests.length);
+    let reply: Reply;
+    if (isReviewRequest(body)) {
+      reviewRequests.push(body);
+      const input = body.messages.find(message => message.role === 'user')?.content;
+      if (typeof input !== 'string') return new Response('Expected reviewer user text.', { status: 400 });
+      reply = { text: JSON.stringify(await (options.review ?? supportedResearchReviewResponse)(input)) };
+    } else {
+      requests.push(body);
+      reply = await respond(body, requests.length);
+    }
     const chunk = (delta: object, reason: string | null = null) => `data: ${JSON.stringify({ id: 'research-fixture', model: 'research-fixture',
       choices: [{ index: 0, delta, finish_reason: reason }] })}\n\n`;
     const text = 'text' in reply ? chunk({ role: 'assistant', content: reply.text }) + chunk({}, 'stop')
@@ -60,6 +120,7 @@ export async function researchFixture(respond: (request: Request, index: number)
   deferCleanup(() => server.stop(true));
   const open = async () => {
   const opened = researchNeed(await createApplication({ paths, resourceDefaults: options.resourceDefaults, toolDefinitions: options.toolDefinitions, researchPreferences: options.researchPreferences, memory: options.memory, researchWeb: options.researchWeb, logger: { write: () => undefined, close: async () => undefined },
+    provider: options.provider ?? new PiProviderAdapter({ credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }),
     agentFactory: tools => new PiAgentAdapter({ cwd: paths.runtimeDir, agentDir: paths.runtimeDir, tools,
       credentials: new InMemoryCredentialStore(), runtimeApiKey: 'synthetic-research-key' }) }));
   deferCleanup(() => opened.close());
@@ -84,6 +145,6 @@ export async function researchFixture(respond: (request: Request, index: number)
     return { accepted, completion };
   }
   async function run(input: SessionInputRequest) { const started = await start(input); return { accepted: researchNeed(started.accepted), terminal: await started.completion }; }
-  return { get app() { return app; }, task, session, config, paths, requests, request, start, run,
+  return { get app() { return app; }, task, session, config, paths, requests, reviewRequests, request, start, run,
     async reopen() { researchNeed(await app.close()); app = await open(); } };
 }

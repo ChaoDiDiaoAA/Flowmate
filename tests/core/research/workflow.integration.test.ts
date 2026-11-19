@@ -66,7 +66,7 @@ it('rejects duplicate in-flight and unknown steps without publishing duplicate s
 });
 
 it('gates claims and full reports on acquisition while preserving an explicit partial checkpoint', async () => {
-  const partial = { formatVersion: 2, answer: [], sections: [],
+  const partial = { formatVersion: 3, answer: [], sections: [],
     completeness: 'partial', conflicts: [], limitations: ['The planned source is pending.'], unresolvedQuestions: ['What costs apply?'],
     coverage: [{ questionId: 'cost-1', claimIds: [], status: 'gap', reason: 'The source is pending.' }] };
   const f = await researchFixture((_request, index) => {

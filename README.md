@@ -30,7 +30,7 @@
 | 能力 | Flowmate 的自定义实现与作用 |
 |---|---|
 | **Personal Agent 持续事项助手** | 基于 Pi Durable 保存固定票组、逐票 Todo、候选与处置，按原配置、授权和预算继续执行。 |
-| **结构化 Deep Research** | 从本地资料与可选 Tavily 网页取证。保存报告时逐句核对引用、原文位置和采集回执，支持导出 Markdown 与 PDF。 |
+| **结构化 Deep Research** | 从本地资料与可选 Tavily 网页取证。保存有结论的报告前，逐句核对引用和采集回执，并单独请求所选模型判断引文能否支持结论。支持 Markdown 与 PDF 导出。 |
 | **Skill Hub 技能管理** | 检查技能依赖，显式启用并固定运行版本；模型先读索引，再按需读取正文。 |
 | **Master + Subagent 协作** | 两套 Runtime 分别接入受限委派，管理并行准入、共享预算、独立历史与停止确认，分别记录结果保存、回送和是否进入父模型请求。 |
 | **预算感知的工具 Runtime** | 让模型看到剩余调用数、时间和可用工具时限，并由执行器落实约束。 |
@@ -81,7 +81,14 @@ flowchart TB
 
 ## 🔬 Deep Research：从研究问题到可追溯的证据链
 
-用授权的本地文本、Markdown、已登记解析资料和可选公开网页回答研究问题，保留来源、结论与缺口。**Web search** 按任务开启，新建任务时默认关闭。
+用授权的本地文本、Markdown、已登记解析资料和可选公开网页回答同一个研究问题，生成带逐句引用的报告。
+
+| Web search | 来源与报告 |
+|---|---|
+| 关闭（新任务默认） | 根据授权本地资料研究，新报告引用本地证据。 |
+| 开启 | 在同一任务中结合选定本地资料和网页取证，综合生成一份报告。 |
+
+已有任务可在 Run 和工具确认停止后切换开关。任务、Assistant 会话、本地材料和历史保留，随后重新生成并确认计划。
 
 ![Deep Research 创建表单中的研究问题、Web search 开关和本地资料选择](docs/screenshots/Deep%20Research.png)
 
@@ -100,11 +107,11 @@ flowchart TB
   Receipts --> Checkpoint["更新研究 Checkpoint<br/>依据工具终态与来源<br/>成功 / 失败 / 中断"]
   Steps -->|"复用成功证据"| Claims["综合证据并保存原子 Claim<br/>证据关系 / 结论依赖"]
   Checkpoint --> Claims
-  Claims --> References["为正文逐句关联引用<br/>保存前核对原文、位置和采集回执"]
-  References --> Coverage{"报告完整性条件<br/>是否满足？"}
-  Coverage -->|"满足"| Full["保存完整报告"]
-  Coverage -->|"原计划可补证且预算允许"| Steps
-  Coverage -->|"仍有缺口"| Partial["保存部分报告<br/>明确冲突与未解决问题"]
+  Claims --> References["核对逐句引用和采集回执<br/>单次模型审核引文能否支持事实"]
+  Checkpoint -->|"无可引用结论且采集已停止"| Partial["保存部分报告<br/>明确冲突与未解决问题"]
+  References -->|"未通过"| Reject["修正引用或表述后再提交"]
+  References -->|"通过且覆盖完整"| Full["保存完整报告"]
+  References -->|"通过但仍有缺口"| Partial
   Full --> Deliver["点击引用查看证据<br/>导出 Markdown 或 PDF"]
   Partial --> Deliver
   Collect -.->|"中断后重新查看"| Restore["读取持久步骤与来源<br/>恢复进度展示"]
@@ -112,11 +119,12 @@ flowchart TB
   Continue --> Steps
 ```
 
-1. **确认计划。** 核对研究问题、来源、步骤和预算。开启联网时，确认页列出将发送给 Tavily 的搜索词、时间范围、结果排名和指定的公开网址。确认该版本后才开始调查。修改计划需重新确认，变更任务授权范围需新建研究任务。
+1. **确认计划。** 核对研究问题、来源、步骤和预算。开启联网时，检查确认页中的搜索词、时间范围、排名和指定网址。Tavily 会收到搜索词及选定或指定的 URL；这些内容只应包含公开信息。切换 **Web search** 保留研究任务、Assistant 会话、本地资料和历史；在 Assistant 重新生成计划并确认后才可继续调查。关闭后，新报告不能引用网页证据，旧报告和已保存的网页原文仍可查看。改变选定的本地资料需要新建研究任务。
 2. **按步骤采集。** 主 Agent 通过 Tavily 搜索公开网页或提取指定网址。搜索优先实时抓取，指定排名缺少候选时，沿用已确认的查询和日期条件补查一次，再提取选中网页的正文。主 Agent 与可选只读调查子代理共享 **2** 路采集及根预算，排队可取消。**Continue research** 复用已成功保存的来源并尝试符合条件的剩余步骤。
-3. **保存、复核和导出。** 新报告的摘要、结论和章节正文逐句标注引用。保存前，Host 核对每句引用所指的 Claim 证据、来源快照、原文字符区间和采集 Run／ToolCall。缺少有效引用或原文不匹配时拒绝保存。该校验无需额外的模型语义审核。部分报告可保留证据缺口和未解决问题。
+3. **逐句审核后保存。** 新报告（格式 3）的摘要、结论和章节正文逐句引用具体 Claim 证据。Host 先核对来源快照、引用原文、UTF-16 字符区间和采集 Run／ToolCall，再用当前研究模型发出一次独立上下文的请求，拆分并检查每句话的事实。只有全部充分支持才保存。部分支持、不支持、矛盾或审核未完成时，Agent 根据错误反馈改写或补证，再重新审核。共享预算须为审核和后续 Assistant 回应各留一次调用。没有可引用结论时，可保存明确标为部分报告的空正文和证据缺口。
+4. **复核和导出。** 在 **Report** 点击 `[1]` 等标记查看原文和采集回执，通过 **Open Claim** 或 **View saved passage** 继续追溯。展开 **Semantic review** 查看逐句事实和理由，再通过 **Export format → Save report** 导出 Markdown 或 PDF。PDF 的编号可跳转到 References 附录。
 
-在 **Report** 点击 `[1]` 等标记，查看引用原文、来源与采集回执，再打开对应 Claim 或已保存片段。通过 **Export format → Save report** 选择 Markdown 或 PDF，两种格式沿用正文编号和引用附录。PDF 中的编号可跳到附录。历史报告可继续查看和导出 Markdown，重新生成后可导出 PDF。
+保存后的报告和审核回执保留对应正文、引用与计划版本。打开或导出已保存报告不会重新请求审核模型。格式 2 的逐句引用报告仍支持 PDF，并标注未经过独立语义审核；更早的章节级引用报告仍支持 Markdown。Claim 状态和独立审核均是模型判断，涉及重要决定时仍应核对原文。
 
 旧计划仍可读取。要使用步骤跟踪，可重新生成并确认含步骤的计划。具体操作见 [Deep Research 业务流程](docs/public/workflows.zh-CN.md#deep-research)。
 
@@ -273,7 +281,7 @@ flowchart TB
   Startup["后端重启"] -.-> Restore["读取持久历史与 Checkpoint<br/>恢复进度展示"]
   Conversation -.-> Restore
   Checkpoint -.-> Restore
-  Restore --> Continue["用户明确 Continue research<br/>后续 Run 复用成功来源"]
+  Restore --> Continue["用户明确 Continue research<br/>后续 Run 复用同一计划的成功来源"]
   Continue --> Capture
 ```
 
@@ -353,7 +361,7 @@ bun run dev
 
 在 **Deep Research → New research** 输入问题，按需选择本地资料。需要公开网页时，在实际执行的 Host 启动环境配置 `FLOWMATE_TAVILY_API_KEY`，重启后打开 **Web search**。桌面本地 Host 从启动桌面的环境继承该变量，WinSW 从服务启动环境读取。
 
-点击 **Create research**，在 Assistant 点击 **Send** 生成计划，核对来源后点击 **Confirm plan version**。在 **Research steps** 查看进度，在 **Report** 点击正文引用查看证据，再用 **Export format → Save report** 导出 Markdown 或 PDF。可在 **Settings → General → Research preferences** 保存偏好。
+点击 **Create research**，在 Assistant 点击 **Send** 生成计划，核对来源和预算后点击 **Confirm plan version**。在 **Research steps** 查看进度，在 **Report** 查看引用和 **Semantic review**，再用 **Export format → Save report** 导出 Markdown 或 PDF。已有任务切换联网后须重新生成并确认计划。可在 **Settings → General → Research preferences** 保存偏好。
 
 ### 6. 体验单票复核
 
@@ -419,7 +427,7 @@ bun --no-env-file run eval:full
 | 方面 | 当前能力与边界 |
 |---|---|
 | **Personal Agent** | 基于 Pi Durable 持续整理固定票组，保留逐票 Todo、补料、候选、原配置与人工最终处置；按已保存授权恢复合格原尝试。 |
-| **研究** | 使用选定本地资料与按任务开启的 Tavily 网页搜索和提取。按已确认的计划采集，继续时复用成功来源。新报告逐句引用并支持 Markdown 和 PDF 导出。 |
+| **研究** | 使用选定本地资料与按任务开启的 Tavily 网页搜索和提取。按已确认的计划采集，继续同一计划时复用成功来源。新报告逐句引用，有正文时须通过模型证据审核，支持 Markdown 和 PDF 导出。 |
 | **日常任务** | Chats、Invoices、Deep Research 使用 AgentSession，支持资料问答、持久会话和当前平台可用的 Pi 原生工具；工作目录选择不构成沙箱。 |
 | **发票** | 支持已有解析材料上的候选、字段核算、人工复核、接受与导出；不在 Host 中执行原票解析。 |
 | **验证** | 已有工程测试，以及轨迹、候选、数据集、评分、实验和回归入口。机制覆盖、真实模型质量、相对 Gate 与平台回读分别判断，不由功能存在推导质量达标。 |

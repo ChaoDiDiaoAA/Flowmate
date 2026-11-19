@@ -5,7 +5,7 @@ import { invoiceToolSchemas } from '../../../packages/contracts/src/invoice.ts';
 import { isJsonData } from '../../../packages/contracts/src/tools.ts';
 import { ContextSnapshotDetailSchema, PublicContextRequestEvidenceSchema } from '../../../packages/contracts/src/context.ts';
 import { DelegateArgsSchema } from '../../../packages/contracts/src/subagents.ts';
-import { ResearchPlanToolInputSchema, ResearchClaimBodySchema, ResearchReportBodySchema, CitedResearchReportBodySchema } from '../../../packages/contracts/src/research.ts';
+import { ResearchPlanToolInputSchema, ResearchClaimBodySchema, ResearchReportBodySchema, CitedResearchReportBodySchema, ReviewedResearchReportBodySchema } from '../../../packages/contracts/src/research.ts';
 import type { EvaluationContext, EvaluationScore } from './types.ts';
 import type { MetricDefinition } from './catalog.ts';
 
@@ -76,7 +76,7 @@ export function diagnosticApplicable(context: EvaluationContext, id: DiagnosticI
 
 type Tool = z.infer<typeof ToolCallSnapshotSchema>;
 const additionalInputs: Readonly<Record<string, z.ZodTypeAny>> = { Agent: DelegateArgsSchema,
-    save_research_plan: ResearchPlanToolInputSchema, save_research_claim: ResearchClaimBodySchema, save_research_report: z.union([CitedResearchReportBodySchema, ResearchReportBodySchema]) };
+    save_research_plan: ResearchPlanToolInputSchema, save_research_claim: ResearchClaimBodySchema, save_research_report: z.union([ReviewedResearchReportBodySchema, CitedResearchReportBodySchema, ResearchReportBodySchema]) };
 function originals(context: EvaluationContext) {
     const evidence = context.result.evidence;
     const runs = z.array(z.object({ runId: z.number().int().positive(), sessionId: z.number().int().positive(),

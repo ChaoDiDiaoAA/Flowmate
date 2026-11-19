@@ -6,8 +6,9 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, deferCleanup } from '../../support/resources.ts';
 import { openTestDatabase } from '../../support/database.ts';
 import { openTestDatabase as openDatabase } from '../../support/database.ts';
-import { citedSentence } from '../../support/research.ts';
+import { citedSentence, createResearchReviewReceipt } from '../../support/research.ts';
 import type { Result } from '@flowmate/contracts';
+import { TOOL_CONFIG, projectCitedResearchReport } from '@flowmate/contracts';
 
 const at = '2026-10-10T00:00:00.000Z';
 const body = {
@@ -52,6 +53,14 @@ function stop(f: ReturnType<typeof fixture>, runId: number) {
   f.store.db.query(`UPDATE runs SET status='completed',output_json='{}',ended_at=?,stopped_at=? WHERE id=?`).run(at, at, runId);
 }
 
+function saveReport(f: ReturnType<typeof fixture>, input: Omit<Parameters<typeof f.store.research.saveReport>[0], 'semanticReview'>) {
+  const task = need(f.store.research.get(input.researchId));
+  const plan = need(f.store.research.getPlan({ researchId: input.researchId, planId: task.currentPlanId! }));
+  return f.store.research.saveReport({ ...input, semanticReview: createResearchReviewReceipt(input.report, {
+    researchId: input.researchId, planId: plan.planId, revision: plan.revision, runId: input.runId, toolCallId: input.toolCallId, reviewedAt: at,
+  }) });
+}
+
 it.each([['unknown', 'gap', 'partial', 'research_coverage_invalid', 'coverage'],
   ['cost-1', 'gap', 'full', 'research_evidence_incomplete', 'covered'],
   ['cost-1', 'covered', 'partial', 'input_invalid', 'input']] as const)
@@ -59,8 +68,8 @@ it.each([['unknown', 'gap', 'partial', 'research_coverage_invalid', 'coverage'],
     const f=fixture(),planning=run(f,'planning'),plan=need(savePlan(f,planning,call(f,planning,'save_research_plan'))); stop(f,planning);
     const runId=run(f,'researching',plan),toolCallId=call(f,runId,'save_research_report');
     const body = completeness === 'full' ? [citedSentence('Potential finding.', [1])] : [];
-    const result=f.store.research.saveReport({researchId:f.task.researchId,runId,toolCallId,at,
-      report:{formatVersion:2,answer:body,sections:body.length ? [{title:'Cost',sentences:body}] : [],completeness,conflicts:[],limitations:[],unresolvedQuestions:[],
+    const result=saveReport(f, {researchId:f.task.researchId,runId,toolCallId,at,
+      report:{formatVersion:3,answer:body,sections:body.length ? [{title:'Cost',sentences:body}] : [],completeness,conflicts:[],limitations:[],unresolvedQuestions:[],
       coverage:[{questionId,claimIds:[],status,reason:'No supported claims yet.'}]}});
     expect(result).toMatchObject({ok:false,error:{code}});
     if(result.ok)throw new Error('Invalid report unexpectedly committed.');
@@ -152,10 +161,11 @@ describe('P15 research storage, isolated engineering fixtures', () => {
     const plan = need(savePlan(f, planning, call(f, planning, 'save_research_plan')));
     stop(f, planning);
     const runId = run(f, 'researching', plan), toolCallId = call(f, runId, 'read_research_local');
-    const source = need(f.store.research.saveSource({ researchId: f.task.researchId, runId, toolCallId,
+    const saveSource = (toolCallId: number) => need(f.store.research.saveSource({ researchId: f.task.researchId, runId, toolCallId,
       source: { kind: 'local', address: 'artifact:1', title: 'Local pricing', artifactId: 1, documentId: null,
         fetchedAt: at, publishedAt: null, relativePath: `artifacts/research/${f.task.researchId}/source-${toolCallId}.txt`,
         bytes: 10, characters: 10, truncated: false }, at }));
+    const source = saveSource(toolCallId);
     expect(source).toMatchObject({ runId, toolCallId, publishedAt: null });
     const ref = { researchId: f.task.researchId, planId: plan.planId, revision: plan.revision, runId, toolCallId,
       sourceSnapshotId: source.sourceSnapshotId, locator: { start: 0, end: 4, quote: 'Cost' } };
@@ -166,6 +176,10 @@ describe('P15 research storage, isolated engineering fixtures', () => {
     expect(f.store.research.saveClaim({ researchId: f.task.researchId, runId, toolCallId: claimCall,
       claim: { ...draft, text: 'Different' }, at })).toMatchObject({ ok: false, error: { code: 'research_identity_conflict' } });
     const invalidCall = call(f, runId, 'save_research_claim', 'forged-claim');
+    const otherSource = saveSource(call(f, runId, 'read_research_local', 'second-source'));
+    expect(f.store.research.saveClaim({ researchId: f.task.researchId, runId, toolCallId: invalidCall,
+      claim: { ...draft, evidence: [{ relation: 'supports', ref: { ...ref, sourceSnapshotId: otherSource.sourceSnapshotId } }] }, at }))
+      .toMatchObject({ ok: false, error: { code: 'research_identity_conflict' } });
     for (const bad of [{ ...ref, researchId: 999 }, { ...ref, toolCallId: 999 }, { ...ref, revision: 99 },
       { ...ref, locator: { start: 0, end: 99, quote: 'Cost' } }]) {
       expect(f.store.research.saveClaim({ researchId: f.task.researchId, runId, toolCallId: invalidCall,
@@ -181,14 +195,14 @@ describe('P15 research storage, isolated engineering fixtures', () => {
         verification: { status: 'supported', reasons: ['Pretend conflicting evidence is resolved.'] } }, at }))
       .toMatchObject({ ok: false, error: { code: 'research_evidence_incomplete' } });
     const reportCall = call(f, runId, 'save_research_report');
-    expect(f.store.research.saveReport({ researchId: f.task.researchId, runId, toolCallId: reportCall,
-      report: { formatVersion: 2, answer: [citedSentence('Usage is metered.', [claim.claimId])],
+    expect(saveReport(f, { researchId: f.task.researchId, runId, toolCallId: reportCall,
+      report: { formatVersion: 3, answer: [citedSentence('Usage is metered.', [claim.claimId])],
         sections: [{ title: 'Cost', sentences: [citedSentence('Usage is metered.', [claim.claimId])] }],
         completeness: 'partial', conflicts: [], limitations: ['Not verified.'], unresolvedQuestions: ['Cost conditions'],
         coverage: [{ questionId: 'cost-1', claimIds: [claim.claimId], status: 'covered', reason: 'Pretend the question is covered.' }] }, at }))
       .toMatchObject({ ok: false, error: { code: 'research_coverage_invalid' } });
-    const report = need(f.store.research.saveReport({ researchId: f.task.researchId, runId, toolCallId: reportCall,
-      report: { formatVersion: 2, answer: [], sections: [],
+    const report = need(saveReport(f, { researchId: f.task.researchId, runId, toolCallId: reportCall,
+      report: { formatVersion: 3, answer: [], sections: [],
         completeness: 'partial', conflicts: [], limitations: ['Not verified.'], unresolvedQuestions: ['Cost conditions'],
         coverage: [{ questionId: 'cost-1', claimIds: [claim.claimId], status: 'gap', reason: 'Pending verification.' }] }, at }));
     expect(need(f.store.research.get(f.task.researchId)).status).toBe('researching');
@@ -201,6 +215,99 @@ describe('P15 research storage, isolated engineering fixtures', () => {
     const revised = need(savePlan(f, revisionRun, call(f, revisionRun, 'save_research_plan', 'revision-plan'))); stop(f, revisionRun);
     const emptyInvestigation = run(f, 'researching', revised); stop(f, emptyInvestigation);
     expect(need(f.store.research.get(f.task.researchId))).toMatchObject({ status: 'failed', currentReportId: report.reportId });
+  });
+
+  it('requires a receipt for the exact report, confirmed plan and writing ToolCall', () => {
+    const f = fixture(), planning = run(f, 'planning');
+    const plan = need(savePlan(f, planning, call(f, planning, 'save_research_plan'))); stop(f, planning);
+    const runId = run(f, 'researching', plan), toolCallId = call(f, runId, 'save_research_report');
+    const researchId = f.task.researchId;
+    const report = { formatVersion: 3 as const, answer: [], sections: [], completeness: 'partial' as const,
+      conflicts: [], limitations: [], unresolvedQuestions: [],
+      coverage: [{ questionId: 'cost-1', claimIds: [], status: 'gap' as const, reason: 'No pricing is available.' }] };
+    const input = { researchId, runId, toolCallId, report, at };
+    const semanticReview = createResearchReviewReceipt(report, { researchId, runId, toolCallId, planId: plan.planId,
+      revision: plan.revision, reviewedAt: at });
+    // @ts-expect-error The required receipt must also be checked at runtime.
+    expect(f.store.research.saveReport(input)).toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    for (const receipt of [{ ...semanticReview, planId: plan.planId + 1 }, { ...semanticReview, revision: plan.revision + 1 },
+      { ...semanticReview, runId: planning }, { ...semanticReview, toolCallId: call(f, runId, 'save_research_report', 'other-report') }]) {
+      expect(f.store.research.saveReport({ ...input, semanticReview: receipt }))
+        .toMatchObject({ ok: false, error: { code: 'research_review_mismatch' } });
+    }
+    expect(f.store.research.saveReport({ ...input, report: { ...report, limitations: ['A later edit.'] }, semanticReview }))
+      .toMatchObject({ ok: false, error: { code: 'input_invalid' } });
+    expect(need(f.store.research.listReports({ researchId, limit: 10 })).items).toEqual([]);
+    expect(need(f.store.research.get(researchId)).currentReportId).toBeNull();
+    const saved = need(f.store.research.saveReport({ ...input, semanticReview }));
+    expect(saved.semanticReview).toEqual(semanticReview);
+    expect(f.store.research.saveReport({ ...input, semanticReview })).toEqual({ ok: true, data: saved });
+    stop(f, runId);
+    expect(f.store.research.saveReport({ ...input, semanticReview })).toEqual({ ok: true, data: saved });
+    const changedReport = { ...report, limitations: ['A later edit after completion.'] };
+    const changedReview = createResearchReviewReceipt(changedReport, { researchId, runId, toolCallId, planId: plan.planId,
+      revision: plan.revision, reviewedAt: at });
+    expect(f.store.research.saveReport({ ...input, report: changedReport, semanticReview: changedReview }))
+      .toMatchObject({ ok: false, error: { code: 'research_identity_conflict' } });
+    expect(need(f.store.research.listReports({ researchId, limit: 10 })).items).toEqual([saved]);
+  });
+
+  it('refuses an otherwise valid report whose ToolCall result envelope would exceed storage limits', () => {
+    const f = fixture(), planning = run(f, 'planning');
+    const plan = need(savePlan(f, planning, call(f, planning, 'save_research_plan'))); stop(f, planning);
+    const runId = run(f, 'researching', plan), researchId = f.task.researchId;
+    const sourceCall = call(f, runId, 'read_research_local');
+    const source = need(f.store.research.saveSource({ researchId, runId, toolCallId: sourceCall, at,
+      source: { kind: 'local', address: 'artifact:1', title: 'Costs', artifactId: 1, documentId: null,
+        fetchedAt: at, publishedAt: null, relativePath: `artifacts/research/${researchId}/source-${sourceCall}.txt`,
+        bytes: 4, characters: 4, truncated: false } }));
+    const claim = need(f.store.research.saveClaim({ researchId, runId, toolCallId: call(f, runId, 'save_research_claim'), at,
+      claim: { questionId: 'cost-1', text: 'Costs apply.', dependencies: [], evidence: [{ relation: 'supports',
+        ref: { researchId, planId: plan.planId, revision: plan.revision, runId, toolCallId: sourceCall,
+          sourceSnapshotId: source.sourceSnapshotId, locator: { start: 0, end: 4, quote: 'Cost' } } }],
+        verification: { status: 'supported', reasons: ['Controlled receipt-size fixture.'] } } }));
+    const toolCallId = call(f, runId, 'save_research_report');
+    const report = { formatVersion: 3 as const, answer: [citedSentence('Costs apply.', [claim.claimId])], sections: [],
+      completeness: 'partial' as const, conflicts: [], limitations: [], unresolvedQuestions: [],
+      coverage: [{ questionId: 'cost-1', claimIds: [claim.claimId], status: 'covered' as const, reason: 'Costs documented.' }] };
+    const semanticReview = createResearchReviewReceipt(report, { researchId, runId, toolCallId, planId: plan.planId,
+      revision: plan.revision, reviewedAt: at });
+    if (semanticReview.status !== 'verified') throw Error('Expected a controlled finding review.');
+    const fact = { ...semanticReview.sentences[0]!.facts[0]!, reason: 'x'.repeat(512) };
+    const metadata = { researchId, planId: plan.planId, revision: plan.revision, runId, toolCallId,
+      reportId: Number.MAX_SAFE_INTEGER, createdAt: at };
+    const projected = () => ({ ...projectCitedResearchReport({ ...report, semanticReview }), ...metadata });
+    semanticReview.sentences[0]!.facts = [fact];
+    const targetBytes = TOOL_CONFIG.payload.maxOutputBytes - 1;
+    const extraFactBytes = Buffer.byteLength(JSON.stringify(fact)) + 1;
+    const count = Math.ceil((targetBytes - Buffer.byteLength(JSON.stringify(projected()))) / extraFactBytes) + 1;
+    semanticReview.sentences[0]!.facts = Array.from({ length: count }, () => ({ ...fact }));
+    let excess = Buffer.byteLength(JSON.stringify(projected())) - targetBytes;
+    for (const item of semanticReview.sentences[0]!.facts) {
+      const removed = Math.min(excess, item.reason.length - 1);
+      item.reason = item.reason.slice(removed); excess -= removed;
+      if (excess === 0) break;
+    }
+    expect(Buffer.byteLength(JSON.stringify(projected()))).toBe(targetBytes);
+    expect(Buffer.byteLength(JSON.stringify({ version: 1, status: 'succeeded', committedCandidateId: null, data: projected() })))
+      .toBeGreaterThan(TOOL_CONFIG.payload.maxStoredResultEnvelopeBytes);
+    const rejected = f.store.research.saveReport({ researchId, runId, toolCallId, report, semanticReview, at });
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) throw Error('An oversized ToolCall result envelope was committed.');
+    expect(rejected.error.code).toBe('research_report_too_large');
+    expect(need(f.store.research.get(researchId)).currentReportId).toBeNull();
+    expect(need(f.store.research.listReports({ researchId, limit: 10 })).items).toEqual([]);
+    const envelopeBytes = () => Buffer.byteLength(JSON.stringify({ version: 1, status: 'succeeded', committedCandidateId: null, data: projected() }));
+    let envelopeExcess = envelopeBytes() - TOOL_CONFIG.payload.maxStoredResultEnvelopeBytes;
+    for (const item of semanticReview.sentences[0]!.facts) {
+      const removed = Math.min(envelopeExcess, item.reason.length - 1);
+      item.reason = item.reason.slice(removed); envelopeExcess -= removed;
+      if (envelopeExcess === 0) break;
+    }
+    expect(envelopeBytes()).toBe(TOOL_CONFIG.payload.maxStoredResultEnvelopeBytes);
+    const accepted = need(f.store.research.saveReport({ researchId, runId, toolCallId, report, semanticReview, at }));
+    expect(need(f.store.research.get(researchId)).currentReportId).toBe(accepted.reportId);
+    expect(need(f.store.research.getReport({ researchId, reportId: accepted.reportId }))).toEqual(accepted);
   });
 
   it('upgrades an existing v18 store without fabricating research identities or changing old records', () => {

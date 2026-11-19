@@ -281,6 +281,7 @@ const bridge: DesktopBridge = {
   listResearchMaterials: input => invokeAssembly('list_research_materials', input ?? {}),
   queryResearchWebStatus: () => invokeAssembly('query_research_web_status', {}),
   createResearchTask: input => invokeAssembly('create_research_task', input),
+  updateResearchWebAccess: input => invokeAssembly('update_research_web_access', input),
   listResearchTasks: input => invokeAssembly('list_research_tasks', input ?? {}),
   queryResearchTask: researchId => invokeAssembly('query_research_task', { researchId }),
   queryResearchForSession: input => invokeAssembly('query_research_for_session', input),

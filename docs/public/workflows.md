@@ -16,7 +16,7 @@ If evidence is missing, ask for the gap rather than a guessed fact. For independ
 
 ## Deep Research
 
-Research reads selected local `.txt` and `.md` material and registered parsed documents. **Web search** defaults to off for each new task. Set `FLOWMATE_TAVILY_API_KEY` in the executing Host's startup environment and restart it to enable the switch. Desktop local mode inherits the value from the desktop launcher. Set the variable in the Windows service startup environment for WinSW.
+Research reads selected local `.txt` and `.md` material and registered parsed documents. **Web search** defaults to off. To turn it on, set `FLOWMATE_TAVILY_API_KEY` in the executing Host's startup environment and restart it. Desktop local mode inherits the value from the desktop launcher. Set the variable in the Windows service startup environment for WinSW. Turning web search off does not require a key.
 
 ```mermaid
 flowchart LR
@@ -28,30 +28,54 @@ flowchart LR
   Evidence -->|unfinished or failed| Continue[User explicitly continues]
   Continue --> Read
   Evidence -->|acquisition settled| Claims[Claims with evidence and dependencies]
-  Claims --> Check[Check each sentence citation against saved evidence]
-  Evidence -->|acquisition stopped, no citable findings| Check
-  Check --> Report[Save full or explicit partial report]
+  Claims --> Check[Validate citations and review support for each fact]
+  Evidence -->|acquisition stopped, no citable findings| Report
+  Check -->|passed| Report[Save full or explicit partial report]
+  Check -->|failed| Revise[Revise citations or findings before submitting again]
   Report --> Review[Review references and export Markdown or PDF]
 ```
 
 1. Optionally open **Settings → General → Research preferences**, enter the desired evidence or report preferences, and select **Save research preferences**. The default is empty and the text is limited to 8,192 UTF-8 bytes; each research Run captures the saved text and revision. Saving does not start a model call.
 2. Open **Deep Research → New research**, enter the question and optional scope, and import or select authorized local material or parsed documents as needed. Enable **Web search** if the task needs public webpages. Select **Create research**, then **Send** in the linked Assistant to generate a plan. The currently selected invoice is not added automatically.
-3. Inspect the saved Plan's questions, evidence needs, source scope, budget and stop conditions. A plan with steps binds each acquisition to its questions and one selected material, query or public URL. With web search enabled, **Web requests to Tavily** lists the saved plan's search terms, time ranges, result ranks and specified public URLs for review. Use **Revise plan** if necessary, then explicitly select **Confirm plan version** to start investigation. Changing the authorized material selection requires a new research task.
+3. Inspect the saved Plan's questions, evidence needs, source scope, budget and stop conditions. A plan with **Web search** enabled requires a public web step and, if local materials were selected, a local read step. **Web requests to Tavily** lists the search terms, time ranges, result ranks and specified public URLs. Tavily receives the terms and URLs used for search and extraction. Keep credentials, private identifiers, local paths and confidential text out of those fields, including URL query strings and fragments. Use **Revise plan** if necessary, then select **Confirm plan version** to start investigation.
 4. For a plan with steps, inspect **Research steps** and the saved-source links. Local reads, web searches and page extraction share **two** active acquisition slots per task, including reads delegated to `research-investigator` children. This is separate from the limit of four owned children. The parent runs the confirmed Tavily steps and saves Claims and reports. Search tries live fetching first. If the selected rank has no candidate, Flowmate repeats discovery once with the confirmed query, date constraints and rank, then extracts the selected webpage. If a selected search result has no body, Flowmate extracts that URL directly.
-5. Open **Report** and choose a version in **Saved report**. Click a marker such as `[1]` to see its source snapshot, exact quotation, UTF-16 character range, acquisition time and Run / ToolCall. Use **View saved passage** to open the text in **Evidence**, **Open Claim** to inspect its supporting or refuting evidence and dependencies, or **Open webpage** for a web source. Web snapshots retain the page text, URL, acquisition time and source date when available.
-6. Choose Markdown or PDF under **Export format**, then select **Save report**. Both formats retain the sentence markers and References appendix. In a PDF, clicking a marker jumps to its entry. Historical reports with section-level citations remain readable and exportable as Markdown. Generate a new report to export PDF.
+5. Open **Report** and choose a version in **Saved report**. Click a marker such as `[1]` to see its source snapshot, exact quotation, UTF-16 character range, acquisition time and Run / ToolCall. **Semantic review** shows the model, policy, Run / ToolCall and per-sentence verdicts, fact spans, reasons and citations. Use **View saved passage** to open the text in **Evidence**, **Open Claim** to inspect its supporting or refuting evidence and dependencies, or **Open webpage** for a web source. Web snapshots retain the page text, URL, acquisition time and source date when available. **Open webpage** opens the saved URL in the system browser and may contact the website.
+6. Choose Markdown or PDF under **Export format**, then select **Save report**. For reports with sentence citations, both export formats retain the same markers and references. In a PDF, clicking a marker jumps to its entry. Older reports with sentence citations (format 2) still support PDF and show that no independent semantic review was recorded. Earlier reports with section-level citations remain readable and exportable as Markdown.
 
-Every sentence in a new report's answer, conclusions and section body requires a citation to a specific evidence entry on a saved Claim. Before saving, Flowmate checks the Claim and plan, compares the quote with the saved snapshot at the recorded UTF-16 offsets (start inclusive, end exclusive), and checks the acquisition Run / ToolCall IDs against the successfully completed tool call. If a citation is missing or fails these checks, the report is not saved. This check requires no additional model call.
+Every sentence in a new report (format 3) cites specific evidence on a saved Claim. Before saving, Flowmate checks the Claim and plan, compares the quote at the recorded UTF-16 offsets (start inclusive, end exclusive), and checks the acquisition Run / ToolCall receipt. For a report with findings, it then sends the draft, research question and scope, source metadata and relevant saved passages to the selected model provider. This is one isolated request per eligible save attempt, with no conversation history, tools or automatic retry. It uses the Run's shared model budget and leaves one call for the Assistant response, so at least two calls and enough time must remain when saving. If the checks or review fail, the report is not saved.
 
-A full report requires successful planned acquisitions and support for the planned questions. Once active acquisitions stop, a partial report can record failed or unfinished steps, limitations, conflicts and unresolved questions separately from the body. If there are no citable findings, the partial report can leave its body empty and record the gaps.
+The reviewer breaks each sentence into checkable facts and compares entities, metrics, values, units, dates, conditions, negation and necessary reasoning against the cited passages. The Host combines the fact decisions into the sentence result below. Every sentence with findings must pass, including in a partial report.
+
+| Sentence result | Meaning | Save behavior |
+|---|---|---|
+| `supported` | All facts have full support and the reviewer reports complete coverage | Eligible to save after the remaining checks |
+| `partially_supported` | Some support exists, but facts, conditions or review coverage remain incomplete, with no explicit contradiction | Refuse the save |
+| `unsupported` | No fact receives full or partial support, and no contradiction is established | Refuse the save |
+| `contradicted` | At least one fact conflicts with the evidence | Refuse the save |
+
+After a refusal, inspect the original `save_research_report` error in Assistant. The Agent can narrow the wording, correct the citations, or obtain permitted evidence and submit again within the remaining budget. A changed sentence, citation or plan requires another review. The saved receipt binds the exact report and its plan and writing ToolCall. Repeating the original committed ToolCall with the identical payload returns its original receipt; revisions use a new save call.
+
+| Save issue | Next action |
+|---|---|
+| Missing citation, quotation mismatch or invalid acquisition record | Correct the reference using saved evidence and its original receipt |
+| Partial support, no support or contradiction | Rewrite, supplement evidence or remove the unsupported statement |
+| Review timeout, insufficient budget or incomplete model response | Retain the gap and check the confirmed execution limits before another attempt |
+| Report or ToolCall result too large | Shorten the draft and submit again; the Host generates the review receipt |
+| Execution stop unconfirmed | Check the original Run and ToolCall before continuing |
+
+Citation, semantic review and size failures detected before commit leave the saved report and current report pointer unchanged. If a save reply is lost or its commit result is unknown, inspect the original Run and ToolCall before retrying. Opening or exporting a saved report uses its recorded review.
+
+A full report requires successful planned acquisitions, supported Claims for every planned question, supported cited Claims and dependencies, and no unresolved questions. Once active acquisitions stop, a partial report can record failed or unfinished steps, limitations, conflicts and unresolved questions separately from the body. If there are no citable findings, a partial report can record the gaps with an empty body; this does not call the reviewer.
 
 For a plan with steps, the checkpoint displays `pending`, `running`, `succeeded`, `failed` or `interrupted`. Success requires a successful tool receipt, confirmed cleanup and a saved source; a model's statement is not a receipt. Claim saving is blocked while a step remains pending, running or interrupted. A failed step remains visible for diagnosis and prevents a full report until it succeeds.
 
 When a confirmed plan has pending, failed or interrupted steps, **Continue research** is shown. It can be enabled only when the selected research Session, model and runtime are ready, no Run is active, and the page is not loading or saving. It starts an explicit new investigation Run using the confirmed plan: a succeeded step reuses its original saved source if that source remains available, while remaining eligible steps can be attempted. A prior step whose stopping is unconfirmed remains blocked; inspect the original Run and ToolCall instead of starting a replacement blindly. Merely reopening the page or querying history does not run the model or replay a tool call. After restart, a valid saved research focus can be restored, but a later user selection is not replaced by a delayed restore.
 
+To change **Web search** on an existing task, wait for the Host to confirm that its Runs and tools have stopped, then use the task's switch. Both directions retain the same task, Assistant session, local material IDs and history. The previous plan can no longer be continued. Send the question in Assistant to generate and confirm a new plan; the switch itself starts no Run. With the switch off, new investigations cannot acquire or cite web evidence, including snapshots from an earlier plan. Saved reports, sources and exports stay available under their original authorization. Changing the selected local materials requires a new research task.
+
 Older plans without `steps` remain readable and use their original read/query flow; they do not automatically gain a step list. To use step tracking, generate and confirm a new plan. See [Agent runtime](agent-runtime.md#context-memory-layers) for the different lifetimes of focus, history, preferences and checkpoint.
 
-Source location validity is not semantic correctness. A Report's own coverage is a product result, not an independent quality score. A completed investigation Run without a saved report is not a delivered report. Use [Evaluation](EVALUATION.md) for independent evidence and multi-hop quality checks.
+Claim statuses describe the research Agent's judgment. The separate review records the model's judgment of evidence for the report's cited sentences. Read the original passages for important decisions; neither judgment guarantees truth, and neither measures real-world accuracy. See [Evaluation](EVALUATION.md) for quality checks. A completed investigation Run without a saved report has not delivered a report.
 
 ## Invoice review
 

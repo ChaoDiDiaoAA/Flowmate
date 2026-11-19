@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { AppErrorSchema, RuntimeRequestOverridesSchema, RuntimeBudgetOverridesSchema } from './runtime.ts';
+import { AppErrorSchema, RuntimeRequestOverridesSchema, RuntimeBudgetOverridesSchema, TokenColumnsSchema, UsageRecordSchema } from './runtime.ts';
 import type { Result } from './runtime.ts';
 
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -157,7 +157,6 @@ const sentence = z.object({ text: boundedText(4000).refine(isResearchSentence, '
   citations: z.array(citation).min(1).max(64).refine(rows => unique(rows.map(row => `${row.claimId}:${row.evidenceIndex}`)),
     'A sentence must cite distinct Claim evidence entries.') }).strict();
 const citedBody = reportBody.extend({
-  formatVersion: z.literal(2),
   answer: z.array(sentence).max(128),
   sections: z.array(z.object({ title: label, sentences: z.array(sentence).min(1).max(128) }).strict()).max(32),
 });
@@ -181,8 +180,11 @@ function checkCitedBody(body: z.infer<typeof citedBody>, ctx: z.RefinementCtx) {
   if (new TextEncoder().encode(JSON.stringify(body)).length > 2_000_000)
     ctx.addIssue({ code: 'custom', path: ['sections'], message: 'The report exceeds its size limit.' });
 }
-export const CitedResearchReportBodySchema = citedBody.superRefine(checkCitedBody);
+export const CitedResearchReportBodySchema = citedBody.extend({ formatVersion: z.literal(2) }).superRefine(checkCitedBody);
 export type CitedResearchReportBody = z.infer<typeof CitedResearchReportBodySchema>;
+const reviewedBody = citedBody.extend({ formatVersion: z.literal(3) });
+export const ReviewedResearchReportBodySchema = reviewedBody.superRefine(checkCitedBody);
+export type ReviewedResearchReportBody = z.infer<typeof ReviewedResearchReportBodySchema>;
 export type ResearchSentence = z.infer<typeof sentence>;
 export function researchSentences(body: Pick<CitedResearchReportBody, 'answer' | 'sections'>): ResearchSentence[] {
   return [...body.answer, ...body.sections.flatMap(section => section.sentences)];
@@ -198,18 +200,119 @@ export function researchCitations(body: Pick<CitedResearchReportBody, 'answer' |
 export function researchCitationKey({ claimId, evidenceIndex }: z.infer<typeof citation>): string {
   return `${claimId}:${evidenceIndex}`;
 }
+export const RESEARCH_SEMANTIC_POLICY_VERSION = 'research-semantic-v1';
+export const ResearchSemanticReviewIdentitySchema = z.object({ researchId: id, planId: id, revision: id, runId: id, toolCallId: id }).strict();
+export type ResearchSemanticReviewIdentity = z.infer<typeof ResearchSemanticReviewIdentitySchema>;
+const semanticVerdict = z.enum(['supported', 'partially_supported', 'unsupported', 'contradicted']);
+const semanticSentenceLimit = 128 * 33;
+const semanticSentenceIndex = z.number().int().min(0).max(semanticSentenceLimit - 1);
+export const ResearchSemanticReviewFactSchema = z.object({
+  start: z.number().int().min(0).max(3999), end: z.number().int().min(1).max(4000), text: boundedText(4000),
+  citations: z.array(citation).max(64).refine(rows => unique(rows.map(researchCitationKey))),
+  verdict: semanticVerdict, reason: boundedText(512),
+}).strict().refine(fact => fact.end - fact.start === fact.text.length, 'Fact requires exact UTF-16 offsets.');
+export type ResearchSemanticReviewFact = z.infer<typeof ResearchSemanticReviewFactSchema>;
+export const ResearchSemanticDecisionSchema = z.object({
+  sentenceIndex: semanticSentenceIndex, complete: z.boolean(), facts: z.array(ResearchSemanticReviewFactSchema).max(4000),
+}).strict();
+const reviewedSentence = ResearchSemanticDecisionSchema.extend({ ...sentence.shape, verdict: semanticVerdict });
+export type ResearchSemanticReviewSentence = z.infer<typeof reviewedSentence>;
+type CitedSentenceBody = z.infer<typeof citedBody>;
+type SemanticDecision = z.infer<typeof ResearchSemanticDecisionSchema>;
+export function researchSemanticVerdict({ complete, facts }: SemanticDecision): z.infer<typeof semanticVerdict> {
+  if (facts.some(fact => fact.verdict === 'contradicted')) return 'contradicted';
+  const supported = facts.filter(fact => fact.verdict === 'supported').length;
+  if (complete && supported > 0 && supported === facts.length) return 'supported';
+  if (supported > 0 || facts.some(fact => fact.verdict === 'partially_supported')) return 'partially_supported';
+  return 'unsupported';
+}
+const semanticContext = reportBody.pick({ completeness: true, conflicts: true, limitations: true, unresolvedQuestions: true, coverage: true })
+  .extend({
+    answerSentenceCount: z.number().int().min(0).max(128),
+    sections: z.array(z.object({ title: label, sentenceCount: z.number().int().min(1).max(128) }).strict()).max(32),
+  });
+export function researchSemanticReportContext(report: CitedSentenceBody): z.infer<typeof semanticContext> {
+  const { completeness, conflicts, limitations, unresolvedQuestions, coverage, answer, sections } = report;
+  return { completeness, conflicts, limitations, unresolvedQuestions,
+    coverage: coverage.map(({ questionId, claimIds, status, reason }) => ({ questionId, claimIds, status, reason })),
+    answerSentenceCount: answer.length, sections: sections.map(({ title, sentences }) => ({ title, sentenceCount: sentences.length })) };
+}
+const semanticReviewBase = ResearchSemanticReviewIdentitySchema.extend({
+  policyVersion: z.literal(RESEARCH_SEMANTIC_POLICY_VERSION), reviewedAt: z.string().datetime(), reportContext: semanticContext,
+});
+const modelReview = semanticReviewBase.extend({
+  model: z.object({ provider: boundedText(128), model: boundedText(128) }).strict(),
+  responseId: boundedText(512).nullable(), usage: UsageRecordSchema, tokens: TokenColumnsSchema,
+  sentences: z.array(reviewedSentence).min(1).max(semanticSentenceLimit),
+});
+export const ResearchSemanticReviewSchema = z.discriminatedUnion('status', [
+  modelReview.extend({ status: z.literal('verified') }),
+  modelReview.extend({ status: z.literal('rejected') }),
+  semanticReviewBase.extend({ status: z.literal('no_findings'), sentences: z.tuple([]) }),
+]).refine(review => {
+  if (review.status === 'no_findings') return true;
+  return review.sentences.every((row, index) => row.sentenceIndex === index && row.verdict === researchSemanticVerdict(row))
+    && (review.status === 'verified') === review.sentences.every(row => row.verdict === 'supported');
+}, 'Semantic review status must match the ordered sentence decisions.');
+export type ResearchSemanticReview = z.infer<typeof ResearchSemanticReviewSchema>;
+
+function sameCitation(a: z.infer<typeof citation>, b: z.infer<typeof citation>): boolean {
+  return a.claimId === b.claimId && a.evidenceIndex === b.evidenceIndex;
+}
+export function researchSemanticReviewMatchesReport(report: CitedSentenceBody, review: ResearchSemanticReview,
+  identity: ResearchSemanticReviewIdentity): boolean {
+  const context = semanticContext.safeParse(review.reportContext);
+  if (review.status === 'rejected' || review.runId !== identity.runId || review.toolCallId !== identity.toolCallId
+    || review.researchId !== identity.researchId || review.planId !== identity.planId || review.revision !== identity.revision
+    || !context.success || JSON.stringify(researchSemanticReportContext(report)) !== JSON.stringify(context.data)) return false;
+  const sentences = researchSentences(report);
+  if (review.status === 'no_findings') return sentences.length === 0;
+  return sentences.length === review.sentences.length && review.sentences.every((row, i) => {
+    const original = sentences[i]!;
+    return row.sentenceIndex === i && row.text === original.text && row.complete && row.verdict === 'supported' && row.facts.length > 0
+      && row.citations.length === original.citations.length && row.citations.every((ref, j) => sameCitation(ref, original.citations[j]!))
+      && row.facts.every(fact => fact.verdict === 'supported' && fact.end <= original.text.length
+        && original.text.slice(fact.start, fact.end) === fact.text && fact.citations.some(ref => original.citations.some(selected => sameCitation(ref, selected))));
+  });
+}
+export const ReviewedResearchReportRecordSchema = reviewedBody.extend({ semanticReview: ResearchSemanticReviewSchema }).superRefine(
+  ({ semanticReview, ...report }, ctx) => {
+    checkCitedBody(report, ctx);
+    if (!researchSemanticReviewMatchesReport(report, semanticReview, semanticReview))
+      ctx.addIssue({ code: 'custom', path: ['semanticReview'], message: 'The saved report requires its matching successful semantic review.' });
+  });
+export type ReviewedResearchReportRecord = z.infer<typeof ReviewedResearchReportRecordSchema>;
+
 export const ResearchReportBodySchema = reportBody.refine(value => unique(value.coverage.map(c => c.questionId)), 'Each question has one coverage record.');
 export const ResearchReportSchema = reportBody.extend({ answer: z.union([boundedText(32000), z.literal('')]), sections: reportBody.shape.sections.min(0), reportId: id, researchId: id, planId: id, revision: id,
   runId: id, toolCallId: id, createdAt: z.string().datetime(),
-  cited: citedBody.pick({ answer: true, sections: true, formatVersion: true }).optional()
-}).refine(value => unique(value.coverage.map(c => c.questionId)) &&
-  (value.cited !== undefined || Boolean(value.answer.trim()) && value.sections.length > 0));
-export function projectCitedResearchReport(record: CitedResearchReportBody) {
-  const { formatVersion, answer, sections, ...facts } = record;
-  return { ...facts, answer: answer.map(item => item.text.trim()).join(' '),
+  cited: citedBody.pick({ answer: true, sections: true }).extend({ formatVersion: z.union([z.literal(2), z.literal(3)]) }).optional(),
+  semanticReview: ResearchSemanticReviewSchema.optional(),
+}).refine(value => {
+  if (!unique(value.coverage.map(c => c.questionId))) return false;
+  if (value.cited?.formatVersion !== 3) return value.semanticReview === undefined
+    && (value.cited !== undefined || Boolean(value.answer.trim()) && value.sections.length > 0);
+  const { completeness, conflicts, limitations, unresolvedQuestions, coverage } = value;
+  const body = { ...value.cited, completeness, conflicts, limitations, unresolvedQuestions, coverage };
+  if (!value.semanticReview || !researchSemanticReviewMatchesReport(body, value.semanticReview, value)
+    || !ReviewedResearchReportBodySchema.safeParse(body).success) return false;
+  const projected = projectResearchSentences(body);
+  return value.answer === projected.answer && value.sections.length === projected.sections.length
+    && value.sections.every((section, i) => {
+      const expected = projected.sections[i]!;
+      return section.title === expected.title && section.text === expected.text && section.claimIds.length === expected.claimIds.length
+        && section.claimIds.every((claimId, index) => claimId === expected.claimIds[index]);
+    });
+});
+function projectResearchSentences({ answer, sections }: Pick<CitedSentenceBody, 'answer' | 'sections'>) {
+  return { answer: answer.map(item => item.text.trim()).join(' '),
     sections: sections.map(section => ({ title: section.title, text: section.sentences.map(item => item.text.trim()).join(' '),
       claimIds: citedClaimIds(section.sentences) })),
-    cited: { formatVersion, answer, sections } };
+  };
+}
+export function projectCitedResearchReport<T extends CitedResearchReportBody | ReviewedResearchReportRecord>(record: T) {
+  const { formatVersion, answer, sections, ...facts } = record;
+  return { ...facts, ...projectResearchSentences({ answer, sections }), cited: { formatVersion: formatVersion as T['formatVersion'], answer, sections } };
 }
 export const ResearchPageRequestSchema = z.object({ beforeId: id.optional(), limit: z.number().int().min(1).max(100).default(30) }).strict();
 export const ResearchTaskPageSchema = z.object({ items: z.array(ResearchTaskSchema).max(100), nextBeforeId: id.nullable() }).strict();
@@ -296,6 +399,7 @@ export interface ResearchQueryApi {
   importResearchMaterial(input: ImportResearchMaterialRequest): Promise<Result<ResearchMaterial>>;
   listResearchMaterials(input?: ResearchPageRequest): Promise<Result<z.infer<typeof ResearchMaterialsPageSchema>>>;
   createResearchTask(input: CreateResearchTaskRequest): Promise<Result<ResearchTask>>;
+  updateResearchWebAccess(input: import('./research-commands.ts').UpdateResearchWebAccessRequest): Promise<Result<ResearchTask>>;
   listResearchTasks(input?: ResearchPageRequest): Promise<Result<ResearchTaskPage>>;
   queryResearchTask(researchId: number): Promise<Result<ResearchTask>>;
   queryResearchPlan(input: z.infer<typeof ResearchPlanRequestSchema>): Promise<Result<ResearchPlan>>;

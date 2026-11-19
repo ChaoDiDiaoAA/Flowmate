@@ -48,6 +48,8 @@ flowchart LR
 
 对于带步骤的研究任务，将已确认计划和 Checkpoint 与原 Run／ToolCall、已保存来源及明确继续操作对照。采集 `succeeded` 记录的是成功回执与来源，并非独立 Gold、Claim 已获支持或质量得分。部分报告与 Run 完成也回答不同问题。见 [Deep Research](workflows.zh-CN.md#deep-research)。
 
+格式 3 报告还应对照 `semanticReview` 和原保存 ToolCall，检查审核模型、策略、逐句事实、判定及用量。被拒绝的审核保存在失败的保存调用中，已保存报告携带匹配其正文和引用的成功判定。这些产品审核记录用于检查，不作为独立质量标签。[语义审核样例](../../agent-eval/tests/fixtures/research-semantic-review.json) 是 Agent 编写的候选，仍为 `status: pending`；先人工确认事实拆分和判定，再用于评估误放行、误拒绝或事实遗漏。工程测试中的受控审核响应验证保存行为与回执绑定。
+
 将事实与解释分开。缺少业务回执可以证明未记录交付，单凭这一点不能确定是 Prompt、工具报错还是模型选择导致。Provider、基础设施、Runtime 和 Judge 故障需要各自诊断；未采到的证据保留缺口。
 
 Langfuse 上传后回读相关观察、父子关系、内容及分数。请求被接受不等于远端轨迹完整。写入结果未知时先查原操作，不能盲目重发。Benchmark 观察保留在 Run 中，不再复制为产品 Trace 文件。

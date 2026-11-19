@@ -144,6 +144,48 @@ describe('PiProviderAdapter', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it('sends the independent reviewer system instruction and checks admission before any HTTP attempt', async () => {
+    let admissions = 0;
+    const adapter = new PiProviderAdapter({ credentials: new InMemoryCredentialStore(), runtimeApiKey: 'SYNTHETIC_ONLY',
+      fetch: async (url, init) => {
+        expect(admissions).toBe(2);
+        const request = new Request(url, init);
+        expect(request.url).toBe('https://unused.invalid/v1/chat/completions');
+        expect(request.headers.get('authorization')).toBe('Bearer SYNTHETIC_ONLY');
+        const wire = await request.json() as { messages: Array<{ role: string; content: string }>; tools?: unknown[] };
+        expect(wire.messages).toEqual([{ role: 'system', content: 'Independent reviewer instructions.' },
+          { role: 'user', content: '返回一句话\n\n合成文本' }]);
+        expect(wire.tools ?? []).toEqual([]);
+        return new Response('data: {"choices":[{"index":0,"delta":{"content":"{}"},"finish_reason":null}]}\n\n'
+          + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          { headers: { 'content-type': 'text/event-stream' } });
+      } });
+    try {
+      const signal = new AbortController().signal;
+      const prepared = await adapter.prepare({ ...config, modelRef: { provider: 'fixture', model: 'fixture' },
+        connection: { baseUrl: 'https://unused.invalid/v1', api: 'openai-completions', contextWindow: 64000, maxTokens: 2048 } },
+        { timeoutMs: 1000, stopGraceMs: 500 }, signal);
+      if (!prepared.ok) throw Error(prepared.error.code);
+      const review = { ...input, systemPrompt: 'Independent reviewer instructions.' };
+      const events: NativeObservation[] = [];
+      const denied = await prepared.data.execute(review, signal, event => events.push(event), {
+        beforeRequest: async () => {
+          admissions++;
+          return { ok: false, error: { code: 'budget_exhausted', category: 'runtime', message: 'No calls remain.', retryable: false } };
+        },
+      });
+      expect(admissions).toBe(1);
+      expect(denied).toMatchObject({ text: '', stopped: true, error: { code: 'provider_request_denied' },
+        usage: { source: 'not-requested', attempts: 0, attemptsComplete: true } });
+      expect(events.some(event => event.type === 'request_dispatched')).toBe(false);
+      const outcome = await prepared.data.execute(review, signal, () => {}, {
+        beforeRequest: async () => { admissions++; return { ok: true, data: undefined }; },
+      });
+      expect(outcome).toMatchObject({ text: '{}', error: null, stopped: true, usage: { attempts: 1, attemptsComplete: true } });
+      expect(admissions).toBe(2);
+    } finally { expect((await adapter.close()).closed).toBe(true); }
+  });
+
   it('registers the environment-defined endpoint with Pi and keeps its API key out of the persisted snapshot', async () => {
     const envConfig: ProviderConfig = {
       ...config,

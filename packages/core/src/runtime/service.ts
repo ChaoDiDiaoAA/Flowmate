@@ -74,6 +74,7 @@ import type { createMemoryRuntime } from '../openviking/runtime.ts';
 import { SUBAGENT_ROLE, SUBAGENT_SYSTEM_PROMPT, SUBAGENT_TOOL_NAMES, DelegateArgsSchema } from '@flowmate/contracts';
 import { visibleFrozenSkills } from '../skill-hub/capability-map.ts';
 import { captureFrozenResourceContents } from '../skill-hub/bundle.ts';
+import { addResearchReviewUsage } from './research-usage.ts';
 import type { SubagentOrigin, PreparedSubagent, SubagentConfig, DelegateArgs, AgentObservation, AgentToolBinding } from '@flowmate/contracts';
 
 export interface RuntimeLogger {
@@ -162,6 +163,7 @@ type AgentExecutionContext = {
   scope: RunScope | null;
   maxModelCalls?: number;
   modelBudget?: { used: number; limit: number };
+  reviewOutcomes?: Array<Pick<NativeOutcome, 'usage' | 'tokens'>>;
   runtimeStrategy?: RuntimeStrategySnapshot;
   workingDirectory?: string;
   inputId?: number;
@@ -1408,7 +1410,7 @@ export class RuntimeService {
         this.active = active;
         const context: AgentExecutionContext = { active, request, session, input, admission, scope, workingDirectory, promptText: content.promptText,
           resources, extensions, ...(inputDefinitions ? { inputDefinitions } : {}), ...(resourceBinding ? { resourceBinding } : {}),
-          ...(extensions?.included.some(item => item.ref.id === 'subagents')
+          ...(request.research?.phase === 'researching' || extensions?.included.some(item => item.ref.id === 'subagents')
             ? { modelBudget: { used: 0, limit: request.budget.maxModelCalls } } : {}),
           ...(inputId === undefined ? {} : { inputId }),
           ...(accepted.data.input.contextSnapshotId === null ? {} : { contextSnapshotId: accepted.data.input.contextSnapshotId }),
@@ -1670,7 +1672,7 @@ export class RuntimeService {
         parent.active.controller.signal.removeEventListener('abort', stopFromParent);
         origin.delegateSignal!.removeEventListener('abort', stopFromDelegate);
       };
-      const context: AgentExecutionContext = { ...parent, active, session: row.data, inputDefinitions: childDefinitions,
+      const context: AgentExecutionContext = { ...parent, active, session: row.data, inputDefinitions: childDefinitions, reviewOutcomes: undefined,
         request: { ...parent.request, sessionId: row.data.sessionId, text: args.data.prompt, goalMode: 'answer',
           budget, timeoutMs: remaining }, admission: null, scope, input: saved.data.input,
         promptText: storedInput.data.content.promptText, inputId: created.data.inputId, contextSnapshotId: created.data.contextSnapshotId,
@@ -1841,6 +1843,97 @@ export class RuntimeService {
     } : undefined;
   }
 
+  private reserveModelRequest(context: AgentExecutionContext, reservedAfter = context === this.agentContext ? 0 : 1): Result<void> {
+    const root = this.agentContext, shared = context.modelBudget;
+    if (!root || !shared || root.modelBudget !== shared || root.active.controller.signal.aborted || context.active.controller.signal.aborted
+      || root.active.terminalCommitted || context.active.terminalCommitted || this.poisoned)
+      return fail(appError('input_admission_closed', 'runtime', 'The root request budget is closed.'));
+    if (shared.used >= shared.limit - reservedAfter)
+      return fail(appError('agent_model_call_budget', 'runtime', 'The shared root request budget is exhausted.'));
+    shared.used++;
+    return ok(undefined);
+  }
+
+  public async reviewResearchReport(input: { runId: number; sessionId: number; systemPrompt: string; text: string },
+    call: import('@flowmate/contracts').ToolCallContext): Promise<Result<{
+      model: import('@flowmate/contracts').ModelRef; text: string; responseId: string | null;
+      usage: UsageRecord; tokens: import('@flowmate/contracts').TokenColumns;
+    }>> {
+    const context = this.agentContext;
+    if (!context || context.active.runId !== input.runId || context.request.sessionId !== input.sessionId
+      || context.request.research?.phase !== 'researching')
+      return fail(appError('research_review_unavailable', 'tool', 'The active research Run cannot perform review.'));
+    const verify = () => this.readRuntimeStorage(store => {
+      const permission = store.sessions.isModelUseBlocked(input.sessionId);
+      const saved = store.toolCalls.get({ runId: input.runId, sessionId: input.sessionId, nativeToolCallId: call.nativeToolCallId });
+      if (!permission.ok) return permission;
+      if (permission.data) return fail(appError('session_scope_revoked', 'session', 'Research material use was revoked.'));
+      if (this.agentContext !== context || call.signal.aborted || context.active.controller.signal.aborted || context.active.terminalCommitted
+        || !saved.ok || saved.data.toolName !== 'save_research_report' || saved.data.status !== 'running')
+        return fail(appError('research_review_unavailable', 'tool', 'The original report save is no longer active.'));
+      return ok(undefined);
+    });
+    const allowed = await verify();
+    if (!allowed.ok) return allowed;
+    const deadline = Math.min(call.deadlineAt ?? Infinity, context.active.startedAt + context.request.timeoutMs);
+    const remaining = Math.floor(deadline - this.dependencies.monotonicNow());
+    if (remaining < 1) return fail(appError('tool_timeout', 'runtime', 'No time remains for report review.'));
+    const controller = new AbortController();
+    const signal = AbortSignal.any([call.signal, context.active.controller.signal, controller.signal]);
+    const timer = setTimeout(() => controller.abort('tool_timeout'), remaining);
+    let admissionError: AppError | undefined;
+    const config = { ...context.request.config, parameters: { ...context.request.config.parameters, maxRetries: 0 } };
+    try {
+      const pending = (async () => {
+        const prepared = await this.dependencies.provider.prepare(config, { timeoutMs: remaining, stopGraceMs: context.request.stopGraceMs }, signal);
+        if (!prepared.ok) return prepared;
+        if (signal.aborted) return fail(appError('research_review_cancelled', 'tool', 'Report review was stopped.'));
+        const outcome = await prepared.data.execute({ goal: 'Review every final research sentence against the selected evidence.',
+          systemPrompt: input.systemPrompt, text: input.text, messageTimestamp: Date.now() }, signal, () => {}, {
+          beforeRequest: async () => {
+            const permission = await verify();
+            const reserved = permission.ok ? this.reserveModelRequest(context, 1) : permission;
+            if (!reserved.ok) admissionError = reserved.error;
+            return reserved;
+          },
+        });
+        (context.reviewOutcomes ??= []).push(outcome);
+        if (!outcome.stopped) {
+          context.active.stopFailure = appError('stop_not_confirmed', 'runtime', 'Report reviewer stopping is unconfirmed.');
+          context.active.stop('shutdown');
+          context.active.poisoned = this.poisoned = true;
+          return fail(context.active.stopFailure);
+        }
+        if (admissionError) return fail(admissionError);
+        if (signal.aborted || outcome.partial || outcome.error)
+          return fail(outcome.error ?? appError('research_review_incomplete', 'tool', 'Report review did not complete.'));
+        return ok({ model: { ...config.modelRef, model: outcome.responseModel || config.modelRef.model },
+          text: outcome.text, responseId: outcome.responseId, usage: outcome.usage, tokens: outcome.tokens });
+      })();
+      let onAbort!: () => void;
+      const stopped = new Promise<'aborted'>(resolve => { onAbort = () => resolve('aborted'); signal.addEventListener('abort', onAbort, { once: true }); if (signal.aborted) onAbort(); });
+      try {
+        const first = await Promise.race([pending, stopped]);
+        if (first !== 'aborted') return first;
+        const settled = await withinGrace(pending, context.request.stopGraceMs);
+        if (settled.kind !== 'grace') return settled.value;
+        (context.reviewOutcomes ??= []).push({
+          usage: { ...initialUsage(this.dependencies.now()), source: 'unknown', attempts: null, attemptsComplete: false,
+            reason: 'research-review-stop-unconfirmed' },
+          tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+        });
+        context.active.stopFailure = appError('stop_not_confirmed', 'runtime', 'Report reviewer stopping is unconfirmed.');
+        context.active.stop('shutdown');
+        context.active.poisoned = this.poisoned = true;
+        const finalization = pending.then(() => undefined, () => undefined).finally(() => this.pendingNativeFinalizations.delete(finalization));
+        this.pendingNativeFinalizations.add(finalization);
+        return fail(context.active.stopFailure);
+      } finally { signal.removeEventListener('abort', onAbort); }
+    } catch {
+      return fail(appError('research_review_unavailable', 'tool', 'The report reviewer could not complete the request.', true));
+    } finally { clearTimeout(timer); }
+  }
+
   private executionInput(context: AgentExecutionContext,
     expectedAssembly?: import('@flowmate/contracts').ExtensionAssemblyEvidence): AgentExecutionInput {
     const { active, request, session, input } = context;
@@ -1866,16 +1959,7 @@ export class RuntimeService {
       budgetAwareness: this.dependencies.runtimePolicy?.budgetAwareness ?? true,
       remainingRunMs: () => Math.max(0, active.startedAt + request.timeoutMs - this.dependencies.monotonicNow()),
       verifyInputUse: inputIds => this.readRuntimeStorage(store => this.verifyInputUses(context, inputIds, store)),
-      ...(context.modelBudget ? { reserveModelRequest: () => {
-        const root = this.agentContext, shared = context.modelBudget!;
-        if (!root || root.modelBudget !== shared || root.active.controller.signal.aborted || active.controller.signal.aborted
-          || root.active.terminalCommitted || active.terminalCommitted || this.poisoned)
-          return fail(appError('input_admission_closed', 'runtime', 'The root request budget is closed.'));
-        if (shared.used >= shared.limit - (context === root ? 0 : 1))
-          return fail(appError('agent_model_call_budget', 'runtime', 'The shared root request budget is exhausted.'));
-        shared.used += 1;
-        return ok(undefined);
-      } } : {}),
+      ...(context.modelBudget ? { reserveModelRequest: () => this.reserveModelRequest(context) } : {}),
       completeInputResult: (inputIds, resultEntryId) => this.completeInputResult(context, inputIds, resultEntryId),
       onInputAdmissionClosed: () => { active.inputAdmissionClosed = true; },
       verifyModelUse: () => this.readRuntimeStorage(store => {
@@ -2204,6 +2288,7 @@ export class RuntimeService {
     unconfirmed = false,
   ): Promise<Result<AgentOutcome>> {
     const { active, request, session } = context;
+    if (active.stopFailure?.code === 'stop_not_confirmed') { stopped = false; unconfirmed = true; }
     if (active.terminalCommitted) return fail(appError('run_state_invalid', 'runtime', 'Agent Run 终态已开始提交。', false, active.runId), active.runId);
     const settledChildren: number[] = [];
     for (const owner of this.childSlots.values()) {
@@ -2364,8 +2449,10 @@ export class RuntimeService {
         agent: { ...productAgent, ...(context.admission ? { candidateIds } : {}) },
         ...(ownedChild ? { nativeOutcomeFacts: serializeSubagentCompletion(outcome) } : {}),
       } : null;
-      const usage = outcome?.usage ?? initialUsage(this.dependencies.now());
-      const tokens = outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false };
+      const { usage, tokens } = addResearchReviewUsage({
+        usage: outcome?.usage ?? initialUsage(this.dependencies.now()),
+        tokens: outcome?.tokens ?? { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+      }, context.reviewOutcomes ?? []);
       terminal = {
         status,
         inputResults: status === 'completed' ? inputResults : [],

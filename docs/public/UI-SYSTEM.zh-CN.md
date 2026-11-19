@@ -39,10 +39,11 @@ Light、dark、system 主题复用背景、表面、正文、边框、强调、�
 - 草稿归属具体 Session，在当前窗口内切换对话主区与侧栏、收起并重新展开 Assistant，均保留当前草稿。
 - 输入属于具体 Session/Context，迟到回复不能把旧工作区或结果附到新选择。
 - Host 就绪后可恢复有效保存的研究页面与任务。任务不可用时显示提示；迟到的恢复不会覆盖用户后来的选择或草稿，也不会启动研究。
-- **New research** 中的 **Web search** 按任务授权联网，默认关闭。Host 缺少 Tavily 配置时，开关禁用并显示配置提示。**Plan → Web requests to Tavily** 展示待确认的搜索词、时间范围、结果排名和指定网址。
+- **New research** 中的 **Web search** 默认关闭。已有任务也有开关，任务的 Run 和工具确认停止后 Host 才接受切换。开启联网需要 Host 配置 Tavily，关闭不需要。切换保留任务、Assistant 会话、本地资料选择和历史。在 Assistant 发送问题重新生成计划，确认后才能调查。**Plan → Web requests to Tavily** 列出搜索词、日期范围、排名和指定网址。确认前请检查搜索词和网址是否含有私密信息。
 - 在 **Report** 选择已保存版本后，点击正文引用编号可查看引文、来源快照和采集记录。**View saved passage** 在 **Evidence** 中定位原文，**Open Claim** 查看对应 Claim 及其证据。网页来源还提供 **Open webpage**。
-- 在 **Report → Export format** 选择 Markdown 或 PDF，再点击 **Save report**。支持逐句引用的新报告可导出 PDF，历史报告仍支持 Markdown。
+- 在 **Report** 展开 **Semantic review** 中的句子，查看有结论的格式 3 报告的模型判定、事实片段和证据。空正文部分报告显示未调用审核模型；格式 2 显示没有独立审核记录。通过 **Export format → Save report** 导出 Markdown 或 PDF；格式 2 和 3 支持 PDF，更早的报告仅支持 Markdown。关闭联网后仍可查看已保存报告和引用面板。
 - **Research steps** 展示已保存步骤状态、错误和来源入口。已确认计划存在 pending、failed 或 interrupted 步骤时显示 **Continue research**；选定研究 Session、模型与运行时就绪，没有活跃 Run 且页面未在加载或保存时才能启用。详见 [Deep Research](workflows.zh-CN.md#deep-research)。
+- **Saved report** 列出已提交的报告版本。引用校验或语义审核拒绝保存时，在 Assistant 查看保存工具的错误。重新打开已保存报告展示原审核记录。
 - Send、Stop、Fill with Agent、Save、Accept、Export 含义不同，字段可见值不证明候选提交。
 - 加载、错误、缺证据、历史不可用、停止未确认分别保留；回复丢失不等于成功，也不授权新执行。
 - 未保存发票编辑仅在内存，离开时显式 Save/Discard。

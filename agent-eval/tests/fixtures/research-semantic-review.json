@@ -1,0 +1,16 @@
+{
+  "status": "pending",
+  "authority": "agent-authored",
+  "policyVersion": "research-semantic-v1",
+  "humanReview": "Confirm the proposed facts and verdicts before using these samples to measure model quality.",
+  "samples": [
+    { "id": "revenue-to-profit", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司净利润同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["该公司净利润同比增长 20%。"] },
+    { "id": "same-metric", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司营业收入同比增长 20%。", "proposedVerdict": "supported", "proposedFacts": ["该公司营业收入同比增长 20%。"] },
+    { "id": "compound-partial", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司营业收入和净利润均同比增长 20%。", "proposedVerdict": "partially_supported", "proposedFacts": ["营业收入同比增长 20%。", "净利润同比增长 20%。"] },
+    { "id": "negative-profit", "source": "该公司营业收入同比增长 20%，净利润同比下降 5%。", "sentence": "该公司净利润同比增长 20%。", "proposedVerdict": "contradicted", "proposedFacts": ["该公司净利润同比增长 20%。"] },
+    { "id": "condition-omitted", "source": "仅测试环境支持本地部署。", "sentence": "所有环境均支持本地部署。", "proposedVerdict": "contradicted", "proposedFacts": ["所有环境均支持本地部署。"] },
+    { "id": "time-mismatch", "source": "2024 年营业收入同比增长 20%。", "sentence": "2025 年营业收入同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["2025 年营业收入同比增长 20%。"] },
+    { "id": "baseline-mismatch", "source": "本季度营收环比增长 20%。", "sentence": "本季度营收同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["本季度营收同比增长 20%。"] },
+    { "id": "causation-overstatement", "source": "采用方案后，延迟下降，尚未排除同期硬件升级的影响。", "sentence": "采用该方案导致延迟下降。", "proposedVerdict": "unsupported", "proposedFacts": ["采用该方案导致延迟下降。"] }
+  ]
+}

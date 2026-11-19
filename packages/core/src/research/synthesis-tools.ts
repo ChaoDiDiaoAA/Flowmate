@@ -1,12 +1,16 @@
 import { setImmediate } from 'node:timers/promises';
 import { appError, fail, ok, ToolExecutionFailure, ResearchEvidenceRequestSchema, ResearchEvidenceSchema,
-  RESEARCH_WEB_TOOL_NAMES, ResearchClaimBodySchema, ClaimSchema, CitedResearchReportBodySchema, ResearchReportSchema, EvidenceRefSchema, researchSentences } from '@flowmate/contracts';
-import type { EvidenceRef, ResearchSourcePolicy, ResearchRunBinding, ToolDefinition, ToolCallContext, ProductToolContext, SourceSnapshot, ManagedFileContents, Claim, ResearchReport, CitedResearchReportBody } from '@flowmate/contracts';
+  RESEARCH_WEB_TOOL_NAMES, ResearchClaimBodySchema, ClaimSchema, ResearchReportSchema, EvidenceRefSchema, researchSentences } from '@flowmate/contracts';
+import type { EvidenceRef, ResearchSourcePolicy, ResearchRunBinding, ToolDefinition, ToolCallContext, ProductToolContext, SourceSnapshot, ManagedFileContents, Claim, ResearchReport } from '@flowmate/contracts';
 import type { z } from 'zod';
 import type { DbHandle } from '../storage/database.ts';
 import type { FileStore } from '../storage/file-store.ts';
 import { researchExcerpt, researchEvidenceRef, researchSourceAllowed } from './source-text.ts';
 import { checkResearchControl } from './tools.ts';
+import { z as schema } from 'zod';
+import { ReviewedResearchReportBodySchema, ResearchSemanticReviewSchema } from '@flowmate/contracts';
+import type { ReviewedResearchReportBody } from '@flowmate/contracts';
+import { reviewResearchReport } from './semantic-review.ts';
 
 export type ResearchEvidenceOptions = { database: Pick<DbHandle, 'read' | 'transaction'>; files: Pick<FileStore, 'readResearchSource'> };
 type VerifiedBody = { source: SourceSnapshot; text: string };
@@ -39,6 +43,8 @@ export async function readResearchEvidence(options: ResearchEvidenceOptions, raw
 
 export function createResearchSynthesisTools(options: ResearchEvidenceOptions & {
   files: Pick<FileStore, 'readResearchSource' | 'inspectResearchSource'>; now(): string;
+  review: (input: { runId: number; sessionId: number; systemPrompt: string; text: string }, call: ToolCallContext) =>
+    ReturnType<import('../runtime/service.ts').RuntimeService['reviewResearchReport']>;
 }): ToolDefinition<any, any>[] {
   async function identity(call: ToolCallContext, context: ProductToolContext, root: boolean) {
     return options.database.read(store => {
@@ -106,15 +112,17 @@ export function createResearchSynthesisTools(options: ResearchEvidenceOptions & 
           throw error instanceof ToolExecutionFailure ? error
           : new ToolExecutionFailure(appError('research_write_failed', 'storage', 'Research storage is unavailable.', true)); });
       } },
-    { name: 'save_research_report', version: 'p15-v2', label: 'Save research report', effect: 'LOCAL_WRITE', executionMode: 'sequential',
-      description: 'Save a formatVersion=2 report. Use arrays of {text,citations:[{claimId,evidenceIndex}]} in answer and in each section.sentences. Put one sentence in each text item and cite at least one zero-based evidence entry from a saved Claim. Include all passages needed to support the sentence. The Host checks citation coverage, saved quotation, offsets and acquisition identity. Empty body arrays are allowed for an explicit partial report without findings. coverage needs exactly one record per planned questionId; covered requires non-empty claimIds for that question with verification.status=supported. completeness=full additionally requires every coverage record covered, all referenced Claims and dependencies supported, and unresolvedQuestions=[]. Include conflicts and limitations. If evidence remains incomplete, explicitly submit partial with gap/conflict records and unresolved questions within the remaining budget; the service never downgrades full automatically. A completed Run does not imply a full report.',
-      inputSchema: CitedResearchReportBodySchema, outputSchema: ResearchReportSchema,
-      execute: async (report: CitedResearchReportBody, call, context) => {
+    { name: 'save_research_report', version: 'p15-v3', label: 'Save research report', effect: 'LOCAL_WRITE', executionMode: 'sequential',
+      description: 'Save a formatVersion=3 report. Use arrays of {text,citations:[{claimId,evidenceIndex}]} in answer and in each section.sentences. Put one sentence in each text item and cite at least one zero-based evidence entry from a saved Claim. Include all passages needed to support the sentence. The Host checks citation coverage, saved quotation, offsets and acquisition identity, then independently reviews every factual assertion in the final sentences. All sentences must be fully supported. Reserve one model call for review and one for the following response. Correct unsupported wording or citations before resubmitting. Do not submit semanticReview. Empty body arrays are allowed for an explicit partial report without findings. coverage needs exactly one record per planned questionId; covered requires non-empty claimIds for that question with verification.status=supported. completeness=full additionally requires every coverage record covered, all referenced Claims and dependencies supported, and unresolvedQuestions=[]. Include conflicts and limitations. If evidence remains incomplete, explicitly submit partial with gap/conflict records and unresolved questions within the remaining budget; the service never downgrades full automatically. A completed Run does not imply a full report.',
+      inputSchema: ReviewedResearchReportBodySchema,
+      outputSchema: schema.union([ResearchReportSchema, schema.object({ semanticReview: ResearchSemanticReviewSchema }).strict()]),
+      execute: async (report: ReviewedResearchReportBody, call, context) => {
         report = structuredClone(report); call = { ...call }; context = structuredClone(context);
         const { binding, toolCallId } = await identity(call, context, true), seen = new Set<number>(), bodies = new Map<number, VerifiedBody>();
         const input = { researchId: binding.researchId, runId: context.runId, toolCallId, report, at: options.now() };
         const allowed = await options.database.read(store => store.research.validateReport(input));
         if (!allowed.ok) throw new ToolExecutionFailure(allowed.error);
+        const claims = new Map<number, Claim>();
         const pending = [...researchSentences(report).flatMap(sentence => sentence.citations.map(citation => citation.claimId)),
           ...report.coverage.flatMap(coverage => coverage.claimIds)];
         while (pending.length) {
@@ -126,17 +134,25 @@ export function createResearchSynthesisTools(options: ResearchEvidenceOptions & 
           }).catch(error => { throw error instanceof ToolExecutionFailure ? error
             : new ToolExecutionFailure(appError('research_read_failed', 'storage', 'Research storage is unavailable.', true)); });
           if (!claim.ok) throw new ToolExecutionFailure(claim.error);
+          claims.set(id, claim.data);
           if (claim.data.planId !== binding.plan!.planId || claim.data.revision !== binding.plan!.revision
             || report.completeness === 'full' && claim.data.verification.status !== 'supported')
             throw new ToolExecutionFailure(appError('research_evidence_incomplete', 'tool', 'Report Claims and dependencies must belong to the confirmed plan; completeness=full requires every verification.status=supported. Correct the evidence or explicitly submit partial with gaps within the remaining budget.'));
           for (const evidence of claim.data.evidence) await verify(evidence.ref, binding, bodies);
           pending.push(...claim.data.dependencies);
         }
+        const plan = await options.database.read(store => store.research.getPlan({ researchId: binding.researchId, planId: binding.plan!.planId }));
+        if (!plan.ok) throw new ToolExecutionFailure(plan.error);
+        const semanticReview = await reviewResearchReport({ report, question: plan.data.body.question, scope: plan.data.body.scope,
+          sources: [...bodies.values()].map(body => body.source), researchId: binding.researchId,
+          planId: binding.plan!.planId, revision: binding.plan!.revision,
+          runId: context.runId, toolCallId, reviewedAt: options.now() },
+          claims, payload => options.review({ ...payload, runId: context.runId, sessionId: context.sessionId }, call));
         let confirmed: ResearchReport | undefined;
         return options.database.transaction(store => {
           checkResearchControl(call);
           verifyCurrentBodies(bodies, store.contents);
-          const result = store.research.saveReport({ ...input, at: options.now() });
+          const result = store.research.saveReport({ ...input, semanticReview, at: options.now() });
           if (!result.ok) throw new ToolExecutionFailure(result.error);
           store.db.afterCommit?.(() => { confirmed = result.data; });
           return result.data;

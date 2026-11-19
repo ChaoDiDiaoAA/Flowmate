@@ -125,7 +125,7 @@ export class PiProviderAdapter implements ProviderPort {
 
     return ok({
       snapshot,
-      execute: async (input, executionSignal, observe) => {
+      execute: async (input, executionSignal, observe, control) => {
         if (this.closed) return this.closedOutcome();
         this.activeExecutions += 1;
         let deferredRelease = false;
@@ -139,7 +139,7 @@ export class PiProviderAdapter implements ProviderPort {
           return await this.execute(runtime, model, config, input, executionSignal, observe, limits.stopGraceMs, (settled) => {
             deferredRelease = true;
             void settled.then(release, release);
-          });
+          }, control);
         } finally {
           if (!deferredRelease) release();
         }
@@ -166,10 +166,15 @@ export class PiProviderAdapter implements ProviderPort {
     observe: (event: NativeObservation) => void,
     stopGraceMs: number,
     deferReleaseUntil: (settled: Promise<unknown>) => void,
+    control?: { beforeRequest(): Promise<Result<void>> },
   ): Promise<NativeOutcome> {
     const facts: FetchFacts = { attempts: 0, responseStatus: null, requestStarted: false, responseStarted: false, transportFailed: false, complete: false };
+    let requestDenied = false;
     const baseFetch: FetchLike = this.dependencies.fetch ?? ((request, init) => globalThis.fetch(request, init));
     const fetch: FetchLike = async (request, init) => {
+      const allowed = await control?.beforeRequest();
+      if (allowed && !allowed.ok) { requestDenied = true; throw Error(allowed.error.code); }
+      if (signal.aborted) throw Error('provider_cancelled');
       facts.attempts += 1;
       facts.requestStarted = true;
       const requestUrl = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url;
@@ -202,6 +207,7 @@ export class PiProviderAdapter implements ProviderPort {
     else signal.addEventListener('abort', abortRequest, { once: true });
     try {
       const context = {
+        ...(input.systemPrompt === undefined ? {} : { systemPrompt: input.systemPrompt }),
         messages: [{ role: 'user' as const, content: projectUserText(input), timestamp: input.messageTimestamp }],
         tools: [],
       };
@@ -300,6 +306,14 @@ export class PiProviderAdapter implements ProviderPort {
     signal.removeEventListener('abort', abortRequest);
 
     if (streamFailed || (!facts.responseStarted && streamError?.stopReason === 'error')) facts.complete = false;
+    if (requestDenied && facts.attempts === 0) {
+      return { text: '', partial: false, stopReason: 'not-requested', responseId: null, responseModel: model.id,
+        error: appError('provider_request_denied', 'provider', 'The model request was denied before dispatch.'),
+        usage: { version: 1, source: 'not-requested', reason: 'request-denied', sdkValues: null, attempts: 0,
+          attemptsComplete: true, costSource: null, updatedAt: new Date().toISOString() },
+        tokens: { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false },
+        stopped: true, cleanupErrors: [] };
+    }
 
     if (outputLimitExceeded) {
       this.dependencies.witness?.({ type: 'output_limit_stop', stopped: facts.complete, streamFailed, aborted: requestController.signal.aborted });
