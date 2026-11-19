@@ -7,6 +7,15 @@ import { PiProviderAdapter } from '@flowmate/runtime-pi';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { ok, type ProviderPort } from '@flowmate/contracts';
 
+function unsupportedReview(text: string, unsupported: string, reason: string) {
+  const response = supportedResearchReviewResponse(text);
+  if (!response.sentences) throw new Error('Expected a final review request.');
+  return { sentences: response.sentences.map(row => row.facts[0]?.text !== unsupported ? row : {
+    ...row, facts: row.facts.map(fact => ({ ...fact, citations: [], verdict: 'unsupported', reason })),
+    citationReviews: row.citationReviews.map(review => ({ ...review, verdict: 'irrelevant', reason, contributions: [] })),
+  }) };
+}
+
 async function fixture(alter?: (claim: ResearchClaimBody, bodyPath: string) => ResearchClaimBody,
   options: { partial?: boolean; failReport?: boolean; invalidCitation?: boolean; changeSourceBeforeReport?: boolean;
     review?: (text: string) => object | Promise<object>; maxModelCalls?: number; metricDrift?: boolean;
@@ -91,8 +100,11 @@ it('records a coverage gap, reads one bounded supplementary passage and saves it
   expect(evidence.excerpt.quote).toBe(f.text.slice(4000, 4600));
   const requestsBefore = f.requests.length, query = { researchId: f.task.researchId, reportId: report.reportId };
   const exported = need(await f.app.exportResearchReport(query));
-  expect(exported.markdown).toContain('[[1]](#reference-1)'); expect(exported.markdown).toContain('[[2]](#reference-2)');
-  expect(exported.markdown.match(/\[\[2\]\]\(#reference-2\)/g)).toHaveLength(2);
+  const [reportMarkdown, reviewMarkdown] = exported.markdown.split('\n## Semantic review\n');
+  expect(reportMarkdown).toContain('[[1]](#reference-1)');
+  expect(reportMarkdown!.match(/\[\[2\]\]\(#reference-2\)/g)).toHaveLength(2);
+  expect(reviewMarkdown).toContain('**Citation contributions**');
+  expect(reviewMarkdown!.match(/\[Reference 2\]\(#reference-2\)/g)).toHaveLength(4);
   expect(exported.markdown).toContain('Claim verification'); expect(exported.markdown).toContain(claim.evidence[0]!.ref.locator.quote);
   expect(exported.markdown).toContain(`Run ${claim.evidence[0]!.ref.runId} / ToolCall ${claim.evidence[0]!.ref.toolCallId}`);
   expect(need(await f.app.exportResearchReport(query))).toEqual(exported);
@@ -112,9 +124,7 @@ it('rejects semantic drift through the actual reviewer request even when the Cla
   const f = await fixture(undefined, { metricDrift: true, review: text => {
     expect(text).toContain('该公司营业收入同比增长 20%。');
     expect(text).toContain('该公司净利润同比增长 20%。');
-    const response = supportedResearchReviewResponse(text);
-    return { sentences: response.sentences.map((row, index) => index ? row : { ...row,
-      facts: row.facts.map(fact => ({ ...fact, verdict: 'unsupported', reason: 'The quotation concerns revenue, not net profit.' })) }) };
+    return unsupportedReview(text, '该公司净利润同比增长 20%。', 'The quotation concerns revenue, not net profit.');
   } });
   expect(f.reviewRequests).toHaveLength(1);
   expect(f.task.currentReportId).toBeNull();
@@ -158,13 +168,7 @@ it('reviews corrected wording in a new save call and binds only its successful d
       } };
     }
     return { text: 'The corrected report is saved.' };
-  }, undefined, { material: sourceText, review: text => {
-    const response = supportedResearchReviewResponse(text);
-    return { sentences: response.sentences.map(row => ({ ...row, facts: row.facts.map(fact => ({
-      ...fact, verdict: fact.text === wrongText ? 'unsupported' : 'supported',
-      reason: fact.text === wrongText ? 'The release reports revenue, not profit.' : 'The metric matches the release.',
-    })) })) };
-  } });
+  }, undefined, { material: sourceText, review: text => unsupportedReview(text, wrongText, 'The release reports revenue, not profit.') });
   await f.run(f.request(1));
   const task = need(await f.app.queryResearchTask(f.task.researchId));
   const plan = need(await f.app.queryResearchPlan({ researchId: task.researchId, planId: task.currentPlanId! }));

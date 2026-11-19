@@ -10,7 +10,7 @@ Flowmate 是基于 Pi SDK 的本地优先 Agent 桌面工作台，提供持久�
 
 使用者路线：[快速开始](getting-started.zh-CN.md) → [业务流程](workflows.zh-CN.md) → [Skills 与扩展](skills-and-extensions.zh-CN.md)。持续处理发票请阅读 [Personal Agent](personal-agent.zh-CN.md)，委派任务请阅读 [Subagent](subagents.zh-CN.md)，迁移本地数据前阅读[打包与恢复](packaging-and-recovery.zh-CN.md)。
 
-在 [Deep Research 流程](workflows.zh-CN.md#deep-research)了解如何在同一任务切换联网、重新确认计划、按逐句引用追溯证据、查看独立事实审核、处理保存拒绝，以及导出 Markdown 或 PDF。[Context 与 Memory 分层](agent-runtime.zh-CN.md#context-memory-layers)说明输入依据、会话历史和研究进度分别如何保存与恢复。
+在 [Deep Research 流程](workflows.zh-CN.md#deep-research)了解如何在同一任务切换联网、重新确认计划、按逐句引用追溯证据及重复引用的编号规则、查看来源上下文与独立事实及引用贡献审核、处理保存拒绝，以及导出 Markdown 或 PDF。[Context 与 Memory 分层](agent-runtime.zh-CN.md#context-memory-layers)说明输入依据、会话历史和研究进度分别如何保存与恢复。
 
 持续整理一组发票时，从 **Personal Agent** 进入[专题指南](personal-agent.zh-CN.md)：固定选择已解析发票，逐票跟踪 Todo、补料和候选复核，直到每张票都有明确最终处置。
 

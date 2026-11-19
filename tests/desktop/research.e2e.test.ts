@@ -169,8 +169,9 @@ test('research desktop creates and confirms a plan, reads local evidence, export
   test.setTimeout(90000);
   const userData = await mkdtemp(join(tmpdir(), 'flowmate-p15-ui-'));
   const finding = '部署必须在本地运行。';
+  const qualification = '适用于测试环境的部署规范和执行条件。';
   const text = 'Team policy: deployments must run locally.\n' + finding + '\n'
-    + '适用于测试环境的部署规范和执行条件。\n'.repeat(185) + '引用末尾保留。';
+    + (qualification + '\n').repeat(185) + '引用末尾保留。';
   let page!: Page, requests = 0, reviewRequests = 0, holdNext = false, releaseHeld: () => void = () => {};
   const desktopEnvironment = { ...environment(userData), FLOWMATE_TAVILY_API_KEY: 'synthetic-tavily-desktop-key' };
   const provider = await createHttpProvider(async request => {
@@ -181,8 +182,11 @@ test('research desktop creates and confirms a plan, reads local evidence, export
       expect(body.messages.map(message => message.role)).toEqual(['system', 'user']);
       expect(body.tools ?? []).toEqual([]);
       const reviewed = supportedResearchReviewResponse(body.messages[1]!.content);
+      const start = text.indexOf(qualification);
+      const result = reviewed.sentences ? { ...reviewed, contextFindings: [{ sourceSnapshotId: 1, sentenceIndex: 0,
+        kind: 'qualification', locator: { start, end: start + qualification.length, quote: qualification } }] } : reviewed;
       return new Response('data: ' + JSON.stringify({ id: 'p15-ui-review', model: 'research-ui',
-        choices: [{ index: 0, delta: { content: JSON.stringify(reviewed) }, finish_reason: null }] })
+        choices: [{ index: 0, delta: { content: JSON.stringify(result) }, finish_reason: null }] })
         + '\n\ndata: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\ndata: [DONE]\n\n',
         { headers: { 'content-type': 'text/event-stream' } });
     }
@@ -286,10 +290,18 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     await page.getByRole('button', { name: 'Report', exact: true }).click(); await expect(page.locator('.research-detail')).toContainText('Deployment must run locally.');
     expect(reviewRequests).toBe(1);
     const review = page.getByRole('region', { name: 'Semantic review', exact: true });
-    await expect(review).toContainText('verified · Policy research-semantic-v1');
+    await expect(review).toContainText('verified · Policy research-semantic-v2');
+    await expect(review).toContainText('Source context · full');
+    const sourceContext = review.getByText('Source context · full', { exact: true });
+    await sourceContext.click();
+    await expect(review.getByRole('button', { name: 'View reviewed segment from source 1', exact: true })).toBeVisible();
+    await review.getByRole('button', { name: 'View context passage from source 1', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Saved source text', exact: true }).locator('pre')).toHaveText(qualification);
+    await page.getByRole('button', { name: 'Report', exact: true }).click();
     const reviewedSection = review.locator('details').filter({ hasText: 'Sentence 2 · supported · complete' });
     await reviewedSection.locator('summary').click();
     await expect(reviewedSection.getByText('Controlled structural fixture verdict.', { exact: false })).toBeVisible();
+    await expect(reviewedSection.getByText('The fixture citation directly supports the fact.', { exact: false })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Open Assistant', exact: true })).toBeVisible();
     const markers = page.getByRole('button', { name: 'Reference 1', exact: true });
     await expect(page.locator('.research-answer').getByRole('button', { name: 'Reference 1', exact: true })).toBeVisible();
@@ -316,7 +328,11 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     expect(markdown).toContain('ToolCall');
     expect(markdown).toContain('## Semantic review');
     expect(markdown).toContain('All 2 sentences passed independent factual review with research-ui.');
+    expect(markdown).toContain('The fixture citation directly supports the fact.');
+    expect(markdown).toContain('Source context · full');
+    expect(markdown).toContain('[Sentence 1](#sentence-1) · qualification');
     expect(markdown.match(/\[\[1\]\]\(#reference-1\)/g)).toHaveLength(2);
+    expect(markdown.match(/\[Reference 1\]\(#reference-1\)/g)).toHaveLength(4);
     await page.screenshot({ path: testInfo.outputPath('research-report.png') });
     await page.getByLabel('Export format').selectOption('pdf');
     const pdfOutput = testInfo.outputPath('research-report.pdf');
@@ -327,8 +343,9 @@ test('research desktop creates and confirms a plan, reads local evidence, export
     expect(pdf.startsWith('%PDF-')).toBe(true);
     expect(pdf.trimEnd().endsWith('%%EOF')).toBe(true);
     expect(pdf.match(/\/Type \/Page\b/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
-    // The answer and section plus their two reviewed facts link to the same saved passage.
-    expect(pdf.match(/\/Dest \/reference-1\b/g) ?? []).toHaveLength(4);
+    // The answer, section, reviewed facts, and citation reviews link to the same saved passage.
+    expect(pdf.match(/\/Dest \/reference-1\b/g) ?? []).toHaveLength(6);
+    expect(pdf).toContain('/Dest /review-sentence-1');
     // The existing no-overwrite publication failure must preserve both reports and external content.
     const conflictPath = join(userData, 'different-content.pdf'); writeFileSync(conflictPath, 'Keep my existing file.');
     await app.evaluate(({ dialog }, destination) => { dialog.showSaveDialog = (async () => ({ canceled: false, filePath: destination })) as typeof dialog.showSaveDialog; }, conflictPath);

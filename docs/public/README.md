@@ -10,7 +10,7 @@ This engineering delivery covers verified capabilities while the application is 
 
 For users: [Getting started](getting-started.md) → [Workflows](workflows.md) → [Skills and extensions](skills-and-extensions.md). Read [Personal Agent](personal-agent.md) for ongoing invoice work, [Subagents](subagents.md) for delegation, and [Packaging and recovery](packaging-and-recovery.md) before moving local data.
 
-For research with local material and optional Tavily web sources, follow the [Deep Research workflow](workflows.md#deep-research). It explains how to change Web search on the same task, confirm a new plan, trace sentence citations, inspect independent factual review, handle a refused save, and export Markdown or PDF. The [Context and memory layers](agent-runtime.md#context-memory-layers) explain what is captured for an input, retained as history or restored as research progress.
+For research with local material and optional Tavily web sources, follow the [Deep Research workflow](workflows.md#deep-research). It explains how to change Web search on the same task, confirm a new plan, trace sentence citations with numbers reused for the same evidence, inspect source context and independent fact and citation-contribution review, handle a refused save, and export Markdown or PDF. The [Context and memory layers](agent-runtime.md#context-memory-layers) explain what is captured for an input, retained as history or restored as research progress.
 
 For ongoing invoice work, open **Personal Agent** and follow [the Personal Agent guide](personal-agent.md): select a fixed set of parsed invoices, track per-invoice Todo items, supplement material and review candidates until every invoice has an explicit final disposition.
 

@@ -13,7 +13,7 @@ import type { PublishedArtifact } from '../storage/file-store.ts';
 import type { UpdateResearchWebAccessRequest } from '../../../contracts/src/research-commands.ts';
 import { readTransaction } from '../storage/reads.ts';
 import { createSessionRepository } from '../storage/repositories.ts';
-import { ReviewedResearchReportBodySchema, ReviewedResearchReportRecordSchema, researchSemanticReviewMatchesReport, TOOL_CONFIG } from '@flowmate/contracts';
+import { ReviewedResearchReportBodySchema, ReviewedResearchReportRecordSchema, researchSemanticReviewMatchesReport, researchReviewBindingsMatch, RESEARCH_SEMANTIC_POLICY_VERSION, TOOL_CONFIG } from '@flowmate/contracts';
 import type { ReviewedResearchReportBody, ResearchSemanticReview } from '@flowmate/contracts';
 
 type Identity = { researchId: number; runId: number; toolCallId: number; at: string };
@@ -384,8 +384,13 @@ export function createResearchRepository(db: Database): ResearchRepository {
       const report = parseInput(ReviewedResearchReportBodySchema, input.report);
       const saved = parseInput(ReviewedResearchReportRecordSchema, { ...report, semanticReview: input.semanticReview });
       const found = duplicate('report', input, saved); if (found) return found;
+      requireFact(input.semanticReview.policyVersion === RESEARCH_SEMANTIC_POLICY_VERSION, 'research_review_mismatch');
       const plan = checkReport(input, report);
       requireFact(researchSemanticReviewMatchesReport(report, input.semanticReview, { ...input, planId: plan.planId, revision: plan.revision }), 'research_review_mismatch');
+      const bindings = input.semanticReview.evidenceBindings ?? [];
+      requireFact(researchReviewBindingsMatch(input.semanticReview,
+        new Map(bindings.map(binding => [binding.claimId, record('claim', input.researchId, binding.claimId)])),
+        [...new Set(bindings.map(binding => binding.source.sourceSnapshotId))].map(id => record('source', input.researchId, id))), 'research_review_mismatch');
       const projected = { ...projectCitedResearchReport(saved), researchId: input.researchId, planId: plan.planId, revision: plan.revision,
         runId: input.runId, toolCallId: input.toolCallId, reportId: Number.MAX_SAFE_INTEGER, createdAt: input.at };
       const resultEnvelope = { version: 1, committedCandidateId: null, status: 'succeeded', data: projected };

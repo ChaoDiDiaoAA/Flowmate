@@ -146,19 +146,56 @@ export function ResearchPage(props: Props) {
   function renderSemanticReview(report: ResearchReport) {
     const review = report.semanticReview;
     if (!review) return <p className="research-help">No independent semantic review for this report.</p>;
+    const v2 = review.policyVersion === 'research-semantic-v2' ? review : undefined;
     return <section aria-label="Semantic review">
       <h3>Semantic review</h3>
       <p className="research-help">{statusLabel(review.status)} · Policy {review.policyVersion} · Run {review.runId} / ToolCall {review.toolCallId}
-        {review.status !== 'no_findings' && <> · Model {review.model.provider} / {review.model.model}</>}</p>
+        {review.status !== 'no_findings' && <> · Model {review.model.provider} / {review.model.model}</>} · {new Date(review.reviewedAt).toLocaleString()}</p>
       {review.status === 'no_findings' && <p>No findings to review. No review model was called.</p>}
+      {review.policyVersion === 'research-semantic-v1' && <p className="research-help">This v1 receipt does not include saved source context or citation contribution checks.</p>}
       {review.sentences.map(row => <details className="research-execution" key={row.sentenceIndex}>
         <summary>Sentence {row.sentenceIndex + 1} · {statusLabel(row.verdict)} · {row.complete ? 'complete' : 'incomplete'}</summary>
         <p className="research-prose">{row.text}</p>
         <ul>{row.facts.map((fact, index) => <li key={index}>
-          <p className="research-prose"><strong>{fact.text}</strong> · {statusLabel(fact.verdict)} · UTF-16 offsets [{fact.start}, {fact.end})</p>
+          <p className="research-prose">Fact {index + 1}: <strong>{fact.text}</strong> · {statusLabel(fact.verdict)} · UTF-16 offsets [{fact.start}, {fact.end})</p>
           <p>{fact.reason}{fact.citations.map(citation => renderCitation(citation, true))}</p>
         </li>)}</ul>
+        {v2 && !!row.citationReviews?.length && <><p><strong>Citation contributions</strong></p>
+          <ul>{row.citationReviews.map(check => <li key={researchCitationKey(check)}>
+            Claim {check.claimId}, evidence index {check.evidenceIndex}{renderCitation(check)} · {check.verdict}: {check.reason}
+            <ul>{check.contributions.map(item => <li key={item.factIndex}>
+              Fact {item.factIndex + 1} · {statusLabel(item.role)}: {item.reason}
+            </li>)}</ul>
+          </li>)}</ul>
+        </>}
       </details>)}
+      {v2?.context && v2.status !== 'no_findings' && <details className="research-execution">
+        <summary>Source context · {v2.context.mode}</summary>
+        {v2.context.segments.map(({ sourceSnapshotId, start, end, readStart, readEnd, findings }) => <section key={`${sourceSnapshotId}:${start}`}>
+          <p className="research-help">Source snapshot {sourceSnapshotId} · segment [{start}, {end}) · read [{readStart}, {readEnd}) · complete</p>
+          <button type="button" className="text-button"
+            onClick={() => void readEvidence(sourceSnapshotId, start, Math.min(4000, end - start))}>View reviewed segment from source {sourceSnapshotId}</button>
+          {findings.length ? <ul>{findings.map(({ sentenceIndex, kind, locator }, index) => <li key={index}>
+            <p>Sentence {sentenceIndex + 1} · {kind} · UTF-16 offsets [{locator.start}, {locator.end})</p>
+            <pre className="research-prose">{locator.quote}</pre>
+            <button type="button" className="text-button"
+              onClick={() => void readEvidence(sourceSnapshotId, locator.start, Math.min(4000, locator.end - locator.start))}>View context passage from source {sourceSnapshotId}</button>
+          </li>)}</ul> : <p className="research-help">No context findings recorded.</p>}
+        </section>)}
+      </details>}
+      {!!v2?.evidenceBindings?.length && <details className="research-execution">
+        <summary>Reviewed evidence bindings</summary>
+        <ul>{v2.evidenceBindings.map(({ claimId, evidenceIndex, ref, source }) => <li key={researchCitationKey({ claimId, evidenceIndex })}>
+          Claim {claimId}, evidence index {evidenceIndex} · {source.title} · Source snapshot {source.sourceSnapshotId} · Run {source.runId} / ToolCall {source.toolCallId} · UTF-16 offsets [{ref.locator.start}, {ref.locator.end})
+          <button type="button" className="text-button" onClick={() => void readEvidence(source.sourceSnapshotId, ref.locator.start, Math.min(4000, ref.locator.end - ref.locator.start))}>View bound passage</button>
+        </li>)}</ul>
+      </details>}
+      {!!v2?.stages?.length && <details className="research-execution">
+        <summary>Review stages</summary>
+        <ul>{v2.stages.map(({ stage, model, responseId, usage, tokens }, index) => <li key={index}>
+          {stage} · {model.provider} / {model.model} · Response {responseId ?? 'unknown'} · Usage {usage.source} ({usage.attempts ?? 'unknown'} attempts) · Tokens (input / output / total) {tokens.inputTokens ?? 'unknown'} / {tokens.outputTokens ?? 'unknown'} / {tokens.totalTokens ?? 'unknown'} · {tokens.usageComplete ? 'complete' : 'incomplete'} · Cost {tokens.cost ?? 'unknown'}
+        </li>)}</ul>
+      </details>}
     </section>;
   }
   function renderReference(item: ResearchReference) {
@@ -328,7 +365,7 @@ export function ResearchPage(props: Props) {
                   {report.cited ? renderSentences(report.cited.sections[index]!.sentences) : section.text}</p><div className="research-citations">
                   {section.claimIds.map(id => <button type="button" className="secondary-button" key={id} onClick={() => void readClaim(id)}>Inspect claim {id}</button>)}</div></section>)}
                 {report.cited && !report.answer && !report.sections.length && <p className="research-help">No citable findings</p>}
-                {renderSemanticReview(report)}
+                {renderSemanticReview(activeDocument?.report ?? report)}
                 {reference && renderReference(reference)}
               </>}
               <section><h3>Coverage</h3><ul className="research-coverage">{report.coverage.map(row => <li key={row.questionId}><strong>{row.questionId}</strong><span className="research-badge">{row.status}</span><p>{row.reason}</p><small>Claims: {row.claimIds.join(', ') || 'none'}</small></li>)}</ul></section>

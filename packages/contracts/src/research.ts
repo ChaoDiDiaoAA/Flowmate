@@ -200,7 +200,7 @@ export function researchCitations(body: Pick<CitedResearchReportBody, 'answer' |
 export function researchCitationKey({ claimId, evidenceIndex }: z.infer<typeof citation>): string {
   return `${claimId}:${evidenceIndex}`;
 }
-export const RESEARCH_SEMANTIC_POLICY_VERSION = 'research-semantic-v1';
+export const RESEARCH_SEMANTIC_POLICY_VERSION = 'research-semantic-v2';
 export const ResearchSemanticReviewIdentitySchema = z.object({ researchId: id, planId: id, revision: id, runId: id, toolCallId: id }).strict();
 export type ResearchSemanticReviewIdentity = z.infer<typeof ResearchSemanticReviewIdentitySchema>;
 const semanticVerdict = z.enum(['supported', 'partially_supported', 'unsupported', 'contradicted']);
@@ -214,6 +214,10 @@ export const ResearchSemanticReviewFactSchema = z.object({
 export type ResearchSemanticReviewFact = z.infer<typeof ResearchSemanticReviewFactSchema>;
 export const ResearchSemanticDecisionSchema = z.object({
   sentenceIndex: semanticSentenceIndex, complete: z.boolean(), facts: z.array(ResearchSemanticReviewFactSchema).max(4000),
+  citationReviews: z.array(citation.extend({ verdict: z.enum(['contributes', 'irrelevant', 'contradicted']), reason: boundedText(512),
+    contributions: z.array(z.object({ factIndex: z.number().int().min(0).max(3999),
+      role: z.enum(['direct_support', 'necessary_premise']), reason: boundedText(512) }).strict()).max(4000),
+  }).strict()).max(64).optional(),
 }).strict();
 const reviewedSentence = ResearchSemanticDecisionSchema.extend({ ...sentence.shape, verdict: semanticVerdict });
 export type ResearchSemanticReviewSentence = z.infer<typeof reviewedSentence>;
@@ -238,7 +242,15 @@ export function researchSemanticReportContext(report: CitedSentenceBody): z.infe
     answerSentenceCount: answer.length, sections: sections.map(({ title, sentences }) => ({ title, sentenceCount: sentences.length })) };
 }
 const semanticReviewBase = ResearchSemanticReviewIdentitySchema.extend({
-  policyVersion: z.literal(RESEARCH_SEMANTIC_POLICY_VERSION), reviewedAt: z.string().datetime(), reportContext: semanticContext,
+  policyVersion: z.enum(['research-semantic-v1', 'research-semantic-v2']), reviewedAt: z.string().datetime(), reportContext: semanticContext,
+  evidenceBindings: z.array(citation.extend({ ref: EvidenceRefSchema, source: SourceSnapshotSchema }).strict()).max(32768).optional(),
+  context: z.object({ mode: z.enum(['full', 'segmented']), segments: z.array(z.object({ sourceSnapshotId: id,
+    start: z.number().int().nonnegative(), end: z.number().int().positive(), readStart: z.number().int().nonnegative(), readEnd: z.number().int().positive(),
+    complete: z.literal(true), findings: z.array(z.object({ sentenceIndex: semanticSentenceIndex,
+      kind: z.enum(['qualification', 'contradiction', 'definition', 'correction', 'unresolved']), locator: ResearchLocatorSchema }).strict()).max(4096),
+  }).strict()).max(4096) }).strict().optional(),
+  stages: z.array(z.object({ stage: z.enum(['context', 'final']), model: z.object({ provider: boundedText(128), model: boundedText(128) }).strict(),
+    responseId: boundedText(512).nullable(), usage: UsageRecordSchema, tokens: TokenColumnsSchema }).strict()).max(64).optional(),
 });
 const modelReview = semanticReviewBase.extend({
   model: z.object({ provider: boundedText(128), model: boundedText(128) }).strict(),
@@ -250,11 +262,59 @@ export const ResearchSemanticReviewSchema = z.discriminatedUnion('status', [
   modelReview.extend({ status: z.literal('rejected') }),
   semanticReviewBase.extend({ status: z.literal('no_findings'), sentences: z.tuple([]) }),
 ]).refine(review => {
-  if (review.status === 'no_findings') return true;
+  if (review.policyVersion === 'research-semantic-v2' && (!review.evidenceBindings || !review.context || !review.stages
+    || !unique(review.evidenceBindings.map(researchCitationKey)))) return false;
+  if (review.status === 'no_findings') return review.policyVersion === 'research-semantic-v1'
+    || review.evidenceBindings!.length === 0 && review.context!.segments.length === 0 && review.stages!.length === 0;
+  if (review.policyVersion === 'research-semantic-v2' && (!review.evidenceBindings!.length
+    || review.stages!.at(-1)?.stage !== 'final' || review.stages!.slice(0, -1).some(stage => stage.stage !== 'context')
+    || (review.context!.mode === 'full' ? review.stages!.length !== 1 : review.stages!.length !== review.context!.segments.length + 1)
+    || review.context!.segments.some(segment => segment.findings.some(finding => !review.sentences[finding.sentenceIndex]
+      || finding.kind === 'unresolved' || finding.locator.start < segment.readStart || finding.locator.end > segment.readEnd)))) return false;
   return review.sentences.every((row, index) => row.sentenceIndex === index && row.verdict === researchSemanticVerdict(row))
-    && (review.status === 'verified') === review.sentences.every(row => row.verdict === 'supported');
+    && (review.status === 'verified') === review.sentences.every(row => row.verdict === 'supported'
+      && (review.policyVersion === 'research-semantic-v1' || researchCitationContributionsValid(row, true)));
 }, 'Semantic review status must match the ordered sentence decisions.');
 export type ResearchSemanticReview = z.infer<typeof ResearchSemanticReviewSchema>;
+
+export function researchCitationContributionsValid(row: ResearchSemanticReviewSentence, requireSupport = false): boolean {
+  const checks = row.citationReviews;
+  if (!checks || checks.length !== row.citations.length || !unique(checks.map(researchCitationKey))) return false;
+  return checks.every(check => row.citations.some(ref => sameCitation(ref, check))
+    && (!requireSupport || check.verdict === 'contributes')
+    && (check.verdict === 'contributes' ? check.contributions.length > 0 : check.contributions.length === 0)
+    && unique(check.contributions.map(item => item.factIndex))
+    && check.contributions.every(item => row.facts[item.factIndex]?.citations.some(ref => sameCitation(ref, check))
+      && (!requireSupport || row.facts[item.factIndex]!.verdict === 'supported')))
+    && row.facts.every((fact, index) => fact.citations.filter(ref => row.citations.some(selected => sameCitation(ref, selected)))
+      .every(ref => checks.some(check => sameCitation(check, ref) && check.contributions.some(item => item.factIndex === index)))
+      && (!requireSupport || checks.some(check => check.verdict === 'contributes' && check.contributions.some(item => item.factIndex === index))));
+}
+
+/** Exact saved identities and text; URL or quotation similarity never substitutes for identity. */
+export function researchReviewBindingsMatch(review: ResearchSemanticReview, claims: ReadonlyMap<number, Claim>, sources: readonly SourceSnapshot[]): boolean {
+  if (review.policyVersion === 'research-semantic-v1') return true;
+  if (!review.evidenceBindings || !review.context || !review.stages) return false;
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  if (!review.evidenceBindings.every(binding => {
+    const claim = claims.get(binding.claimId), evidence = claim?.evidence[binding.evidenceIndex];
+    const source = sources.find(source => source.sourceSnapshotId === binding.source.sourceSnapshotId);
+    return claim?.researchId === review.researchId && claim.planId === review.planId && claim.revision === review.revision
+      && same(evidence?.ref, binding.ref) && same(source, binding.source)
+      && binding.ref.sourceSnapshotId === source?.sourceSnapshotId && binding.ref.runId === source.runId && binding.ref.toolCallId === source.toolCallId;
+  })) return false;
+  return review.context.segments.every(segment => {
+    const source = sources.find(source => source.sourceSnapshotId === segment.sourceSnapshotId);
+    return source && review.evidenceBindings!.some(binding => binding.source.sourceSnapshotId === segment.sourceSnapshotId)
+      && segment.readStart <= segment.start && segment.start < segment.end && segment.end <= segment.readEnd
+      && segment.readEnd <= source.characters;
+  }) && [...new Set(review.evidenceBindings.map(binding => binding.source.sourceSnapshotId))].every(id => {
+    const source = sources.find(source => source.sourceSnapshotId === id)!;
+    const segments = review.context!.segments.filter(segment => segment.sourceSnapshotId === id).sort((a,b) => a.start-b.start);
+    return !source.truncated && segments.length > 0 && segments[0]!.start === 0 && segments.at(-1)!.end === source.characters
+      && segments.every((segment,index) => index === 0 || segments[index-1]!.end === segment.start);
+  });
+}
 
 function sameCitation(a: z.infer<typeof citation>, b: z.infer<typeof citation>): boolean {
   return a.claimId === b.claimId && a.evidenceIndex === b.evidenceIndex;
@@ -267,12 +327,17 @@ export function researchSemanticReviewMatchesReport(report: CitedSentenceBody, r
     || !context.success || JSON.stringify(researchSemanticReportContext(report)) !== JSON.stringify(context.data)) return false;
   const sentences = researchSentences(report);
   if (review.status === 'no_findings') return sentences.length === 0;
+  if (review.policyVersion === 'research-semantic-v2' && (!review.evidenceBindings || !review.context || !review.stages
+    || review.stages.at(-1)?.stage !== 'final'
+    || !sentences.every(row => row.citations.every(ref => review.evidenceBindings!.some(binding => sameCitation(ref, binding)))))) return false;
   return sentences.length === review.sentences.length && review.sentences.every((row, i) => {
     const original = sentences[i]!;
     return row.sentenceIndex === i && row.text === original.text && row.complete && row.verdict === 'supported' && row.facts.length > 0
       && row.citations.length === original.citations.length && row.citations.every((ref, j) => sameCitation(ref, original.citations[j]!))
       && row.facts.every(fact => fact.verdict === 'supported' && fact.end <= original.text.length
-        && original.text.slice(fact.start, fact.end) === fact.text && fact.citations.some(ref => original.citations.some(selected => sameCitation(ref, selected))));
+        && original.text.slice(fact.start, fact.end) === fact.text && fact.citations.some(ref => original.citations.some(selected => sameCitation(ref, selected))))
+      && (review.policyVersion === 'research-semantic-v1' || researchCitationContributionsValid(row, true)
+        && row.facts.every(fact => fact.citations.every(ref => review.evidenceBindings!.some(binding => sameCitation(ref, binding)))));
   });
 }
 export const ReviewedResearchReportRecordSchema = reviewedBody.extend({ semanticReview: ResearchSemanticReviewSchema }).superRefine(

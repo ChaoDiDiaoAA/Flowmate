@@ -24,13 +24,31 @@ export function researchPrintHtml(document: ResearchReportDocument): string {
   const section = (name: string, items: string[]) => items.length
     ? `<h2>${name}</h2><ul>${items.map(item => `<li>${escape(item)}</li>`).join('')}</ul>` : '';
   const review = report.semanticReview;
+  const v2 = review?.policyVersion === 'research-semantic-v2' ? review : undefined;
+  const legacyReviewNote = review?.policyVersion === 'research-semantic-v1'
+    ? '<p>This v1 receipt does not include saved source context or citation contribution checks.</p>' : '';
+  const contextHtml = v2?.context && v2.status !== 'no_findings' ? `<h3>Source context · ${v2.context.mode}</h3>
+${v2.context.segments.map(({ sourceSnapshotId, start, end, readStart, readEnd, findings }) => `
+<p class="meta">Source snapshot ${sourceSnapshotId} · segment [${start}, ${end}) · read [${readStart}, ${readEnd}) · complete</p>
+${findings.map(({ sentenceIndex, kind, locator }) => `<p><a href="#review-sentence-${sentenceIndex + 1}">Sentence ${sentenceIndex + 1}</a> · ${kind} · UTF-16 offsets [${locator.start}, ${locator.end})</p>
+<blockquote>${escape(locator.quote)}</blockquote>`).join('') || '<p>No context findings recorded.</p>'}`).join('')}` : '';
+  const receiptHtml = v2 && v2.status !== 'no_findings' ? contextHtml
+    + section('Reviewed evidence bindings', (v2.evidenceBindings ?? []).map(({ claimId, evidenceIndex, ref, source }) =>
+      `Claim ${claimId}, evidence index ${evidenceIndex} · ${source.title} · Source snapshot ${source.sourceSnapshotId} · Run ${source.runId} / ToolCall ${source.toolCallId} · UTF-16 offsets [${ref.locator.start}, ${ref.locator.end})`))
+    + section('Review stages', (v2.stages ?? []).map(({ stage, model, responseId, usage, tokens }) =>
+      `${stage} · ${model.provider} / ${model.model} · Response ${responseId ?? 'unknown'} · Usage ${usage.source} (${usage.attempts ?? 'unknown'} attempts) · Tokens (input / output / total) ${tokens.inputTokens ?? 'unknown'} / ${tokens.outputTokens ?? 'unknown'} / ${tokens.totalTokens ?? 'unknown'} · ${tokens.usageComplete ? 'complete' : 'incomplete'} · Cost ${tokens.cost ?? 'unknown'}`))
+    : legacyReviewNote;
   const reviewHtml = review ? `<h2>Semantic review</h2>
-<p class="meta">${escape(review.status.replaceAll('_', ' '))} · Policy ${escape(review.policyVersion)} · Run ${review.runId} / ToolCall ${review.toolCallId}${review.status !== 'no_findings' ? ` · Model ${escape(review.model.provider)} / ${escape(review.model.model)}` : ''}</p>
+<p class="meta">${escape(review.status.replaceAll('_', ' '))} · Policy ${escape(review.policyVersion)} · Run ${review.runId} / ToolCall ${review.toolCallId}${review.status !== 'no_findings' ? ` · Model ${escape(review.model.provider)} / ${escape(review.model.model)}` : ''} · ${escape(review.reviewedAt)}</p>
 ${review.status === 'no_findings' ? '<p>No findings to review. No review model was called.</p>' : ''}
-${review.sentences.map(row => `<h3>Sentence ${row.sentenceIndex + 1} · ${escape(row.verdict.replaceAll('_', ' '))} · ${row.complete ? 'complete' : 'incomplete'}</h3>
+${review.sentences.map(row => `<h3 id="review-sentence-${row.sentenceIndex + 1}">Sentence ${row.sentenceIndex + 1} · ${escape(row.verdict.replaceAll('_', ' '))} · ${row.complete ? 'complete' : 'incomplete'}</h3>
 <p>${escape(row.text)}</p>
-<ul>${row.facts.map(fact => `<li><strong>${escape(fact.text)}</strong> · ${escape(fact.verdict.replaceAll('_', ' '))} · UTF-16 offsets [${fact.start}, ${fact.end})<br>
-${escape(fact.reason)}${fact.citations.map(citation => marker(citation, true)).join('')}</li>`).join('')}</ul>`).join('')}`
+<ul>${row.facts.map((fact, index) => `<li>Fact ${index + 1}: <strong>${escape(fact.text)}</strong> · ${escape(fact.verdict.replaceAll('_', ' '))} · UTF-16 offsets [${fact.start}, ${fact.end})<br>
+${escape(fact.reason)}${fact.citations.map(citation => marker(citation, true)).join('')}</li>`).join('')}</ul>
+${v2 && row.citationReviews?.length ? `<p><strong>Citation contributions</strong></p><ul>${row.citationReviews.map(check => `
+<li>Claim ${check.claimId}, evidence index ${check.evidenceIndex}${marker(check)} · ${check.verdict}: ${escape(check.reason)}
+<ul>${check.contributions.map(item => `<li>Fact ${item.factIndex + 1} · ${item.role.replaceAll('_', ' ')}: ${escape(item.reason)}</li>`).join('')}</ul></li>`).join('')}</ul>` : ''}`).join('')}
+${receiptHtml}`
     : '<p class="meta">No independent semantic review for this report.</p>';
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">

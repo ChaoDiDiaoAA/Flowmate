@@ -1854,13 +1854,14 @@ export class RuntimeService {
     return ok(undefined);
   }
 
-  public async reviewResearchReport(input: { runId: number; sessionId: number; systemPrompt: string; text: string },
+  public async reviewResearchReport(input: { runId: number; sessionId: number; systemPrompt: string; text: string; requiredCalls?: number },
     call: import('@flowmate/contracts').ToolCallContext): Promise<Result<{
       model: import('@flowmate/contracts').ModelRef; text: string; responseId: string | null;
       usage: UsageRecord; tokens: import('@flowmate/contracts').TokenColumns;
     }>> {
     const context = this.agentContext;
-    if (!context || context.active.runId !== input.runId || context.request.sessionId !== input.sessionId
+    if (!Number.isSafeInteger(input.requiredCalls ?? 1) || (input.requiredCalls ?? 1) < 1 || (input.requiredCalls ?? 1) > 64
+      || !context || context.active.runId !== input.runId || context.request.sessionId !== input.sessionId
       || context.request.research?.phase !== 'researching')
       return fail(appError('research_review_unavailable', 'tool', 'The active research Run cannot perform review.'));
     const verify = () => this.readRuntimeStorage(store => {
@@ -1892,7 +1893,7 @@ export class RuntimeService {
           systemPrompt: input.systemPrompt, text: input.text, messageTimestamp: Date.now() }, signal, () => {}, {
           beforeRequest: async () => {
             const permission = await verify();
-            const reserved = permission.ok ? this.reserveModelRequest(context, 1) : permission;
+            const reserved = permission.ok ? this.reserveModelRequest(context, input.requiredCalls ?? 1) : permission;
             if (!reserved.ok) admissionError = reserved.error;
             return reserved;
           },

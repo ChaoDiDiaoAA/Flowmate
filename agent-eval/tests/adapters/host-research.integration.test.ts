@@ -43,15 +43,19 @@ test('the actual application Host rejects an unsupported report, then saves and 
             const user = body.messages[1]?.content;
             if (typeof user !== 'string') throw Error('Expected the independent reviewer context.');
             const reviewed = supportedResearchReviewResponse(user);
+            if (!reviewed.sentences) throw Error('Expected one final review of the short source.');
             expect(reviewed.sentences).toHaveLength(2);
             expect(JSON.parse(user.slice(user.indexOf('\n\n') + 2))).toMatchObject({
                 evidence: [{ evidenceIndex: 0, quote: prefix }], evidenceBySentence: [[expect.any(String)], [expect.any(String)]],
             });
             const expectedSection = reviewRequests.length === 1 ? unsupportedText : 'Usage is metered.';
-            const section = reviewed.sentences[1]!.facts[0]!;
-            expect(section.text).toBe(expectedSection);
-            const decision = reviewRequests.length === 1 ? { sentences: [reviewed.sentences[0], { ...reviewed.sentences[1],
-                facts: [{ ...section, verdict: 'unsupported', reason: 'The selected quote says usage is metered and does not establish free usage.' }] }] } : reviewed;
+            const section = reviewed.sentences[1]!;
+            expect(section.facts[0]!.text).toBe(expectedSection);
+            const reason = 'The selected quote says usage is metered and does not establish free usage.';
+            const decision = reviewRequests.length === 1 ? { sentences: [reviewed.sentences[0], { ...section,
+                facts: section.facts.map(fact => ({ ...fact, citations: [], verdict: 'unsupported', reason })),
+                citationReviews: section.citationReviews.map(citation => ({ ...citation, verdict: 'irrelevant', reason, contributions: [] })),
+            }] } : reviewed;
             return new Response(chunk({ role: 'assistant', content: JSON.stringify(decision) }) + chunk({}, 'stop') + 'data: [DONE]\n\n',
                 { headers: { 'content-type': 'text/event-stream' } });
         }
@@ -164,7 +168,7 @@ test('the actual application Host rejects an unsupported report, then saves and 
         section.sentences.push({text:textAdded,citations:section.sentences[0]!.citations});
         amended.sections[0]!.text+=' '+textAdded;
         expect(buildResearchFrame({task:researchTask,result:changed,projected:trial.input,judge:null})).toBeUndefined();
-        amended.semanticReview=createResearchReviewReceipt({...amended,...amended.cited!,formatVersion:3},amended);
+        amended.semanticReview=createResearchReviewReceipt({...amended,...amended.cited!,formatVersion:3},amended,amended.semanticReview?.evidenceBindings);
         const additional=buildResearchFrame({task:researchTask,result:changed,projected:trial.input,judge:null})!;
         expect(additional.blocks.some(b=>b.text.includes('additional unchecked fact'))).toBe(true);
         expect(additional.integrity.valid).toBe(false);

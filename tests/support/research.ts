@@ -4,7 +4,7 @@ import type { ApplicationOptions } from '../../apps/composition.ts';
 import {
   ok, RESEARCH_SEMANTIC_POLICY_VERSION, ResearchSemanticReviewSchema, researchSemanticReportContext, researchSentences,
   type AgentRunEvent, type ProviderConfig, type ResearchIntent, type ResearchSemanticReviewIdentity,
-  type ResearchSentence, type Result, type ReviewedResearchReportBody, type SessionInputRequest, type UsageRecordV1,
+  type ResearchSemanticReview, type ResearchSentence, type Result, type ReviewedResearchReportBody, type SessionInputRequest, type UsageRecordV1,
 } from '@flowmate/contracts';
 import { deferCleanup, mkdtempSync } from './resources.ts';
 
@@ -20,13 +20,21 @@ export function citedSentence(text: string, claimIds: number[], evidenceIndex = 
 
 function supportedDecision({ text, citations }: ResearchSentence, sentenceIndex: number) {
   return { sentenceIndex, complete: true, facts: [{ start: 0, end: text.length, text, citations,
-    verdict: 'supported' as const, reason: 'Controlled structural fixture verdict.' }] };
+    verdict: 'supported' as const, reason: 'Controlled structural fixture verdict.' }],
+    citationReviews: citations.map(citation => ({ ...citation, verdict: 'contributes' as const,
+      reason: 'Controlled citation verdict.', contributions: [{ factIndex: 0, role: 'direct_support' as const,
+        reason: 'The fixture citation directly supports the fact.' }] })) };
 }
 
 export function supportedResearchReviewResponse(text: string) {
   const separator = text.indexOf('\n\n');
   const json = separator >= 0 && !text.trimStart().startsWith('{') ? text.slice(separator + 2) : text;
-  const { report } = JSON.parse(json) as { report: Pick<ReviewedResearchReportBody, 'answer' | 'sections'> };
+  const { report, segment } = JSON.parse(json) as { report: Pick<ReviewedResearchReportBody, 'answer' | 'sections'>;
+    segment?: { sourceSnapshotId: number; start: number; end: number } };
+  if (segment) {
+    const { sourceSnapshotId, start, end } = segment;
+    return { sourceSnapshotId, start, end, complete: true, findings: [] };
+  }
   return { sentences: researchSentences(report).map(supportedDecision) };
 }
 
@@ -44,13 +52,19 @@ export async function controlledResearchReviewer({ text }: { text: string }) {
 }
 
 export function createResearchReviewReceipt(report: ReviewedResearchReportBody,
-  { researchId, planId, revision, runId, toolCallId, reviewedAt = new Date().toISOString() }: ResearchSemanticReviewIdentity & { reviewedAt?: string }) {
-  const binding = { researchId, planId, revision, runId, toolCallId, reviewedAt,
+  { researchId, planId, revision, runId, toolCallId, reviewedAt = new Date().toISOString() }: ResearchSemanticReviewIdentity & { reviewedAt?: string },
+  evidenceBindings: NonNullable<ResearchSemanticReview['evidenceBindings']> = []) {
+  const binding = { researchId, planId, revision, runId, toolCallId, reviewedAt, evidenceBindings,
     policyVersion: RESEARCH_SEMANTIC_POLICY_VERSION, reportContext: researchSemanticReportContext(report) };
   const sentences = researchSentences(report).map((sentence, index) => ({ ...sentence, ...supportedDecision(sentence, index), verdict: 'supported' }));
+  const sources = [...new Map(evidenceBindings.map(({ source }) => [source.sourceSnapshotId, source])).values()];
+  const context = { mode: 'full', segments: sources.map(({ sourceSnapshotId, characters }) => ({
+    sourceSnapshotId, start: 0, end: characters, readStart: 0, readEnd: characters, complete: true, findings: [],
+  })) };
+  const metadata = controlledReviewMetadata(reviewedAt);
   return ResearchSemanticReviewSchema.parse(sentences.length
-    ? { ...binding, ...controlledReviewMetadata(reviewedAt), status: 'verified', sentences }
-    : { ...binding, status: 'no_findings', sentences: [] });
+    ? { ...binding, ...metadata, context, stages: [{ stage: 'final', ...metadata }], status: 'verified', sentences }
+    : { ...binding, context, stages: [], status: 'no_findings', sentences: [] });
 }
 
 type Request = { tools?: Array<{ function: { name: string } }>; messages: Array<{ role: string; content: unknown }> };

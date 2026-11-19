@@ -72,7 +72,7 @@ API 协议必须匹配服务地址。Anthropic 兼容地址需要对应 API 类�
 
 **Web search** 默认关闭。要在同一任务中结合本地与网页证据，将 `FLOWMATE_TAVILY_API_KEY` 配到执行 Host 的启动环境并重启，再打开开关。已有任务也可在 Run 和工具停止后切换，保留本地材料和历史，在 Assistant 重新生成计划并确认。
 
-确认计划后，在 **Research steps** 查看进度。有结论的新报告须通过引用校验和独立事实审核后才保存。被拒绝时在 Assistant 查看保存错误，成功后在 **Report → Semantic review** 和正文引用编号中查看审核记录及证据。通过 **Export format → Save report** 导出 Markdown 或 PDF，格式 2 和 3 的逐句引用报告都支持 PDF。中断后可在条件允许时点击 **Continue research**。发票流程需要原件与外部准备的解析材料，应用不生成解析。
+确认计划后，在 **Research steps** 查看进度。保存新结论前，审核会检查每项事实是否有依据、每条引用是否有贡献。被拒绝时在 Assistant 查看保存错误，成功后在 **Report → Semantic review** 和正文引用编号中查看审核记录及证据。通过 **Export format → Save report** 导出 Markdown 或 PDF，格式 2 和 3 的逐句引用报告都支持 PDF。不同证据按摘要和章节正文中的首次出现顺序编号，重复引用保留原号，两种格式对应同一套引用条目。中断后可在条件允许时点击 **Continue research**。发票流程需要原件与外部准备的解析材料，应用不生成解析。
 
 | 现象 | 优先检查 |
 |---|---|

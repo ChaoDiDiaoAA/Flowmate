@@ -40,6 +40,8 @@ Run 准备保留选定资源版本及原文件内容。刷新不会将新作者�
 
 研究 Prompt 和 Skill 引导同一个本地资料任务结合可选网页证据。新报告逐句引用，由 Host 生成独立审核回执，写作 Agent 不能自行提交 `semanticReview` 字段。指令要求为审核及后续回应预留模型调用，并为预期产生有引用结论的新计划建议单工具 120 秒、整个 Run 300 秒。执行使用用户确认的限制。切换联网后须确认新计划，被拒绝的报告须修改后重新审核。
 
+总结、翻译、合并或拆分句子时应保留结构化 Citation，提交已保存 Claim 的 ID 和准确的证据索引。Host 按最终正文中的首次出现顺序生成展示编号，同一证据条目重复出现时复用原号。不要用生成的摘要替换来源引文，也不要将展示编号当作证据身份。改写后的最终正文及引用须有匹配的审核；来源较长时，可能需要 N 次上下文扫描及一次最终判定，均受已确认预算约束。
+
 Personal Agent 在 **Assistant configuration** 中独立选择模型、工具、Prompt 和 Skill，不沿用普通 Assistant 当前选择。Durable 路径根据可用发票与资源工具检查依赖；目前没有 Durable 扩展适配器，依赖扩展的 Skill 无法用于 Durable 阶段。已受理 Work 保留其选定配置和资源版本。详见 [Personal Agent](personal-agent.zh-CN.md)。
 
 编写资源时，使 SKILL frontmatter 名称与 Manifest、ID 一致，提供准确描述、真实依赖，声明 Manifest 所需文件和 UTF-8 字节数。沿用当前作者指南与相邻资源，不另造加载格式。

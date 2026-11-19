@@ -1,16 +1,24 @@
 {
   "status": "pending",
   "authority": "agent-authored",
-  "policyVersion": "research-semantic-v1",
-  "humanReview": "Confirm the proposed facts and verdicts before using these samples to measure model quality.",
+  "policyVersion": "research-semantic-v2",
+  "humanReview": "Each sample is pending. A human must independently inspect the full source, each selected quote (defaults to the full source), and each fact before supplying a verified label. Source groups belong to only one partition.",
   "samples": [
-    { "id": "revenue-to-profit", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司净利润同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["该公司净利润同比增长 20%。"] },
-    { "id": "same-metric", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司营业收入同比增长 20%。", "proposedVerdict": "supported", "proposedFacts": ["该公司营业收入同比增长 20%。"] },
-    { "id": "compound-partial", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司营业收入和净利润均同比增长 20%。", "proposedVerdict": "partially_supported", "proposedFacts": ["营业收入同比增长 20%。", "净利润同比增长 20%。"] },
-    { "id": "negative-profit", "source": "该公司营业收入同比增长 20%，净利润同比下降 5%。", "sentence": "该公司净利润同比增长 20%。", "proposedVerdict": "contradicted", "proposedFacts": ["该公司净利润同比增长 20%。"] },
-    { "id": "condition-omitted", "source": "仅测试环境支持本地部署。", "sentence": "所有环境均支持本地部署。", "proposedVerdict": "contradicted", "proposedFacts": ["所有环境均支持本地部署。"] },
-    { "id": "time-mismatch", "source": "2024 年营业收入同比增长 20%。", "sentence": "2025 年营业收入同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["2025 年营业收入同比增长 20%。"] },
-    { "id": "baseline-mismatch", "source": "本季度营收环比增长 20%。", "sentence": "本季度营收同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["本季度营收同比增长 20%。"] },
-    { "id": "causation-overstatement", "source": "采用方案后，延迟下降，尚未排除同期硬件升级的影响。", "sentence": "采用该方案导致延迟下降。", "proposedVerdict": "unsupported", "proposedFacts": ["采用该方案导致延迟下降。"] }
+    { "id": "revenue-to-profit", "partition": "tune", "sourceGroup": "financial-metrics", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司净利润同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["该公司净利润同比增长 20%。"] },
+    { "id": "same-metric", "partition": "tune", "sourceGroup": "financial-metrics", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司营业收入同比增长 20%。", "proposedVerdict": "supported", "proposedFacts": ["该公司营业收入同比增长 20%。"] },
+    { "id": "compound-partial", "partition": "tune", "sourceGroup": "financial-metrics", "source": "该公司营业收入同比增长 20%。", "sentence": "该公司营业收入和净利润均同比增长 20%。", "proposedVerdict": "partially_supported", "proposedFacts": ["营业收入同比增长 20%。", "净利润同比增长 20%。"] },
+    { "id": "negative-profit", "partition": "tune", "sourceGroup": "financial-metrics", "source": "该公司营业收入同比增长 20%，净利润同比下降 5%。", "sentence": "该公司净利润同比增长 20%。", "proposedVerdict": "contradicted", "proposedFacts": ["该公司净利润同比增长 20%。"] },
+    { "id": "condition-omitted", "partition": "tune", "sourceGroup": "deployment-guide", "source": "仅测试环境支持本地部署。", "sentence": "所有环境均支持本地部署。", "proposedVerdict": "contradicted", "proposedFacts": ["所有环境均支持本地部署。"] },
+    { "id": "time-mismatch", "partition": "tune", "sourceGroup": "financial-metrics", "source": "2024 年营业收入同比增长 20%。", "sentence": "2025 年营业收入同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["2025 年营业收入同比增长 20%。"] },
+    { "id": "baseline-mismatch", "partition": "tune", "sourceGroup": "financial-metrics", "source": "本季度营收环比增长 20%。", "sentence": "本季度营收同比增长 20%。", "proposedVerdict": "unsupported", "proposedFacts": ["本季度营收同比增长 20%。"] },
+    { "id": "causation-overstatement", "partition": "tune", "sourceGroup": "latency-trial", "source": "采用方案后，延迟下降，尚未排除同期硬件升级的影响。", "sentence": "采用该方案导致延迟下降。", "proposedVerdict": "unsupported", "proposedFacts": ["采用该方案导致延迟下降。"] },
+    { "id": "valid-paraphrase", "partition": "validation", "sourceGroup": "library-hours", "source": "周五图书馆从上午八点开放至中午十二点。", "sentence": "周五上午八点至十二点可以使用图书馆。", "proposedVerdict": "supported", "proposedFacts": ["周五上午八点至十二点可以使用图书馆。"] },
+    { "id": "late-correction", "partition": "validation", "sourceGroup": "water-survey", "source": "该河水样本的铜含量为 14 毫克每升。\n\n校准说明：上述检测错用了仪器档位，铜含量校正为 4 毫克每升。", "selectedQuotes": ["该河水样本的铜含量为 14 毫克每升。"], "sentence": "该河水样本的铜含量为 14 毫克每升。", "proposedVerdict": "contradicted", "proposedFacts": ["该河水样本的铜含量为 14 毫克每升。"] },
+    { "id": "context-definition", "partition": "validation", "sourceGroup": "rental-policy", "source": "本细则所称标准日为 24 小时。\n\n该租赁服务的最短租期为一标准日。", "selectedQuotes": ["该租赁服务的最短租期为一标准日。"], "sentence": "该租赁服务最短可租 24 小时。", "proposedVerdict": "supported", "proposedFacts": ["该租赁服务最短可租 24 小时。"] },
+    { "id": "context-exception", "partition": "validation", "sourceGroup": "library-hours", "source": "图书馆周五开放时间为上午八点至中午十二点。\n\n节假日当天闭馆，本周五为节假日。", "selectedQuotes": ["图书馆周五开放时间为上午八点至中午十二点。"], "sentence": "图书馆本周五上午八点至十二点开放。", "proposedVerdict": "contradicted", "proposedFacts": ["图书馆本周五上午八点至十二点开放。"] },
+    { "id": "irrelevant-extra-citation", "partition": "validation", "sourceGroup": "exhibit-log", "source": "展览有 24 件作品。展厅的墙壁是蓝色的。", "selectedQuotes": ["展览有 24 件作品。", "展厅的墙壁是蓝色的。"], "sentence": "展览有 24 件作品。", "proposedVerdict": "supported", "proposedFacts": ["展览有 24 件作品。"], "proposedCitationVerdicts": ["contributes", "irrelevant"] },
+    { "id": "support-elsewhere", "partition": "validation", "sourceGroup": "exhibit-log", "source": "展览有 24 件作品。展厅的墙壁是蓝色的。", "selectedQuotes": ["展厅的墙壁是蓝色的。"], "sentence": "展览有 24 件作品。", "proposedVerdict": "unsupported", "proposedFacts": ["展览有 24 件作品。"], "proposedCitationVerdicts": ["irrelevant"] },
+    { "id": "necessary-premise", "partition": "validation", "sourceGroup": "rental-policy", "source": "本细则所称标准日为 24 小时。\n\n该租赁服务的最短租期为一标准日。", "selectedQuotes": ["该租赁服务的最短租期为一标准日。", "本细则所称标准日为 24 小时。"], "sentence": "该租赁服务最短可租 24 小时。", "proposedVerdict": "supported", "proposedFacts": ["该租赁服务最短可租 24 小时。"], "proposedCitationVerdicts": ["contributes", "contributes"] },
+    { "id": "unresolved-cross-reference", "partition": "validation", "sourceGroup": "entry-rules", "source": "该证件通常允许进入东区，例外见未随本页保存的附件。", "sentence": "该证件始终允许进入东区。", "proposedVerdict": "partially_supported", "proposedFacts": ["该证件始终允许进入东区。"] }
   ]
 }

@@ -730,7 +730,7 @@ test('Personal Agent configuration keeps explicit resource versions, failed draf
       await page.getByLabel('Assistant preferences', { exact: true }).fill('Use the explicitly selected invoice guidance.');
     };
     await edit();
-    const researchSkill = page.getByLabel('Enable Skill deep-research v5', { exact: true });
+    const researchSkill = page.getByLabel('Enable Skill deep-research v6', { exact: true });
     await expect(researchSkill).toBeDisabled();
     await expect(researchSkill).not.toBeChecked();
     await expect(page.getByRole('group', { name: 'Personal Agent Skills', exact: true }))

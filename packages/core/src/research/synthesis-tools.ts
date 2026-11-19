@@ -43,7 +43,7 @@ export async function readResearchEvidence(options: ResearchEvidenceOptions, raw
 
 export function createResearchSynthesisTools(options: ResearchEvidenceOptions & {
   files: Pick<FileStore, 'readResearchSource' | 'inspectResearchSource'>; now(): string;
-  review: (input: { runId: number; sessionId: number; systemPrompt: string; text: string }, call: ToolCallContext) =>
+  review: (input: { runId: number; sessionId: number; systemPrompt: string; text: string; requiredCalls?: number }, call: ToolCallContext) =>
     ReturnType<import('../runtime/service.ts').RuntimeService['reviewResearchReport']>;
 }): ToolDefinition<any, any>[] {
   async function identity(call: ToolCallContext, context: ProductToolContext, root: boolean) {
@@ -112,8 +112,8 @@ export function createResearchSynthesisTools(options: ResearchEvidenceOptions & 
           throw error instanceof ToolExecutionFailure ? error
           : new ToolExecutionFailure(appError('research_write_failed', 'storage', 'Research storage is unavailable.', true)); });
       } },
-    { name: 'save_research_report', version: 'p15-v3', label: 'Save research report', effect: 'LOCAL_WRITE', executionMode: 'sequential',
-      description: 'Save a formatVersion=3 report. Use arrays of {text,citations:[{claimId,evidenceIndex}]} in answer and in each section.sentences. Put one sentence in each text item and cite at least one zero-based evidence entry from a saved Claim. Include all passages needed to support the sentence. The Host checks citation coverage, saved quotation, offsets and acquisition identity, then independently reviews every factual assertion in the final sentences. All sentences must be fully supported. Reserve one model call for review and one for the following response. Correct unsupported wording or citations before resubmitting. Do not submit semanticReview. Empty body arrays are allowed for an explicit partial report without findings. coverage needs exactly one record per planned questionId; covered requires non-empty claimIds for that question with verification.status=supported. completeness=full additionally requires every coverage record covered, all referenced Claims and dependencies supported, and unresolvedQuestions=[]. Include conflicts and limitations. If evidence remains incomplete, explicitly submit partial with gap/conflict records and unresolved questions within the remaining budget; the service never downgrades full automatically. A completed Run does not imply a full report.',
+    { name: 'save_research_report', version: 'p15-v4', label: 'Save research report', effect: 'LOCAL_WRITE', executionMode: 'sequential',
+      description: 'Save a formatVersion=3 report. Use arrays of {text,citations:[{claimId,evidenceIndex}]} in answer and in each section.sentences. Put one sentence in each text item and cite at least one zero-based evidence entry from a saved Claim. Include all passages needed to support the sentence. The Host checks citation coverage, saved quotation, offsets and acquisition identity, then independently reviews every factual assertion in the final sentences. All facts must be fully supported and each listed citation must contribute to this sentence. Review uses complete saved source context; large context requires N scans plus one final review. Reserve these calls and one following response within confirmed deadlines. Rewrites must carry structured citations and be reviewed again; never replace original quotations with summaries. Correct unsupported wording or citations before resubmitting. Do not submit semanticReview. Empty body arrays are allowed for an explicit partial report without findings. coverage needs exactly one record per planned questionId; covered requires non-empty claimIds for that question with verification.status=supported. completeness=full additionally requires every coverage record covered, all referenced Claims and dependencies supported, and unresolvedQuestions=[]. Include conflicts and limitations. If evidence remains incomplete, explicitly submit partial with gap/conflict records and unresolved questions within the remaining budget; the service never downgrades full automatically. A completed Run does not imply a full report.',
       inputSchema: ReviewedResearchReportBodySchema,
       outputSchema: schema.union([ResearchReportSchema, schema.object({ semanticReview: ResearchSemanticReviewSchema }).strict()]),
       execute: async (report: ReviewedResearchReportBody, call, context) => {
@@ -144,7 +144,7 @@ export function createResearchSynthesisTools(options: ResearchEvidenceOptions & 
         const plan = await options.database.read(store => store.research.getPlan({ researchId: binding.researchId, planId: binding.plan!.planId }));
         if (!plan.ok) throw new ToolExecutionFailure(plan.error);
         const semanticReview = await reviewResearchReport({ report, question: plan.data.body.question, scope: plan.data.body.scope,
-          sources: [...bodies.values()].map(body => body.source), researchId: binding.researchId,
+          sources: [...bodies.values()].map(body => body.source), sourceBodies: new Map([...bodies].map(([id, body]) => [id, body.text])), researchId: binding.researchId,
           planId: binding.plan!.planId, revision: binding.plan!.revision,
           runId: context.runId, toolCallId, reviewedAt: options.now() },
           claims, payload => options.review({ ...payload, runId: context.runId, sessionId: context.sessionId }, call));

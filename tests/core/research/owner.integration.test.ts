@@ -1,8 +1,8 @@
-import { expect, test } from 'bun:test';
+import { expect, mock, test } from 'bun:test';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { ToolExecutionFailure, type Result } from '@flowmate/contracts';
+import { researchSemanticReportContext, ToolExecutionFailure, type Result, type ReviewedResearchReportBody, type TokenColumns, type UsageRecordV1 } from '@flowmate/contracts';
 import { createFileStore } from '../../../packages/core/src/storage/file-store.ts';
 import { createResearchPlanTool } from '../../../packages/core/src/research/tools.ts';
 import { createResearchReadTools } from '../../../packages/core/src/research/read-tools.ts';
@@ -57,9 +57,9 @@ async function fixture(researching = false) {
     return { task, binding: run('researching', { planId: plan.planId, revision: plan.revision }) };
   });
   const context = { runId: initial.binding.runId, sessionId: initial.binding.sessionId, scope };
-  const call = async (name: string) => database.transaction(store => {
+  const call = async (name: string, nativeToolCallId = name) => database.transaction(store => {
     const result = need(store.toolCalls.request({ context: null, runId: context.runId, sessionId: context.sessionId,
-      nativeToolCallId: name, toolName: name, toolVersion: '1', effect: name === 'read_research_local' || name === 'query_research_evidence' ? 'READ' : 'LOCAL_WRITE',
+      nativeToolCallId, toolName: name, toolVersion: '1', effect: name === 'read_research_local' || name === 'query_research_evidence' ? 'READ' : 'LOCAL_WRITE',
       rawArguments: {}, requestedAt: at }));
     need(store.toolCalls.fixArguments({ toolCallId: result.toolCallId, finalArguments: {} }));
     need(store.toolCalls.start({ toolCallId: result.toolCallId, startedAt: at }));
@@ -75,8 +75,8 @@ async function hold(f: Awaited<ReturnType<typeof fixture>>) {
   return { release: release.resolve, completion };
 }
 
-async function source(f: Awaited<ReturnType<typeof fixture>>, finish = true) {
-  const call = await f.call('read_research_local');
+async function source(f: Awaited<ReturnType<typeof fixture>>, finish = true, nativeToolCallId = 'read_research_local') {
+  const call = await f.call('read_research_local', nativeToolCallId);
   const published = need(await f.files.publishResearchSource({ researchId: f.task.researchId, toolCallId: call.toolCallId, text }));
   const saved = need(await f.database.transaction(store => store.research.saveSource({ researchId: f.task.researchId,
     runId: f.context.runId, toolCallId: call.toolCallId, source: { kind: 'local', address: 'artifact:1', title: 'Controlled evidence',
@@ -87,11 +87,12 @@ async function source(f: Awaited<ReturnType<typeof fixture>>, finish = true) {
   return saved;
 }
 
-async function storeHistoricalReport(f: Awaited<ReturnType<typeof fixture>>, body: unknown) {
-  const call = await f.call('save_research_report');
+async function storeHistoricalReport(f: Awaited<ReturnType<typeof fixture>>, body: unknown, call?: { toolCallId: number }) {
+  call ??= await f.call('save_research_report');
+  const { toolCallId } = call;
   const reportId = await f.database.transaction(store => Number(store.db.query(
     'INSERT INTO research_reports(research_id,plan_id,revision,run_id,tool_call_id,body_json,created_at) VALUES (?,?,?,?,?,?,?)')
-    .run(f.task.researchId, f.binding.plan!.planId, f.binding.plan!.revision, f.context.runId, call.toolCallId, JSON.stringify(body), at).lastInsertRowid));
+    .run(f.task.researchId, f.binding.plan!.planId, f.binding.plan!.revision, f.context.runId, toolCallId, JSON.stringify(body), at).lastInsertRowid));
   return { researchId: f.task.researchId, reportId };
 }
 
@@ -130,6 +131,118 @@ test('keeps stored v2 sentences and evidence available to Markdown and PDF witho
   expect(markdown).toContain('Usage is metered. [[1]](#reference-1)');
   expect(markdown).toContain('This historical report has no independent sentence review.');
 });
+
+test('numbers distinct evidence in body order across snapshots and reuses numbers in Markdown and PDF', async () => {
+  const f = await fixture(true);
+  const sources = [await source(f, true, 'numbering-source-a'), await source(f, true, 'numbering-source-b')];
+  const ids: number[] = [];
+  for (const [index, saved] of sources.entries()) {
+    const call = await f.call('save_research_claim', `numbering-claim-${index}`);
+    const locators = [{ start: 0, end: text.indexOf('\n'), quote: text.slice(0, text.indexOf('\n')) },
+      { start: text.indexOf('Metered'), end: text.length, quote: text.slice(text.indexOf('Metered')) }];
+    const claim = need(await f.database.transaction(store => store.research.saveClaim({
+      researchId: f.task.researchId, runId: f.context.runId, toolCallId: call.toolCallId, at,
+      claim: { questionId: 'cost-1', text: 'Usage is metered.', dependencies: [],
+        evidence: locators.map(locator => ({ relation: 'supports', ref: researchEvidenceRef(f.binding, saved, locator)! })),
+        verification: { status: 'supported', reasons: ['Controlled numbering fixture.'] } },
+    })));
+    ids.push(claim.claimId);
+  }
+  const first = { claimId: ids[1]!, evidenceIndex: 1 }, second = { claimId: ids[0]!, evidenceIndex: 0 }, third = { claimId: ids[0]!, evidenceIndex: 1 };
+  const request = await storeHistoricalReport(f, { formatVersion: 2,
+    answer: [{ text: '第二次采集的计费说明。', citations: [first] }, { text: '第一次采集的原文说明。', citations: [second, third] }],
+    sections: [{ title: '重复引用', sentences: [{ text: '复用前面的两条证据。', citations: [first, second] }] }],
+    completeness: 'partial', conflicts: [], limitations: ['Synthetic numbering acceptance only.'], unresolvedQuestions: [],
+    coverage: [{ questionId: 'cost-1', claimIds: ids, status: 'covered', reason: 'Controlled evidence bindings.' }] });
+  const document = need(await queryResearchReportDocument(f, request));
+  expect(document.references.map(({ number, claimId, evidenceIndex }) => ({ number, claimId, evidenceIndex })))
+    .toEqual([{ ...first, number: 1 }, { ...second, number: 2 }, { ...third, number: 3 }]);
+  expect(document.references.map(ref => [ref.source.sourceSnapshotId, ref.locator.quote]))
+    .toEqual([[sources[1]!.sourceSnapshotId, text.slice(text.indexOf('Metered'))],
+      [sources[0]!.sourceSnapshotId, text.slice(0, text.indexOf('\n'))], [sources[0]!.sourceSnapshotId, text.slice(text.indexOf('Metered'))]]);
+  const { markdown } = need(await exportResearchReport(f, request));
+  const sequence = [1, 2, 3, 1, 2];
+  expect([...markdown.matchAll(/\[\[(\d+)\]\]\(#reference-\d+\)/g)].map(match => Number(match[1]))).toEqual(sequence);
+  expect([...markdown.matchAll(/^### Reference (\d+)$/gm)].map(match => Number(match[1]))).toEqual([1, 2, 3]);
+  mock.module('electron', () => ({ BrowserWindow: class {} }));
+  const { researchPrintHtml } = await import('../../../apps/desktop/main/research-pdf.ts');
+  const html = researchPrintHtml(document);
+  expect([...html.matchAll(/href="#reference-(\d+)">\[(\d+)\]/g)].map(match => [Number(match[1]), Number(match[2])]))
+    .toEqual(sequence.map(number => [number, number]));
+  expect([...html.matchAll(/<h3 id="reference-(\d+)">/g)].map(match => Number(match[1]))).toEqual([1, 2, 3]);
+});
+
+test.each(['valid', 'legacy v1', 'different ref', 'different source', 'wrong context quote', 'missing context source'] as const)(
+  'checks saved semantic review on report read and Markdown export: %s', async variant => {
+    const f = await fixture(true), saved = await source(f), claimCall = await f.call('save_research_claim');
+    const ref = researchEvidenceRef(f.binding, saved, { start: 0, end: text.length, quote: text })!;
+    const statement = 'Usage is metered.';
+    const { claimId } = need(await f.database.transaction(store => store.research.saveClaim({
+      researchId: f.task.researchId, runId: f.context.runId, toolCallId: claimCall.toolCallId, at,
+      claim: { questionId: 'cost-1', text: statement, dependencies: [], evidence: [{ relation: 'supports', ref }],
+        verification: { status: 'supported', reasons: ['The saved source states the usage condition.'] } },
+    })));
+    const call = await f.call('save_research_report'), sentence = citedSentence(statement, [claimId]);
+    const body = { formatVersion: 3, answer: [sentence], sections: [], completeness: 'partial',
+      conflicts: [], limitations: [], unresolvedQuestions: [],
+      coverage: [{ questionId: 'cost-1', claimIds: [claimId], status: 'covered', reason: 'Usage is documented.' }] } satisfies ReviewedResearchReportBody;
+    const model = { provider: 'fixture', model: 'fixture-reviewer' };
+    const usage = { version: 1, source: 'unknown', reason: 'fixture-usage-not-measured', sdkValues: null, attempts: 1,
+      attemptsComplete: true, costSource: null, updatedAt: at } satisfies UsageRecordV1;
+    const tokens = { inputTokens: null, outputTokens: null, totalTokens: null, cost: null, usageComplete: false } satisfies TokenColumns;
+    const locator = { start: text.indexOf('Metered'), end: text.length,
+      quote: variant === 'wrong context quote' ? 'Catered usage.' : 'Metered usage.' };
+    const segment = { sourceSnapshotId: saved.sourceSnapshotId, start: 0, end: text.length, readStart: 0, readEnd: text.length,
+      complete: true, findings: [{ sentenceIndex: 0, kind: 'qualification', locator }] };
+    const policyVersion = variant === 'legacy v1' ? 'research-semantic-v1' : 'research-semantic-v2';
+    const v2 = policyVersion === 'research-semantic-v2';
+    const segments = variant === 'missing context source'
+      ? [segment, { ...segment, sourceSnapshotId: saved.sourceSnapshotId + 1000, findings: [] }] : [segment];
+    const metadata = { model, responseId: 'review-receipt', usage, tokens };
+    const review = { ...f.binding.plan!, researchId: f.task.researchId, runId: f.context.runId, toolCallId: call.toolCallId,
+      policyVersion, reviewedAt: at, reportContext: researchSemanticReportContext(body),
+      status: 'verified', ...metadata,
+      sentences: [{ ...sentence, sentenceIndex: 0, verdict: 'supported', complete: true,
+        facts: [{ start: 0, end: statement.length, text: statement, citations: sentence.citations, verdict: 'supported', reason: 'Metered usage is stated.' }],
+        ...(v2 && { citationReviews: [{ claimId, evidenceIndex: 0, verdict: 'contributes', reason: 'The citation states the usage condition.',
+          contributions: [{ factIndex: 0, role: 'direct_support', reason: 'It directly describes how usage is measured.' }] }] }),
+      }],
+      ...(v2 && { evidenceBindings: [{ claimId, evidenceIndex: 0, ref: variant === 'different ref' ? { ...ref, locator } : ref,
+        source: variant === 'different source' ? { ...saved, title: 'Different title for the same snapshot' } : saved }],
+      context: { mode: 'segmented', segments },
+      stages: [...segments.map(() => ({ stage: 'context', ...metadata })), { stage: 'final', ...metadata }] }),
+    };
+    const request = await storeHistoricalReport(f, { ...body, semanticReview: review }, call);
+    const document = await queryResearchReportDocument(f, request), exported = await exportResearchReport(f, request);
+    if (variant !== 'valid' && variant !== 'legacy v1') {
+      const code = variant === 'missing context source' ? 'research_not_found' : 'research_evidence_mismatch';
+      expect(document).toMatchObject({ ok: false, error: { code } });
+      expect(exported).toMatchObject({ ok: false, error: { code } });
+      return;
+    }
+    const proven = need(document);
+    expect(proven.report.semanticReview?.policyVersion).toBe(policyVersion);
+    const { markdown } = need(exported);
+    mock.module('electron', () => ({ BrowserWindow: class {} }));
+    const { researchPrintHtml } = await import('../../../apps/desktop/main/research-pdf.ts');
+    const html = researchPrintHtml(proven);
+    if (v2) {
+      expect(markdown).toContain('It directly describes how usage is measured.');
+      expect(markdown.match(/\[\[1\]\]\(#reference-1\)/g)).toHaveLength(1);
+      expect(markdown.match(/\[Reference 1\]\(#reference-1\)/g)).toHaveLength(2);
+      expect(markdown).toContain(`Source snapshot ${saved.sourceSnapshotId}`);
+      expect(markdown).toContain('qualification');
+      expect(markdown).toContain('review-receipt');
+      expect(html).toContain('It directly describes how usage is measured.');
+      expect(html).toContain('href="#review-sentence-1"');
+      expect(html).toContain('<blockquote>Metered usage.</blockquote>');
+      expect(html).toContain('review-receipt');
+    } else {
+      const note = 'This v1 receipt does not include saved source context or citation contribution checks.';
+      expect(markdown).toContain(note);
+      expect(html).toContain(note);
+    }
+  });
 
 test('a stored Claim cannot establish report evidence if acquisition never successfully stopped', async () => {
   const f = await fixture(true), saved = await source(f, false);
